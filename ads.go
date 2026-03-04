@@ -9,6 +9,14 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// ListSymbols returns the discovered symbol table.
+// The map is populated during Connect() and keys are fully qualified symbol names.
+func (conn *Connection) ListSymbols() map[string]*Symbol {
+	conn.symbolLock.Lock()
+	defer conn.symbolLock.Unlock()
+	return conn.symbols
+}
+
 func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 	conn.symbolLock.Lock()
 	defer conn.symbolLock.Unlock()
