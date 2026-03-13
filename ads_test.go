@@ -287,7 +287,7 @@ func TestParseUploadSymbolInfoSymbols_Empty(t *testing.T) {
 
 func TestSymbolParseBOOL(t *testing.T) {
 	sym := &Symbol{DataType: "BOOL", Length: 1}
-	val, err := sym.parse([]byte{1}, 0)
+	val, err := sym.parse([]byte{1}, 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestSymbolParseBOOL(t *testing.T) {
 	}
 
 	sym2 := &Symbol{DataType: "BOOL", Length: 1}
-	val, err = sym2.parse([]byte{0}, 0)
+	val, err = sym2.parse([]byte{0}, 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestSymbolParseINT16(t *testing.T) {
 	data := make([]byte, 2)
 	data[0] = byte(0xD6) // -42 as little-endian int16 = 0xFFD6
 	data[1] = byte(0xFF)
-	val, err := sym.parse(data, 0)
+	val, err := sym.parse(data, 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestSymbolParseUINT(t *testing.T) {
 	sym := &Symbol{DataType: "UINT", Length: 2}
 	data := make([]byte, 2)
 	binary.LittleEndian.PutUint16(data, 1234)
-	val, err := sym.parse(data, 0)
+	val, err := sym.parse(data, 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -336,7 +336,7 @@ func TestSymbolParseREAL(t *testing.T) {
 	sym := &Symbol{DataType: "REAL", Length: 4}
 	data := make([]byte, 4)
 	binary.LittleEndian.PutUint32(data, 0x41200000) // 10.0 as float32
-	val, err := sym.parse(data, 0)
+	val, err := sym.parse(data, 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestSymbolParseSTRING(t *testing.T) {
 	sym := &Symbol{DataType: "STRING", Length: 20}
 	data := make([]byte, 20)
 	copy(data, "Hello\x00")
-	val, err := sym.parse(data, 0)
+	val, err := sym.parse(data, 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestSymbolParseSTRING(t *testing.T) {
 
 func TestSymbolParseUnknownType(t *testing.T) {
 	sym := &Symbol{DataType: "UNKNOWN_TYPE", Length: 4}
-	_, err := sym.parse([]byte{0, 0, 0, 0}, 0)
+	_, err := sym.parse([]byte{0, 0, 0, 0}, 0, nil)
 	if err == nil {
 		t.Error("expected error for unknown data type")
 	}

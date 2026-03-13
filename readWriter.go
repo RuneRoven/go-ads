@@ -11,7 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-func (symbol *Symbol) parse(data []byte, offset int) (string, error) {
+func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]SymbolUploadDataType) (string, error) {
 	start := offset
 	stop := start + int(symbol.Length)
 	if start+int(symbol.Length) > len(data) {
@@ -21,7 +21,7 @@ func (symbol *Symbol) parse(data []byte, offset int) (string, error) {
 	var newValue = "nil"
 	if len(symbol.Childs) > 0 {
 		for _, value := range symbol.Childs {
-			value.parse(data[offset:stop], int(value.Offset))
+			value.parse(data[offset:stop], int(value.Offset), datatypes)
 		}
 		newValue = symbol.GetJSON(false)
 
@@ -142,7 +142,17 @@ func (symbol *Symbol) parse(data []byte, offset int) (string, error) {
 
 			newValue = t.Truncate(time.Millisecond).Format("2006-01-02 15:04:05")
 		default:
-			return "", fmt.Errorf("unknown format cannot parse")
+			// Try resolving type alias via datatype table
+			if datatypes != nil {
+				if dt, ok := datatypes[symbol.DataType]; ok {
+					if stringArrayIncludes(parseableTypes, dt.DataType) {
+						resolved := *symbol
+						resolved.DataType = dt.DataType
+						return resolved.parse(data, offset, nil)
+					}
+				}
+			}
+			return "", fmt.Errorf("unknown format cannot parse: %s", symbol.DataType)
 		}
 	}
 	if strcmp(symbol.Value, newValue) != 0 &&
@@ -203,11 +213,17 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 	dt := symbol.DataType
 
 	if !stringArrayIncludes(parseableTypes, symbol.DataType) {
-		dtDt := datatypes[dt].DataType
-		if stringArrayIncludes(parseableTypes, dtDt) {
-			dt = datatypes[dt].DataType
+		if datatypes == nil {
+			return nil, fmt.Errorf("cannot write to symbol with aliased type %q without full symbol discovery; call LoadSymbols() first", symbol.DataType)
+		}
+		dtEntry, ok := datatypes[dt]
+		if !ok {
+			return nil, fmt.Errorf("datatype %q not found in datatype table", dt)
+		}
+		if stringArrayIncludes(parseableTypes, dtEntry.DataType) {
+			dt = dtEntry.DataType
 		} else {
-			return nil, fmt.Errorf("data type not parseable %v", dtDt)
+			return nil, fmt.Errorf("data type not parseable %v", dtEntry.DataType)
 		}
 	}
 	switch dt {

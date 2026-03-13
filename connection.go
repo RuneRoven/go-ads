@@ -53,6 +53,12 @@ type Connection struct {
 	isLocal              bool
 	disconnected         atomic.Bool
 
+	// Symbol discovery mode tracking
+	symbolsFullyLoaded bool            // true after LoadSymbols() or LoadSymbolsSlow() completes
+	symbolListLoaded   bool            // true after LoadSymbolList() — symbol names available for browsing
+	datatypesLoaded    bool            // true after LoadDataTypes() — struct children expandable
+	onDemandSymbols    map[string]bool // tracks symbol names resolved on-demand (for reconnect)
+
 	// Feature support flags (detected at runtime)
 	sumReadSupported atomic.Bool
 	sumReadChecked   atomic.Bool
@@ -85,6 +91,8 @@ func NewConnection(ctx context.Context, ip string, port int, netid string, amsPo
 	conn.activeRequests = map[uint32]chan []byte{}
 	conn.activeNotifications = make(map[uint32]*Symbol)
 	conn.sendChannel = make(chan []byte)
+	conn.symbols = map[string]*Symbol{}
+	conn.onDemandSymbols = map[string]bool{}
 	// Use an independent context so that Close() can still send cleanup commands
 	// even after the parent context is canceled (e.g. on SIGTERM)
 	conn.ctx, conn.shutdown = context.WithCancel(context.Background())
@@ -149,10 +157,12 @@ func (conn *Connection) Connect(local bool) error {
 		}
 		conn.source = result
 	}
-	err = conn.loadSymbols()
+	// Read symbol version for later change detection (best-effort, don't fail connect)
+	version, err := conn.GetSymbolVersion()
 	if err != nil {
-		log.Error().Err(err).Msg("failed to load symbols during connect")
-		return err
+		log.Debug().Err(err).Msg("could not read symbol version during connect")
+	} else {
+		conn.symbolVersion = version
 	}
 	return nil
 }
@@ -266,24 +276,63 @@ func (conn *Connection) Reconnect() error {
 		go conn.listen()
 		go conn.transmitWorker()
 
-		// Re-load symbols
-		err = conn.loadSymbols()
-		if err != nil {
-			lastErr = err
-			conn.disconnected.Store(true)
-			log.Warn().Err(err).Int("attempt", attempts).Msg("reconnect symbol load failed, retrying")
-			// Stop goroutines before next attempt
-			conn.shutdown()
-			if conn.connection != nil {
-				conn.connection.Close()
+		// Re-load symbols based on discovery mode
+		if conn.symbolsFullyLoaded {
+			// Full discovery was done — redo it
+			err = conn.loadSymbols()
+			if err != nil {
+				lastErr = err
+				conn.disconnected.Store(true)
+				log.Warn().Err(err).Int("attempt", attempts).Msg("reconnect symbol load failed, retrying")
+				// Stop goroutines before next attempt
+				conn.shutdown()
+				if conn.connection != nil {
+					conn.connection.Close()
+				}
+				conn.waitGroup.Wait()
+				conn.ctx, conn.shutdown = context.WithCancel(context.Background())
+				conn.sendChannel = make(chan []byte)
+				conn.systemResponse = make(chan []byte)
+				conn.activeRequests = map[uint32]chan []byte{}
+				time.Sleep(conn.reconnectInterval)
+				continue
 			}
-			conn.waitGroup.Wait()
-			conn.ctx, conn.shutdown = context.WithCancel(context.Background())
-			conn.sendChannel = make(chan []byte)
-			conn.systemResponse = make(chan []byte)
-			conn.activeRequests = map[uint32]chan []byte{}
-			time.Sleep(conn.reconnectInterval)
-			continue
+		} else if conn.symbolListLoaded || conn.datatypesLoaded {
+			// Partial discovery — re-download what was loaded
+			if conn.symbolListLoaded {
+				err = conn.LoadSymbolList(SlowDiscoveryConfig{})
+				if err != nil {
+					log.Warn().Err(err).Msg("reconnect: failed to reload symbol list")
+				}
+			}
+			if conn.datatypesLoaded {
+				err = conn.LoadDataTypes(SlowDiscoveryConfig{})
+				if err != nil {
+					log.Warn().Err(err).Msg("reconnect: failed to reload datatypes")
+				}
+			}
+		} else if len(conn.onDemandSymbols) > 0 {
+			// On-demand mode: re-resolve only the symbols that were previously loaded
+			conn.symbolLock.Lock()
+			oldSymbols := conn.onDemandSymbols
+			conn.symbols = make(map[string]*Symbol)
+			conn.onDemandSymbols = make(map[string]bool)
+			conn.symbolLock.Unlock()
+
+			for name := range oldSymbols {
+				_, err := conn.GetSymbol(name) // triggers on-demand resolution
+				if err != nil {
+					log.Warn().Err(err).Str("symbol", name).Msg("failed to re-resolve symbol on reconnect")
+				}
+			}
+		} else {
+			// No symbols were loaded — read symbol version for future use
+			version, err := conn.GetSymbolVersion()
+			if err != nil {
+				log.Debug().Err(err).Msg("could not read symbol version during reconnect")
+			} else {
+				conn.symbolVersion = version
+			}
 		}
 
 		// Re-subscribe notifications using stored configs (don't re-append)

@@ -73,7 +73,7 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 	}
 	timeStamp := int64(timestamp)/windowsTick - secToUnixEpoch
 	notificationTime := time.Unix(timeStamp, int64(timestamp)%(windowsTick)*100)
-	value, err := symbol.parse(content, 0)
+	value, err := symbol.parse(content, 0, conn.datatypes)
 	if err != nil {
 		log.Error().
 			Err(err).

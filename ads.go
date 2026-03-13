@@ -4,27 +4,185 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
 )
 
-// ListSymbols returns the discovered symbol table.
-// The map is populated during Connect() and keys are fully qualified symbol names.
-func (conn *Connection) ListSymbols() map[string]*Symbol {
+// ListSymbols returns the full symbol table.
+// Requires LoadSymbols() or LoadSymbolsSlow() to have been called first.
+// Returns an error if full discovery has not been performed.
+func (conn *Connection) ListSymbols() (map[string]*Symbol, error) {
 	conn.symbolLock.Lock()
 	defer conn.symbolLock.Unlock()
-	return conn.symbols
+	if !conn.symbolsFullyLoaded {
+		return nil, fmt.Errorf("full symbol discovery has not been run; call LoadSymbols() or LoadSymbolsSlow() first")
+	}
+	return conn.symbols, nil
+}
+
+// LoadSymbols performs full symbol and datatype discovery from the PLC.
+// After calling this, ListSymbols() returns all symbols, and struct/array
+// children are available. Write operations with type aliases also work.
+// This downloads the entire symbol and datatype tables in single requests,
+// which may cause real-time jitter on the PLC. For large programs, consider
+// LoadSymbolsSlow() instead.
+func (conn *Connection) LoadSymbols() error {
+	err := conn.loadSymbols()
+	if err != nil {
+		return err
+	}
+	conn.symbolLock.Lock()
+	conn.symbolsFullyLoaded = true
+	conn.onDemandSymbols = map[string]bool{}
+	conn.symbolLock.Unlock()
+	return nil
+}
+
+// SlowDiscoveryConfig configures chunked symbol table download.
+type SlowDiscoveryConfig struct {
+	// ChunkSize is the number of bytes to download per request.
+	// Default: 4096 bytes.
+	ChunkSize uint32
+
+	// ChunkDelay is the delay between chunk requests, giving the PLC
+	// time to handle its real-time tasks. Default: 100ms.
+	ChunkDelay time.Duration
+}
+
+// LoadSymbolsSlow downloads the full symbol table in chunks with delays
+// between each chunk, to minimize disruption to the PLC's real-time task.
+// If the PLC does not support offset-based chunked reads, it falls back
+// to downloading each table in a single request with a delay between them.
+func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
+	if cfg.ChunkSize == 0 {
+		cfg.ChunkSize = 4096
+	}
+	if cfg.ChunkDelay == 0 {
+		cfg.ChunkDelay = 100 * time.Millisecond
+	}
+
+	// Step 1: Read symbol version
+	version, err := conn.GetSymbolVersion()
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to read symbol version during slow discovery")
+	} else {
+		conn.symbolVersion = version
+	}
+
+	// Step 2: Get upload info (small request)
+	uploadInfo, err := conn.GetSymbolUploadInfo()
+	if err != nil {
+		return fmt.Errorf("failed to get symbol upload info: %w", err)
+	}
+
+	time.Sleep(cfg.ChunkDelay)
+
+	// Step 3: Download datatypes in chunks
+	datatypesData, err := conn.downloadInChunks(
+		uint32(GroupSymbolDataTypeUpload),
+		uploadInfo.DataTypeLength,
+		cfg.ChunkSize,
+		cfg.ChunkDelay,
+	)
+	if err != nil {
+		// Fallback: download datatypes in one request
+		log.Info().Err(err).Msg("chunked datatype download failed, falling back to single request")
+		datatypesData, err = conn.GetUploadSymbolInfoDataTypes(uploadInfo.DataTypeLength)
+		if err != nil {
+			return fmt.Errorf("failed to download datatypes: %w", err)
+		}
+	}
+	datatypes, err := ParseUploadSymbolInfoDataTypes(datatypesData)
+	if err != nil {
+		return fmt.Errorf("failed to parse datatypes: %w", err)
+	}
+
+	time.Sleep(cfg.ChunkDelay)
+
+	// Step 4: Download symbols in chunks
+	symbolsData, err := conn.downloadInChunks(
+		uint32(GroupSymbolUpload),
+		uploadInfo.SymbolLength,
+		cfg.ChunkSize,
+		cfg.ChunkDelay,
+	)
+	if err != nil {
+		// Fallback: download symbols in one request
+		log.Info().Err(err).Msg("chunked symbol download failed, falling back to single request")
+		symbolsData, err = conn.GetUploadSymbolInfoSymbols(uploadInfo.SymbolLength)
+		if err != nil {
+			return fmt.Errorf("failed to download symbols: %w", err)
+		}
+	}
+	symbols, err := ParseUploadSymbolInfoSymbols(symbolsData, datatypes)
+	if err != nil {
+		return fmt.Errorf("failed to parse symbols: %w", err)
+	}
+
+	// Step 5: Store results
+	conn.symbolLock.Lock()
+	conn.datatypes = datatypes
+	conn.symbols = symbols
+	conn.symbolsFullyLoaded = true
+	conn.onDemandSymbols = map[string]bool{}
+	conn.symbolLock.Unlock()
+
+	log.Info().
+		Uint32("symbolCount", uploadInfo.SymbolCount).
+		Uint32("datatypeCount", uploadInfo.DataTypeCount).
+		Msg("slow symbol discovery complete")
+
+	return nil
+}
+
+// downloadInChunks reads a large ADS data blob in smaller pieces using
+// the offset parameter of the ADS Read command.
+func (conn *Connection) downloadInChunks(group uint32, totalLength uint32, chunkSize uint32, delay time.Duration) ([]byte, error) {
+	if totalLength == 0 {
+		return []byte{}, nil
+	}
+
+	result := make([]byte, 0, totalLength)
+	var offset uint32
+
+	for offset < totalLength {
+		remaining := totalLength - offset
+		readLen := chunkSize
+		if remaining < readLen {
+			readLen = remaining
+		}
+
+		chunk, err := conn.Read(group, offset, readLen)
+		if err != nil {
+			return nil, fmt.Errorf("chunk read at offset %d failed: %w", offset, err)
+		}
+
+		result = append(result, chunk...)
+		offset += uint32(len(chunk))
+
+		if offset < totalLength && delay > 0 {
+			time.Sleep(delay)
+		}
+	}
+
+	if uint32(len(result)) != totalLength {
+		return nil, fmt.Errorf("downloaded %d bytes but expected %d", len(result), totalLength)
+	}
+
+	return result, nil
 }
 
 func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 	conn.symbolLock.Lock()
-	defer conn.symbolLock.Unlock()
 	localSymbol, ok := conn.symbols[symbolName]
 	if ok {
 		if localSymbol.Handle == 0 {
 			handle, err := conn.GetHandleByName(symbolName)
 			if err != nil {
+				conn.symbolLock.Unlock()
 				return nil, err
 			}
 			localSymbol.Handle = handle
@@ -32,14 +190,92 @@ func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 		log.Trace().
 			Interface("symbol", localSymbol).
 			Msg("symbol got")
+		conn.symbolLock.Unlock()
 		return localSymbol, nil
 	}
-	err := fmt.Errorf("symbol does not exist")
-	log.Error().
-		Err(err).
-		Str("symbol name", symbolName).
-		Msg("error getting handle by name")
-	return nil, err
+	conn.symbolLock.Unlock()
+
+	// On-demand resolution: query the PLC for this specific symbol
+	sym, err := conn.getSymbolInfoByName(symbolName)
+	if err != nil {
+		return nil, fmt.Errorf("symbol %q not found and on-demand lookup failed: %w", symbolName, err)
+	}
+
+	handle, err := conn.GetHandleByName(symbolName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get handle for %q: %w", symbolName, err)
+	}
+	sym.Handle = handle
+
+	conn.symbolLock.Lock()
+	// Check if another goroutine resolved this symbol while we were waiting
+	if existing, ok := conn.symbols[symbolName]; ok {
+		conn.symbolLock.Unlock()
+		return existing, nil
+	}
+	conn.symbols[symbolName] = sym
+	conn.onDemandSymbols[symbolName] = true
+	conn.symbolLock.Unlock()
+
+	log.Info().
+		Str("symbol", symbolName).
+		Str("dataType", sym.DataType).
+		Uint32("length", sym.Length).
+		Msg("symbol resolved on-demand")
+
+	return sym, nil
+}
+
+// getSymbolInfoByName queries a single symbol's metadata from the PLC
+// using GroupSymbolInfoByNameEx (0xF009).
+// Returns a populated Symbol with Group, Offset, Length, DataType, etc.
+// Does NOT populate Childs (struct/array children require full discovery).
+func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) {
+	resp, err := conn.WriteRead(
+		uint32(GroupSymbolInfoByNameEx),
+		0,
+		2048,
+		[]byte(symbolName),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("GetSymbolInfoByName(%s) failed: %w", symbolName, err)
+	}
+
+	buff := bytes.NewBuffer(resp)
+	entry := symbolEntry{}
+	if err := binary.Read(buff, binary.LittleEndian, &entry); err != nil {
+		return nil, fmt.Errorf("failed to parse symbol entry for %s: %w", symbolName, err)
+	}
+
+	// Read null-terminated strings: name, type, comment
+	name := make([]byte, entry.NameLength)
+	binary.Read(buff, binary.LittleEndian, name)
+	buff.Next(1) // null terminator
+
+	dt := make([]byte, entry.TypeLength)
+	binary.Read(buff, binary.LittleEndian, dt)
+	buff.Next(1) // null terminator
+
+	comment := make([]byte, entry.CommentLength)
+	binary.Read(buff, binary.LittleEndian, comment)
+
+	dataType := string(dt)
+	if len(dataType) >= 6 && dataType[:6] == "STRING" {
+		dataType = "STRING"
+	}
+
+	sym := &Symbol{
+		FullName:          symbolName,
+		Name:              string(name),
+		DataType:          dataType,
+		Comment:           string(comment),
+		Group:             entry.IGroup,
+		Offset:            entry.IOffs,
+		Length:            entry.Size,
+		LastUpdateTime:    time.Now(),
+		MinUpdateInterval: 50 * time.Millisecond,
+	}
+	return sym, nil
 }
 
 func (conn *Connection) GetHandleByName(symbolName string) (handle uint32, err error) {
@@ -113,7 +349,7 @@ func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
 		Str("symbol", symbolName).
 		Str("Value", symbol.Value).
 		Msg("Rdebug")
-	value, err := symbol.parse(data, 0)
+	value, err := symbol.parse(data, 0, conn.datatypes)
 	if err != nil {
 		log.Error().
 			Err(err).
@@ -233,7 +469,7 @@ func (conn *Connection) RefreshSymbols() error {
 	return nil
 }
 
-func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, cycleTime int, transMode TransMode, updateReceiver chan *Update) error {
+func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, cycleTime int, transMode TransMode, updateReceiver chan *Update) (uint32, error) {
 	symbol, err := conn.GetSymbol(symbolName)
 	if err != nil {
 		log.
@@ -241,7 +477,7 @@ func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, c
 			Str("symbol", symbolName).
 			Err(err).
 			Msg("error getting symbol")
-		return err
+		return 0, err
 	}
 	handle, err := conn.AddDeviceNotification(
 		uint32(GroupSymbolValueByHandle),
@@ -251,7 +487,7 @@ func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, c
 		time.Duration(maxDelay)*time.Millisecond,
 		time.Duration(cycleTime)*time.Millisecond)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	log.Info().
 		Int("handle", int(handle)).
@@ -261,7 +497,7 @@ func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, c
 	defer conn.symbolLock.Unlock()
 	symbol.Notification = updateReceiver
 	conn.activeNotifications[handle] = symbol
-	return nil
+	return handle, nil
 }
 
 type Update struct {
@@ -328,7 +564,7 @@ func (conn *Connection) ReadMultipleSymbols(names []string) (map[string]string, 
 				Msg("symbol read error in batch")
 			continue
 		}
-		value, err := infos[i].symbol.parse(result.Data, 0)
+		value, err := infos[i].symbol.parse(result.Data, 0, conn.datatypes)
 		if err != nil {
 			log.Error().Err(err).Str("symbol", infos[i].name).Msg("error parsing symbol in batch read")
 			continue
@@ -406,4 +642,354 @@ func (conn *Connection) AddSymbolNotifications(configs []NotificationConfig, ch 
 	conn.notificationChannel = ch
 
 	return nil
+}
+
+// SymbolBrowseEntry represents a browsable symbol or child.
+type SymbolBrowseEntry struct {
+	Name        string // short name (e.g., "motor")
+	FullName    string // full path (e.g., "MAIN.motor")
+	DataType    string // type name (e.g., "ST_Motor", "INT")
+	Size        uint32
+	HasChildren bool   // true if struct/array (requires LoadDataTypes to expand)
+	Comment     string
+}
+
+// LoadSymbolList downloads only the symbol table (0xF00B) from the PLC in chunks.
+// This is the smaller of the two tables and enables browsing top-level symbol names.
+// After calling this, BrowseSymbols() can list root symbols and navigate by prefix.
+// To also expand struct/array children, call LoadDataTypes() afterwards.
+func (conn *Connection) LoadSymbolList(cfg SlowDiscoveryConfig) error {
+	if cfg.ChunkSize == 0 {
+		cfg.ChunkSize = 4096
+	}
+	if cfg.ChunkDelay == 0 {
+		cfg.ChunkDelay = 100 * time.Millisecond
+	}
+
+	// Read symbol version
+	version, err := conn.GetSymbolVersion()
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to read symbol version during LoadSymbolList")
+	} else {
+		conn.symbolVersion = version
+	}
+
+	// Get upload info
+	uploadInfo, err := conn.GetSymbolUploadInfo()
+	if err != nil {
+		return fmt.Errorf("failed to get symbol upload info: %w", err)
+	}
+
+	time.Sleep(cfg.ChunkDelay)
+
+	// Download symbols in chunks
+	symbolsData, err := conn.downloadInChunks(
+		uint32(GroupSymbolUpload),
+		uploadInfo.SymbolLength,
+		cfg.ChunkSize,
+		cfg.ChunkDelay,
+	)
+	if err != nil {
+		// Fallback: download symbols in one request
+		log.Info().Err(err).Msg("chunked symbol download failed, falling back to single request")
+		symbolsData, err = conn.GetUploadSymbolInfoSymbols(uploadInfo.SymbolLength)
+		if err != nil {
+			return fmt.Errorf("failed to download symbols: %w", err)
+		}
+	}
+
+	// Parse without datatypes — no child expansion
+	symbols, err := ParseUploadSymbolInfoSymbols(symbolsData, nil)
+	if err != nil {
+		return fmt.Errorf("failed to parse symbols: %w", err)
+	}
+
+	conn.symbolLock.Lock()
+	conn.symbols = symbols
+	conn.symbolListLoaded = true
+	conn.onDemandSymbols = map[string]bool{}
+
+	// If datatypes were already loaded, retroactively expand children
+	if conn.datatypesLoaded && conn.datatypes != nil {
+		conn.rebuildSymbolChildrenLocked()
+	}
+	conn.symbolLock.Unlock()
+
+	log.Info().
+		Uint32("symbolCount", uploadInfo.SymbolCount).
+		Msg("symbol list loaded (browse mode)")
+
+	return nil
+}
+
+// LoadDataTypes downloads only the datatype table (0xF00E) from the PLC in chunks.
+// After calling this along with LoadSymbolList(), struct/array children can be
+// browsed and expanded via BrowseSymbols().
+func (conn *Connection) LoadDataTypes(cfg SlowDiscoveryConfig) error {
+	if cfg.ChunkSize == 0 {
+		cfg.ChunkSize = 4096
+	}
+	if cfg.ChunkDelay == 0 {
+		cfg.ChunkDelay = 100 * time.Millisecond
+	}
+
+	// Get upload info
+	uploadInfo, err := conn.GetSymbolUploadInfo()
+	if err != nil {
+		return fmt.Errorf("failed to get symbol upload info: %w", err)
+	}
+
+	time.Sleep(cfg.ChunkDelay)
+
+	// Download datatypes in chunks
+	datatypesData, err := conn.downloadInChunks(
+		uint32(GroupSymbolDataTypeUpload),
+		uploadInfo.DataTypeLength,
+		cfg.ChunkSize,
+		cfg.ChunkDelay,
+	)
+	if err != nil {
+		// Fallback: download datatypes in one request
+		log.Info().Err(err).Msg("chunked datatype download failed, falling back to single request")
+		datatypesData, err = conn.GetUploadSymbolInfoDataTypes(uploadInfo.DataTypeLength)
+		if err != nil {
+			return fmt.Errorf("failed to download datatypes: %w", err)
+		}
+	}
+
+	datatypes, err := ParseUploadSymbolInfoDataTypes(datatypesData)
+	if err != nil {
+		return fmt.Errorf("failed to parse datatypes: %w", err)
+	}
+
+	conn.symbolLock.Lock()
+	conn.datatypes = datatypes
+	conn.datatypesLoaded = true
+
+	// If symbols were already loaded, retroactively expand children
+	if conn.symbolListLoaded && conn.symbols != nil {
+		conn.rebuildSymbolChildrenLocked()
+	}
+	conn.symbolLock.Unlock()
+
+	log.Info().
+		Uint32("datatypeCount", uploadInfo.DataTypeCount).
+		Msg("datatypes loaded")
+
+	return nil
+}
+
+// rebuildSymbolChildrenLocked rebuilds children for all symbols using the datatype table.
+// Must be called with symbolLock held.
+func (conn *Connection) rebuildSymbolChildrenLocked() {
+	if conn.symbols == nil || conn.datatypes == nil {
+		return
+	}
+
+	// Collect top-level symbol names (those without a dot, i.e., not children)
+	// We rebuild from the original top-level symbols only
+	topLevel := make(map[string]*Symbol)
+	for name, sym := range conn.symbols {
+		topLevel[name] = sym
+	}
+
+	for _, sym := range topLevel {
+		dt, ok := conn.datatypes[sym.DataType]
+		if ok {
+			sym.Childs = dt.addOffset(sym, conn.datatypes, sym.Group, sym.Offset)
+			addChilds(sym, conn.symbols)
+		}
+	}
+
+	log.Info().Int("symbols", len(conn.symbols)).Msg("symbol children rebuilt from datatypes")
+}
+
+// BrowseSymbols returns browsable entries at the given path in the symbol hierarchy.
+// If path is empty, returns root-level groupings (first path segments).
+// If path is specified, returns children of that symbol or prefix.
+// Requires LoadSymbolList() or LoadSymbols() to have been called first.
+func (conn *Connection) BrowseSymbols(path string) ([]SymbolBrowseEntry, error) {
+	conn.symbolLock.Lock()
+	defer conn.symbolLock.Unlock()
+
+	if !conn.symbolListLoaded && !conn.symbolsFullyLoaded {
+		return nil, fmt.Errorf("symbol list not loaded; call LoadSymbolList() or LoadSymbols() first")
+	}
+
+	if path == "" {
+		return conn.browseRoot(), nil
+	}
+
+	return conn.browseChildren(path), nil
+}
+
+// browseRoot returns unique root-level entries (first segment of each symbol name).
+// Must be called with symbolLock held.
+func (conn *Connection) browseRoot() []SymbolBrowseEntry {
+	roots := make(map[string]bool)
+	var entries []SymbolBrowseEntry
+
+	for name, sym := range conn.symbols {
+		// Skip children (only top-level symbols from the upload have no Parent)
+		if sym.Parent != nil {
+			continue
+		}
+
+		// Get first segment (e.g., "MAIN" from "MAIN.myVar")
+		dot := strings.IndexByte(name, '.')
+		if dot < 0 {
+			// No dot — this is a root symbol itself
+			if !roots[name] {
+				roots[name] = true
+				entries = append(entries, SymbolBrowseEntry{
+					Name:        sym.Name,
+					FullName:    sym.FullName,
+					DataType:    sym.DataType,
+					Size:        sym.Length,
+					HasChildren: conn.symbolHasChildren(sym),
+					Comment:     sym.Comment,
+				})
+			}
+			continue
+		}
+
+		root := name[:dot]
+		if !roots[root] {
+			roots[root] = true
+			// Check if the root itself is a symbol
+			if rootSym, ok := conn.symbols[root]; ok {
+				entries = append(entries, SymbolBrowseEntry{
+					Name:        rootSym.Name,
+					FullName:    rootSym.FullName,
+					DataType:    rootSym.DataType,
+					Size:        rootSym.Length,
+					HasChildren: true, // has children since we found dotted names
+					Comment:     rootSym.Comment,
+				})
+			} else {
+				// Virtual grouping (e.g., "MAIN" prefix with no symbol for "MAIN" itself)
+				entries = append(entries, SymbolBrowseEntry{
+					Name:        root,
+					FullName:    root,
+					HasChildren: true,
+				})
+			}
+		}
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].FullName < entries[j].FullName
+	})
+	return entries
+}
+
+// browseChildren returns children of a given path.
+// Must be called with symbolLock held.
+func (conn *Connection) browseChildren(path string) []SymbolBrowseEntry {
+	// First: check if the exact symbol exists and has Childs
+	if sym, ok := conn.symbols[path]; ok && len(sym.Childs) > 0 {
+		var entries []SymbolBrowseEntry
+		for _, child := range sym.Childs {
+			entries = append(entries, SymbolBrowseEntry{
+				Name:        child.Name,
+				FullName:    child.FullName,
+				DataType:    child.DataType,
+				Size:        child.Length,
+				HasChildren: conn.symbolHasChildren(child),
+				Comment:     child.Comment,
+			})
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].FullName < entries[j].FullName
+		})
+		return entries
+	}
+
+	// Fallback: scan for symbols with the prefix "path."
+	prefix := path + "."
+	seen := make(map[string]bool)
+	var entries []SymbolBrowseEntry
+
+	for name := range conn.symbols {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+
+		// Get next segment after prefix
+		rest := name[len(prefix):]
+		dot := strings.IndexByte(rest, '.')
+		var segment string
+		if dot < 0 {
+			segment = rest
+		} else {
+			segment = rest[:dot]
+		}
+
+		childFullName := prefix + segment
+		if seen[childFullName] {
+			continue
+		}
+		seen[childFullName] = true
+
+		if childSym, ok := conn.symbols[childFullName]; ok {
+			entries = append(entries, SymbolBrowseEntry{
+				Name:        childSym.Name,
+				FullName:    childSym.FullName,
+				DataType:    childSym.DataType,
+				Size:        childSym.Length,
+				HasChildren: conn.symbolHasChildren(childSym),
+				Comment:     childSym.Comment,
+			})
+		} else {
+			// We know there are deeper symbols, so this is a grouping
+			entries = append(entries, SymbolBrowseEntry{
+				Name:        segment,
+				FullName:    childFullName,
+				HasChildren: true,
+			})
+		}
+	}
+
+	// Also check for the exact symbol with no deeper children
+	if sym, ok := conn.symbols[path]; ok && len(entries) == 0 {
+		entries = append(entries, SymbolBrowseEntry{
+			Name:        sym.Name,
+			FullName:    sym.FullName,
+			DataType:    sym.DataType,
+			Size:        sym.Length,
+			HasChildren: false,
+			Comment:     sym.Comment,
+		})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].FullName < entries[j].FullName
+	})
+	return entries
+}
+
+// symbolHasChildren determines if a symbol likely has children.
+// Must be called with symbolLock held.
+func (conn *Connection) symbolHasChildren(sym *Symbol) bool {
+	// If we already have expanded children, yes
+	if len(sym.Childs) > 0 {
+		return true
+	}
+
+	// If datatypes are loaded, check the datatype table
+	if conn.datatypesLoaded && conn.datatypes != nil {
+		if dt, ok := conn.datatypes[sym.DataType]; ok {
+			return len(dt.Childs) > 0
+		}
+	}
+
+	// Heuristic: if the datatype is not a primitive parseable type, it's likely a struct
+	if sym.DataType != "" && !stringArrayIncludes(parseableTypes, sym.DataType) {
+		// Exclude known non-struct types
+		if sym.DataType != "TIME" && sym.DataType != "TOD" && sym.DataType != "DATE" && sym.DataType != "DT" {
+			return true
+		}
+	}
+
+	return false
 }

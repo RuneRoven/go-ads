@@ -40,8 +40,14 @@ func main() {
 	info, _ := conn.ReadDeviceInfo()
 	fmt.Printf("Device: %s\n", string(info.DeviceName[:]))
 
+	// Symbols are resolved on-demand — no full discovery needed
 	value, _ := conn.ReadFromSymbol("MAIN.myVar")
 	fmt.Println("Value:", value)
+
+	// Optional: load full symbol table for listing/struct access
+	conn.LoadSymbols()
+	symbols, _ := conn.ListSymbols()
+	fmt.Printf("Total symbols: %d\n", len(symbols))
 }
 ```
 
