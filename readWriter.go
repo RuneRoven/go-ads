@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"time"
 
+	"encoding/json"
+
 	"github.com/rs/zerolog/log"
 )
 
@@ -99,6 +101,18 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 			i := binary.LittleEndian.Uint64(data[start:stop])
 			f := math.Float64frombits(i)
 			newValue = strconv.FormatFloat(f, 'f', -1, 64)
+		case "LINT":
+			if stop-start != 8 {
+				return "", fmt.Errorf("LINT Size Wrong")
+			}
+			i := int64(binary.LittleEndian.Uint64(data[start:stop]))
+			newValue = strconv.FormatInt(i, 10)
+		case "ULINT", "LWORD":
+			if stop-start != 8 {
+				return "", fmt.Errorf("ULINT Size Wrong")
+			}
+			i := binary.LittleEndian.Uint64(data[start:stop])
+			newValue = strconv.FormatUint(i, 10)
 		case "STRING":
 			trimmedBytes := bytes.TrimSpace(data[start:stop])
 			secondIndex := bytes.IndexByte(trimmedBytes, byte(0))
@@ -156,7 +170,7 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 		}
 	}
 	if strcmp(symbol.Value, newValue) != 0 &&
-		time.Since(symbol.LastUpdateTime) > symbol.MinUpdateInterval {
+		(symbol.Value == "" || time.Since(symbol.LastUpdateTime) > symbol.MinUpdateInterval) {
 		symbol.LastUpdateTime = time.Now()
 		symbol.Value = newValue
 		symbol.Valid = true
@@ -201,12 +215,34 @@ var parseableTypes = []string{
 	"REAL",
 	"LREAL",
 	"STRING",
+	"TIME",
+	"TOD",
+	"DATE",
+	"DT",
+	"LINT",
+	"ULINT",
+	"LWORD",
 }
 
 func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string]SymbolUploadDataType) (data []byte, err error) {
 	if len(symbol.Childs) > 0 {
-		err = fmt.Errorf("cannot write to a whole struct at once")
-		return
+		var fields map[string]string
+		if err := json.Unmarshal([]byte(value), &fields); err != nil {
+			return nil, fmt.Errorf("struct write requires JSON input: %w", err)
+		}
+		buf := make([]byte, symbol.Length)
+		for name, child := range symbol.Childs {
+			childValue, ok := fields[name]
+			if !ok {
+				continue
+			}
+			childBytes, err := child.writeToNode(childValue, 0, datatypes)
+			if err != nil {
+				return nil, fmt.Errorf("field %q: %w", name, err)
+			}
+			copy(buf[child.Offset:child.Offset+child.Length], childBytes)
+		}
+		return buf, nil
 	}
 
 	buf := bytes.NewBuffer([]byte{})
@@ -304,6 +340,58 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 
 		v64 := math.Float64bits(v)
 		binary.Write(buf, binary.LittleEndian, &v64)
+	case "LINT":
+		v, e := strconv.ParseInt(value, 10, 64)
+		if e != nil {
+			return nil, e
+		}
+		v64 := int64(v)
+		binary.Write(buf, binary.LittleEndian, &v64)
+	case "ULINT", "LWORD":
+		v, e := strconv.ParseUint(value, 10, 64)
+		if e != nil {
+			return nil, e
+		}
+		v64 := uint64(v)
+		binary.Write(buf, binary.LittleEndian, &v64)
+	case "TIME":
+		t, e := time.Parse("15:04:05.999999999", value)
+		if e != nil {
+			t, e = time.Parse("15:04:05", value)
+			if e != nil {
+				return nil, fmt.Errorf("TIME: expected format 15:04:05 or 15:04:05.999999999: %w", e)
+			}
+		}
+		// Inverse of parse(): parse uses time.Unix(0, i*ms - 1h) then Format in local TZ
+		target := time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.Local)
+		ms := uint32((target.UnixNano() + int64(time.Hour)) / int64(time.Millisecond))
+		binary.Write(buf, binary.LittleEndian, &ms)
+	case "TOD":
+		t, e := time.Parse("15:04", value)
+		if e != nil {
+			return nil, fmt.Errorf("TOD: expected format 15:04: %w", e)
+		}
+		target := time.Date(1970, 1, 1, t.Hour(), t.Minute(), 0, 0, time.Local)
+		ms := uint32((target.UnixNano() + int64(time.Hour)) / int64(time.Millisecond))
+		binary.Write(buf, binary.LittleEndian, &ms)
+	case "DATE":
+		t, e := time.Parse("2006-01-02", value)
+		if e != nil {
+			return nil, fmt.Errorf("DATE: expected format 2006-01-02: %w", e)
+		}
+		// Inverse of parse(): parse uses time.Unix(0, i*second) then Format in local TZ
+		target := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.Local)
+		secs := uint32(target.Unix())
+		binary.Write(buf, binary.LittleEndian, &secs)
+	case "DT":
+		t, e := time.Parse("2006-01-02 15:04:05", value)
+		if e != nil {
+			return nil, fmt.Errorf("DT: expected format 2006-01-02 15:04:05: %w", e)
+		}
+		// Inverse of parse(): parse uses time.Unix(0, i*second - 1h) then Format in local TZ
+		target := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.Local)
+		secs := uint32((target.UnixNano() + int64(time.Hour)) / int64(time.Second))
+		binary.Write(buf, binary.LittleEndian, &secs)
 	case "STRING":
 		newBuf := make([]byte, symbol.Length)
 		copy(newBuf, []byte(value))

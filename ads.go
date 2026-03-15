@@ -578,6 +578,68 @@ func (conn *Connection) ReadMultipleSymbols(names []string) (map[string]string, 
 	return values, nil
 }
 
+// WriteMultipleSymbols writes multiple symbols in a single ADS round-trip using SumWrite.
+// Returns a map of symbol name to per-symbol error code.
+// Uses direct iGroup/iOffs addressing when available (after LoadSymbols),
+// falling back to handle-based addressing for on-demand symbols.
+func (conn *Connection) WriteMultipleSymbols(values map[string]string) (map[string]ReturnCode, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+
+	// Snapshot datatypes under lock
+	conn.symbolLock.Lock()
+	datatypes := conn.datatypes
+	conn.symbolLock.Unlock()
+
+	type symbolInfo struct {
+		name   string
+		symbol *Symbol
+	}
+	var infos []symbolInfo
+	var requests []SumWriteRequest
+
+	for name, value := range values {
+		symbol, err := conn.GetSymbol(name)
+		if err != nil {
+			log.Error().Err(err).Str("symbol", name).Msg("error getting symbol for batch write")
+			continue
+		}
+
+		data, err := symbol.writeToNode(value, 0, datatypes)
+		if err != nil {
+			log.Error().Err(err).Str("symbol", name).Msg("error serializing symbol for batch write")
+			continue
+		}
+
+		var req SumWriteRequest
+		if symbol.Group != 0 {
+			req = SumWriteRequest{Group: symbol.Group, Offset: symbol.Offset, Data: data}
+		} else {
+			req = SumWriteRequest{Group: uint32(GroupSymbolValueByHandle), Offset: symbol.Handle, Data: data}
+		}
+
+		infos = append(infos, symbolInfo{name: name, symbol: symbol})
+		requests = append(requests, req)
+	}
+
+	if len(requests) == 0 {
+		return nil, fmt.Errorf("no valid symbols found for batch write")
+	}
+
+	results, err := conn.SumWrite(requests)
+	if err != nil {
+		return nil, fmt.Errorf("batch write failed: %w", err)
+	}
+
+	codes := make(map[string]ReturnCode, len(results))
+	for i, result := range results {
+		codes[infos[i].name] = result.Error
+	}
+
+	return codes, nil
+}
+
 // AddSymbolNotifications adds multiple symbol notifications in a single ADS round-trip using SumAddDeviceNotification.
 func (conn *Connection) AddSymbolNotifications(configs []NotificationConfig, ch chan *Update) error {
 	if len(configs) == 0 {

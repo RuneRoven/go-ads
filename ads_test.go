@@ -2,6 +2,7 @@ package ads
 
 import (
 	"encoding/binary"
+	"math"
 	"testing"
 )
 
@@ -395,4 +396,237 @@ func searchSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// --- writeToNode round-trip tests ---
+
+// testWriteRoundTrip writes a value via writeToNode then reads it back via parse and compares.
+func testWriteRoundTrip(t *testing.T, dataType string, length uint32, value string) {
+	t.Helper()
+	sym := &Symbol{DataType: dataType, Length: length}
+	data, err := sym.writeToNode(value, 0, nil)
+	if err != nil {
+		t.Fatalf("writeToNode(%q, %q) error: %v", dataType, value, err)
+	}
+
+	sym2 := &Symbol{DataType: dataType, Length: length}
+	parsed, err := sym2.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("parse(%q) error: %v", dataType, err)
+	}
+	if parsed != value {
+		t.Errorf("round-trip %q: wrote %q, got back %q", dataType, value, parsed)
+	}
+}
+
+func TestWriteToNodeRoundTrip_BOOL(t *testing.T) {
+	testWriteRoundTrip(t, "BOOL", 1, "true")
+	testWriteRoundTrip(t, "BOOL", 1, "false")
+}
+
+func TestWriteToNodeRoundTrip_BYTE(t *testing.T) {
+	testWriteRoundTrip(t, "BYTE", 1, "0")
+	testWriteRoundTrip(t, "BYTE", 1, "255")
+	testWriteRoundTrip(t, "USINT", 1, "42")
+}
+
+func TestWriteToNodeRoundTrip_SINT(t *testing.T) {
+	testWriteRoundTrip(t, "SINT", 1, "-128")
+	testWriteRoundTrip(t, "SINT", 1, "127")
+}
+
+func TestWriteToNodeRoundTrip_UINT(t *testing.T) {
+	testWriteRoundTrip(t, "UINT", 2, "0")
+	testWriteRoundTrip(t, "UINT", 2, "65535")
+	testWriteRoundTrip(t, "WORD", 2, "1234")
+	testWriteRoundTrip(t, "UINT16", 2, "5678")
+}
+
+func TestWriteToNodeRoundTrip_INT(t *testing.T) {
+	testWriteRoundTrip(t, "INT", 2, "-32768")
+	testWriteRoundTrip(t, "INT", 2, "32767")
+	testWriteRoundTrip(t, "INT16", 2, "-42")
+}
+
+func TestWriteToNodeRoundTrip_UDINT(t *testing.T) {
+	testWriteRoundTrip(t, "UDINT", 4, "0")
+	testWriteRoundTrip(t, "UDINT", 4, "4294967295")
+	testWriteRoundTrip(t, "DWORD", 4, "12345678")
+}
+
+func TestWriteToNodeRoundTrip_DINT(t *testing.T) {
+	testWriteRoundTrip(t, "DINT", 4, "-2147483648")
+	testWriteRoundTrip(t, "DINT", 4, "2147483647")
+}
+
+func TestWriteToNodeRoundTrip_REAL(t *testing.T) {
+	sym := &Symbol{DataType: "REAL", Length: 4}
+	data, err := sym.writeToNode("3.14", 0, nil)
+	if err != nil {
+		t.Fatalf("writeToNode error: %v", err)
+	}
+	// Verify bytes encode float32(3.14)
+	bits := binary.LittleEndian.Uint32(data)
+	f := math.Float32frombits(bits)
+	if math.Abs(float64(f)-3.14) > 0.001 {
+		t.Errorf("REAL: got %v, want ~3.14", f)
+	}
+}
+
+func TestWriteToNodeRoundTrip_LREAL(t *testing.T) {
+	sym := &Symbol{DataType: "LREAL", Length: 8}
+	data, err := sym.writeToNode("3.141592653589793", 0, nil)
+	if err != nil {
+		t.Fatalf("writeToNode error: %v", err)
+	}
+	bits := binary.LittleEndian.Uint64(data)
+	f := math.Float64frombits(bits)
+	if math.Abs(f-3.141592653589793) > 1e-10 {
+		t.Errorf("LREAL: got %v, want 3.141592653589793", f)
+	}
+}
+
+func TestWriteToNodeRoundTrip_STRING(t *testing.T) {
+	testWriteRoundTrip(t, "STRING", 20, "Hello")
+}
+
+func TestWriteToNodeRoundTrip_TIME(t *testing.T) {
+	testWriteRoundTrip(t, "TIME", 4, "12:34:56")
+	testWriteRoundTrip(t, "TIME", 4, "00:00:00")
+}
+
+func TestWriteToNodeRoundTrip_TIME_WithMs(t *testing.T) {
+	testWriteRoundTrip(t, "TIME", 4, "12:34:56.789")
+}
+
+func TestWriteToNodeRoundTrip_TOD(t *testing.T) {
+	testWriteRoundTrip(t, "TOD", 4, "15:30")
+	testWriteRoundTrip(t, "TOD", 4, "00:00")
+}
+
+func TestWriteToNodeRoundTrip_DATE(t *testing.T) {
+	testWriteRoundTrip(t, "DATE", 4, "2024-01-15")
+	testWriteRoundTrip(t, "DATE", 4, "2000-06-15")
+}
+
+func TestWriteToNodeRoundTrip_DT(t *testing.T) {
+	testWriteRoundTrip(t, "DT", 4, "2024-01-15 12:30:00")
+	testWriteRoundTrip(t, "DT", 4, "1970-01-01 00:00:00")
+}
+
+func TestWriteToNodeRoundTrip_LINT(t *testing.T) {
+	testWriteRoundTrip(t, "LINT", 8, "0")
+	testWriteRoundTrip(t, "LINT", 8, "-9223372036854775808")
+	testWriteRoundTrip(t, "LINT", 8, "9223372036854775807")
+}
+
+func TestWriteToNodeRoundTrip_ULINT(t *testing.T) {
+	testWriteRoundTrip(t, "ULINT", 8, "0")
+	testWriteRoundTrip(t, "ULINT", 8, "18446744073709551615")
+	testWriteRoundTrip(t, "LWORD", 8, "42")
+}
+
+func TestWriteToNodeStruct(t *testing.T) {
+	child1 := &Symbol{
+		Name:     "field1",
+		FullName: "test.field1",
+		DataType: "INT",
+		Length:   2,
+		Offset:  0,
+	}
+	child2 := &Symbol{
+		Name:     "field2",
+		FullName: "test.field2",
+		DataType: "DINT",
+		Length:   4,
+		Offset:  4, // 2 bytes padding after field1
+	}
+	parent := &Symbol{
+		Name:     "test",
+		FullName: "test",
+		DataType: "ST_Test",
+		Length:   8,
+		Childs: map[string]*Symbol{
+			"field1": child1,
+			"field2": child2,
+		},
+	}
+
+	data, err := parent.writeToNode(`{"field1":"42","field2":"100"}`, 0, nil)
+	if err != nil {
+		t.Fatalf("struct writeToNode error: %v", err)
+	}
+
+	if len(data) != 8 {
+		t.Fatalf("expected 8 bytes, got %d", len(data))
+	}
+
+	// field1 at offset 0: INT 42
+	v1 := int16(binary.LittleEndian.Uint16(data[0:2]))
+	if v1 != 42 {
+		t.Errorf("field1: got %d, want 42", v1)
+	}
+
+	// bytes 2-3 should be zero (padding)
+	if data[2] != 0 || data[3] != 0 {
+		t.Errorf("padding bytes should be zero: got %v", data[2:4])
+	}
+
+	// field2 at offset 4: DINT 100
+	v2 := int32(binary.LittleEndian.Uint32(data[4:8]))
+	if v2 != 100 {
+		t.Errorf("field2: got %d, want 100", v2)
+	}
+}
+
+func TestWriteToNodeStructPartialFields(t *testing.T) {
+	child1 := &Symbol{Name: "x", FullName: "s.x", DataType: "BYTE", Length: 1, Offset: 0}
+	child2 := &Symbol{Name: "y", FullName: "s.y", DataType: "BYTE", Length: 1, Offset: 1}
+	parent := &Symbol{
+		Name: "s", FullName: "s", DataType: "ST_S", Length: 2,
+		Childs: map[string]*Symbol{"x": child1, "y": child2},
+	}
+
+	// Only write "x", "y" should remain zero
+	data, err := parent.writeToNode(`{"x":"7"}`, 0, nil)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if data[0] != 7 {
+		t.Errorf("x: got %d, want 7", data[0])
+	}
+	if data[1] != 0 {
+		t.Errorf("y: got %d, want 0 (unset)", data[1])
+	}
+}
+
+func TestWriteToNodeAliasResolution(t *testing.T) {
+	datatypes := map[string]SymbolUploadDataType{
+		"MyInt": {DataType: "INT"},
+	}
+	sym := &Symbol{DataType: "MyInt", Length: 2}
+	data, err := sym.writeToNode("123", 0, datatypes)
+	if err != nil {
+		t.Fatalf("alias writeToNode error: %v", err)
+	}
+	v := int16(binary.LittleEndian.Uint16(data))
+	if v != 123 {
+		t.Errorf("got %d, want 123", v)
+	}
+}
+
+func TestWriteToNodeAliasWithoutDatatypes(t *testing.T) {
+	sym := &Symbol{DataType: "MyCustomType", Length: 4}
+	_, err := sym.writeToNode("42", 0, nil)
+	if err == nil {
+		t.Error("expected error for alias without datatypes")
+	}
+}
+
+func TestWriteToNodeUnknownType(t *testing.T) {
+	sym := &Symbol{DataType: "UNKNOWN_XYZ", Length: 4}
+	_, err := sym.writeToNode("42", 0, map[string]SymbolUploadDataType{})
+	if err == nil {
+		t.Error("expected error for unknown type")
+	}
 }

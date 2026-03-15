@@ -5,6 +5,7 @@ package ads
 import (
 	"context"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -31,9 +32,10 @@ func setupConnection(t *testing.T) *Connection {
 
 	ip := getEnvOrDefault("ADS_PLC_IP", "192.168.3.224")
 	targetAMS := getEnvOrDefault("ADS_TARGET_AMS", "5.154.236.19.1.1")
+	targetPort, _ := strconv.Atoi(getEnvOrDefault("ADS_TARGET_PORT", "851"))
 	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
 
-	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, 851, localAMS, 10500, 5*time.Second)
+	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second)
 	if err != nil {
 		t.Fatalf("NewConnection failed: %v", err)
 	}
@@ -318,5 +320,146 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 		t.Logf("warning: received notification after unsubscribe: %s = %s (may be in-flight)", update.Variable, update.Value)
 	case <-time.After(2 * time.Second):
 		t.Log("no notification after unsubscribe (expected)")
+	}
+}
+
+// writeTestCase defines a single write-and-confirm test case.
+type writeTestCase struct {
+	envVar    string
+	testValue string
+}
+
+var writeTestCases = []writeTestCase{
+	{"ADS_WRITE_BOOL", "true"},
+	{"ADS_WRITE_INT", "12345"},
+	{"ADS_WRITE_REAL", "3.14"},
+	{"ADS_WRITE_STRING", "hello"},
+	{"ADS_WRITE_LREAL", "2.718281828"},
+}
+
+func TestIntegrationWriteAndConfirm(t *testing.T) {
+	for _, tc := range writeTestCases {
+		tc := tc
+		symbolName := os.Getenv(tc.envVar)
+		if symbolName == "" {
+			continue
+		}
+		t.Run(tc.envVar, func(t *testing.T) {
+			conn := setupConnection(t)
+
+			// Load full symbol table so parse() works correctly
+			if err := conn.LoadSymbols(); err != nil {
+				t.Fatalf("LoadSymbols failed: %v", err)
+			}
+
+			// 1. Read current value (save for restore)
+			original, err := conn.ReadFromSymbol(symbolName)
+			if err != nil {
+				t.Fatalf("ReadFromSymbol(%q) failed: %v", symbolName, err)
+			}
+			t.Logf("original value of %s = %s", symbolName, original)
+
+			// 2. Write test value
+			err = conn.WriteToSymbol(symbolName, tc.testValue)
+			if err != nil {
+				t.Fatalf("WriteToSymbol(%q, %q) failed: %v", symbolName, tc.testValue, err)
+			}
+
+			// 3. Read back and assert
+			readBack, err := conn.ReadFromSymbol(symbolName)
+			if err != nil {
+				t.Fatalf("ReadFromSymbol(%q) after write failed: %v", symbolName, err)
+			}
+			t.Logf("wrote %q, read back %q", tc.testValue, readBack)
+
+			// For floats, accept minor formatting differences
+			if readBack != tc.testValue {
+				t.Errorf("write-confirm mismatch: wrote %q but read back %q", tc.testValue, readBack)
+			}
+
+			// 4. Restore original value
+			err = conn.WriteToSymbol(symbolName, original)
+			if err != nil {
+				t.Errorf("failed to restore original value %q to %s: %v", original, symbolName, err)
+			}
+		})
+	}
+}
+
+func TestIntegrationWriteMultipleSymbols(t *testing.T) {
+	// Collect symbols that have env vars set
+	type symbolPair struct {
+		name      string
+		testValue string
+	}
+	var pairs []symbolPair
+	for _, tc := range writeTestCases {
+		name := os.Getenv(tc.envVar)
+		if name != "" {
+			pairs = append(pairs, symbolPair{name: name, testValue: tc.testValue})
+		}
+	}
+	if len(pairs) < 2 {
+		t.Skip("need at least 2 ADS_WRITE_* env vars set for WriteMultipleSymbols test")
+	}
+
+	conn := setupConnection(t)
+
+	// Load full symbol table so parse() works correctly
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	// 1. Save current values
+	originals := make(map[string]string)
+	for _, p := range pairs {
+		val, err := conn.ReadFromSymbol(p.name)
+		if err != nil {
+			t.Fatalf("ReadFromSymbol(%q) failed: %v", p.name, err)
+		}
+		originals[p.name] = val
+		t.Logf("original %s = %s", p.name, val)
+	}
+
+	// 2. Write all via WriteMultipleSymbols
+	writeValues := make(map[string]string)
+	for _, p := range pairs {
+		writeValues[p.name] = p.testValue
+	}
+	codes, err := conn.WriteMultipleSymbols(writeValues)
+	if err != nil {
+		t.Fatalf("WriteMultipleSymbols failed: %v", err)
+	}
+
+	// 3. Check per-symbol return codes
+	for name, code := range codes {
+		if code != ReturnCodeNoErrors {
+			t.Errorf("WriteMultipleSymbols: %s returned error code %d", name, code)
+		}
+	}
+
+	// 4. Read back each, assert matches
+	for _, p := range pairs {
+		readBack, err := conn.ReadFromSymbol(p.name)
+		if err != nil {
+			t.Errorf("ReadFromSymbol(%q) after batch write failed: %v", p.name, err)
+			continue
+		}
+		if readBack != p.testValue {
+			t.Errorf("batch write-confirm mismatch for %s: wrote %q but read back %q", p.name, p.testValue, readBack)
+		}
+		t.Logf("confirmed %s = %s", p.name, readBack)
+	}
+
+	// 5. Restore originals
+	restoreCodes, err := conn.WriteMultipleSymbols(originals)
+	if err != nil {
+		t.Errorf("failed to restore originals: %v", err)
+	} else {
+		for name, code := range restoreCodes {
+			if code != ReturnCodeNoErrors {
+				t.Errorf("restore %s returned error code %d", name, code)
+			}
+		}
 	}
 }

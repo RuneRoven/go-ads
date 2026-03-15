@@ -316,6 +316,83 @@ func main() {
 				fmt.Printf("%s = %s\n", symbolName, value)
 			}
 
+		case "write":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			if len(parts) < 3 {
+				fmt.Println("Usage: write <symbol|number> <value>")
+				continue
+			}
+			symbolName := parts[1]
+			value := strings.Join(parts[2:], " ")
+			// Resolve browse index to symbol name
+			if num, err := strconv.Atoi(symbolName); err == nil {
+				if len(bs.entries) == 0 {
+					fmt.Println("No browse results. Use 'browse' first.")
+					continue
+				}
+				if num < 0 || num >= len(bs.entries) {
+					fmt.Printf("Index %d out of range (0-%d)\n", num, len(bs.entries)-1)
+					continue
+				}
+				symbolName = bs.entries[num].FullName
+			}
+			err := conn.WriteToSymbol(symbolName, value)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
+				continue
+			}
+			fmt.Printf("Wrote %q to %s\n", value, symbolName)
+			// Read back to confirm
+			readBack, err := conn.ReadFromSymbol(symbolName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Read-back error: %v\n", err)
+				continue
+			}
+			fmt.Printf("  confirmed: %s = %s\n", symbolName, readBack)
+
+		case "writemulti":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			if len(parts) < 2 {
+				fmt.Println("Usage: writemulti <sym1>=<val1> <sym2>=<val2> ...")
+				continue
+			}
+			values := make(map[string]string)
+			for _, pair := range parts[1:] {
+				eqIdx := strings.IndexByte(pair, '=')
+				if eqIdx < 0 {
+					fmt.Printf("Invalid pair %q (expected key=value)\n", pair)
+					continue
+				}
+				values[pair[:eqIdx]] = pair[eqIdx+1:]
+			}
+			if len(values) == 0 {
+				fmt.Println("No valid key=value pairs provided.")
+				continue
+			}
+			codes, err := conn.WriteMultipleSymbols(values)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "WriteMultiple error: %v\n", err)
+				continue
+			}
+			for name, code := range codes {
+				fmt.Printf("  %s: return code %d\n", name, code)
+			}
+			// Read back each symbol to confirm
+			for name := range values {
+				readBack, err := conn.ReadFromSymbol(name)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "  read-back %s error: %v\n", name, err)
+					continue
+				}
+				fmt.Printf("  confirmed: %s = %s\n", name, readBack)
+			}
+
 		case "subscribe":
 			if conn == nil {
 				fmt.Println("Not connected. Use 'connect' first.")
@@ -478,6 +555,8 @@ func printHelp() {
 	fmt.Println("  <number>                                 Browse into entry by index from last browse result")
 	fmt.Println("  ..  / back                               Navigate up one level in browse hierarchy")
 	fmt.Println("  read <symbol|number>                     Read a symbol value (by name or browse index)")
+	fmt.Println("  write <symbol|number> <value>            Write a value to a symbol (by name or browse index)")
+	fmt.Println("  writemulti <sym1>=<val1> <sym2>=<val2>   Write multiple symbols in one round-trip")
 	fmt.Println("  subscribe <symbol> [cycle_ms] [delay_ms] Subscribe to symbol changes")
 	fmt.Println("  quit                                     Graceful shutdown")
 }
