@@ -367,23 +367,6 @@ func TestSymbolParseUnknownType(t *testing.T) {
 	}
 }
 
-// --- strcmp ---
-
-func TestStrcmp(t *testing.T) {
-	if strcmp("abc", "abc") != 0 {
-		t.Error("equal strings should return 0")
-	}
-	if strcmp("abc", "abd") >= 0 {
-		t.Error("abc < abd")
-	}
-	if strcmp("abd", "abc") <= 0 {
-		t.Error("abd > abc")
-	}
-	if strcmp("ab", "abc") >= 0 {
-		t.Error("shorter string should be less")
-	}
-}
-
 // helper
 func containsSubstring(s, substr string) bool {
 	return len(s) >= len(substr) && searchSubstring(s, substr)

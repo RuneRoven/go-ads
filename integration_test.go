@@ -4,6 +4,7 @@ package ads
 
 import (
 	"context"
+	"math"
 	"os"
 	"strconv"
 	"testing"
@@ -32,7 +33,11 @@ func setupConnection(t *testing.T) *Connection {
 
 	ip := getEnvOrDefault("ADS_PLC_IP", "192.168.3.224")
 	targetAMS := getEnvOrDefault("ADS_TARGET_AMS", "5.154.236.19.1.1")
-	targetPort, _ := strconv.Atoi(getEnvOrDefault("ADS_TARGET_PORT", "851"))
+	targetPortStr := getEnvOrDefault("ADS_TARGET_PORT", "851")
+	targetPort, err := strconv.Atoi(targetPortStr)
+	if err != nil {
+		t.Fatalf("invalid ADS_TARGET_PORT %q: %v", targetPortStr, err)
+	}
 	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
 
 	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second)
@@ -324,17 +329,47 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 }
 
 // writeTestCase defines a single write-and-confirm test case.
+// altValue is used when the PLC's current value already equals testValue,
+// ensuring the test always writes a different value.
 type writeTestCase struct {
 	envVar    string
 	testValue string
+	altValue  string
 }
 
 var writeTestCases = []writeTestCase{
-	{"ADS_WRITE_BOOL", "true"},
-	{"ADS_WRITE_INT", "12345"},
-	{"ADS_WRITE_REAL", "3.14"},
-	{"ADS_WRITE_STRING", "hello"},
-	{"ADS_WRITE_LREAL", "2.718281828"},
+	{"ADS_WRITE_BOOL", "true", "false"},
+	{"ADS_WRITE_INT", "42", "100"},
+	{"ADS_WRITE_REAL", "3.14", "6.28"},
+	{"ADS_WRITE_STRING", "hello", "world"},
+	{"ADS_WRITE_LREAL", "2.718281828", "1.414213562"},
+}
+
+// valuesApproxEqual compares two value strings. For float types (REAL/LREAL),
+// it uses approximate comparison to handle float32/float64 round-trip differences.
+// The envVar hint (e.g. "ADS_WRITE_REAL") is used when available; otherwise it
+// falls back to trying numeric parsing.
+func valuesApproxEqual(expected, actual, envVar string) bool {
+	if expected == actual {
+		return true
+	}
+	// Use env var hint for known float types
+	isFloat := envVar == "ADS_WRITE_REAL" || envVar == "ADS_WRITE_LREAL"
+	if !isFloat {
+		// Fallback: try parsing both as floats
+		_, err1 := strconv.ParseFloat(expected, 64)
+		_, err2 := strconv.ParseFloat(actual, 64)
+		isFloat = err1 == nil && err2 == nil
+	}
+	if !isFloat {
+		return false
+	}
+	e, _ := strconv.ParseFloat(expected, 64)
+	a, _ := strconv.ParseFloat(actual, 64)
+	if e == 0 {
+		return math.Abs(a) < 1e-6
+	}
+	return math.Abs((e-a)/e) < 1e-6
 }
 
 func TestIntegrationWriteAndConfirm(t *testing.T) {
@@ -359,29 +394,43 @@ func TestIntegrationWriteAndConfirm(t *testing.T) {
 			}
 			t.Logf("original value of %s = %s", symbolName, original)
 
-			// 2. Write test value
-			err = conn.WriteToSymbol(symbolName, tc.testValue)
-			if err != nil {
-				t.Fatalf("WriteToSymbol(%q, %q) failed: %v", symbolName, tc.testValue, err)
+			// Pick a write value that differs from the original
+			writeValue := tc.testValue
+			if writeValue == original {
+				writeValue = tc.altValue
+				t.Logf("original equals testValue, using altValue %q", writeValue)
 			}
 
-			// 3. Read back and assert
+			// 2. Write test value
+			err = conn.WriteToSymbol(symbolName, writeValue)
+			if err != nil {
+				t.Fatalf("WriteToSymbol(%q, %q) failed: %v", symbolName, writeValue, err)
+			}
+
+			// 3. Read back and assert it changed
 			readBack, err := conn.ReadFromSymbol(symbolName)
 			if err != nil {
 				t.Fatalf("ReadFromSymbol(%q) after write failed: %v", symbolName, err)
 			}
-			t.Logf("wrote %q, read back %q", tc.testValue, readBack)
+			t.Logf("wrote %q, read back %q", writeValue, readBack)
 
-			// For floats, accept minor formatting differences
-			if readBack != tc.testValue {
-				t.Errorf("write-confirm mismatch: wrote %q but read back %q", tc.testValue, readBack)
+			if !valuesApproxEqual(writeValue, readBack, tc.envVar) {
+				t.Errorf("write-confirm mismatch: wrote %q but read back %q", writeValue, readBack)
 			}
 
-			// 4. Restore original value
+			// 4. Restore original value and confirm
 			err = conn.WriteToSymbol(symbolName, original)
 			if err != nil {
-				t.Errorf("failed to restore original value %q to %s: %v", original, symbolName, err)
+				t.Fatalf("failed to restore original value %q to %s: %v", original, symbolName, err)
 			}
+			restored, err := conn.ReadFromSymbol(symbolName)
+			if err != nil {
+				t.Fatalf("ReadFromSymbol(%q) after restore failed: %v", symbolName, err)
+			}
+			if !valuesApproxEqual(original, restored, tc.envVar) {
+				t.Errorf("restore mismatch: expected %q but read back %q", original, restored)
+			}
+			t.Logf("restored %s = %s", symbolName, restored)
 		})
 	}
 }
@@ -391,12 +440,13 @@ func TestIntegrationWriteMultipleSymbols(t *testing.T) {
 	type symbolPair struct {
 		name      string
 		testValue string
+		altValue  string
 	}
 	var pairs []symbolPair
 	for _, tc := range writeTestCases {
 		name := os.Getenv(tc.envVar)
 		if name != "" {
-			pairs = append(pairs, symbolPair{name: name, testValue: tc.testValue})
+			pairs = append(pairs, symbolPair{name: name, testValue: tc.testValue, altValue: tc.altValue})
 		}
 	}
 	if len(pairs) < 2 {
@@ -410,7 +460,7 @@ func TestIntegrationWriteMultipleSymbols(t *testing.T) {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
-	// 1. Save current values
+	// 1. Read current values (save for restore)
 	originals := make(map[string]string)
 	for _, p := range pairs {
 		val, err := conn.ReadFromSymbol(p.name)
@@ -421,45 +471,62 @@ func TestIntegrationWriteMultipleSymbols(t *testing.T) {
 		t.Logf("original %s = %s", p.name, val)
 	}
 
-	// 2. Write all via WriteMultipleSymbols
+	// 2. Build write values, ensuring each differs from the original
 	writeValues := make(map[string]string)
 	for _, p := range pairs {
-		writeValues[p.name] = p.testValue
+		v := p.testValue
+		if v == originals[p.name] {
+			v = p.altValue
+		}
+		writeValues[p.name] = v
 	}
+
+	// 3. Write all via WriteMultipleSymbols
 	codes, err := conn.WriteMultipleSymbols(writeValues)
 	if err != nil {
 		t.Fatalf("WriteMultipleSymbols failed: %v", err)
 	}
 
-	// 3. Check per-symbol return codes
+	// 4. Check per-symbol return codes
 	for name, code := range codes {
 		if code != ReturnCodeNoErrors {
 			t.Errorf("WriteMultipleSymbols: %s returned error code %d", name, code)
 		}
 	}
 
-	// 4. Read back each, assert matches
+	// 5. Read back each, assert it changed to the written value
 	for _, p := range pairs {
+		expected := writeValues[p.name]
 		readBack, err := conn.ReadFromSymbol(p.name)
 		if err != nil {
 			t.Errorf("ReadFromSymbol(%q) after batch write failed: %v", p.name, err)
 			continue
 		}
-		if readBack != p.testValue {
-			t.Errorf("batch write-confirm mismatch for %s: wrote %q but read back %q", p.name, p.testValue, readBack)
+		if !valuesApproxEqual(expected, readBack, "") {
+			t.Errorf("batch write-confirm mismatch for %s: wrote %q but read back %q", p.name, expected, readBack)
 		}
 		t.Logf("confirmed %s = %s", p.name, readBack)
 	}
 
-	// 5. Restore originals
+	// 6. Restore originals and confirm
 	restoreCodes, err := conn.WriteMultipleSymbols(originals)
 	if err != nil {
-		t.Errorf("failed to restore originals: %v", err)
-	} else {
-		for name, code := range restoreCodes {
-			if code != ReturnCodeNoErrors {
-				t.Errorf("restore %s returned error code %d", name, code)
-			}
+		t.Fatalf("failed to restore originals: %v", err)
+	}
+	for name, code := range restoreCodes {
+		if code != ReturnCodeNoErrors {
+			t.Errorf("restore %s returned error code %d", name, code)
 		}
+	}
+	for _, p := range pairs {
+		restored, err := conn.ReadFromSymbol(p.name)
+		if err != nil {
+			t.Errorf("ReadFromSymbol(%q) after restore failed: %v", p.name, err)
+			continue
+		}
+		if !valuesApproxEqual(originals[p.name], restored, "") {
+			t.Errorf("restore mismatch for %s: expected %q but read back %q", p.name, originals[p.name], restored)
+		}
+		t.Logf("restored %s = %s", p.name, restored)
 	}
 }

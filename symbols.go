@@ -83,8 +83,9 @@ type Symbol struct {
 	Length            uint32
 	Changed           bool
 
-	Value string
-	Valid bool
+	Value       string
+	Valid       bool
+	ValueParsed bool // true after first successful parse
 
 	Notification chan<- *Update
 
@@ -109,12 +110,12 @@ func ParseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUpload
 			log.Error().Err(err).Msg("error during binary read")
 		}
 		buff.Next(1)
-		binary.Read(buff, binary.LittleEndian, dt)
+		err = binary.Read(buff, binary.LittleEndian, dt)
 		if err != nil {
 			log.Error().Err(err).Msg("error during binary read")
 		}
 		buff.Next(1)
-		binary.Read(buff, binary.LittleEndian, comment)
+		err = binary.Read(buff, binary.LittleEndian, comment)
 		if err != nil {
 			log.Error().Err(err).Msg("error during binary read")
 		}
@@ -204,9 +205,6 @@ func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string
 
 		// Check if subitems exist
 		dt, ok := datatypes[segment.DataType]
-		if segment.DataType == "AnalogueValue" {
-			log.Error().Msg("test")
-		}
 		if ok {
 			//log.Warn("Found sub ",segment.DataType);
 			child.Childs = dt.addOffset(&child, datatypes, child.Group, child.Offset)
@@ -237,8 +235,9 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 	totalSize := data.Len()
 
 	if totalSize < 48 {
-		err = fmt.Errorf(parent, " - Wrong size < 48 byte")
+		err = fmt.Errorf("%s - wrong size < 48 bytes", parent)
 		log.Error().Err(err).Hex("data", data.Bytes()).Msg("error during binary read")
+		return
 	}
 
 	err = binary.Read(data, binary.LittleEndian, &result)

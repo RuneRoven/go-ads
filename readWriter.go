@@ -26,161 +26,168 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 			value.parse(data[offset:stop], int(value.Offset), datatypes)
 		}
 		newValue = symbol.GetJSON(false)
+		symbol.updateValue(newValue)
+		return symbol.Value, nil
+	}
 
-	} else {
-		if len(data) < int(symbol.Length) {
-			log.Error().
-				Msgf("Incoming data is to small, !0<%d<%d<%d", start, stop, len(data))
-			return "", nil
+	if len(data) < int(symbol.Length) {
+		log.Error().
+			Msgf("Incoming data is to small, !0<%d<%d<%d", start, stop, len(data))
+		return "", nil
+	}
+
+	switch symbol.DataType {
+	case "BOOL":
+		if stop-start != 1 {
+			return "", fmt.Errorf("BOOL Size Wrong")
 		}
+		if data[start:stop][0] > 0 {
+			newValue = "true"
+		} else {
+			newValue = "false"
+		}
+	case "BYTE", "USINT": // Unsigned Short INT 0 to 255
+		if stop-start != 1 {
+			return "", fmt.Errorf("BYTE Size Wrong")
+		}
+		buf := bytes.NewBuffer(data[start:stop])
+		var i uint8
+		binary.Read(buf, binary.LittleEndian, &i)
+		newValue = strconv.FormatInt(int64(i), 10)
+	case "SINT": // Short INT -128 to 127
+		if stop-start != 1 {
+			return "", fmt.Errorf("SINT Size Wrong")
+		}
+		buf := bytes.NewBuffer(data[start:stop])
+		var i int8
+		binary.Read(buf, binary.LittleEndian, &i)
+		newValue = strconv.FormatInt(int64(i), 10)
+	case "UINT", "WORD", "UINT16":
+		if stop-start != 2 {
+			return "", fmt.Errorf("WORD Size Wrong")
+		}
+		i := binary.LittleEndian.Uint16(data[start:stop])
+		newValue = strconv.FormatUint(uint64(i), 10)
+	case "UDINT", "DWORD":
+		if stop-start != 4 {
+			return "", fmt.Errorf("DWORD Size Wrong")
+		}
+		i := binary.LittleEndian.Uint32(data[start:stop])
+		newValue = strconv.FormatUint(uint64(i), 10)
+	case "INT", "INT16":
+		if stop-start != 2 {
+			return "", fmt.Errorf("INT Size Wrong")
+		}
+		var i int16
+		i = int16(binary.LittleEndian.Uint16(data[start:stop]))
+		newValue = strconv.FormatInt(int64(i), 10)
+	case "DINT":
+		if stop-start != 4 {
+			return "", fmt.Errorf("DINT Size Wrong")
+		}
+		buf := bytes.NewBuffer(data[start:stop])
+		var i int32
+		binary.Read(buf, binary.LittleEndian, &i)
+		newValue = strconv.FormatInt(int64(i), 10)
+	case "REAL":
+		if stop-start != 4 {
+			return "", fmt.Errorf("REAL Size Wrong")
+		}
+		i := binary.LittleEndian.Uint32(data[start:stop])
+		f := math.Float32frombits(i)
+		newValue = strconv.FormatFloat(float64(f), 'f', -1, 32)
+	case "LREAL":
+		if stop-start != 8 {
+			return "", fmt.Errorf("LREAL Size Wrong")
+		}
+		i := binary.LittleEndian.Uint64(data[start:stop])
+		f := math.Float64frombits(i)
+		newValue = strconv.FormatFloat(f, 'f', -1, 64)
+	case "LINT":
+		if stop-start != 8 {
+			return "", fmt.Errorf("LINT Size Wrong")
+		}
+		i := int64(binary.LittleEndian.Uint64(data[start:stop]))
+		newValue = strconv.FormatInt(i, 10)
+	case "ULINT", "LWORD":
+		if stop-start != 8 {
+			return "", fmt.Errorf("ULINT Size Wrong")
+		}
+		i := binary.LittleEndian.Uint64(data[start:stop])
+		newValue = strconv.FormatUint(i, 10)
+	case "STRING":
+		trimmedBytes := bytes.TrimSpace(data[start:stop])
+		secondIndex := bytes.IndexByte(trimmedBytes, byte(0))
+		if secondIndex >= len(trimmedBytes) {
+			secondIndex = len(trimmedBytes)
+		}
+		if secondIndex < 0 {
+			secondIndex = len(trimmedBytes)
+		}
+		newValue = string(trimmedBytes[:(secondIndex)])
+	case "TIME":
+		if stop-start != 4 {
+			return "", fmt.Errorf("TIME Size Wrong")
+		}
+		i := binary.LittleEndian.Uint32(data[start:stop])
+		t := time.Unix(0, int64(uint64(i)*uint64(time.Millisecond))-int64(time.Hour))
 
-		switch symbol.DataType {
-		case "BOOL":
-			if stop-start != 1 {
-				return "", fmt.Errorf("BOOL Size Wrong")
-			}
-			if data[start:stop][0] > 0 {
-				newValue = "true"
-			} else {
-				newValue = "false"
-			}
-		case "BYTE", "USINT": // Unsigned Short INT 0 to 255
-			if stop-start != 1 {
-				return "", fmt.Errorf("BYTE Size Wrong")
-			}
-			buf := bytes.NewBuffer(data[start:stop])
-			var i uint8
-			binary.Read(buf, binary.LittleEndian, &i)
-			newValue = strconv.FormatInt(int64(i), 10)
-		case "SINT": // Short INT -128 to 127
-			if stop-start != 1 {
-				return "", fmt.Errorf("SINT Size Wrong")
-			}
-			buf := bytes.NewBuffer(data[start:stop])
-			var i int8
-			binary.Read(buf, binary.LittleEndian, &i)
-			newValue = strconv.FormatInt(int64(i), 10)
-		case "UINT", "WORD", "UINT16":
-			if stop-start != 2 {
-				return "", fmt.Errorf("WORD Size Wrong")
-			}
-			i := binary.LittleEndian.Uint16(data[start:stop])
-			newValue = strconv.FormatUint(uint64(i), 10)
-		case "UDINT", "DWORD":
-			if stop-start != 4 {
-				return "", fmt.Errorf("DWORD Size Wrong")
-			}
-			i := binary.LittleEndian.Uint32(data[start:stop])
-			newValue = strconv.FormatUint(uint64(i), 10)
-		case "INT", "INT16":
-			if stop-start != 2 {
-				return "", fmt.Errorf("INT Size Wrong")
-			}
-			var i int16
-			i = int16(binary.LittleEndian.Uint16(data[start:stop]))
-			newValue = strconv.FormatInt(int64(i), 10)
-		case "DINT":
-			if stop-start != 4 {
-				return "", fmt.Errorf("DINT Size Wrong")
-			}
-			buf := bytes.NewBuffer(data[start:stop])
-			var i int32
-			binary.Read(buf, binary.LittleEndian, &i)
-			newValue = strconv.FormatInt(int64(i), 10)
-		case "REAL":
-			if stop-start != 4 {
-				return "", fmt.Errorf("REAL Size Wrong")
-			}
-			i := binary.LittleEndian.Uint32(data[start:stop])
-			f := math.Float32frombits(i)
-			newValue = strconv.FormatFloat(float64(f), 'f', -1, 32)
-		case "LREAL":
-			if stop-start != 8 {
-				return "", fmt.Errorf("LREAL Size Wrong")
-			}
-			i := binary.LittleEndian.Uint64(data[start:stop])
-			f := math.Float64frombits(i)
-			newValue = strconv.FormatFloat(f, 'f', -1, 64)
-		case "LINT":
-			if stop-start != 8 {
-				return "", fmt.Errorf("LINT Size Wrong")
-			}
-			i := int64(binary.LittleEndian.Uint64(data[start:stop]))
-			newValue = strconv.FormatInt(i, 10)
-		case "ULINT", "LWORD":
-			if stop-start != 8 {
-				return "", fmt.Errorf("ULINT Size Wrong")
-			}
-			i := binary.LittleEndian.Uint64(data[start:stop])
-			newValue = strconv.FormatUint(i, 10)
-		case "STRING":
-			trimmedBytes := bytes.TrimSpace(data[start:stop])
-			secondIndex := bytes.IndexByte(trimmedBytes, byte(0))
-			if secondIndex >= len(trimmedBytes) {
-				secondIndex = len(trimmedBytes)
-			}
-			if secondIndex < 0 {
-				secondIndex = len(trimmedBytes)
-			}
-			newValue = string(trimmedBytes[:(secondIndex)])
-		case "TIME":
-			if stop-start != 4 {
-				return "", fmt.Errorf("TIME Size Wrong")
-			}
-			i := binary.LittleEndian.Uint32(data[start:stop])
-			t := time.Unix(0, int64(uint64(i)*uint64(time.Millisecond))-int64(time.Hour))
+		newValue = t.Truncate(time.Millisecond).Format("15:04:05.999999999")
+	case "TOD":
+		if stop-start != 4 {
+			return "", fmt.Errorf("TOD Size Wrong")
+		}
+		i := binary.LittleEndian.Uint32(data[start:stop])
+		t := time.Unix(0, int64(uint64(i)*uint64(time.Millisecond))-int64(time.Hour))
 
-			newValue = t.Truncate(time.Millisecond).Format("15:04:05.999999999")
-		case "TOD":
-			if stop-start != 4 {
-				return "", fmt.Errorf("TOD Size Wrong")
-			}
-			i := binary.LittleEndian.Uint32(data[start:stop])
-			t := time.Unix(0, int64(uint64(i)*uint64(time.Millisecond))-int64(time.Hour))
+		newValue = t.Truncate(time.Millisecond).Format("15:04")
+	case "DATE":
+		if stop-start != 4 {
+			return "", fmt.Errorf("DATE Size Wrong")
+		}
+		i := binary.LittleEndian.Uint32(data[start:stop])
+		t := time.Unix(0, int64(uint64(i)*uint64(time.Second)))
 
-			newValue = t.Truncate(time.Millisecond).Format("15:04")
-		case "DATE":
-			if stop-start != 4 {
-				return "", fmt.Errorf("DATE Size Wrong")
-			}
-			i := binary.LittleEndian.Uint32(data[start:stop])
-			t := time.Unix(0, int64(uint64(i)*uint64(time.Second)))
+		newValue = t.Truncate(time.Millisecond).Format("2006-01-02")
+	case "DT":
+		if stop-start != 4 {
+			return "", fmt.Errorf("DT Size Wrong")
+		}
+		i := binary.LittleEndian.Uint32(data[start:stop])
+		t := time.Unix(0, int64(uint64(i)*uint64(time.Second))-int64(time.Hour))
 
-			newValue = t.Truncate(time.Millisecond).Format("2006-01-02")
-		case "DT":
-			if stop-start != 4 {
-				return "", fmt.Errorf("DT Size Wrong")
-			}
-			i := binary.LittleEndian.Uint32(data[start:stop])
-			t := time.Unix(0, int64(uint64(i)*uint64(time.Second))-int64(time.Hour))
-
-			newValue = t.Truncate(time.Millisecond).Format("2006-01-02 15:04:05")
-		default:
-			// Try resolving type alias via datatype table
-			if datatypes != nil {
-				if dt, ok := datatypes[symbol.DataType]; ok {
-					if stringArrayIncludes(parseableTypes, dt.DataType) {
-						resolved := *symbol
-						resolved.DataType = dt.DataType
-						return resolved.parse(data, offset, nil)
-					}
+		newValue = t.Truncate(time.Millisecond).Format("2006-01-02 15:04:05")
+	default:
+		// Try resolving type alias via datatype table
+		if datatypes != nil {
+			if dt, ok := datatypes[symbol.DataType]; ok {
+				if stringArrayIncludes(parseableTypes, dt.DataType) {
+					resolved := *symbol
+					resolved.DataType = dt.DataType
+					return resolved.parse(data, offset, nil)
 				}
 			}
-			return "", fmt.Errorf("unknown format cannot parse: %s", symbol.DataType)
 		}
+		return "", fmt.Errorf("unknown format cannot parse: %s", symbol.DataType)
 	}
-	if strcmp(symbol.Value, newValue) != 0 &&
-		(symbol.Value == "" || time.Since(symbol.LastUpdateTime) > symbol.MinUpdateInterval) {
-		symbol.LastUpdateTime = time.Now()
-		symbol.Value = newValue
-		symbol.Valid = true
-		symbol.Changed = true
-		symbol.parentChanged()
-	}
+
+	symbol.updateValue(newValue)
 	log.Trace().
 		Str("value", newValue).
 		Msg("parse value")
 	return symbol.Value, nil
+}
+
+func (symbol *Symbol) updateValue(newValue string) {
+	if symbol.Value != newValue &&
+		(!symbol.ValueParsed || time.Since(symbol.LastUpdateTime) > symbol.MinUpdateInterval) {
+		symbol.LastUpdateTime = time.Now()
+		symbol.Value = newValue
+		symbol.Valid = true
+		symbol.ValueParsed = true
+		symbol.Changed = true
+		symbol.parentChanged()
+	}
 }
 
 func (symbol *Symbol) parentChanged() {
@@ -403,17 +410,3 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 	return buf.Bytes(), err
 }
 
-func strcmp(a, b string) int {
-	min := len(b)
-	if len(a) < len(b) {
-		min = len(a)
-	}
-	diff := 0
-	for i := 0; i < min && diff == 0; i++ {
-		diff = int(a[i]) - int(b[i])
-	}
-	if diff == 0 {
-		diff = len(a) - len(b)
-	}
-	return diff
-}

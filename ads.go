@@ -293,39 +293,51 @@ func (conn *Connection) GetHandleByName(symbolName string) (handle uint32, err e
 
 func (conn *Connection) WriteToSymbol(symbolName string, value string) error {
 	symbol, err := conn.GetSymbol(symbolName)
-	conn.symbolLock.Lock()
-	defer conn.symbolLock.Unlock()
 	if err != nil {
 		log.Error().
 			Err(err).
 			Msg("error getting symbol")
 		return err
 	}
-	data, err := symbol.writeToNode(value, 0, conn.datatypes)
+
+	// Snapshot datatypes under lock, then serialize without holding the lock
+	conn.symbolLock.Lock()
+	datatypes := conn.datatypes
+	handle := symbol.Handle
+	conn.symbolLock.Unlock()
+
+	data, err := symbol.writeToNode(value, 0, datatypes)
 	if err != nil {
 		log.Error().
 			Err(err).
 			Msg("error during write to symbol")
 		return err
 	}
-	err = conn.Write(uint32(GroupSymbolValueByHandle), symbol.Handle, data)
+
+	// Network I/O without lock
+	err = conn.Write(uint32(GroupSymbolValueByHandle), handle, data)
 	if err != nil {
 		log.Error().
 			Err(err).
 			Msg("error during write to symbol")
 		return err
 	}
+
+	// Invalidate cached value so the next ReadFromSymbol fetches fresh data
+	conn.symbolLock.Lock()
+	symbol.Value = ""
+	symbol.ValueParsed = false
+	conn.symbolLock.Unlock()
+
 	log.Trace().
 		Str("symbol", symbolName).
 		Str("Value", value).
 		Msg("wrote to symbol")
-	return err
+	return nil
 }
 
 func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
 	symbol, err := conn.GetSymbol(symbolName)
-	conn.symbolLock.Lock()
-	defer conn.symbolLock.Unlock()
 	if err != nil {
 		log.Error().
 			Err(err).
@@ -333,11 +345,22 @@ func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
 			Msg("error getting symbol")
 		return "", err
 	}
+
+	// Check cache under lock
+	conn.symbolLock.Lock()
 	now := time.Now()
 	if now.Sub(symbol.LastUpdateTime) < symbol.MinUpdateInterval && symbol.Value != "" {
-		return symbol.Value, nil
+		cached := symbol.Value
+		conn.symbolLock.Unlock()
+		return cached, nil
 	}
-	data, err := conn.Read(uint32(GroupSymbolValueByHandle), symbol.Handle, symbol.Length)
+	handle := symbol.Handle
+	length := symbol.Length
+	datatypes := conn.datatypes
+	conn.symbolLock.Unlock()
+
+	// Network I/O without lock
+	data, err := conn.Read(uint32(GroupSymbolValueByHandle), handle, length)
 	if err != nil {
 		log.Error().
 			Err(err).
@@ -348,8 +371,8 @@ func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
 	log.Trace().
 		Str("symbol", symbolName).
 		Str("Value", symbol.Value).
-		Msg("Rdebug")
-	value, err := symbol.parse(data, 0, conn.datatypes)
+		Msg("ReadFromSymbol")
+	value, err := symbol.parse(data, 0, datatypes)
 	if err != nil {
 		log.Error().
 			Err(err).
@@ -361,8 +384,13 @@ func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
 		Str("symbol", symbolName).
 		Str("Value", value).
 		Msg("Read from symbol")
+
+	// Update cache under lock
+	conn.symbolLock.Lock()
 	symbol.LastUpdateTime = now
 	symbol.Value = value
+	conn.symbolLock.Unlock()
+
 	return value, nil
 }
 
@@ -633,9 +661,16 @@ func (conn *Connection) WriteMultipleSymbols(values map[string]string) (map[stri
 	}
 
 	codes := make(map[string]ReturnCode, len(results))
+	conn.symbolLock.Lock()
 	for i, result := range results {
 		codes[infos[i].name] = result.Error
+		// Invalidate cached value for successful writes so next read is fresh
+		if result.Error == ReturnCodeNoErrors {
+			infos[i].symbol.Value = ""
+			infos[i].symbol.ValueParsed = false
+		}
 	}
+	conn.symbolLock.Unlock()
 
 	return codes, nil
 }

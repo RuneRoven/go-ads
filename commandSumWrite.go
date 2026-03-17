@@ -27,7 +27,10 @@ func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, 
 		return nil, nil
 	}
 
-	// Skip SumWrite if we already know sum commands are not supported
+	// Skip SumWrite if we already know sum commands are not supported.
+	// We reuse sumReadChecked/sumReadSupported because PLCs that lack SumRead
+	// (GroupSumupRead 0xF080) also lack SumWrite (GroupSumupWrite 0xF081) —
+	// both were introduced together in the ADS sum command extension.
 	if conn.sumReadChecked.Load() && !conn.sumReadSupported.Load() {
 		return conn.sumWriteFallback(requests)
 	}

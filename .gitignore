@@ -1,2 +1,4 @@
 /examples/simple/simple
+/examples/simple/go-ads-cli
 .env*
+.DS_Store

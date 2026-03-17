@@ -342,6 +342,9 @@ func main() {
 			err := conn.WriteToSymbol(symbolName, value)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
+				if strings.Contains(err.Error(), "aliased type") {
+					fmt.Println("  hint: run 'discover' first to load type definitions")
+				}
 				continue
 			}
 			fmt.Printf("Wrote %q to %s\n", value, symbolName)
