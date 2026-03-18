@@ -5,8 +5,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -38,7 +38,7 @@ type SymbolUploadDataType struct {
 	Name          string
 	DataType      string
 	Comment       string
-	Childs        map[string]*SymbolUploadDataType
+	Children      map[string]*SymbolUploadDataType
 }
 
 type symbolEntry struct {
@@ -58,7 +58,7 @@ type symbolUploadSymbol struct {
 	Name        string
 	DataType    string
 	Comment     string
-	Childs      map[string]*symbolUploadSymbol
+	Children    map[string]*symbolUploadSymbol
 }
 
 type SymbolUploadInfo struct {
@@ -89,8 +89,8 @@ type Symbol struct {
 
 	Notification chan<- *Update
 
-	Parent *Symbol
-	Childs map[string]*Symbol
+	Parent   *Symbol
+	Children map[string]*Symbol
 }
 
 func ParseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUploadDataType) (symbols map[string]*Symbol, err error) {
@@ -100,31 +100,25 @@ func ParseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUpload
 	for buff.Len() > 0 {
 		begBuff := buff.Len()
 		result := symbolEntry{}
-		binary.Read(buff, binary.LittleEndian, &result)
+		if err := binary.Read(buff, binary.LittleEndian, &result); err != nil {
+			return nil, fmt.Errorf("reading symbol entry: %w", err)
+		}
 
 		name := make([]byte, result.NameLength)
 		dt := make([]byte, result.TypeLength)
 		comment := make([]byte, result.CommentLength)
-		err := binary.Read(buff, binary.LittleEndian, name)
-		if err != nil {
-			log.Error().Err(err).Msg("error during binary read")
+		if err := binary.Read(buff, binary.LittleEndian, name); err != nil {
+			return nil, fmt.Errorf("reading symbol name: %w", err)
 		}
 		buff.Next(1)
-		err = binary.Read(buff, binary.LittleEndian, dt)
-		if err != nil {
-			log.Error().Err(err).Msg("error during binary read")
+		if err := binary.Read(buff, binary.LittleEndian, dt); err != nil {
+			return nil, fmt.Errorf("reading symbol type: %w", err)
 		}
 		buff.Next(1)
-		err = binary.Read(buff, binary.LittleEndian, comment)
-		if err != nil {
-			log.Error().Err(err).Msg("error during binary read")
+		if err := binary.Read(buff, binary.LittleEndian, comment); err != nil {
+			return nil, fmt.Errorf("reading symbol comment: %w", err)
 		}
 		buff.Next(1)
-		if err != nil {
-			log.Error().
-				Err(err).
-				Msg("Error during parse")
-		}
 		item := symbolUploadSymbol{}
 		item.Name = string(name)
 		item.DataType = string(dt)
@@ -139,79 +133,75 @@ func ParseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUpload
 		symbol := addSymbol(item, datatypes)
 
 		symbols[item.Name] = symbol
-		addChilds(symbol, symbols)
+		addChildren(symbol, symbols)
 
 		buff.Next(int(item.SymbolEntry.EntryLength) - (begBuff - endBuff))
 	}
 	return
 }
 
-func addChilds(symbol *Symbol, symbols map[string]*Symbol) {
-	for _, child := range symbol.Childs {
+func addChildren(symbol *Symbol, symbols map[string]*Symbol) {
+	for _, child := range symbol.Children {
 		if _, ok := symbols[child.FullName]; !ok {
 			symbols[child.FullName] = child
-			addChilds(child, symbols)
+			addChildren(child, symbols)
 		}
 	}
 }
 
 func addSymbol(symbol symbolUploadSymbol, datatypes map[string]SymbolUploadDataType) *Symbol {
-	sym := &Symbol{}
-	sym.Name = symbol.Name
-	sym.LastUpdateTime = time.Now()
-	sym.MinUpdateInterval = time.Millisecond * 50
-	sym.FullName = symbol.Name
-	sym.DataType = symbol.DataType
-	sym.Comment = symbol.Comment
-	sym.Length = symbol.SymbolEntry.Size
-
-	sym.Group = symbol.SymbolEntry.IGroup
-	sym.Offset = symbol.SymbolEntry.IOffs
+	sym := &Symbol{
+		Name:              symbol.Name,
+		LastUpdateTime:    time.Now(),
+		MinUpdateInterval: 50 * time.Millisecond,
+		FullName:          symbol.Name,
+		DataType:          symbol.DataType,
+		Comment:           symbol.Comment,
+		Length:            symbol.SymbolEntry.Size,
+		Group:             symbol.SymbolEntry.IGroup,
+		Offset:            symbol.SymbolEntry.IOffs,
+	}
 
 	dt, ok := datatypes[symbol.DataType]
 	if ok {
-		sym.Childs = dt.addOffset(sym, datatypes, sym.Group, sym.Offset)
+		sym.Children = dt.addOffset(sym, datatypes, sym.Group, sym.Offset)
 	}
 
 	return sym
 }
 
-func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string]SymbolUploadDataType, group uint32, offset uint32) (childs map[string]*Symbol) {
-	childs = map[string]*Symbol{}
+func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string]SymbolUploadDataType, group uint32, offset uint32) (children map[string]*Symbol) {
+	children = map[string]*Symbol{}
 
-	var path string
-
-	for key, segment := range data.Childs {
-
+	for key, segment := range data.Children {
+		var path string
 		if segment.Name[0:1] != "[" {
 			path = fmt.Sprint(parent.FullName, ".", segment.Name)
 		} else {
 			path = fmt.Sprint(parent.Name, segment.Name)
 		}
 
-		child := Symbol{}
-		child.Name = segment.Name
-		child.LastUpdateTime = time.Now()
-		child.MinUpdateInterval = time.Millisecond * 50
-		child.FullName = path
-		child.DataType = segment.DataType
-		child.Comment = segment.Comment
-		child.Length = segment.DatatypeEntry.Size
-		// Uppdate with area and offset
-		child.Group = group
-		child.Offset = segment.DatatypeEntry.Offs
-
-		child.Parent = parent
+		child := Symbol{
+			Name:              segment.Name,
+			LastUpdateTime:    time.Now(),
+			MinUpdateInterval: 50 * time.Millisecond,
+			FullName:          path,
+			DataType:          segment.DataType,
+			Comment:           segment.Comment,
+			Length:            segment.DatatypeEntry.Size,
+			// Update with area and offset
+			Group:  group,
+			Offset: segment.DatatypeEntry.Offs,
+			Parent: parent,
+		}
 
 		// Check if subitems exist
 		dt, ok := datatypes[segment.DataType]
 		if ok {
-			//log.Warn("Found sub ",segment.DataType);
-			child.Childs = dt.addOffset(&child, datatypes, child.Group, child.Offset)
-
+			child.Children = dt.addOffset(&child, datatypes, child.Group, child.Offset)
 		}
 
-		childs[key] = &child
+		children[key] = &child
 	}
 
 	return
@@ -221,14 +211,16 @@ func ParseUploadSymbolInfoDataTypes(data []byte) (datatypes map[string]SymbolUpl
 	buff := bytes.NewBuffer(data)
 	datatypes = make(map[string]SymbolUploadDataType)
 	for buff.Len() > 0 {
-		header, _ := decodeSymbolUploadDataType(buff, "")
+		header, err := decodeSymbolUploadDataType(buff, "")
+		if err != nil {
+			return nil, fmt.Errorf("parsing datatype entry: %w", err)
+		}
 		datatypes[header.Name] = header
 	}
 	return
 }
 
 func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header SymbolUploadDataType, err error) {
-
 	result := datatypeEntry{}
 	header = SymbolUploadDataType{}
 
@@ -243,6 +235,7 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 	err = binary.Read(data, binary.LittleEndian, &result)
 	if err != nil {
 		log.Error().Err(err).Msg("error during binary read")
+		return
 	}
 	name := make([]byte, result.NameLength)
 	dt := make([]byte, result.TypeLength)
@@ -251,16 +244,19 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 	err = binary.Read(data, binary.LittleEndian, name)
 	if err != nil {
 		log.Error().Err(err).Msg("error during binary read")
+		return
 	}
 	data.Next(1)
 	err = binary.Read(data, binary.LittleEndian, dt)
 	if err != nil {
 		log.Error().Err(err).Msg("error during binary read")
+		return
 	}
 	data.Next(1)
 	err = binary.Read(data, binary.LittleEndian, comment)
 	if err != nil {
 		log.Error().Err(err).Msg("error during binary read")
+		return
 	}
 	data.Next(1)
 
@@ -270,10 +266,8 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 
 	header.DatatypeEntry = result
 
-	if len(header.DataType) > 6 {
-		if header.DataType[:6] == "STRING" {
-			header.DataType = "STRING"
-		}
+	if len(header.DataType) >= 6 && header.DataType[:6] == "STRING" {
+		header.DataType = "STRING"
 	}
 
 	childLen := int(result.EntryLength) - (totalSize - data.Len())
@@ -281,80 +275,66 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 		return
 	}
 
-	childs := make([]byte, childLen)
-	n, err := data.Read(childs)
+	childData := make([]byte, childLen)
+	n, err := data.Read(childData)
 	if err != nil {
-		log.Error().
-			Int("read bytes", n).
-			Int("expected bytes", childLen).
-			Err(err).
-			Msg("error reading childs")
+		return header, fmt.Errorf("reading children of %s (got %d of %d bytes): %w", header.Name, n, childLen, err)
 	}
 
-	if len(childs) == 0 {
-		return
-	}
-
-	buff := bytes.NewBuffer(childs)
-	if header.Childs == nil {
-		header.Childs = map[string]*SymbolUploadDataType{}
+	buff := bytes.NewBuffer(childData)
+	if header.Children == nil {
+		header.Children = map[string]*SymbolUploadDataType{}
 	}
 	if header.DatatypeEntry.ArrayDim > 0 {
-		// Childs is an array
-		var result datatypeArrayInfo
+		// Children is an array
+		var arrayInfo datatypeArrayInfo
 		arrayLevels := []datatypeArrayInfo{}
 
 		for i := 0; i < int(header.DatatypeEntry.ArrayDim); i++ {
-			err = binary.Read(buff, binary.LittleEndian, &result)
+			err = binary.Read(buff, binary.LittleEndian, &arrayInfo)
 			if err != nil {
-				log.Error().
-					Err(err).
-					Msg("error reading array")
+				return header, fmt.Errorf("reading array info for %s: %w", header.Name, err)
 			}
-			arrayLevels = append(arrayLevels, result)
+			arrayLevels = append(arrayLevels, arrayInfo)
 		}
-		header.Childs = makeArrayChilds(arrayLevels, header.DataType, header.DatatypeEntry.Size)
+		header.Children = makeArrayChildren(arrayLevels, header.DataType, header.DatatypeEntry.Size)
 	} else {
-		// Childs is standard variables
-		for j := 0; j < (int)(result.SubItems); j++ {
+		// Children is standard variables
+		for j := 0; j < int(result.SubItems); j++ {
 			child, err := decodeSymbolUploadDataType(buff, header.Name)
 			if err != nil {
-				log.Error().
-					Err(err).
-					Msg("error reading array")
+				return header, fmt.Errorf("reading subitem %d of %s: %w", j, header.Name, err)
 			}
-			header.Childs[child.Name] = &child
+			header.Children[child.Name] = &child
 		}
 	}
 
 	return
 }
 
-func makeArrayChilds(levels []datatypeArrayInfo, dt string, size uint32) (childs map[string]*SymbolUploadDataType) {
-	childs = map[string]*SymbolUploadDataType{}
+func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (children map[string]*SymbolUploadDataType) {
+	children = map[string]*SymbolUploadDataType{}
 
 	if len(levels) < 1 {
 		return
 	}
 
-	level := levels[:1][0]
-	subChilds := makeArrayChilds(levels[1:], dt, size)
+	level := levels[0]
+	subChildren := makeArrayChildren(levels[1:], dt, size)
 
 	var offset uint32
 
 	for i := level.LBound; i < level.LBound+level.Elements; i++ {
-		name := fmt.Sprint("[", i, "]")
+		name := fmt.Sprintf("[%d]", i)
 
 		child := SymbolUploadDataType{}
 		child.Name = name
 		child.DataType = dt
 		child.DatatypeEntry.Offs = offset
 		child.DatatypeEntry.Size = size / level.Elements
-		child.Childs = subChilds
+		child.Children = subChildren
 
-		//child.Walk("")
-
-		childs[name] = &child
+		children[name] = &child
 		offset += size / level.Elements
 	}
 
@@ -370,13 +350,11 @@ func (symbol *Symbol) GetJSON(onlyChanged bool) string {
 	return ""
 }
 
-var openBracketRegex = regexp.MustCompile(`\[`)
-var closeBracketRegex = regexp.MustCompile(`\]`)
 var stringsList = map[string]struct{}{"STRING": {}, "TIME": {}, "TOD": {}, "DATE": {}, "DT": {}}
 
 // parseSymbol returns JSON interface for symbol
 func (symbol *Symbol) parseSymbol(onlyChanged bool) (rData interface{}) {
-	if len(symbol.Childs) == 0 {
+	if len(symbol.Children) == 0 {
 		if symbol.DataType == "BOOL" {
 			rData, _ = strconv.ParseBool(symbol.Value)
 		} else if _, ok := stringsList[symbol.DataType]; ok {
@@ -386,26 +364,14 @@ func (symbol *Symbol) parseSymbol(onlyChanged bool) (rData interface{}) {
 		}
 	} else {
 		localMap := make(map[string]interface{})
-		for _, child := range symbol.Childs {
-			s := openBracketRegex.ReplaceAllString(child.Name, `"[`)
-			s = closeBracketRegex.ReplaceAllString(s, `]"`)
-			if onlyChanged {
-				if child.Changed {
-					localMap[s] = child.parseSymbol(true)
-					// child.Changed = false
-				}
-			} else {
-				localMap[s] = child.parseSymbol(false)
+		for _, child := range symbol.Children {
+			s := strings.ReplaceAll(child.Name, "[", `"[`)
+			s = strings.ReplaceAll(s, "]", `]"`)
+			if !onlyChanged || child.Changed {
+				localMap[s] = child.parseSymbol(onlyChanged)
 			}
 		}
 		rData = localMap
 	}
 	return
 }
-
-// func (symbol *Symbol) clearChanged() {
-// 	for _, localsymbol := range symbol.Childs {
-// 		localsymbol.clearChanged()
-// 	}
-// 	symbol.Changed = false
-// }

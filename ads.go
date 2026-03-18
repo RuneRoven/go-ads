@@ -2,9 +2,10 @@ package ads
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -69,7 +70,9 @@ func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		log.Warn().Err(err).Msg("failed to read symbol version during slow discovery")
 	} else {
+		conn.symbolLock.Lock()
 		conn.symbolVersion = version
+		conn.symbolLock.Unlock()
 	}
 
 	// Step 2: Get upload info (small request)
@@ -178,22 +181,26 @@ func (conn *Connection) downloadInChunks(group uint32, totalLength uint32, chunk
 func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 	conn.symbolLock.Lock()
 	localSymbol, ok := conn.symbols[symbolName]
+	needHandle := ok && localSymbol.Handle == 0
+	conn.symbolLock.Unlock()
+
 	if ok {
-		if localSymbol.Handle == 0 {
+		if needHandle {
+			// Network I/O must happen outside the lock to avoid deadlock
+			// with handleNotification which also acquires symbolLock.
 			handle, err := conn.GetHandleByName(symbolName)
 			if err != nil {
-				conn.symbolLock.Unlock()
 				return nil, err
 			}
+			conn.symbolLock.Lock()
 			localSymbol.Handle = handle
+			conn.symbolLock.Unlock()
 		}
 		log.Trace().
 			Interface("symbol", localSymbol).
 			Msg("symbol got")
-		conn.symbolLock.Unlock()
 		return localSymbol, nil
 	}
-	conn.symbolLock.Unlock()
 
 	// On-demand resolution: query the PLC for this specific symbol
 	sym, err := conn.getSymbolInfoByName(symbolName)
@@ -229,7 +236,7 @@ func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 // getSymbolInfoByName queries a single symbol's metadata from the PLC
 // using GroupSymbolInfoByNameEx (0xF009).
 // Returns a populated Symbol with Group, Offset, Length, DataType, etc.
-// Does NOT populate Childs (struct/array children require full discovery).
+// Does NOT populate Children (struct/array children require full discovery).
 func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) {
 	resp, err := conn.WriteRead(
 		uint32(GroupSymbolInfoByNameEx),
@@ -249,15 +256,21 @@ func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) 
 
 	// Read null-terminated strings: name, type, comment
 	name := make([]byte, entry.NameLength)
-	binary.Read(buff, binary.LittleEndian, name)
+	if err := binary.Read(buff, binary.LittleEndian, name); err != nil {
+		return nil, fmt.Errorf("reading symbol name for %s: %w", symbolName, err)
+	}
 	buff.Next(1) // null terminator
 
 	dt := make([]byte, entry.TypeLength)
-	binary.Read(buff, binary.LittleEndian, dt)
+	if err := binary.Read(buff, binary.LittleEndian, dt); err != nil {
+		return nil, fmt.Errorf("reading symbol type for %s: %w", symbolName, err)
+	}
 	buff.Next(1) // null terminator
 
 	comment := make([]byte, entry.CommentLength)
-	binary.Read(buff, binary.LittleEndian, comment)
+	if err := binary.Read(buff, binary.LittleEndian, comment); err != nil {
+		return nil, fmt.Errorf("reading symbol comment for %s: %w", symbolName, err)
+	}
 
 	dataType := string(dt)
 	if len(dataType) >= 6 && dataType[:6] == "STRING" {
@@ -281,23 +294,16 @@ func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) 
 func (conn *Connection) GetHandleByName(symbolName string) (handle uint32, err error) {
 	resp, err := conn.WriteRead(uint32(GroupSymbolHandleByName), 0, 4, []byte(symbolName))
 	if err != nil {
-		log.Error().
-			Err(err).
-			Str("symbol name", symbolName).
-			Msg("error getting handle by name")
-		return 0, err
+		return 0, fmt.Errorf("getting handle for %q: %w", symbolName, err)
 	}
 	handle = binary.LittleEndian.Uint32(resp)
-	return handle, err
+	return handle, nil
 }
 
 func (conn *Connection) WriteToSymbol(symbolName string, value string) error {
 	symbol, err := conn.GetSymbol(symbolName)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Msg("error getting symbol")
-		return err
+		return fmt.Errorf("write to %q: %w", symbolName, err)
 	}
 
 	// Snapshot datatypes under lock, then serialize without holding the lock
@@ -308,19 +314,13 @@ func (conn *Connection) WriteToSymbol(symbolName string, value string) error {
 
 	data, err := symbol.writeToNode(value, 0, datatypes)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Msg("error during write to symbol")
-		return err
+		return fmt.Errorf("write to %q: serialization failed: %w", symbolName, err)
 	}
 
 	// Network I/O without lock
 	err = conn.Write(uint32(GroupSymbolValueByHandle), handle, data)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Msg("error during write to symbol")
-		return err
+		return fmt.Errorf("write to %q: %w", symbolName, err)
 	}
 
 	// Invalidate cached value so the next ReadFromSymbol fetches fresh data
@@ -331,7 +331,7 @@ func (conn *Connection) WriteToSymbol(symbolName string, value string) error {
 
 	log.Trace().
 		Str("symbol", symbolName).
-		Str("Value", value).
+		Str("value", value).
 		Msg("wrote to symbol")
 	return nil
 }
@@ -339,11 +339,7 @@ func (conn *Connection) WriteToSymbol(symbolName string, value string) error {
 func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
 	symbol, err := conn.GetSymbol(symbolName)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Str("symbol", symbolName).
-			Msg("error getting symbol")
-		return "", err
+		return "", fmt.Errorf("read %q: %w", symbolName, err)
 	}
 
 	// Check cache under lock
@@ -362,23 +358,11 @@ func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
 	// Network I/O without lock
 	data, err := conn.Read(uint32(GroupSymbolValueByHandle), handle, length)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Str("symbol", symbolName).
-			Msg("error during read symbol")
-		return "", err
+		return "", fmt.Errorf("read %q: %w", symbolName, err)
 	}
-	log.Trace().
-		Str("symbol", symbolName).
-		Str("Value", symbol.Value).
-		Msg("ReadFromSymbol")
 	value, err := symbol.parse(data, 0, datatypes)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Str("symbol", symbolName).
-			Msg("error during parse symbol")
-		return "", err
+		return "", fmt.Errorf("read %q: parse failed: %w", symbolName, err)
 	}
 	log.Trace().
 		Str("symbol", symbolName).
@@ -405,19 +389,31 @@ func (conn *Connection) GetSymbolUploadInfo() (uploadInfo SymbolUploadInfo, err 
 		}
 	}
 	buff := bytes.NewBuffer(res)
-	binary.Read(buff, binary.LittleEndian, &uploadInfo.SymbolCount)
-	binary.Read(buff, binary.LittleEndian, &uploadInfo.SymbolLength)
-	binary.Read(buff, binary.LittleEndian, &uploadInfo.DataTypeCount)
-	binary.Read(buff, binary.LittleEndian, &uploadInfo.DataTypeLength)
+	if err = binary.Read(buff, binary.LittleEndian, &uploadInfo.SymbolCount); err != nil {
+		return uploadInfo, fmt.Errorf("reading SymbolCount: %w", err)
+	}
+	if err = binary.Read(buff, binary.LittleEndian, &uploadInfo.SymbolLength); err != nil {
+		return uploadInfo, fmt.Errorf("reading SymbolLength: %w", err)
+	}
+	if err = binary.Read(buff, binary.LittleEndian, &uploadInfo.DataTypeCount); err != nil {
+		return uploadInfo, fmt.Errorf("reading DataTypeCount: %w", err)
+	}
+	if err = binary.Read(buff, binary.LittleEndian, &uploadInfo.DataTypeLength); err != nil {
+		return uploadInfo, fmt.Errorf("reading DataTypeLength: %w", err)
+	}
 	if buff.Len() >= 8 {
-		binary.Read(buff, binary.LittleEndian, &uploadInfo.ExtraCount)
-		binary.Read(buff, binary.LittleEndian, &uploadInfo.ExtraLength)
+		if err = binary.Read(buff, binary.LittleEndian, &uploadInfo.ExtraCount); err != nil {
+			return uploadInfo, fmt.Errorf("reading ExtraCount: %w", err)
+		}
+		if err = binary.Read(buff, binary.LittleEndian, &uploadInfo.ExtraLength); err != nil {
+			return uploadInfo, fmt.Errorf("reading ExtraLength: %w", err)
+		}
 	}
 	return
 }
 
 func (conn *Connection) GetUploadSymbolInfoSymbols(length uint32) (data []byte, err error) {
-	res, err := conn.Read(uint32(GroupSymbolUpload), 0, length) //UploadSymbolInfo;
+	res, err := conn.Read(uint32(GroupSymbolUpload), 0, length)
 	if err != nil {
 		return nil, fmt.Errorf("GetUploadSymbolInfoSymbols failed: %w", err)
 	}
@@ -430,7 +426,7 @@ func (conn *Connection) GetUploadSymbolInfoDataTypes(length uint32) (data []byte
 		0x0,
 		length)
 	if err != nil {
-		return nil, fmt.Errorf("error doing DT UPLOAD %d", err)
+		return nil, fmt.Errorf("error doing DT UPLOAD: %w", err)
 	}
 	return data, nil
 }
@@ -454,9 +450,12 @@ func (conn *Connection) CheckSymbolVersion() (changed bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	if version != conn.symbolVersion {
+	conn.symbolLock.Lock()
+	oldVersion := conn.symbolVersion
+	conn.symbolLock.Unlock()
+	if version != oldVersion {
 		log.Info().
-			Uint32("old", conn.symbolVersion).
+			Uint32("old", oldVersion).
 			Uint32("new", version).
 			Msg("symbol version changed")
 		return true, nil
@@ -475,17 +474,25 @@ func (conn *Connection) RefreshSymbols() error {
 		return nil
 	}
 
-	// Release old handles
+	// Collect handles under lock, then release without holding the lock
+	// to avoid deadlock (conn.Write does network I/O and waits for response).
 	conn.symbolLock.Lock()
+	var handleList []uint32
 	for _, symbol := range conn.symbols {
 		if symbol.Handle != 0 {
-			handleBytes := make([]byte, 4)
-			binary.LittleEndian.PutUint32(handleBytes, symbol.Handle)
-			conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes)
+			handleList = append(handleList, symbol.Handle)
 			symbol.Handle = 0
 		}
 	}
 	conn.symbolLock.Unlock()
+
+	for _, h := range handleList {
+		handleBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(handleBytes, h)
+		if err := conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+			log.Warn().Err(err).Uint32("handle", h).Msg("failed to release symbol handle")
+		}
+	}
 
 	// Reload symbols
 	err = conn.loadSymbols()
@@ -493,19 +500,17 @@ func (conn *Connection) RefreshSymbols() error {
 		return fmt.Errorf("failed to refresh symbols: %w", err)
 	}
 
-	log.Info().Uint32("version", conn.symbolVersion).Msg("symbols refreshed")
+	conn.symbolLock.Lock()
+	v := conn.symbolVersion
+	conn.symbolLock.Unlock()
+	log.Info().Uint32("version", v).Msg("symbols refreshed")
 	return nil
 }
 
 func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, cycleTime int, transMode TransMode, updateReceiver chan *Update) (uint32, error) {
 	symbol, err := conn.GetSymbol(symbolName)
 	if err != nil {
-		log.
-			Error().
-			Str("symbol", symbolName).
-			Err(err).
-			Msg("error getting symbol")
-		return 0, err
+		return 0, fmt.Errorf("notification for %q: %w", symbolName, err)
 	}
 	handle, err := conn.AddDeviceNotification(
 		uint32(GroupSymbolValueByHandle),
@@ -525,6 +530,16 @@ func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, c
 	defer conn.symbolLock.Unlock()
 	symbol.Notification = updateReceiver
 	conn.activeNotifications[handle] = symbol
+
+	// Save config for reconnect re-subscribe
+	conn.notificationConfigs = append(conn.notificationConfigs, NotificationConfig{
+		SymbolName:       symbolName,
+		MaxDelay:         maxDelay,
+		CycleTime:        cycleTime,
+		TransmissionMode: transMode,
+	})
+	conn.notificationChannel = updateReceiver
+
 	return handle, nil
 }
 
@@ -768,7 +783,9 @@ func (conn *Connection) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		log.Warn().Err(err).Msg("failed to read symbol version during LoadSymbolList")
 	} else {
+		conn.symbolLock.Lock()
 		conn.symbolVersion = version
+		conn.symbolLock.Unlock()
 	}
 
 	// Get upload info
@@ -893,8 +910,8 @@ func (conn *Connection) rebuildSymbolChildrenLocked() {
 	for _, sym := range topLevel {
 		dt, ok := conn.datatypes[sym.DataType]
 		if ok {
-			sym.Childs = dt.addOffset(sym, conn.datatypes, sym.Group, sym.Offset)
-			addChilds(sym, conn.symbols)
+			sym.Children = dt.addOffset(sym, conn.datatypes, sym.Group, sym.Offset)
+			addChildren(sym, conn.symbols)
 		}
 	}
 
@@ -974,8 +991,8 @@ func (conn *Connection) browseRoot() []SymbolBrowseEntry {
 		}
 	}
 
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].FullName < entries[j].FullName
+	slices.SortFunc(entries, func(a, b SymbolBrowseEntry) int {
+		return cmp.Compare(a.FullName, b.FullName)
 	})
 	return entries
 }
@@ -983,10 +1000,10 @@ func (conn *Connection) browseRoot() []SymbolBrowseEntry {
 // browseChildren returns children of a given path.
 // Must be called with symbolLock held.
 func (conn *Connection) browseChildren(path string) []SymbolBrowseEntry {
-	// First: check if the exact symbol exists and has Childs
-	if sym, ok := conn.symbols[path]; ok && len(sym.Childs) > 0 {
+	// First: check if the exact symbol exists and has Children
+	if sym, ok := conn.symbols[path]; ok && len(sym.Children) > 0 {
 		var entries []SymbolBrowseEntry
-		for _, child := range sym.Childs {
+		for _, child := range sym.Children {
 			entries = append(entries, SymbolBrowseEntry{
 				Name:        child.Name,
 				FullName:    child.FullName,
@@ -996,8 +1013,8 @@ func (conn *Connection) browseChildren(path string) []SymbolBrowseEntry {
 				Comment:     child.Comment,
 			})
 		}
-		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].FullName < entries[j].FullName
+		slices.SortFunc(entries, func(a, b SymbolBrowseEntry) int {
+			return cmp.Compare(a.FullName, b.FullName)
 		})
 		return entries
 	}
@@ -1059,8 +1076,8 @@ func (conn *Connection) browseChildren(path string) []SymbolBrowseEntry {
 		})
 	}
 
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].FullName < entries[j].FullName
+	slices.SortFunc(entries, func(a, b SymbolBrowseEntry) int {
+		return cmp.Compare(a.FullName, b.FullName)
 	})
 	return entries
 }
@@ -1069,19 +1086,19 @@ func (conn *Connection) browseChildren(path string) []SymbolBrowseEntry {
 // Must be called with symbolLock held.
 func (conn *Connection) symbolHasChildren(sym *Symbol) bool {
 	// If we already have expanded children, yes
-	if len(sym.Childs) > 0 {
+	if len(sym.Children) > 0 {
 		return true
 	}
 
 	// If datatypes are loaded, check the datatype table
 	if conn.datatypesLoaded && conn.datatypes != nil {
 		if dt, ok := conn.datatypes[sym.DataType]; ok {
-			return len(dt.Childs) > 0
+			return len(dt.Children) > 0
 		}
 	}
 
 	// Heuristic: if the datatype is not a primitive parseable type, it's likely a struct
-	if sym.DataType != "" && !stringArrayIncludes(parseableTypes, sym.DataType) {
+	if sym.DataType != "" && !slices.Contains(parseableTypes, sym.DataType) {
 		// Exclude known non-struct types
 		if sym.DataType != "TIME" && sym.DataType != "TOD" && sym.DataType != "DATE" && sym.DataType != "DT" {
 			return true

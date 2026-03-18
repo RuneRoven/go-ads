@@ -8,34 +8,37 @@ import (
 )
 
 // ReadStateResponse - ADS command id: 4
-type states struct {
+// States holds the ADS and device state returned by ReadState.
+type States struct {
 	AdsState    AdsState
 	DeviceState uint16
 }
 
-func (conn *Connection) ReadState() (response states, err error) {
+func (conn *Connection) ReadState() (response States, err error) {
 	// Try to send the request
 	resp, err := conn.sendRequest(CommandIDReadState, []byte{})
-	log.Trace().
-		Bytes("data", resp).
-		Msg("response from plc for state")
 	if err != nil {
 		log.Error().
 			Err(err).
 			Msg("Error during read state")
 		return
 	}
+	log.Trace().
+		Bytes("data", resp).
+		Msg("response from plc for state")
 	type readStateResponse struct {
 		Error ReturnCode
-		states
+		States
 	}
 	stateResponse := &readStateResponse{}
 	buff := bytes.NewBuffer(resp)
-	binary.Read(buff, binary.LittleEndian, stateResponse)
+	if err = binary.Read(buff, binary.LittleEndian, stateResponse); err != nil {
+		return response, err
+	}
 	log.Debug().
-		Interface("AdsState", stateResponse.AdsState).
-		Interface("DeviceState", stateResponse.DeviceState).
-		Msg("response.ADSState")
+		Uint16("adsState", uint16(stateResponse.AdsState)).
+		Uint16("deviceState", stateResponse.DeviceState).
+		Msg("read state response")
 
-	return stateResponse.states, err
+	return stateResponse.States, nil
 }

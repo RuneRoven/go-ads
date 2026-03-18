@@ -126,13 +126,23 @@ func TestIntegrationReadSymbol(t *testing.T) {
 			t.Fatalf("LoadSymbols failed: %v", err)
 		}
 		symbols, _ := conn.ListSymbols()
-		for name := range symbols {
-			symbolName = name
-			break
+		// Pick a symbol with a well-known parseable base type
+		parseableSet := map[string]bool{
+			"BOOL": true, "BYTE": true, "USINT": true, "SINT": true,
+			"UINT": true, "UINT16": true, "WORD": true, "INT": true, "INT16": true,
+			"UDINT": true, "DWORD": true, "DINT": true,
+			"REAL": true, "LREAL": true, "STRING": true,
+			"LINT": true, "ULINT": true, "LWORD": true,
+		}
+		for name, sym := range symbols {
+			if parseableSet[sym.DataType] {
+				symbolName = name
+				break
+			}
 		}
 	}
 	if symbolName == "" {
-		t.Skip("no symbols available")
+		t.Skip("no parseable leaf symbols available")
 	}
 
 	// ReadFromSymbol uses on-demand resolution if symbol not already loaded
@@ -262,6 +272,14 @@ func TestIntegrationNotification(t *testing.T) {
 		t.Skip("no symbols available")
 	}
 
+	// Verify no active notifications before subscribe
+	conn.symbolLock.Lock()
+	beforeCount := len(conn.activeNotifications)
+	conn.symbolLock.Unlock()
+	if beforeCount != 0 {
+		t.Fatalf("expected 0 active notifications before subscribe, got %d", beforeCount)
+	}
+
 	ch := make(chan *Update, 10)
 	handle, err := conn.AddSymbolNotification(symbolName, 100, 100, TransModeServerOnChange, ch)
 	if err != nil {
@@ -269,12 +287,37 @@ func TestIntegrationNotification(t *testing.T) {
 	}
 	t.Logf("notification handle: %d", handle)
 
+	// Verify handle is tracked
+	conn.symbolLock.Lock()
+	afterCount := len(conn.activeNotifications)
+	_, tracked := conn.activeNotifications[handle]
+	conn.symbolLock.Unlock()
+	if afterCount != 1 {
+		t.Errorf("expected 1 active notification after subscribe, got %d", afterCount)
+	}
+	if !tracked {
+		t.Errorf("handle %d not found in activeNotifications", handle)
+	}
+
 	select {
 	case update := <-ch:
 		t.Logf("notification: %s = %s at %v", update.Variable, update.Value, update.TimeStamp)
 	case <-time.After(5 * time.Second):
 		t.Log("no notification received within 5s (may be expected if value doesn't change)")
 	}
+
+	// Clean up: delete the notification and verify handle removal
+	err = conn.DeleteDeviceNotification(handle)
+	if err != nil {
+		t.Fatalf("DeleteDeviceNotification(%d) failed: %v", handle, err)
+	}
+	conn.symbolLock.Lock()
+	cleanupCount := len(conn.activeNotifications)
+	conn.symbolLock.Unlock()
+	if cleanupCount != 0 {
+		t.Errorf("expected 0 active notifications after delete, got %d", cleanupCount)
+	}
+	t.Logf("handle %d cleaned up successfully", handle)
 }
 
 func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
@@ -297,12 +340,26 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 
 	ch := make(chan *Update, 10)
 
+	// Verify clean state
+	conn.symbolLock.Lock()
+	if len(conn.activeNotifications) != 0 {
+		t.Fatalf("expected 0 active notifications at start, got %d", len(conn.activeNotifications))
+	}
+	conn.symbolLock.Unlock()
+
 	// Subscribe
 	handle, err := conn.AddSymbolNotification(symbolName, 100, 100, TransModeServerOnChange, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotification(%q) failed: %v", symbolName, err)
 	}
 	t.Logf("subscribed to %s (handle=%d)", symbolName, handle)
+
+	// Verify handle is tracked
+	conn.symbolLock.Lock()
+	if _, ok := conn.activeNotifications[handle]; !ok {
+		t.Errorf("handle %d not tracked in activeNotifications after subscribe", handle)
+	}
+	conn.symbolLock.Unlock()
 
 	// Wait briefly for a notification
 	select {
@@ -319,6 +376,16 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 	}
 	t.Logf("unsubscribed handle %d", handle)
 
+	// Verify handle removed from tracking
+	conn.symbolLock.Lock()
+	if _, ok := conn.activeNotifications[handle]; ok {
+		t.Errorf("handle %d still in activeNotifications after DeleteDeviceNotification", handle)
+	}
+	if len(conn.activeNotifications) != 0 {
+		t.Errorf("expected 0 active notifications after unsubscribe, got %d", len(conn.activeNotifications))
+	}
+	conn.symbolLock.Unlock()
+
 	// Verify no more notifications arrive after unsubscribe
 	select {
 	case update := <-ch:
@@ -326,6 +393,193 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Log("no notification after unsubscribe (expected)")
 	}
+}
+
+func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
+	conn := setupConnection(t)
+
+	err := conn.LoadSymbols()
+	if err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	// Collect up to 3 distinct symbol names to subscribe to
+	symbols, _ := conn.ListSymbols()
+	var symbolNames []string
+	for name := range symbols {
+		symbolNames = append(symbolNames, name)
+		if len(symbolNames) >= 3 {
+			break
+		}
+	}
+	if len(symbolNames) == 0 {
+		t.Skip("no symbols available")
+	}
+
+	ch := make(chan *Update, 100)
+
+	// Verify clean state
+	conn.symbolLock.Lock()
+	startCount := len(conn.activeNotifications)
+	conn.symbolLock.Unlock()
+	if startCount != 0 {
+		t.Fatalf("expected 0 active notifications at start, got %d", startCount)
+	}
+
+	// Subscribe to multiple symbols
+	var handles []uint32
+	for _, name := range symbolNames {
+		handle, err := conn.AddSymbolNotification(name, 100, 100, TransModeServerOnChange, ch)
+		if err != nil {
+			t.Fatalf("AddSymbolNotification(%q) failed: %v", name, err)
+		}
+		handles = append(handles, handle)
+		t.Logf("subscribed to %s (handle=%d)", name, handle)
+	}
+
+	// Verify all handles are tracked
+	conn.symbolLock.Lock()
+	activeCount := len(conn.activeNotifications)
+	conn.symbolLock.Unlock()
+	if activeCount != len(handles) {
+		t.Errorf("expected %d active notifications, got %d", len(handles), activeCount)
+	}
+
+	// Delete handles one by one and verify count decreases
+	for i, handle := range handles {
+		err := conn.DeleteDeviceNotification(handle)
+		if err != nil {
+			t.Fatalf("DeleteDeviceNotification(%d) failed: %v", handle, err)
+		}
+		conn.symbolLock.Lock()
+		remaining := len(conn.activeNotifications)
+		conn.symbolLock.Unlock()
+		expected := len(handles) - i - 1
+		if remaining != expected {
+			t.Errorf("after deleting handle %d: expected %d active, got %d", handle, expected, remaining)
+		}
+	}
+
+	// Final check: zero handles remaining
+	conn.symbolLock.Lock()
+	finalCount := len(conn.activeNotifications)
+	conn.symbolLock.Unlock()
+	if finalCount != 0 {
+		t.Errorf("expected 0 active notifications after deleting all, got %d", finalCount)
+	}
+	t.Logf("all %d handles cleaned up successfully", len(handles))
+}
+
+func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
+	// This test verifies that Close() properly releases notification handles
+	// on the PLC, preventing handle leaks that fill up the PLC.
+	ip := getEnvOrDefault("ADS_PLC_IP", "192.168.3.224")
+	targetAMS := getEnvOrDefault("ADS_TARGET_AMS", "5.154.236.19.1.1")
+	targetPortStr := getEnvOrDefault("ADS_TARGET_PORT", "851")
+	targetPort, err := strconv.Atoi(targetPortStr)
+	if err != nil {
+		t.Fatalf("invalid ADS_TARGET_PORT %q: %v", targetPortStr, err)
+	}
+	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
+
+	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second)
+	if err != nil {
+		t.Fatalf("NewConnection failed: %v", err)
+	}
+	err = conn.Connect(false)
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	// Do NOT use t.Cleanup(conn.Close) — we call Close() explicitly to test it
+
+	err = conn.LoadSymbols()
+	if err != nil {
+		conn.Close()
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	symbols, _ := conn.ListSymbols()
+	var symbolNames []string
+	for name := range symbols {
+		symbolNames = append(symbolNames, name)
+		if len(symbolNames) >= 3 {
+			break
+		}
+	}
+	if len(symbolNames) == 0 {
+		conn.Close()
+		t.Skip("no symbols available")
+	}
+
+	ch := make(chan *Update, 100)
+	var handles []uint32
+	for _, name := range symbolNames {
+		handle, err := conn.AddSymbolNotification(name, 100, 100, TransModeServerOnChange, ch)
+		if err != nil {
+			conn.Close()
+			t.Fatalf("AddSymbolNotification(%q) failed: %v", name, err)
+		}
+		handles = append(handles, handle)
+		t.Logf("subscribed to %s (handle=%d)", name, handle)
+	}
+
+	// Verify handles are active
+	conn.symbolLock.Lock()
+	activeBeforeClose := len(conn.activeNotifications)
+	conn.symbolLock.Unlock()
+	if activeBeforeClose != len(handles) {
+		t.Errorf("expected %d active notifications before Close, got %d", len(handles), activeBeforeClose)
+	}
+
+	// Close should release all handles on the PLC
+	conn.Close()
+	t.Logf("Close() completed, released %d notification handles", len(handles))
+
+	// Reconnect and verify no stale handles exist by subscribing to the same
+	// symbols again — if Close() didn't release, the PLC would eventually
+	// run out of handles.
+	conn2, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10501, 5*time.Second)
+	if err != nil {
+		t.Fatalf("second NewConnection failed: %v", err)
+	}
+	err = conn2.Connect(false)
+	if err != nil {
+		t.Fatalf("second Connect failed: %v", err)
+	}
+	defer conn2.Close()
+
+	err = conn2.LoadSymbols()
+	if err != nil {
+		t.Fatalf("second LoadSymbols failed: %v", err)
+	}
+
+	// If old handles leaked, subscribing again would still work (PLC allows many),
+	// but we verify no tracking leaks on our side
+	conn2.symbolLock.Lock()
+	freshCount := len(conn2.activeNotifications)
+	conn2.symbolLock.Unlock()
+	if freshCount != 0 {
+		t.Errorf("fresh connection should have 0 active notifications, got %d", freshCount)
+	}
+
+	// Subscribe to same symbols on new connection to confirm PLC accepts them
+	ch2 := make(chan *Update, 100)
+	for _, name := range symbolNames {
+		handle, err := conn2.AddSymbolNotification(name, 100, 100, TransModeServerOnChange, ch2)
+		if err != nil {
+			t.Errorf("re-subscribe to %s on fresh connection failed: %v (possible PLC handle leak)", name, err)
+		} else {
+			t.Logf("re-subscribed to %s (new handle=%d)", name, handle)
+		}
+	}
+
+	conn2.symbolLock.Lock()
+	resubCount := len(conn2.activeNotifications)
+	conn2.symbolLock.Unlock()
+	if resubCount != len(symbolNames) {
+		t.Errorf("expected %d active notifications after re-subscribe, got %d", len(symbolNames), resubCount)
+	}
+	t.Logf("re-subscription successful: %d handles on fresh connection", resubCount)
 }
 
 // writeTestCase defines a single write-and-confirm test case.

@@ -31,9 +31,11 @@ func StringToNetID(source string) (result [6]byte) {
 }
 
 func stringToNetID(source string) (result [6]byte) {
-	splitLocalhost := strings.Split(source, ".")
-
-	for i, a := range splitLocalhost {
+	parts := strings.Split(source, ".")
+	for i, a := range parts {
+		if i >= 6 {
+			break
+		}
 		value, _ := strconv.ParseUint(a, 10, 8)
 		result[i] = byte(value)
 	}
@@ -49,21 +51,21 @@ func (conn *Connection) encode(command CommandID, data []byte, invokeID uint32) 
 		Int("length of data", len(data)).
 		Msg("Starting encoding of AMS header")
 	tcpHeader := &amsTCPHeader{
-		0,
-		0,
-		uint32(32 + len(data)),
+		Unknown1: 0,
+		System:   0,
+		Length:   uint32(32 + len(data)),
 	}
 	header := &amsHeader{
-		conn.target,
-		conn.source,
-		command,
-		uint16(4),
-		uint32(len(data)),
-		uint32(0),
-		invokeID,
+		Target:    conn.target,
+		Source:    conn.source,
+		Command:   command,
+		State:     uint16(4),
+		Length:    uint32(len(data)),
+		ErrorCode: uint32(0),
+		InvokeID:  invokeID,
 	}
 
-	buff := &bytes.Buffer{}
+	buff := new(bytes.Buffer)
 	err := binary.Write(buff, binary.LittleEndian, tcpHeader)
 	if err != nil {
 		return nil, err

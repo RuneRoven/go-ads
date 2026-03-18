@@ -8,7 +8,7 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// DeleteDeviceNotification does stuff
+// DeleteDeviceNotification deletes a device notification by handle.
 func (conn *Connection) DeleteDeviceNotification(handle uint32) error {
 	request := &bytes.Buffer{}
 	type deleteNotificationCommandPacket struct {
@@ -17,12 +17,14 @@ func (conn *Connection) DeleteDeviceNotification(handle uint32) error {
 	var content = deleteNotificationCommandPacket{
 		handle,
 	}
-	binary.Write(request, binary.LittleEndian, content)
+	if err := binary.Write(request, binary.LittleEndian, content); err != nil {
+		return fmt.Errorf("binary.Write failed: %w", err)
+	}
 	// Try to send the request
 	resp, err := conn.sendRequest(CommandIDDeleteDeviceNotification, request.Bytes())
 	if err != nil {
-		log.Info().
-			Int("handle", int(handle)).
+		log.Warn().
+			Uint32("handle", handle).
 			Err(err).
 			Msg("error deleting handle")
 		return err
@@ -31,19 +33,21 @@ func (conn *Connection) DeleteDeviceNotification(handle uint32) error {
 	// Check the result error code
 	respBuffer := bytes.NewBuffer(resp)
 	var adsError ReturnCode
-	binary.Read(respBuffer, binary.LittleEndian, &adsError)
-	if adsError > 0 {
-		log.Info().
-			Int("handle", int(handle)).
-			Int("error", int(adsError)).
-			Msg("error deleting handle")
-		err = fmt.Errorf("ADS error in DeleteDeviceNotification: %v", adsError)
-		return err
+	if err = binary.Read(respBuffer, binary.LittleEndian, &adsError); err != nil {
+		return fmt.Errorf("failed to parse DeleteDeviceNotification response: %w", err)
 	}
-	// close(conn.activeNotifications[handle])
+	if adsError > 0 {
+		log.Warn().
+			Uint32("handle", handle).
+			Uint32("errorCode", uint32(adsError)).
+			Msg("error deleting handle")
+		return fmt.Errorf("ADS error in DeleteDeviceNotification: %w", adsError)
+	}
+	conn.symbolLock.Lock()
 	delete(conn.activeNotifications, handle)
+	conn.symbolLock.Unlock()
 	log.Info().
-		Int("handle", int(handle)).
-		Msg("deleting handle")
+		Uint32("handle", handle).
+		Msg("deleted handle")
 	return nil
 }

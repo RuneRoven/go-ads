@@ -3,6 +3,7 @@ package ads
 import (
 	"encoding/binary"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -216,7 +217,7 @@ func TestReturnCodeString(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.contains, func(t *testing.T) {
 			s := tt.code.String()
-			if !containsSubstring(s, tt.contains) {
+			if !strings.Contains(s, tt.contains) {
 				t.Errorf("ReturnCode(0x%04X).String() = %q, want it to contain %q", uint32(tt.code), s, tt.contains)
 			}
 		})
@@ -367,20 +368,6 @@ func TestSymbolParseUnknownType(t *testing.T) {
 	}
 }
 
-// helper
-func containsSubstring(s, substr string) bool {
-	return len(s) >= len(substr) && searchSubstring(s, substr)
-}
-
-func searchSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
 // --- writeToNode round-trip tests ---
 
 // testWriteRoundTrip writes a value via writeToNode then reads it back via parse and compares.
@@ -529,7 +516,7 @@ func TestWriteToNodeStruct(t *testing.T) {
 		FullName: "test",
 		DataType: "ST_Test",
 		Length:   8,
-		Childs: map[string]*Symbol{
+		Children: map[string]*Symbol{
 			"field1": child1,
 			"field2": child2,
 		},
@@ -567,7 +554,7 @@ func TestWriteToNodeStructPartialFields(t *testing.T) {
 	child2 := &Symbol{Name: "y", FullName: "s.y", DataType: "BYTE", Length: 1, Offset: 1}
 	parent := &Symbol{
 		Name: "s", FullName: "s", DataType: "ST_S", Length: 2,
-		Childs: map[string]*Symbol{"x": child1, "y": child2},
+		Children: map[string]*Symbol{"x": child1, "y": child2},
 	}
 
 	// Only write "x", "y" should remain zero

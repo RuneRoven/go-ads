@@ -19,19 +19,17 @@ func (conn *Connection) Write(group uint32, offset uint32, data []byte) error {
 	writeRequest := writeCommandPacket{
 		group,
 		offset,
-		uint32(binary.Size(data)),
+		uint32(len(data)),
 	}
 
 	err := binary.Write(request, binary.LittleEndian, writeRequest)
 	if err != nil {
-		log.Error().
-			Msgf("binary.Write failed: %s", err)
+		log.Error().Err(err).Msg("binary.Write failed")
 		return err
 	}
 	err = binary.Write(request, binary.LittleEndian, data)
 	if err != nil {
-		log.Error().
-			Msgf("binary.Write failed: %s", err)
+		log.Error().Err(err).Msg("binary.Write failed")
 		return err
 	}
 
@@ -46,13 +44,11 @@ func (conn *Connection) Write(group uint32, offset uint32, data []byte) error {
 	respBuffer := bytes.NewBuffer(resp)
 	var respCode ReturnCode
 	// Check the result error code
-	err = binary.Read(respBuffer, binary.LittleEndian, &respCode)
+	if err = binary.Read(respBuffer, binary.LittleEndian, &respCode); err != nil {
+		return fmt.Errorf("failed to parse Write response: %w", err)
+	}
 	if respCode > 0 {
-		log.Error().
-			Err(err).
-			Msg("error during write")
-		err = fmt.Errorf("ADS error in Write: %v", respCode)
-		return err
+		return fmt.Errorf("ADS error in Write: %w", respCode)
 	}
 
 	return nil

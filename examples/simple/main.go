@@ -440,11 +440,7 @@ func main() {
 
 func doBrowse(conn *ads.Connection, bs *browseState, path string) {
 	// Reset browse state when explicitly browsing
-	if path != "" {
-		bs.path = path
-	} else {
-		bs.path = ""
-	}
+	bs.path = path
 
 	entries, err := conn.BrowseSymbols(bs.path)
 	if err != nil {

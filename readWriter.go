@@ -3,12 +3,12 @@ package ads
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"time"
-
-	"encoding/json"
 
 	"github.com/rs/zerolog/log"
 )
@@ -20,10 +20,12 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 		stop = len(data)
 	}
 
-	var newValue = "nil"
-	if len(symbol.Childs) > 0 {
-		for _, value := range symbol.Childs {
-			value.parse(data[offset:stop], int(value.Offset), datatypes)
+	var newValue string
+	if len(symbol.Children) > 0 {
+		for _, value := range symbol.Children {
+			if _, err := value.parse(data[offset:stop], int(value.Offset), datatypes); err != nil {
+				return "", fmt.Errorf("parsing child %q: %w", value.Name, err)
+			}
 		}
 		newValue = symbol.GetJSON(false)
 		symbol.updateValue(newValue)
@@ -31,9 +33,7 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 	}
 
 	if len(data) < int(symbol.Length) {
-		log.Error().
-			Msgf("Incoming data is to small, !0<%d<%d<%d", start, stop, len(data))
-		return "", nil
+		return "", fmt.Errorf("data too short for %s: need %d bytes, got %d", symbol.DataType, symbol.Length, len(data))
 	}
 
 	switch symbol.DataType {
@@ -50,18 +50,12 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 		if stop-start != 1 {
 			return "", fmt.Errorf("BYTE Size Wrong")
 		}
-		buf := bytes.NewBuffer(data[start:stop])
-		var i uint8
-		binary.Read(buf, binary.LittleEndian, &i)
-		newValue = strconv.FormatInt(int64(i), 10)
+		newValue = strconv.FormatUint(uint64(data[start]), 10)
 	case "SINT": // Short INT -128 to 127
 		if stop-start != 1 {
 			return "", fmt.Errorf("SINT Size Wrong")
 		}
-		buf := bytes.NewBuffer(data[start:stop])
-		var i int8
-		binary.Read(buf, binary.LittleEndian, &i)
-		newValue = strconv.FormatInt(int64(i), 10)
+		newValue = strconv.FormatInt(int64(int8(data[start])), 10)
 	case "UINT", "WORD", "UINT16":
 		if stop-start != 2 {
 			return "", fmt.Errorf("WORD Size Wrong")
@@ -78,16 +72,13 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 		if stop-start != 2 {
 			return "", fmt.Errorf("INT Size Wrong")
 		}
-		var i int16
-		i = int16(binary.LittleEndian.Uint16(data[start:stop]))
+		i := int16(binary.LittleEndian.Uint16(data[start:stop]))
 		newValue = strconv.FormatInt(int64(i), 10)
 	case "DINT":
 		if stop-start != 4 {
 			return "", fmt.Errorf("DINT Size Wrong")
 		}
-		buf := bytes.NewBuffer(data[start:stop])
-		var i int32
-		binary.Read(buf, binary.LittleEndian, &i)
+		i := int32(binary.LittleEndian.Uint32(data[start:stop]))
 		newValue = strconv.FormatInt(int64(i), 10)
 	case "REAL":
 		if stop-start != 4 {
@@ -118,9 +109,6 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 	case "STRING":
 		trimmedBytes := bytes.TrimSpace(data[start:stop])
 		secondIndex := bytes.IndexByte(trimmedBytes, byte(0))
-		if secondIndex >= len(trimmedBytes) {
-			secondIndex = len(trimmedBytes)
-		}
 		if secondIndex < 0 {
 			secondIndex = len(trimmedBytes)
 		}
@@ -161,7 +149,7 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 		// Try resolving type alias via datatype table
 		if datatypes != nil {
 			if dt, ok := datatypes[symbol.DataType]; ok {
-				if stringArrayIncludes(parseableTypes, dt.DataType) {
+				if slices.Contains(parseableTypes, dt.DataType) {
 					resolved := *symbol
 					resolved.DataType = dt.DataType
 					return resolved.parse(data, offset, nil)
@@ -197,15 +185,6 @@ func (symbol *Symbol) parentChanged() {
 	symbol.Changed = true
 }
 
-func stringArrayIncludes(vs []string, t string) bool {
-	for _, v := range vs {
-		if v == t {
-			return true
-		}
-	}
-	return false
-}
-
 var parseableTypes = []string{
 	"BOOL",
 	"BYTE",
@@ -232,13 +211,13 @@ var parseableTypes = []string{
 }
 
 func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string]SymbolUploadDataType) (data []byte, err error) {
-	if len(symbol.Childs) > 0 {
+	if len(symbol.Children) > 0 {
 		var fields map[string]string
 		if err := json.Unmarshal([]byte(value), &fields); err != nil {
 			return nil, fmt.Errorf("struct write requires JSON input: %w", err)
 		}
 		buf := make([]byte, symbol.Length)
-		for name, child := range symbol.Childs {
+		for name, child := range symbol.Children {
 			childValue, ok := fields[name]
 			if !ok {
 				continue
@@ -247,15 +226,19 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 			if err != nil {
 				return nil, fmt.Errorf("field %q: %w", name, err)
 			}
-			copy(buf[child.Offset:child.Offset+child.Length], childBytes)
+			end := child.Offset + child.Length
+			if end > uint32(len(buf)) {
+				return nil, fmt.Errorf("field %q: offset+length %d exceeds struct size %d", name, end, len(buf))
+			}
+			copy(buf[child.Offset:end], childBytes)
 		}
 		return buf, nil
 	}
 
-	buf := bytes.NewBuffer([]byte{})
+	buf := new(bytes.Buffer)
 	dt := symbol.DataType
 
-	if !stringArrayIncludes(parseableTypes, symbol.DataType) {
+	if !slices.Contains(parseableTypes, symbol.DataType) {
 		if datatypes == nil {
 			return nil, fmt.Errorf("cannot write to symbol with aliased type %q without full symbol discovery; call LoadSymbols() first", symbol.DataType)
 		}
@@ -263,10 +246,10 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		if !ok {
 			return nil, fmt.Errorf("datatype %q not found in datatype table", dt)
 		}
-		if stringArrayIncludes(parseableTypes, dtEntry.DataType) {
+		if slices.Contains(parseableTypes, dtEntry.DataType) {
 			dt = dtEntry.DataType
 		} else {
-			return nil, fmt.Errorf("data type not parseable %v", dtEntry.DataType)
+			return nil, fmt.Errorf("data type not parseable: %s", dtEntry.DataType)
 		}
 	}
 	switch dt {
@@ -277,18 +260,16 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		}
 
 		if v {
-			buf.Write([]byte{1})
+			buf.WriteByte(1)
 		} else {
-			buf.Write([]byte{0})
+			buf.WriteByte(0)
 		}
 	case "BYTE", "USINT": // Unsigned Short INT 0 to 255
 		v, e := strconv.ParseUint(value, 10, 8)
 		if e != nil {
 			return nil, e
 		}
-
-		v8 := uint8(v)
-		binary.Write(buf, binary.LittleEndian, &v8)
+		buf.WriteByte(uint8(v))
 	case "UINT", "WORD", "UINT16":
 		v, e := strconv.ParseUint(value, 10, 16)
 		if e != nil {
@@ -296,7 +277,9 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		}
 
 		v16 := uint16(v)
-		binary.Write(buf, binary.LittleEndian, &v16)
+		if err := binary.Write(buf, binary.LittleEndian, &v16); err != nil {
+			return nil, fmt.Errorf("binary.Write UINT failed: %w", err)
+		}
 	case "UDINT", "DWORD":
 		v, e := strconv.ParseUint(value, 10, 32)
 		if e != nil {
@@ -304,16 +287,16 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		}
 
 		v32 := uint32(v)
-		binary.Write(buf, binary.LittleEndian, &v32)
+		if err := binary.Write(buf, binary.LittleEndian, &v32); err != nil {
+			return nil, fmt.Errorf("binary.Write UDINT failed: %w", err)
+		}
 
 	case "SINT": // Short INT -128 to 127
 		v, e := strconv.ParseInt(value, 10, 8)
 		if e != nil {
 			return nil, e
 		}
-
-		v8 := int8(v)
-		binary.Write(buf, binary.LittleEndian, &v8)
+		buf.WriteByte(byte(int8(v)))
 	case "INT", "INT16":
 		v, e := strconv.ParseInt(value, 10, 16)
 		if e != nil {
@@ -321,7 +304,9 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		}
 
 		v16 := int16(v)
-		binary.Write(buf, binary.LittleEndian, &v16)
+		if err := binary.Write(buf, binary.LittleEndian, &v16); err != nil {
+			return nil, fmt.Errorf("binary.Write INT failed: %w", err)
+		}
 	case "DINT":
 		v, e := strconv.ParseInt(value, 10, 32)
 		if e != nil {
@@ -329,7 +314,9 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		}
 
 		v32 := int32(v)
-		binary.Write(buf, binary.LittleEndian, &v32)
+		if err := binary.Write(buf, binary.LittleEndian, &v32); err != nil {
+			return nil, fmt.Errorf("binary.Write DINT failed: %w", err)
+		}
 
 	case "REAL":
 		v, e := strconv.ParseFloat(value, 32)
@@ -338,7 +325,9 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		}
 
 		v32 := math.Float32bits(float32(v))
-		binary.Write(buf, binary.LittleEndian, &v32)
+		if err := binary.Write(buf, binary.LittleEndian, &v32); err != nil {
+			return nil, fmt.Errorf("binary.Write REAL failed: %w", err)
+		}
 	case "LREAL":
 		v, e := strconv.ParseFloat(value, 64)
 		if e != nil {
@@ -346,21 +335,25 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		}
 
 		v64 := math.Float64bits(v)
-		binary.Write(buf, binary.LittleEndian, &v64)
+		if err := binary.Write(buf, binary.LittleEndian, &v64); err != nil {
+			return nil, fmt.Errorf("binary.Write LREAL failed: %w", err)
+		}
 	case "LINT":
 		v, e := strconv.ParseInt(value, 10, 64)
 		if e != nil {
 			return nil, e
 		}
-		v64 := int64(v)
-		binary.Write(buf, binary.LittleEndian, &v64)
+		if err := binary.Write(buf, binary.LittleEndian, &v); err != nil {
+			return nil, fmt.Errorf("binary.Write LINT failed: %w", err)
+		}
 	case "ULINT", "LWORD":
 		v, e := strconv.ParseUint(value, 10, 64)
 		if e != nil {
 			return nil, e
 		}
-		v64 := uint64(v)
-		binary.Write(buf, binary.LittleEndian, &v64)
+		if err := binary.Write(buf, binary.LittleEndian, &v); err != nil {
+			return nil, fmt.Errorf("binary.Write ULINT failed: %w", err)
+		}
 	case "TIME":
 		t, e := time.Parse("15:04:05.999999999", value)
 		if e != nil {
@@ -372,7 +365,9 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		// Inverse of parse(): parse uses time.Unix(0, i*ms - 1h) then Format in local TZ
 		target := time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.Local)
 		ms := uint32((target.UnixNano() + int64(time.Hour)) / int64(time.Millisecond))
-		binary.Write(buf, binary.LittleEndian, &ms)
+		if err := binary.Write(buf, binary.LittleEndian, &ms); err != nil {
+			return nil, fmt.Errorf("binary.Write TIME failed: %w", err)
+		}
 	case "TOD":
 		t, e := time.Parse("15:04", value)
 		if e != nil {
@@ -380,7 +375,9 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		}
 		target := time.Date(1970, 1, 1, t.Hour(), t.Minute(), 0, 0, time.Local)
 		ms := uint32((target.UnixNano() + int64(time.Hour)) / int64(time.Millisecond))
-		binary.Write(buf, binary.LittleEndian, &ms)
+		if err := binary.Write(buf, binary.LittleEndian, &ms); err != nil {
+			return nil, fmt.Errorf("binary.Write TOD failed: %w", err)
+		}
 	case "DATE":
 		t, e := time.Parse("2006-01-02", value)
 		if e != nil {
@@ -389,7 +386,9 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		// Inverse of parse(): parse uses time.Unix(0, i*second) then Format in local TZ
 		target := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.Local)
 		secs := uint32(target.Unix())
-		binary.Write(buf, binary.LittleEndian, &secs)
+		if err := binary.Write(buf, binary.LittleEndian, &secs); err != nil {
+			return nil, fmt.Errorf("binary.Write DATE failed: %w", err)
+		}
 	case "DT":
 		t, e := time.Parse("2006-01-02 15:04:05", value)
 		if e != nil {
@@ -398,15 +397,16 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		// Inverse of parse(): parse uses time.Unix(0, i*second - 1h) then Format in local TZ
 		target := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.Local)
 		secs := uint32((target.UnixNano() + int64(time.Hour)) / int64(time.Second))
-		binary.Write(buf, binary.LittleEndian, &secs)
+		if err := binary.Write(buf, binary.LittleEndian, &secs); err != nil {
+			return nil, fmt.Errorf("binary.Write DT failed: %w", err)
+		}
 	case "STRING":
 		newBuf := make([]byte, symbol.Length)
 		copy(newBuf, []byte(value))
 		buf.Write(newBuf)
 	default:
-		err = fmt.Errorf("datatype '%s' write is not implemented yet", symbol.DataType)
-		return
+		return nil, fmt.Errorf("datatype %q write is not implemented yet", symbol.DataType)
 	}
-	return buf.Bytes(), err
+	return buf.Bytes(), nil
 }
 

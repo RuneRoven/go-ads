@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -63,7 +64,9 @@ type Connection struct {
 	sumReadSupported atomic.Bool
 	sumReadChecked   atomic.Bool
 
-	reconnecting atomic.Bool // prevents concurrent reconnect attempts
+	reconnecting   atomic.Bool // prevents concurrent reconnect attempts
+	reconnectDone  chan struct{}
+	reconnectMu    sync.Mutex // protects reconnectDone
 }
 
 
@@ -103,12 +106,13 @@ func (conn *Connection) Connect(local bool) error {
 	conn.isLocal = local
 	var err error
 	log.Debug().
-		Msgf("Dialing ip: %s port: %d", conn.ip, conn.port)
+		Str("ip", conn.ip).Int("port", conn.port).
+		Msg("dialing")
 	if local {
 		conn.target.NetID = [6]byte{127, 0, 0, 1, 1, 1}
 		conn.ip = "127.0.0.1"
 	}
-	conn.connection, err = net.Dial("tcp", net.JoinHostPort(conn.ip, fmt.Sprintf("%d", conn.port)))
+	conn.connection, err = net.Dial("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)))
 	if err != nil {
 		log.Error().
 			Err(err).
@@ -129,7 +133,10 @@ func (conn *Connection) Connect(local bool) error {
 	}
 	// Auto-derive source AMS NetID from local IP if source NetID is all zeros
 	if conn.source.NetID == [6]byte{} {
-		localAddr := conn.connection.LocalAddr().(*net.TCPAddr)
+		localAddr, ok := conn.connection.LocalAddr().(*net.TCPAddr)
+		if !ok {
+			return fmt.Errorf("unexpected local address type: %T", conn.connection.LocalAddr())
+		}
 		ip := localAddr.IP.To4()
 		if ip != nil {
 			conn.source.NetID = [6]byte{ip[0], ip[1], ip[2], ip[3], 1, 1}
@@ -139,22 +146,23 @@ func (conn *Connection) Connect(local bool) error {
 		}
 	}
 
-	log.Trace().Msgf("Connected")
+	log.Trace().Msg("connected")
 	go conn.listen()
 	go conn.transmitWorker()
 	if local {
-		resp, _ := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
+		resp, err := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
+		if err != nil {
+			return fmt.Errorf("local mode handshake failed: %w", err)
+		}
 		buf := bytes.NewBuffer(resp)
 		result := AmsAddress{}
 		log.Trace().
 			Bytes("stuff", buf.Bytes()).Msg("got stuff")
 		err = binary.Read(buf, binary.LittleEndian, &result)
-		log.Info().
-			Msgf("result %d", result)
 		if err != nil {
-			log.Error().
-				Msgf("ERROR %v", err)
+			return fmt.Errorf("local mode binary read failed: %w", err)
 		}
+		log.Info().Interface("result", result).Msg("local mode handshake result")
 		conn.source = result
 	}
 	// Read symbol version for later change detection (best-effort, don't fail connect)
@@ -162,7 +170,9 @@ func (conn *Connection) Connect(local bool) error {
 	if err != nil {
 		log.Debug().Err(err).Msg("could not read symbol version during connect")
 	} else {
+		conn.symbolLock.Lock()
 		conn.symbolVersion = version
+		conn.symbolLock.Unlock()
 	}
 	return nil
 }
@@ -172,10 +182,12 @@ func (conn *Connection) Close() {
 	log.Info().Msg("Close called, shutting down")
 
 	// Delete all active notifications (uses sum command with automatic fallback to individual)
+	conn.symbolLock.Lock()
 	handles := make([]uint32, 0, len(conn.activeNotifications))
 	for handle := range conn.activeNotifications {
 		handles = append(handles, handle)
 	}
+	conn.symbolLock.Unlock()
 	if len(handles) > 0 {
 		errors, err := conn.SumDeleteDeviceNotification(handles)
 		if err != nil {
@@ -190,14 +202,23 @@ func (conn *Connection) Close() {
 			}
 		}
 	}
+	// Collect symbol handles under lock, then release without holding the lock
+	conn.symbolLock.Lock()
+	var symHandles []uint32
 	for _, symbol := range conn.symbols {
 		if symbol.Handle != 0 {
-			log.Info().
-				Uint32("handle", symbol.Handle).
-				Msg("Handle deleted")
-			handleBytes := make([]byte, 4)
-			binary.LittleEndian.PutUint32(handleBytes, symbol.Handle)
-			conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes)
+			symHandles = append(symHandles, symbol.Handle)
+		}
+	}
+	conn.symbolLock.Unlock()
+
+	for _, h := range symHandles {
+		handleBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(handleBytes, h)
+		if err := conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+			log.Warn().Err(err).Uint32("handle", h).Msg("failed to release symbol handle during close")
+		} else {
+			log.Info().Uint32("handle", h).Msg("handle deleted")
 		}
 	}
 	conn.shutdown()
@@ -223,7 +244,21 @@ func (conn *Connection) Reconnect() error {
 		log.Info().Msg("reconnect already in progress, skipping")
 		return nil
 	}
-	defer conn.reconnecting.Store(false)
+
+	// Create a channel that waiters (sendRequest) can block on
+	conn.reconnectMu.Lock()
+	conn.reconnectDone = make(chan struct{})
+	conn.reconnectMu.Unlock()
+
+	defer func() {
+		conn.reconnecting.Store(false)
+		conn.reconnectMu.Lock()
+		if conn.reconnectDone != nil {
+			close(conn.reconnectDone)
+			conn.reconnectDone = nil
+		}
+		conn.reconnectMu.Unlock()
+	}()
 
 	log.Info().Msg("attempting reconnect")
 	conn.disconnected.Store(true)
@@ -256,17 +291,21 @@ func (conn *Connection) Reconnect() error {
 		}
 
 		var err error
-		conn.connection, err = net.Dial("tcp", net.JoinHostPort(conn.ip, fmt.Sprintf("%d", conn.port)))
+		conn.connection, err = net.Dial("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)))
 		if err != nil {
 			lastErr = err
 			log.Warn().Err(err).Int("attempt", attempts).Msg("reconnect dial failed, retrying")
 			time.Sleep(conn.reconnectInterval)
 			continue
 		}
-		// Enable TCP keepalive to detect dead connections
+		// Enable aggressive TCP keepalive to detect dead connections quickly
 		if tcpConn, ok := conn.connection.(*net.TCPConn); ok {
-			tcpConn.SetKeepAlive(true)
-			tcpConn.SetKeepAlivePeriod(5 * time.Second)
+			tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
+				Enable:   true,
+				Idle:     3 * time.Second,
+				Interval: 2 * time.Second,
+				Count:    5,
+			})
 		}
 
 		// Clear disconnected flag so sendRequest works during symbol load
@@ -299,17 +338,35 @@ func (conn *Connection) Reconnect() error {
 			}
 		} else if conn.symbolListLoaded || conn.datatypesLoaded {
 			// Partial discovery — re-download what was loaded
+			reloadFailed := false
 			if conn.symbolListLoaded {
 				err = conn.LoadSymbolList(SlowDiscoveryConfig{})
 				if err != nil {
+					reloadFailed = true
 					log.Warn().Err(err).Msg("reconnect: failed to reload symbol list")
 				}
 			}
 			if conn.datatypesLoaded {
 				err = conn.LoadDataTypes(SlowDiscoveryConfig{})
 				if err != nil {
+					reloadFailed = true
 					log.Warn().Err(err).Msg("reconnect: failed to reload datatypes")
 				}
+			}
+			if reloadFailed {
+				conn.disconnected.Store(true)
+				log.Warn().Int("attempt", attempts).Msg("reconnect partial reload failed, retrying")
+				conn.shutdown()
+				if conn.connection != nil {
+					conn.connection.Close()
+				}
+				conn.waitGroup.Wait()
+				conn.ctx, conn.shutdown = context.WithCancel(context.Background())
+				conn.sendChannel = make(chan []byte)
+				conn.systemResponse = make(chan []byte)
+				conn.activeRequests = map[uint32]chan []byte{}
+				time.Sleep(conn.reconnectInterval)
+				continue
 			}
 		} else if len(conn.onDemandSymbols) > 0 {
 			// On-demand mode: re-resolve only the symbols that were previously loaded
@@ -319,11 +376,28 @@ func (conn *Connection) Reconnect() error {
 			conn.onDemandSymbols = make(map[string]bool)
 			conn.symbolLock.Unlock()
 
+			resolveFailed := false
 			for name := range oldSymbols {
 				_, err := conn.GetSymbol(name) // triggers on-demand resolution
 				if err != nil {
+					resolveFailed = true
 					log.Warn().Err(err).Str("symbol", name).Msg("failed to re-resolve symbol on reconnect")
 				}
+			}
+			if resolveFailed {
+				conn.disconnected.Store(true)
+				log.Warn().Int("attempt", attempts).Msg("reconnect on-demand resolve failed, retrying")
+				conn.shutdown()
+				if conn.connection != nil {
+					conn.connection.Close()
+				}
+				conn.waitGroup.Wait()
+				conn.ctx, conn.shutdown = context.WithCancel(context.Background())
+				conn.sendChannel = make(chan []byte)
+				conn.systemResponse = make(chan []byte)
+				conn.activeRequests = map[uint32]chan []byte{}
+				time.Sleep(conn.reconnectInterval)
+				continue
 			}
 		} else {
 			// No symbols were loaded — read symbol version for future use
@@ -331,7 +405,9 @@ func (conn *Connection) Reconnect() error {
 			if err != nil {
 				log.Debug().Err(err).Msg("could not read symbol version during reconnect")
 			} else {
+				conn.symbolLock.Lock()
 				conn.symbolVersion = version
+				conn.symbolLock.Unlock()
 			}
 		}
 
@@ -358,7 +434,9 @@ func (conn *Connection) loadSymbols() error {
 	if err != nil {
 		log.Warn().Err(err).Msg("failed to read symbol version, continuing with symbol load")
 	} else {
+		conn.symbolLock.Lock()
 		conn.symbolVersion = version
+		conn.symbolLock.Unlock()
 	}
 
 	res, err := conn.GetSymbolUploadInfo()
@@ -373,7 +451,6 @@ func (conn *Connection) loadSymbols() error {
 	if err != nil {
 		return fmt.Errorf("failed to parse datatypes: %w", err)
 	}
-	conn.datatypes = datatypes
 	symbolsResponse, err := conn.GetUploadSymbolInfoSymbols(res.SymbolLength)
 	if err != nil {
 		return fmt.Errorf("failed to upload symbols: %w", err)
@@ -382,7 +459,10 @@ func (conn *Connection) loadSymbols() error {
 	if err != nil {
 		return fmt.Errorf("failed to parse symbols: %w", err)
 	}
+	conn.symbolLock.Lock()
+	conn.datatypes = datatypes
 	conn.symbols = symbols
+	conn.symbolLock.Unlock()
 	return nil
 }
 

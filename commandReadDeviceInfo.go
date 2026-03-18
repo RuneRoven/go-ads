@@ -4,11 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-
-	"github.com/rs/zerolog/log"
 )
-
-// ReadDeviceInfoResponse connected device info
 
 // DeviceInfo connected device info
 type DeviceInfo struct {
@@ -35,14 +31,13 @@ func (conn *Connection) ReadDeviceInfo() (response DeviceInfo, err error) {
 	}
 	respBuffer := bytes.NewBuffer(resp)
 	deviceInfoResponse := readDeviceInfoResponse{}
-	binary.Read(respBuffer, binary.LittleEndian, &deviceInfoResponse)
+	if err = binary.Read(respBuffer, binary.LittleEndian, &deviceInfoResponse); err != nil {
+		return response, fmt.Errorf("failed to parse ReadDeviceInfo response: %w", err)
+	}
 	if deviceInfoResponse.Error > 0 {
-		err = fmt.Errorf("ADS error in ReadDeviceInfo: %v", deviceInfoResponse.Error)
+		err = fmt.Errorf("ADS error in ReadDeviceInfo: %w", deviceInfoResponse.Error)
 		return
 	}
 
-	log.Debug().
-		Msg("Device Info")
-
-	return deviceInfoResponse.DeviceInfo, err
+	return deviceInfoResponse.DeviceInfo, nil
 }
