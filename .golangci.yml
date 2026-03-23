@@ -1,0 +1,57 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - gosec
+    - revive
+    - gocritic
+    - misspell
+    - unconvert
+    - errorlint
+    - prealloc
+
+  settings:
+    gosec:
+      excludes:
+        - G104 # duplicates errcheck
+        - G115 # integer overflow conversions are intentional in this binary protocol library
+    errcheck:
+      exclude-functions:
+        - (*bytes.Buffer).Write
+        - (*bytes.Buffer).WriteByte
+        - (net.Conn).Close
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
+
+  exclusions:
+    rules:
+      - linters: [gosec, errcheck]
+        path: ".*_test\\.go"
+      - linters: [errcheck]
+        text: "Error return value of `conn.Reconnect` is not checked"
+      - linters: [errcheck]
+        text: "Error return value of `conn.handleNotification` is not checked"
+      - linters: [errcheck]
+        text: "Error return value of `tc.SetKeepAliveConfig` is not checked"
+      - linters: [errcheck]
+        text: "Error return value of `tcpConn.SetKeepAliveConfig` is not checked"
+      - linters: [prealloc]
+        path: "route\\.go"
+
+formatters:
+  enable:
+    - goimports
+    - gofumpt
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/RuneRoven/go-ads

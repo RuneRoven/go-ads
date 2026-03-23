@@ -1,6 +1,9 @@
 package ads
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // AMSAddress netid and port of device
 type AmsAddress struct {
@@ -497,4 +500,16 @@ func (rc ReturnCode) String() string {
 // Error implements the error interface for ReturnCode, allowing it to be used directly as an error.
 func (rc ReturnCode) Error() string {
 	return rc.String()
+}
+
+// isSumCommandUnsupportedError returns true if the error indicates the PLC does
+// not support sum/batch commands (as opposed to a transient network error).
+func isSumCommandUnsupportedError(err error) bool {
+	var rc ReturnCode
+	if !errors.As(err, &rc) {
+		return false // network/timeout error — not a capability issue
+	}
+	return rc == ReturnCodeDeviceServiceNotSupported ||
+		rc == ReturnCodeGlobalUnknownCommandID ||
+		rc == ReturnCodeGlobalUnknownAdsCommand
 }

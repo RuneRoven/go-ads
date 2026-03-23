@@ -15,7 +15,8 @@ func (conn *Connection) AddDeviceNotification(
 	length uint32,
 	transmissionMode TransMode,
 	maxDelay time.Duration,
-	cycleTime time.Duration) (handle uint32, err error) {
+	cycleTime time.Duration,
+) (handle uint32, err error) {
 	request := new(bytes.Buffer)
 	type addDeviceNotificationCommandPacket struct {
 		Group            uint32
@@ -27,7 +28,7 @@ func (conn *Connection) AddDeviceNotification(
 		Reserved         [16]byte
 	}
 
-	var content = addDeviceNotificationCommandPacket{
+	content := addDeviceNotificationCommandPacket{
 		group,
 		offset,
 		length,

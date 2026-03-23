@@ -50,7 +50,7 @@ func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, err
 
 	resp, err := conn.WriteRead(uint32(GroupSumupReadEx2), uint32(n), readLen, writeData)
 	if err != nil {
-		if !conn.sumReadChecked.Load() {
+		if !conn.sumReadChecked.Load() && isSumCommandUnsupportedError(err) {
 			log.Warn().Err(err).Msg("SumRead not supported by PLC, using individual reads")
 			conn.sumReadSupported.Store(false)
 			conn.sumReadChecked.Store(true)

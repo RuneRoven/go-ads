@@ -102,7 +102,7 @@ func (conn *Connection) sendRequest(command CommandID, data []byte) (response []
 			log.Info().
 				Msg("sendRequest aborted due to shutdown")
 		}
-		return
+		return nil, ctx.Err()
 	case conn.sendChannel <- pack:
 	}
 	// Capture channel reference under lock to avoid concurrent map read
@@ -125,66 +125,69 @@ func (conn *Connection) sendRequest(command CommandID, data []byte) (response []
 }
 
 func (conn *Connection) listen() {
-	conn.waitGroup.Add(1)
-	go func() {
-		defer conn.waitGroup.Done()
-		reader := bufio.NewReader(conn.connection)
-		buff := bytes.Buffer{}
-		for {
-			tcpHeader := amsTCPHeader{}
-			data := make([]byte, 6)
-			select {
-			case <-conn.ctx.Done():
-				log.Info().Msg("exit listen")
-				return
-			default:
-				_, err := io.ReadFull(reader, data)
-				if err != nil {
-					select {
-					case <-conn.ctx.Done():
-						// Shutdown was requested, don't reconnect
-						return
-					default:
-					}
-					log.Error().Err(err).Msg("listen read error, triggering reconnect")
-					go conn.Reconnect()
-					return
-				}
-			}
-			buff.Write(data)
-			err := binary.Read(&buff, binary.LittleEndian, &tcpHeader)
+	defer conn.waitGroup.Done()
+	reader := bufio.NewReader(conn.connection)
+	buff := bytes.Buffer{}
+	for {
+		tcpHeader := amsTCPHeader{}
+		data := make([]byte, 6)
+		select {
+		case <-conn.ctx.Done():
+			log.Info().Msg("exit listen")
+			return
+		default:
+			_, err := io.ReadFull(reader, data)
 			if err != nil {
-				log.Error().Err(err).Msg("error during header read")
-				continue
-			}
-			data = make([]byte, tcpHeader.Length)
-			select {
-			case <-conn.ctx.Done():
-				return
-			default:
-				_, err := io.ReadFull(reader, data)
-				if err != nil {
-					select {
-					case <-conn.ctx.Done():
-						return
-					default:
-					}
-					log.Error().Err(err).Msg("listen body read error, triggering reconnect")
-					go conn.Reconnect()
-					return
-				}
-			}
-			if tcpHeader.System > 0 {
 				select {
-				case conn.systemResponse <- data:
 				case <-conn.ctx.Done():
+					// Shutdown was requested, don't reconnect
 					return
+				default:
 				}
-			} else {
-				go conn.handleReceive(conn.ctx, data)
+				log.Error().Err(err).Msg("listen read error, triggering reconnect")
+				go conn.Reconnect()
+				return
 			}
 		}
-	}()
+		buff.Write(data)
+		err := binary.Read(&buff, binary.LittleEndian, &tcpHeader)
+		if err != nil {
+			log.Error().Err(err).Msg("error during header read")
+			continue
+		}
+		const maxAMSPacket = 4 * 1024 * 1024 // 4 MB sanity limit
+		if tcpHeader.Length > maxAMSPacket {
+			log.Error().Uint32("length", tcpHeader.Length).Msg("AMS packet length exceeds sanity limit, triggering reconnect")
+			go conn.Reconnect()
+			return
+		}
+		data = make([]byte, tcpHeader.Length)
+		select {
+		case <-conn.ctx.Done():
+			return
+		default:
+			_, err := io.ReadFull(reader, data)
+			if err != nil {
+				select {
+				case <-conn.ctx.Done():
+					return
+				default:
+				}
+				log.Error().Err(err).Msg("listen body read error, triggering reconnect")
+				go conn.Reconnect()
+				return
+			}
+		}
+		if tcpHeader.System > 0 {
+			select {
+			case conn.systemResponse <- data:
+			case <-conn.ctx.Done():
+				return
+			}
+		} else {
+			go conn.handleReceive(conn.ctx, data)
+		}
+	}
 }
 
 func (conn *Connection) handleReceive(ctx context.Context, data []byte) {
@@ -256,7 +259,6 @@ func (conn *Connection) handleReceive(ctx context.Context, data []byte) {
 }
 
 func (conn *Connection) transmitWorker() {
-	conn.waitGroup.Add(1)
 	defer conn.waitGroup.Done()
 	writer := bufio.NewWriter(conn.connection)
 	ctx, cancel := context.WithCancel(conn.ctx)
@@ -274,10 +276,14 @@ func (conn *Connection) transmitWorker() {
 			if err != nil {
 				log.Error().
 					Err(err).
-					Msg("error sending data on conn")
+					Msg("error sending data on conn, triggering reconnect")
+				go conn.Reconnect()
+				return
 			}
 			if err := writer.Flush(); err != nil {
-				log.Error().Err(err).Msg("error flushing data on conn")
+				log.Error().Err(err).Msg("error flushing data on conn, triggering reconnect")
+				go conn.Reconnect()
+				return
 			}
 		}
 	}

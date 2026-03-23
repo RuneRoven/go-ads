@@ -3,6 +3,7 @@ package ads
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 
 	"github.com/rs/zerolog/log"
 )
@@ -34,6 +35,9 @@ func (conn *Connection) ReadState() (response States, err error) {
 	buff := bytes.NewBuffer(resp)
 	if err = binary.Read(buff, binary.LittleEndian, stateResponse); err != nil {
 		return response, err
+	}
+	if stateResponse.Error > 0 {
+		return response, fmt.Errorf("ADS error in ReadState: %w", stateResponse.Error)
 	}
 	log.Debug().
 		Uint16("adsState", uint16(stateResponse.AdsState)).

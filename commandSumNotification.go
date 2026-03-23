@@ -51,7 +51,7 @@ func (conn *Connection) SumAddDeviceNotification(requests []SumNotificationReque
 
 	resp, err := conn.WriteRead(uint32(GroupSumupAddDeviceNotification), uint32(n), readLen, writeData)
 	if err != nil {
-		if !conn.sumReadChecked.Load() {
+		if !conn.sumReadChecked.Load() && isSumCommandUnsupportedError(err) {
 			log.Warn().Err(err).Msg("Sum commands not supported by PLC, using individual calls")
 			conn.sumReadSupported.Store(false)
 			conn.sumReadChecked.Store(true)
@@ -104,7 +104,7 @@ func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnC
 
 	resp, err := conn.WriteRead(uint32(GroupSumupDeleteDeviceNotification), uint32(n), readLen, writeData)
 	if err != nil {
-		if !conn.sumReadChecked.Load() {
+		if !conn.sumReadChecked.Load() && isSumCommandUnsupportedError(err) {
 			log.Warn().Err(err).Msg("Sum commands not supported by PLC, using individual calls")
 			conn.sumReadSupported.Store(false)
 			conn.sumReadChecked.Store(true)

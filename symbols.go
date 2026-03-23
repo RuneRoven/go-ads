@@ -135,7 +135,10 @@ func ParseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUpload
 		symbols[item.Name] = symbol
 		addChildren(symbol, symbols)
 
-		buff.Next(int(item.SymbolEntry.EntryLength) - (begBuff - endBuff))
+		skip := int(item.SymbolEntry.EntryLength) - (begBuff - endBuff)
+		if skip > 0 {
+			buff.Next(skip)
+		}
 	}
 	return
 }
@@ -175,10 +178,13 @@ func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string
 
 	for key, segment := range data.Children {
 		var path string
+		if len(segment.Name) == 0 {
+			continue
+		}
 		if segment.Name[0:1] != "[" {
 			path = fmt.Sprint(parent.FullName, ".", segment.Name)
 		} else {
-			path = fmt.Sprint(parent.Name, segment.Name)
+			path = fmt.Sprint(parent.FullName, segment.Name)
 		}
 
 		child := Symbol{
@@ -274,6 +280,9 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 	if childLen <= 0 {
 		return
 	}
+	if childLen > data.Len() {
+		return header, fmt.Errorf("childLen %d exceeds remaining data %d for %s", childLen, data.Len(), header.Name)
+	}
 
 	childData := make([]byte, childLen)
 	n, err := data.Read(childData)
@@ -320,6 +329,9 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (chil
 	}
 
 	level := levels[0]
+	if level.Elements == 0 {
+		return
+	}
 	subChildren := makeArrayChildren(levels[1:], dt, size)
 
 	var offset uint32

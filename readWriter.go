@@ -118,7 +118,7 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 			return "", fmt.Errorf("TIME Size Wrong")
 		}
 		i := binary.LittleEndian.Uint32(data[start:stop])
-		t := time.Unix(0, int64(uint64(i)*uint64(time.Millisecond))-int64(time.Hour))
+		t := time.Unix(0, int64(uint64(i)*uint64(time.Millisecond))).UTC()
 
 		newValue = t.Truncate(time.Millisecond).Format("15:04:05.999999999")
 	case "TOD":
@@ -126,7 +126,7 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 			return "", fmt.Errorf("TOD Size Wrong")
 		}
 		i := binary.LittleEndian.Uint32(data[start:stop])
-		t := time.Unix(0, int64(uint64(i)*uint64(time.Millisecond))-int64(time.Hour))
+		t := time.Unix(0, int64(uint64(i)*uint64(time.Millisecond))).UTC()
 
 		newValue = t.Truncate(time.Millisecond).Format("15:04")
 	case "DATE":
@@ -134,15 +134,15 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 			return "", fmt.Errorf("DATE Size Wrong")
 		}
 		i := binary.LittleEndian.Uint32(data[start:stop])
-		t := time.Unix(0, int64(uint64(i)*uint64(time.Second)))
+		t := time.Unix(int64(i), 0).UTC()
 
-		newValue = t.Truncate(time.Millisecond).Format("2006-01-02")
+		newValue = t.Format("2006-01-02")
 	case "DT":
 		if stop-start != 4 {
 			return "", fmt.Errorf("DT Size Wrong")
 		}
 		i := binary.LittleEndian.Uint32(data[start:stop])
-		t := time.Unix(0, int64(uint64(i)*uint64(time.Second))-int64(time.Hour))
+		t := time.Unix(int64(i), 0).UTC()
 
 		newValue = t.Truncate(time.Millisecond).Format("2006-01-02 15:04:05")
 	default:
@@ -362,9 +362,8 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 				return nil, fmt.Errorf("TIME: expected format 15:04:05 or 15:04:05.999999999: %w", e)
 			}
 		}
-		// Inverse of parse(): parse uses time.Unix(0, i*ms - 1h) then Format in local TZ
-		target := time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.Local)
-		ms := uint32((target.UnixNano() + int64(time.Hour)) / int64(time.Millisecond))
+		target := time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+		ms := uint32(target.UnixNano() / int64(time.Millisecond))
 		if err := binary.Write(buf, binary.LittleEndian, &ms); err != nil {
 			return nil, fmt.Errorf("binary.Write TIME failed: %w", err)
 		}
@@ -373,8 +372,8 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		if e != nil {
 			return nil, fmt.Errorf("TOD: expected format 15:04: %w", e)
 		}
-		target := time.Date(1970, 1, 1, t.Hour(), t.Minute(), 0, 0, time.Local)
-		ms := uint32((target.UnixNano() + int64(time.Hour)) / int64(time.Millisecond))
+		target := time.Date(1970, 1, 1, t.Hour(), t.Minute(), 0, 0, time.UTC)
+		ms := uint32(target.UnixNano() / int64(time.Millisecond))
 		if err := binary.Write(buf, binary.LittleEndian, &ms); err != nil {
 			return nil, fmt.Errorf("binary.Write TOD failed: %w", err)
 		}
@@ -384,7 +383,7 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 			return nil, fmt.Errorf("DATE: expected format 2006-01-02: %w", e)
 		}
 		// Inverse of parse(): parse uses time.Unix(0, i*second) then Format in local TZ
-		target := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.Local)
+		target := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 		secs := uint32(target.Unix())
 		if err := binary.Write(buf, binary.LittleEndian, &secs); err != nil {
 			return nil, fmt.Errorf("binary.Write DATE failed: %w", err)
@@ -394,9 +393,8 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		if e != nil {
 			return nil, fmt.Errorf("DT: expected format 2006-01-02 15:04:05: %w", e)
 		}
-		// Inverse of parse(): parse uses time.Unix(0, i*second - 1h) then Format in local TZ
-		target := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.Local)
-		secs := uint32((target.UnixNano() + int64(time.Hour)) / int64(time.Second))
+		target := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
+		secs := uint32(target.Unix())
 		if err := binary.Write(buf, binary.LittleEndian, &secs); err != nil {
 			return nil, fmt.Errorf("binary.Write DT failed: %w", err)
 		}
@@ -409,4 +407,3 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 	}
 	return buf.Bytes(), nil
 }
-

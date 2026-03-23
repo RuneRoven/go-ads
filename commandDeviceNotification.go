@@ -10,8 +10,10 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-const windowsTick int64 = 10000000
-const secToUnixEpoch int64 = 11644473600
+const (
+	windowsTick    int64 = 10000000
+	secToUnixEpoch int64 = 11644473600
+)
 
 type NotificationStream struct {
 	Length uint32
@@ -51,6 +53,9 @@ func (conn *Connection) DeviceNotification(ctx context.Context, in []byte) error
 			if err = binary.Read(data, binary.LittleEndian, &sample); err != nil {
 				return fmt.Errorf("error reading notification sample: %w", err)
 			}
+			if sample.Size > uint32(data.Len()) {
+				return fmt.Errorf("notification sample size %d exceeds remaining data %d", sample.Size, data.Len())
+			}
 			content = make([]byte, sample.Size)
 			n, err := data.Read(content)
 			if err != nil {
@@ -79,6 +84,7 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 	}
 	datatypes := conn.datatypes
 	notification := symbol.Notification
+	fullName := symbol.FullName
 
 	timeStamp := int64(timestamp)/windowsTick - secToUnixEpoch
 	notificationTime := time.Unix(timeStamp, int64(timestamp)%(windowsTick)*100)
@@ -92,24 +98,35 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 			Msg("error during parse of notification")
 		return nil
 	}
-	symbol.Value = value
 	conn.symbolLock.Unlock()
 
 	log.Trace().
 		Str("update", value).
 		Msg("update received")
 	updateStruct := &Update{
-		Variable:  symbol.FullName,
+		Variable:  fullName,
 		Value:     value,
 		TimeStamp: notificationTime,
 	}
-	// Try to send the response to the waiting request function
+	// Try to send the notification to the user's channel.
+	// Use a timeout to avoid blocking the notification handler indefinitely
+	// if the receiver is slow.
+	// TODO: Consider adding a ring buffer or overflow queue so notifications
+	// are cached when the receiver is slow, and re-sent when it catches up,
+	// instead of dropping them on timeout.
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 	case notification <- updateStruct:
 		log.Debug().
 			Uint32("handle", handle).
 			Msg("Successfully delivered notification")
+	case <-timer.C:
+		log.Warn().
+			Uint32("handle", handle).
+			Str("symbol", fullName).
+			Msg("notification channel send timed out, receiver may be slow")
 	}
 	return nil
 }

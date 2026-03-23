@@ -1,4 +1,7 @@
 /examples/simple/simple
 /examples/simple/go-ads-cli
+examples/simple/config-office.yaml
 .env*
 .DS_Store
+coverage.out
+coverage.html

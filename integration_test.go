@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,6 +27,56 @@ func getEnvOrDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseableSet contains data types that parse() can handle without full datatype resolution.
+var parseableSet = map[string]bool{
+	"BOOL": true, "BYTE": true, "USINT": true, "SINT": true,
+	"UINT": true, "UINT16": true, "WORD": true, "INT": true, "INT16": true,
+	"UDINT": true, "DWORD": true, "DINT": true,
+	"REAL": true, "LREAL": true, "STRING": true,
+	"LINT": true, "ULINT": true, "LWORD": true,
+}
+
+// pickParseableSymbol returns the name of a symbol with a parseable base type from the map.
+// Returns "" if none found.
+func pickParseableSymbol(symbols map[string]*Symbol) string {
+	for name, sym := range symbols {
+		if parseableSet[sym.DataType] {
+			return name
+		}
+	}
+	return ""
+}
+
+// pickParseableSymbols returns up to n symbol names with parseable base types.
+// Prefers top-level symbols (no dots) to avoid struct children that may lack handles.
+func pickParseableSymbols(symbols map[string]*Symbol, n int) []string {
+	var topLevel, nested []string
+	for name, sym := range symbols {
+		if !parseableSet[sym.DataType] {
+			continue
+		}
+		if !strings.Contains(name, ".") {
+			topLevel = append(topLevel, name)
+		} else {
+			nested = append(nested, name)
+		}
+	}
+	var names []string
+	for _, name := range topLevel {
+		names = append(names, name)
+		if len(names) >= n {
+			return names
+		}
+	}
+	for _, name := range nested {
+		names = append(names, name)
+		if len(names) >= n {
+			return names
+		}
+	}
+	return names
 }
 
 func setupConnection(t *testing.T) *Connection {
@@ -126,20 +177,7 @@ func TestIntegrationReadSymbol(t *testing.T) {
 			t.Fatalf("LoadSymbols failed: %v", err)
 		}
 		symbols, _ := conn.ListSymbols()
-		// Pick a symbol with a well-known parseable base type
-		parseableSet := map[string]bool{
-			"BOOL": true, "BYTE": true, "USINT": true, "SINT": true,
-			"UINT": true, "UINT16": true, "WORD": true, "INT": true, "INT16": true,
-			"UDINT": true, "DWORD": true, "DINT": true,
-			"REAL": true, "LREAL": true, "STRING": true,
-			"LINT": true, "ULINT": true, "LWORD": true,
-		}
-		for name, sym := range symbols {
-			if parseableSet[sym.DataType] {
-				symbolName = name
-				break
-			}
-		}
+		symbolName = pickParseableSymbol(symbols)
 	}
 	if symbolName == "" {
 		t.Skip("no parseable leaf symbols available")
@@ -263,13 +301,10 @@ func TestIntegrationNotification(t *testing.T) {
 			t.Fatalf("LoadSymbols failed: %v", err)
 		}
 		symbols, _ := conn.ListSymbols()
-		for name := range symbols {
-			symbolName = name
-			break
-		}
+		symbolName = pickParseableSymbol(symbols)
 	}
 	if symbolName == "" {
-		t.Skip("no symbols available")
+		t.Skip("no parseable symbols available")
 	}
 
 	// Verify no active notifications before subscribe
@@ -329,13 +364,10 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 			t.Fatalf("LoadSymbols failed: %v", err)
 		}
 		symbols, _ := conn.ListSymbols()
-		for name := range symbols {
-			symbolName = name
-			break
-		}
+		symbolName = pickParseableSymbol(symbols)
 	}
 	if symbolName == "" {
-		t.Skip("no symbols available")
+		t.Skip("no parseable symbols available")
 	}
 
 	ch := make(chan *Update, 10)
@@ -403,17 +435,11 @@ func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
-	// Collect up to 3 distinct symbol names to subscribe to
+	// Collect up to 3 distinct parseable symbol names to subscribe to
 	symbols, _ := conn.ListSymbols()
-	var symbolNames []string
-	for name := range symbols {
-		symbolNames = append(symbolNames, name)
-		if len(symbolNames) >= 3 {
-			break
-		}
-	}
+	symbolNames := pickParseableSymbols(symbols, 3)
 	if len(symbolNames) == 0 {
-		t.Skip("no symbols available")
+		t.Skip("no parseable symbols available")
 	}
 
 	ch := make(chan *Update, 100)
@@ -499,16 +525,10 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	}
 
 	symbols, _ := conn.ListSymbols()
-	var symbolNames []string
-	for name := range symbols {
-		symbolNames = append(symbolNames, name)
-		if len(symbolNames) >= 3 {
-			break
-		}
-	}
+	symbolNames := pickParseableSymbols(symbols, 3)
 	if len(symbolNames) == 0 {
 		conn.Close()
-		t.Skip("no symbols available")
+		t.Skip("no parseable symbols available")
 	}
 
 	ch := make(chan *Update, 100)
@@ -782,5 +802,102 @@ func TestIntegrationWriteMultipleSymbols(t *testing.T) {
 			t.Errorf("restore mismatch for %s: expected %q but read back %q", p.name, originals[p.name], restored)
 		}
 		t.Logf("restored %s = %s", p.name, restored)
+	}
+}
+
+func TestIntegrationReadMultipleSymbols(t *testing.T) {
+	conn := setupConnection(t)
+
+	err := conn.LoadSymbols()
+	if err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	symbols, _ := conn.ListSymbols()
+	names := pickParseableSymbols(symbols, 5)
+	if len(names) < 2 {
+		t.Skip("need at least 2 parseable symbols for ReadMultipleSymbols test")
+	}
+
+	values, err := conn.ReadMultipleSymbols(names)
+	if err != nil {
+		t.Fatalf("ReadMultipleSymbols failed: %v", err)
+	}
+
+	if len(values) == 0 {
+		t.Error("expected at least one result from ReadMultipleSymbols")
+	}
+
+	for name, val := range values {
+		t.Logf("  %s = %s", name, val)
+	}
+
+	// Verify each returned value matches an individual read
+	for name, batchVal := range values {
+		singleVal, err := conn.ReadFromSymbol(name)
+		if err != nil {
+			t.Errorf("ReadFromSymbol(%q) failed: %v", name, err)
+			continue
+		}
+		if !valuesApproxEqual(batchVal, singleVal, "") {
+			t.Errorf("batch/single mismatch for %s: batch=%q single=%q", name, batchVal, singleVal)
+		}
+	}
+}
+
+func TestIntegrationLoadSymbolsSlow(t *testing.T) {
+	conn := setupConnection(t)
+
+	err := conn.LoadSymbolsSlow(SlowDiscoveryConfig{
+		ChunkSize:  2048,
+		ChunkDelay: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("LoadSymbolsSlow failed: %v", err)
+	}
+
+	symbols, err := conn.ListSymbols()
+	if err != nil {
+		t.Fatalf("ListSymbols failed: %v", err)
+	}
+	if len(symbols) == 0 {
+		t.Fatal("expected at least one symbol after LoadSymbolsSlow")
+	}
+	t.Logf("LoadSymbolsSlow found %d symbols", len(symbols))
+
+	// Verify a symbol can be read
+	name := pickParseableSymbol(symbols)
+	if name == "" {
+		t.Skip("no parseable symbols available")
+	}
+	value, err := conn.ReadFromSymbol(name)
+	if err != nil {
+		t.Fatalf("ReadFromSymbol(%q) after slow load failed: %v", name, err)
+	}
+	t.Logf("read %s = %s", name, value)
+}
+
+func TestIntegrationCheckSymbolVersion(t *testing.T) {
+	conn := setupConnection(t)
+
+	changed, err := conn.CheckSymbolVersion()
+	if err != nil {
+		// Some PLCs (e.g. TwinCAT 2) don't support GroupSymbolVersion
+		t.Skipf("CheckSymbolVersion not supported on this PLC: %v", err)
+	}
+	// On first call after connect, the stored version should match what Connect() read
+	if changed {
+		t.Log("symbol version changed (unexpected but not fatal)")
+	} else {
+		t.Log("symbol version unchanged (expected)")
+	}
+
+	// Call again — should still be unchanged
+	changed2, err := conn.CheckSymbolVersion()
+	if err != nil {
+		t.Fatalf("second CheckSymbolVersion failed: %v", err)
+	}
+	if changed2 {
+		t.Error("symbol version should not change between two consecutive calls")
 	}
 }

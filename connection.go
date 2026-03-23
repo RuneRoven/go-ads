@@ -19,6 +19,7 @@ type Connection struct {
 	port int
 
 	connection  net.Conn
+	connMu      sync.Mutex // protects connection field against concurrent Close/Reconnect
 	target      AmsAddress
 	source      AmsAddress
 	sendChannel chan []byte
@@ -64,11 +65,10 @@ type Connection struct {
 	sumReadSupported atomic.Bool
 	sumReadChecked   atomic.Bool
 
-	reconnecting   atomic.Bool // prevents concurrent reconnect attempts
-	reconnectDone  chan struct{}
-	reconnectMu    sync.Mutex // protects reconnectDone
+	reconnecting  atomic.Bool // prevents concurrent reconnect attempts
+	reconnectDone chan struct{}
+	reconnectMu   sync.Mutex // protects reconnectDone
 }
-
 
 // NewConnection creates a new ADS connection. requestTimeout is the timeout for individual ADS requests.
 // If requestTimeout is 0, a default of 5000ms is used.
@@ -83,10 +83,18 @@ func NewConnection(ctx context.Context, ip string, port int, netid string, amsPo
 		reconnectInterval:    5 * time.Second,
 		maxReconnectAttempts: 0, // 0 = infinite retries
 	}
-	conn.target.NetID = stringToNetID(netid)
+	netIDBytes, err := stringToNetID(netid)
+	if err != nil {
+		return nil, fmt.Errorf("invalid target NetID: %w", err)
+	}
+	conn.target.NetID = netIDBytes
 	conn.target.Port = uint16(amsPort)
 	if localNetID != "auto" && localNetID != "" {
-		conn.source.NetID = stringToNetID(localNetID)
+		localBytes, err := stringToNetID(localNetID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid local NetID: %w", err)
+		}
+		conn.source.NetID = localBytes
 	}
 	// If localNetID is "auto" or empty, source.NetID stays zero and will be auto-derived in Connect()
 	conn.source.Port = uint16(localPort)
@@ -112,19 +120,22 @@ func (conn *Connection) Connect(local bool) error {
 		conn.target.NetID = [6]byte{127, 0, 0, 1, 1, 1}
 		conn.ip = "127.0.0.1"
 	}
-	conn.connection, err = net.Dial("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)))
+	tcpConn, err := net.Dial("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)))
 	if err != nil {
 		log.Error().
 			Err(err).
 			Msg("Error connecting")
 		return err
 	}
+	conn.connMu.Lock()
+	conn.connection = tcpConn
+	conn.connMu.Unlock()
 	// Enable aggressive TCP keepalive to detect dead connections quickly.
 	// With Idle=3s, Interval=2s, Count=5: connection declared dead after ~13s of no response.
 	// This ensures cable unplugs (>13s) are detected and trigger reconnect,
 	// while not affecting slow-changing notification data (keepalive is TCP-level, not app-level).
-	if tcpConn, ok := conn.connection.(*net.TCPConn); ok {
-		tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
+	if tc, ok := tcpConn.(*net.TCPConn); ok {
+		tc.SetKeepAliveConfig(net.KeepAliveConfig{
 			Enable:   true,
 			Idle:     3 * time.Second,
 			Interval: 2 * time.Second,
@@ -147,6 +158,7 @@ func (conn *Connection) Connect(local bool) error {
 	}
 
 	log.Trace().Msg("connected")
+	conn.waitGroup.Add(2)
 	go conn.listen()
 	go conn.transmitWorker()
 	if local {
@@ -223,9 +235,11 @@ func (conn *Connection) Close() {
 	}
 	conn.shutdown()
 	// Close the TCP connection to unblock listen() which may be stuck in ReadFull
+	conn.connMu.Lock()
 	if conn.connection != nil {
 		conn.connection.Close()
 	}
+	conn.connMu.Unlock()
 	log.Info().
 		Msg("Waiting for workers to close")
 	conn.waitGroup.Wait()
@@ -264,9 +278,11 @@ func (conn *Connection) Reconnect() error {
 	conn.disconnected.Store(true)
 
 	// Close existing TCP connection if still open
+	conn.connMu.Lock()
 	if conn.connection != nil {
 		conn.connection.Close()
 	}
+	conn.connMu.Unlock()
 
 	// Cancel old goroutines and wait
 	conn.shutdown()
@@ -278,8 +294,12 @@ func (conn *Connection) Reconnect() error {
 	// Reset channels, feature flags, and active notifications (old handles are invalid)
 	conn.sendChannel = make(chan []byte)
 	conn.systemResponse = make(chan []byte)
+	conn.activeRequestLock.Lock()
 	conn.activeRequests = map[uint32]chan []byte{}
+	conn.activeRequestLock.Unlock()
+	conn.symbolLock.Lock()
 	conn.activeNotifications = make(map[uint32]*Symbol)
+	conn.symbolLock.Unlock()
 	conn.sumReadChecked.Store(false)
 
 	var lastErr error
@@ -291,15 +311,18 @@ func (conn *Connection) Reconnect() error {
 		}
 
 		var err error
-		conn.connection, err = net.Dial("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)))
+		newConn, err := net.Dial("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)))
 		if err != nil {
 			lastErr = err
 			log.Warn().Err(err).Int("attempt", attempts).Msg("reconnect dial failed, retrying")
 			time.Sleep(conn.reconnectInterval)
 			continue
 		}
+		conn.connMu.Lock()
+		conn.connection = newConn
+		conn.connMu.Unlock()
 		// Enable aggressive TCP keepalive to detect dead connections quickly
-		if tcpConn, ok := conn.connection.(*net.TCPConn); ok {
+		if tcpConn, ok := newConn.(*net.TCPConn); ok {
 			tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
 				Enable:   true,
 				Idle:     3 * time.Second,
@@ -312,112 +335,55 @@ func (conn *Connection) Reconnect() error {
 		conn.disconnected.Store(false)
 
 		// Re-start goroutines
+		conn.waitGroup.Add(2)
 		go conn.listen()
 		go conn.transmitWorker()
 
-		// Re-load symbols based on discovery mode
-		if conn.symbolsFullyLoaded {
-			// Full discovery was done — redo it
-			err = conn.loadSymbols()
+		// Re-perform local-mode handshake if needed
+		if conn.isLocal {
+			resp, err := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 			if err != nil {
 				lastErr = err
-				conn.disconnected.Store(true)
-				log.Warn().Err(err).Int("attempt", attempts).Msg("reconnect symbol load failed, retrying")
-				// Stop goroutines before next attempt
-				conn.shutdown()
-				if conn.connection != nil {
-					conn.connection.Close()
-				}
-				conn.waitGroup.Wait()
-				conn.ctx, conn.shutdown = context.WithCancel(context.Background())
-				conn.sendChannel = make(chan []byte)
-				conn.systemResponse = make(chan []byte)
-				conn.activeRequests = map[uint32]chan []byte{}
+				log.Warn().Err(err).Int("attempt", attempts).Msg("reconnect local handshake failed, retrying")
+				conn.resetForRetry()
 				time.Sleep(conn.reconnectInterval)
 				continue
 			}
-		} else if conn.symbolListLoaded || conn.datatypesLoaded {
-			// Partial discovery — re-download what was loaded
-			reloadFailed := false
-			if conn.symbolListLoaded {
-				err = conn.LoadSymbolList(SlowDiscoveryConfig{})
-				if err != nil {
-					reloadFailed = true
-					log.Warn().Err(err).Msg("reconnect: failed to reload symbol list")
-				}
-			}
-			if conn.datatypesLoaded {
-				err = conn.LoadDataTypes(SlowDiscoveryConfig{})
-				if err != nil {
-					reloadFailed = true
-					log.Warn().Err(err).Msg("reconnect: failed to reload datatypes")
-				}
-			}
-			if reloadFailed {
-				conn.disconnected.Store(true)
-				log.Warn().Int("attempt", attempts).Msg("reconnect partial reload failed, retrying")
-				conn.shutdown()
-				if conn.connection != nil {
-					conn.connection.Close()
-				}
-				conn.waitGroup.Wait()
-				conn.ctx, conn.shutdown = context.WithCancel(context.Background())
-				conn.sendChannel = make(chan []byte)
-				conn.systemResponse = make(chan []byte)
-				conn.activeRequests = map[uint32]chan []byte{}
+			buf := bytes.NewBuffer(resp)
+			result := AmsAddress{}
+			if err = binary.Read(buf, binary.LittleEndian, &result); err != nil {
+				log.Warn().Err(err).Int("attempt", attempts).Msg("reconnect local handshake parse failed, retrying")
+				conn.resetForRetry()
 				time.Sleep(conn.reconnectInterval)
 				continue
 			}
-		} else if len(conn.onDemandSymbols) > 0 {
-			// On-demand mode: re-resolve only the symbols that were previously loaded
-			conn.symbolLock.Lock()
-			oldSymbols := conn.onDemandSymbols
-			conn.symbols = make(map[string]*Symbol)
-			conn.onDemandSymbols = make(map[string]bool)
-			conn.symbolLock.Unlock()
+			conn.source = result
+		}
 
-			resolveFailed := false
-			for name := range oldSymbols {
-				_, err := conn.GetSymbol(name) // triggers on-demand resolution
-				if err != nil {
-					resolveFailed = true
-					log.Warn().Err(err).Str("symbol", name).Msg("failed to re-resolve symbol on reconnect")
-				}
-			}
-			if resolveFailed {
-				conn.disconnected.Store(true)
-				log.Warn().Int("attempt", attempts).Msg("reconnect on-demand resolve failed, retrying")
-				conn.shutdown()
-				if conn.connection != nil {
-					conn.connection.Close()
-				}
-				conn.waitGroup.Wait()
-				conn.ctx, conn.shutdown = context.WithCancel(context.Background())
-				conn.sendChannel = make(chan []byte)
-				conn.systemResponse = make(chan []byte)
-				conn.activeRequests = map[uint32]chan []byte{}
-				time.Sleep(conn.reconnectInterval)
-				continue
-			}
-		} else {
-			// No symbols were loaded — read symbol version for future use
-			version, err := conn.GetSymbolVersion()
-			if err != nil {
-				log.Debug().Err(err).Msg("could not read symbol version during reconnect")
-			} else {
-				conn.symbolLock.Lock()
-				conn.symbolVersion = version
-				conn.symbolLock.Unlock()
-			}
+		// Re-load symbols based on discovery mode
+		if err := conn.reloadSymbols(); err != nil {
+			lastErr = err
+			log.Warn().Err(err).Int("attempt", attempts).Msg("reconnect symbol reload failed, retrying")
+			conn.resetForRetry()
+			time.Sleep(conn.reconnectInterval)
+			continue
 		}
 
 		// Re-subscribe notifications using stored configs (don't re-append)
-		if len(conn.notificationConfigs) > 0 && conn.notificationChannel != nil {
-			savedConfigs := conn.notificationConfigs
-			conn.notificationConfigs = nil // Clear before re-adding to prevent duplicates
-			err = conn.AddSymbolNotifications(savedConfigs, conn.notificationChannel)
+		conn.symbolLock.Lock()
+		savedConfigs := conn.notificationConfigs
+		savedChannel := conn.notificationChannel
+		conn.notificationConfigs = nil // Clear before re-adding to prevent duplicates
+		conn.symbolLock.Unlock()
+		if len(savedConfigs) > 0 && savedChannel != nil {
+			err = conn.AddSymbolNotifications(savedConfigs, savedChannel)
 			if err != nil {
 				log.Warn().Err(err).Msg("reconnect notification re-subscribe failed")
+				// Restore configs so they can be retried on the next reconnect
+				conn.symbolLock.Lock()
+				conn.notificationConfigs = savedConfigs
+				conn.notificationChannel = savedChannel
+				conn.symbolLock.Unlock()
 			}
 		}
 
@@ -425,6 +391,82 @@ func (conn *Connection) Reconnect() error {
 		log.Info().Int("attempts", attempts).Msg("reconnect successful")
 		return nil
 	}
+}
+
+// reloadSymbols re-establishes the symbol table after a reconnect, matching
+// the discovery mode that was used before the connection dropped.
+func (conn *Connection) reloadSymbols() error {
+	conn.symbolLock.Lock()
+	fullyLoaded := conn.symbolsFullyLoaded
+	listLoaded := conn.symbolListLoaded
+	dtLoaded := conn.datatypesLoaded
+	hasOnDemand := len(conn.onDemandSymbols) > 0
+	conn.symbolLock.Unlock()
+
+	switch {
+	case fullyLoaded:
+		// Full discovery was done — redo it
+		return conn.loadSymbols()
+
+	case listLoaded || dtLoaded:
+		// Partial discovery — re-download what was loaded
+		if listLoaded {
+			if err := conn.LoadSymbolList(SlowDiscoveryConfig{}); err != nil {
+				return fmt.Errorf("reload symbol list: %w", err)
+			}
+		}
+		if dtLoaded {
+			if err := conn.LoadDataTypes(SlowDiscoveryConfig{}); err != nil {
+				return fmt.Errorf("reload datatypes: %w", err)
+			}
+		}
+
+	case hasOnDemand:
+		// On-demand mode: re-resolve only the symbols that were previously loaded
+		conn.symbolLock.Lock()
+		oldSymbols := conn.onDemandSymbols
+		conn.symbols = make(map[string]*Symbol)
+		conn.onDemandSymbols = make(map[string]bool)
+		conn.symbolLock.Unlock()
+
+		for name := range oldSymbols {
+			if _, err := conn.GetSymbol(name); err != nil {
+				return fmt.Errorf("re-resolve symbol %q: %w", name, err)
+			}
+		}
+
+	default:
+		// No symbols were loaded — read symbol version for future use
+		version, err := conn.GetSymbolVersion()
+		if err != nil {
+			log.Debug().Err(err).Msg("could not read symbol version during reconnect")
+		} else {
+			conn.symbolLock.Lock()
+			conn.symbolVersion = version
+			conn.symbolLock.Unlock()
+		}
+	}
+
+	return nil
+}
+
+// resetForRetry tears down goroutines, closes the TCP connection, and resets
+// channels/state so the next retry iteration starts clean.
+func (conn *Connection) resetForRetry() {
+	conn.disconnected.Store(true)
+	conn.shutdown()
+	conn.connMu.Lock()
+	if conn.connection != nil {
+		conn.connection.Close()
+	}
+	conn.connMu.Unlock()
+	conn.waitGroup.Wait()
+	conn.ctx, conn.shutdown = context.WithCancel(context.Background())
+	conn.sendChannel = make(chan []byte)
+	conn.systemResponse = make(chan []byte)
+	conn.activeRequestLock.Lock()
+	conn.activeRequests = map[uint32]chan []byte{}
+	conn.activeRequestLock.Unlock()
 }
 
 // loadSymbols loads symbol table and datatypes from the PLC, and saves the symbol version.

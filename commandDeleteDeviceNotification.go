@@ -14,7 +14,7 @@ func (conn *Connection) DeleteDeviceNotification(handle uint32) error {
 	type deleteNotificationCommandPacket struct {
 		Handle uint32
 	}
-	var content = deleteNotificationCommandPacket{
+	content := deleteNotificationCommandPacket{
 		handle,
 	}
 	if err := binary.Write(request, binary.LittleEndian, content); err != nil {

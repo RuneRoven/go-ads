@@ -3,6 +3,7 @@ package ads
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -26,17 +27,21 @@ type amsHeader struct {
 }
 
 // StringToNetID converts a dotted notation NetID string (e.g. "192.168.1.1.1.1") to a 6-byte array.
-func StringToNetID(source string) (result [6]byte) {
+// Returns an error if the string is malformed (wrong number of parts or non-numeric values).
+func StringToNetID(source string) ([6]byte, error) {
 	return stringToNetID(source)
 }
 
-func stringToNetID(source string) (result [6]byte) {
+func stringToNetID(source string) (result [6]byte, err error) {
 	parts := strings.Split(source, ".")
+	if len(parts) != 6 {
+		return result, fmt.Errorf("invalid NetID %q: expected 6 dot-separated parts, got %d", source, len(parts))
+	}
 	for i, a := range parts {
-		if i >= 6 {
-			break
+		value, e := strconv.ParseUint(a, 10, 8)
+		if e != nil {
+			return result, fmt.Errorf("invalid NetID %q: part %d (%q): %w", source, i, a, e)
 		}
-		value, _ := strconv.ParseUint(a, 10, 8)
 		result[i] = byte(value)
 	}
 	return

@@ -21,7 +21,12 @@ func (conn *Connection) ListSymbols() (map[string]*Symbol, error) {
 	if !conn.symbolsFullyLoaded {
 		return nil, fmt.Errorf("full symbol discovery has not been run; call LoadSymbols() or LoadSymbolsSlow() first")
 	}
-	return conn.symbols, nil
+	// Return a shallow copy to prevent callers from mutating the internal map
+	copy := make(map[string]*Symbol, len(conn.symbols))
+	for k, v := range conn.symbols {
+		copy[k] = v
+	}
+	return copy, nil
 }
 
 // LoadSymbols performs full symbol and datatype discovery from the PLC.
@@ -148,6 +153,11 @@ func (conn *Connection) downloadInChunks(group uint32, totalLength uint32, chunk
 		return []byte{}, nil
 	}
 
+	const maxDownloadSize = 64 * 1024 * 1024 // 64 MB sanity limit
+	if totalLength > maxDownloadSize {
+		return nil, fmt.Errorf("download size %d exceeds sanity limit of %d bytes", totalLength, maxDownloadSize)
+	}
+
 	result := make([]byte, 0, totalLength)
 	var offset uint32
 
@@ -218,6 +228,10 @@ func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 	// Check if another goroutine resolved this symbol while we were waiting
 	if existing, ok := conn.symbols[symbolName]; ok {
 		conn.symbolLock.Unlock()
+		// Release the handle we just acquired since another goroutine beat us
+		handleBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(handleBytes, handle)
+		_ = conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes)
 		return existing, nil
 	}
 	conn.symbols[symbolName] = sym
@@ -242,7 +256,7 @@ func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) 
 		uint32(GroupSymbolInfoByNameEx),
 		0,
 		2048,
-		[]byte(symbolName),
+		append([]byte(symbolName), 0),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("GetSymbolInfoByName(%s) failed: %w", symbolName, err)
@@ -292,9 +306,12 @@ func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) 
 }
 
 func (conn *Connection) GetHandleByName(symbolName string) (handle uint32, err error) {
-	resp, err := conn.WriteRead(uint32(GroupSymbolHandleByName), 0, 4, []byte(symbolName))
+	resp, err := conn.WriteRead(uint32(GroupSymbolHandleByName), 0, 4, append([]byte(symbolName), 0))
 	if err != nil {
 		return 0, fmt.Errorf("getting handle for %q: %w", symbolName, err)
+	}
+	if len(resp) < 4 {
+		return 0, fmt.Errorf("getting handle for %q: response too short (%d bytes)", symbolName, len(resp))
 	}
 	handle = binary.LittleEndian.Uint32(resp)
 	return handle, nil
@@ -360,20 +377,23 @@ func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read %q: %w", symbolName, err)
 	}
+
+	// parse() mutates Symbol fields (Value, Changed, Valid, etc.) so it must
+	// run under lock to avoid racing with handleNotification.
+	conn.symbolLock.Lock()
 	value, err := symbol.parse(data, 0, datatypes)
 	if err != nil {
+		conn.symbolLock.Unlock()
 		return "", fmt.Errorf("read %q: parse failed: %w", symbolName, err)
 	}
+	symbol.LastUpdateTime = time.Now()
+	symbol.Value = value
+	conn.symbolLock.Unlock()
+
 	log.Trace().
 		Str("symbol", symbolName).
 		Str("Value", value).
 		Msg("Read from symbol")
-
-	// Update cache under lock
-	conn.symbolLock.Lock()
-	symbol.LastUpdateTime = now
-	symbol.Value = value
-	conn.symbolLock.Unlock()
 
 	return value, nil
 }
@@ -507,6 +527,10 @@ func (conn *Connection) RefreshSymbols() error {
 	return nil
 }
 
+// AddSymbolNotification registers a notification for a single symbol.
+// Note: all notifications must share the same updateReceiver channel.
+// On reconnect, the stored channel is used to re-subscribe all notifications.
+// For multiple notifications, prefer AddSymbolNotifications.
 func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, cycleTime int, transMode TransMode, updateReceiver chan *Update) (uint32, error) {
 	symbol, err := conn.GetSymbol(symbolName)
 	if err != nil {
@@ -762,7 +786,7 @@ type SymbolBrowseEntry struct {
 	FullName    string // full path (e.g., "MAIN.motor")
 	DataType    string // type name (e.g., "ST_Motor", "INT")
 	Size        uint32
-	HasChildren bool   // true if struct/array (requires LoadDataTypes to expand)
+	HasChildren bool // true if struct/array (requires LoadDataTypes to expand)
 	Comment     string
 }
 
@@ -1002,7 +1026,7 @@ func (conn *Connection) browseRoot() []SymbolBrowseEntry {
 func (conn *Connection) browseChildren(path string) []SymbolBrowseEntry {
 	// First: check if the exact symbol exists and has Children
 	if sym, ok := conn.symbols[path]; ok && len(sym.Children) > 0 {
-		var entries []SymbolBrowseEntry
+		entries := make([]SymbolBrowseEntry, 0, len(sym.Children))
 		for _, child := range sym.Children {
 			entries = append(entries, SymbolBrowseEntry{
 				Name:        child.Name,
