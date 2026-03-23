@@ -47,7 +47,7 @@ func (conn *Connection) Read(group uint32, offset uint32, length uint32) (data [
 	response := &readResponse{}
 	err = binary.Read(respBuff, binary.LittleEndian, response)
 	if err != nil {
-		return
+		return nil, fmt.Errorf("failed to parse Read response: %w", err)
 	}
 	if response.Error > 0 {
 		err = fmt.Errorf("ADS error in Read: %w", response.Error)

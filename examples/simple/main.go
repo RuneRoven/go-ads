@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -105,6 +106,7 @@ func main() {
 	defer cancel()
 
 	var conn *ads.Connection
+	var connMu sync.Mutex
 	updateCh := make(chan *ads.Update, 100)
 	bs := &browseState{}
 
@@ -130,9 +132,11 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		fmt.Println("\nShutting down...")
+		connMu.Lock()
 		if conn != nil {
 			conn.Close()
 		}
+		connMu.Unlock()
 		rl.Close()
 		os.Exit(0)
 	}()
@@ -168,7 +172,9 @@ func main() {
 			printHelp()
 
 		case "connect":
+			connMu.Lock()
 			if conn != nil {
+				connMu.Unlock()
 				fmt.Println("Already connected. Use 'quit' to disconnect first.")
 				continue
 			}
@@ -177,6 +183,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Connect failed: %v\n", err)
 				conn = nil
 			}
+			connMu.Unlock()
 
 		case "info":
 			if conn == nil {

@@ -224,6 +224,8 @@ func (conn *Connection) Close() {
 	}
 	conn.symbolLock.Unlock()
 
+	// Release handles individually — ADS has no batch release command,
+	// and Close() is not performance-critical.
 	for _, h := range symHandles {
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, h)
@@ -378,12 +380,15 @@ func (conn *Connection) Reconnect() error {
 		if len(savedConfigs) > 0 && savedChannel != nil {
 			err = conn.AddSymbolNotifications(savedConfigs, savedChannel)
 			if err != nil {
-				log.Warn().Err(err).Msg("reconnect notification re-subscribe failed")
-				// Restore configs so they can be retried on the next reconnect
+				log.Warn().Err(err).Int("attempt", attempts).Msg("reconnect notification re-subscribe failed, retrying")
+				// Restore configs so they can be retried on the next attempt
 				conn.symbolLock.Lock()
 				conn.notificationConfigs = savedConfigs
 				conn.notificationChannel = savedChannel
 				conn.symbolLock.Unlock()
+				conn.resetForRetry()
+				time.Sleep(conn.reconnectInterval)
+				continue
 			}
 		}
 

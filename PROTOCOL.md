@@ -35,7 +35,7 @@ ADS sits on top of AMS (Automation Message Specification), which handles address
 
 ## Protocol Architecture
 
-```
+```text
 ┌─────────────────────────────────────┐
 │          Application Layer          │
 │   (Symbol reads, writes, notifs)    │
@@ -215,7 +215,7 @@ Pushed from the PLC to the client. Contains one or more timestamped data samples
 
 **Structure:**
 
-```
+```text
 NotificationStream:
   Length (4 bytes) — total data length
   Stamps (4 bytes) — number of stamp headers
@@ -363,7 +363,7 @@ Structured types (STRUCTs, FUNCTION_BLOCKs) and arrays are recursively expanded 
 
 ## Library Architecture
 
-```
+```text
 ┌──────────────────────────────────────────────────┐
 │                   Application                     │
 │  ReadFromSymbol / WriteToSymbol / Notifications   │
@@ -527,7 +527,7 @@ Each `SymbolBrowseEntry` contains:
 
 #### `ReadFromSymbol(symbolName string) (string, error)`
 
-Reads a PLC variable by name and returns its parsed string value. If the symbol has not been discovered yet, it is resolved on-demand from the PLC (adds 2 ADS round-trips on first access, cached afterwards). Includes a minimum update interval cache (50ms default) to avoid excessive reads.
+Reads a PLC variable by name and returns its parsed string value. If the symbol has not been discovered yet, it is resolved on-demand from the PLC (adds 2 ADS round-trips on first access, cached afterward). Includes a minimum update interval cache (50ms default) to avoid excessive reads.
 
 #### `WriteToSymbol(symbolName string, value string) error`
 
@@ -611,7 +611,7 @@ Batch delete notifications using `GroupSumupDeleteDeviceNotification`.
 
 ## Connection Lifecycle
 
-```
+```text
 1. NewConnection(...)          — configure target, source, timeouts
        │
 2. [AddRemoteRoute(...)]       — optional: register route on PLC via UDP
@@ -644,7 +644,7 @@ Batch delete notifications using `GroupSumupDeleteDeviceNotification`.
 
 ## Symbol Discovery Limitations
 
-Full symbol discovery (used by this library on `Connect()`) downloads the entire symbol table and all datatype definitions from the PLC in two large ADS Read requests. While convenient, this has important performance and sizing implications.
+Full symbol discovery (triggered by calling `LoadSymbols()`) downloads the entire symbol table and all datatype definitions from the PLC in two large ADS Read requests. While convenient, this has important performance and sizing implications.
 
 ### PLC Real-Time Impact
 
@@ -719,7 +719,7 @@ Secure ADS uses **TCP port 8016** instead of the standard port 48898.
 
 ### Connection Sequence
 
-```
+```text
 1. TCP connect to port 8016
 2. TLS 1.2 handshake (mutual TLS — both sides authenticate)
 3. TlsConnectInfo request (64-512 bytes, inside TLS tunnel)

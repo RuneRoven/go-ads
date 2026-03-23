@@ -32,8 +32,8 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 		return symbol.Value, nil
 	}
 
-	if len(data) < int(symbol.Length) {
-		return "", fmt.Errorf("data too short for %s: need %d bytes, got %d", symbol.DataType, symbol.Length, len(data))
+	if start+int(symbol.Length) > len(data) {
+		return "", fmt.Errorf("data too short for %s at offset %d: need %d bytes, got %d", symbol.DataType, start, symbol.Length, len(data)-start)
 	}
 
 	switch symbol.DataType {
@@ -107,12 +107,12 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 		i := binary.LittleEndian.Uint64(data[start:stop])
 		newValue = strconv.FormatUint(i, 10)
 	case "STRING":
-		trimmedBytes := bytes.TrimSpace(data[start:stop])
-		secondIndex := bytes.IndexByte(trimmedBytes, byte(0))
-		if secondIndex < 0 {
-			secondIndex = len(trimmedBytes)
+		raw := data[start:stop]
+		idx := bytes.IndexByte(raw, 0)
+		if idx < 0 {
+			idx = len(raw)
 		}
-		newValue = string(trimmedBytes[:(secondIndex)])
+		newValue = string(raw[:idx])
 	case "TIME":
 		if stop-start != 4 {
 			return "", fmt.Errorf("TIME Size Wrong")
@@ -212,15 +212,26 @@ var parseableTypes = []string{
 
 func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string]SymbolUploadDataType) (data []byte, err error) {
 	if len(symbol.Children) > 0 {
-		var fields map[string]string
+		var fields map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(value), &fields); err != nil {
 			return nil, fmt.Errorf("struct write requires JSON input: %w", err)
 		}
 		buf := make([]byte, symbol.Length)
 		for name, child := range symbol.Children {
-			childValue, ok := fields[name]
+			raw, ok := fields[name]
 			if !ok {
 				continue
+			}
+			// Convert JSON value to string for writeToNode:
+			// - JSON strings ("hello") → unquoted (hello)
+			// - numbers/bools (42, true) → raw text (42, true)
+			var childValue string
+			if len(raw) > 0 && raw[0] == '"' {
+				if err := json.Unmarshal(raw, &childValue); err != nil {
+					return nil, fmt.Errorf("field %q: invalid JSON string: %w", name, err)
+				}
+			} else {
+				childValue = string(raw)
 			}
 			childBytes, err := child.writeToNode(childValue, 0, datatypes)
 			if err != nil {

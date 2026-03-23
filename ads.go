@@ -172,6 +172,9 @@ func (conn *Connection) downloadInChunks(group uint32, totalLength uint32, chunk
 		if err != nil {
 			return nil, fmt.Errorf("chunk read at offset %d failed: %w", offset, err)
 		}
+		if len(chunk) == 0 {
+			return nil, fmt.Errorf("chunk read at offset %d returned empty response", offset)
+		}
 
 		result = append(result, chunk...)
 		offset += uint32(len(chunk))
@@ -532,6 +535,13 @@ func (conn *Connection) RefreshSymbols() error {
 // On reconnect, the stored channel is used to re-subscribe all notifications.
 // For multiple notifications, prefer AddSymbolNotifications.
 func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, cycleTime int, transMode TransMode, updateReceiver chan *Update) (uint32, error) {
+	conn.symbolLock.Lock()
+	if conn.notificationChannel != nil && conn.notificationChannel != updateReceiver {
+		conn.symbolLock.Unlock()
+		return 0, fmt.Errorf("all symbol notifications on a connection must use the same updateReceiver channel")
+	}
+	conn.symbolLock.Unlock()
+
 	symbol, err := conn.GetSymbol(symbolName)
 	if err != nil {
 		return 0, fmt.Errorf("notification for %q: %w", symbolName, err)

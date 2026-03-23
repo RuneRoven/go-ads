@@ -133,12 +133,15 @@ func parseRouteResponse(data []byte) error {
 	tagCount := binary.LittleEndian.Uint32(data[20:])
 	log.Debug().Uint32("tagCount", tagCount).Msg("route response tags")
 	offset := 24
-	for i := uint32(0); i < tagCount && offset+4 <= len(data); i++ {
+	for i := uint32(0); i < tagCount; i++ {
+		if offset+4 > len(data) {
+			return fmt.Errorf("route response truncated: incomplete tag %d header", i)
+		}
 		tid := binary.LittleEndian.Uint16(data[offset:])
 		tlen := binary.LittleEndian.Uint16(data[offset+2:])
 		offset += 4
 		if offset+int(tlen) > len(data) {
-			break
+			return fmt.Errorf("route response truncated: tag %d data exceeds response", tid)
 		}
 		log.Debug().Uint16("tagID", tid).Uint16("tagLen", tlen).Hex("tagData", data[offset:offset+int(tlen)]).Msg("route response tag")
 		if tid == tagResponseError && tlen >= 4 {

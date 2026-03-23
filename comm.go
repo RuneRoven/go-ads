@@ -71,7 +71,7 @@ func (conn *Connection) sendRequest(command CommandID, data []byte) (response []
 	// First, request a new invoke id
 	id := conn.currentRequest.Inc()
 	// Create a channel for the response
-	conn.activeRequests[id] = make(chan []byte)
+	conn.activeRequests[id] = make(chan []byte, 1)
 	conn.activeRequestLock.Unlock()
 	defer func() {
 		conn.activeRequestLock.Lock()

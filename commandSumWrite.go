@@ -64,8 +64,11 @@ func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, 
 			log.Warn().Err(err).Msg("SumWrite not supported by PLC, using individual writes")
 			conn.sumReadSupported.Store(false)
 			conn.sumReadChecked.Store(true)
+			return conn.sumWriteFallback(requests)
 		}
-		return conn.sumWriteFallback(requests)
+		// Don't fall back for transient errors — writes are not idempotent
+		// and the PLC may have partially applied the batch
+		return nil, fmt.Errorf("SumWrite failed: %w", err)
 	}
 
 	if !conn.sumReadChecked.Load() {
