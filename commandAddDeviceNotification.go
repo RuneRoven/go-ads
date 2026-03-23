@@ -15,7 +15,8 @@ func (conn *Connection) AddDeviceNotification(
 	length uint32,
 	transmissionMode TransMode,
 	maxDelay time.Duration,
-	cycleTime time.Duration) (handle uint32, err error) {
+	cycleTime time.Duration,
+) (handle uint32, err error) {
 	request := new(bytes.Buffer)
 	type addDeviceNotificationCommandPacket struct {
 		Group            uint32
@@ -27,7 +28,7 @@ func (conn *Connection) AddDeviceNotification(
 		Reserved         [16]byte
 	}
 
-	var content = addDeviceNotificationCommandPacket{
+	content := addDeviceNotificationCommandPacket{
 		group,
 		offset,
 		length,
@@ -36,10 +37,8 @@ func (conn *Connection) AddDeviceNotification(
 		uint32(cycleTime.Nanoseconds() / 100), // 1 = 1ms
 		[16]byte{},
 	}
-	err = binary.Write(request, binary.LittleEndian, content)
-	if err != nil {
-		log.Error().
-			Msgf("binary.Write failed: %v", err)
+	if err = binary.Write(request, binary.LittleEndian, content); err != nil {
+		return 0, fmt.Errorf("binary.Write failed: %w", err)
 	}
 	type addDeviceNotificationResponse struct {
 		Error  ReturnCode
@@ -56,18 +55,18 @@ func (conn *Connection) AddDeviceNotification(
 	if err != nil {
 		log.Error().
 			Err(err).
-			Msg("Added notification handler, FAILED: ")
+			Msg("failed to parse notification response")
 		return 0, err
 	}
 	if notificationResponse.Error != 0 {
 		log.Error().
-			Uint32("Error Number", uint32(notificationResponse.Error)).
-			Msg("Added notification handler, FAILED: ")
-		return 0, fmt.Errorf("unable to create notification worker %v", err)
+			Uint32("errorCode", uint32(notificationResponse.Error)).
+			Msg("failed to add notification handler")
+		return 0, fmt.Errorf("unable to create notification: %w", notificationResponse.Error)
 	}
 	log.Trace().
-		Uint32("handle", handle).
-		Msg("Added notification handler: ")
+		Uint32("handle", notificationResponse.Handle).
+		Msg("added notification handler")
 
 	return notificationResponse.Handle, nil
 }

@@ -40,8 +40,14 @@ func main() {
 	info, _ := conn.ReadDeviceInfo()
 	fmt.Printf("Device: %s\n", string(info.DeviceName[:]))
 
+	// Symbols are resolved on-demand — no full discovery needed
 	value, _ := conn.ReadFromSymbol("MAIN.myVar")
 	fmt.Println("Value:", value)
+
+	// Optional: load full symbol table for listing/struct access
+	conn.LoadSymbols()
+	symbols, _ := conn.ListSymbols()
+	fmt.Printf("Total symbols: %d\n", len(symbols))
 }
 ```
 
@@ -55,6 +61,38 @@ go run . -ip 192.168.1.100 -netid 5.1.2.3.1.1 -list
 ```
 
 See `examples/simple/main.go` for all available flags.
+
+## Development
+
+### Prerequisites
+
+- Go 1.21+
+- [golangci-lint](https://golangci-lint.run/docs/welcome/install/) v2+
+- [gofumpt](https://github.com/mvdan/gofumpt) (`go install mvdan.cc/gofumpt@latest`)
+
+### Before pushing
+
+Run all checks locally — this mirrors what CI does on every PR:
+
+```bash
+make all        # format, lint, vet, test
+```
+
+Or run individual targets:
+
+```bash
+make fmt        # format code (gofumpt + goimports)
+make lint       # run golangci-lint
+make vet        # run go vet
+make test       # run tests
+make test-race  # run tests with race detector
+make test-cover # run tests with coverage report
+make build      # build all packages
+```
+
+### CI
+
+CI runs automatically on pull requests to `main` with 4 parallel jobs: lint, test, test-race, and build. All must pass before merging.
 
 ## License
 

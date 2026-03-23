@@ -9,38 +9,37 @@ import (
 )
 
 func (conn *Connection) WriteRead(group uint32, offset uint32, readLength uint32, send []byte) (data []byte, err error) {
-	request := bytes.NewBuffer([]byte{})
+	request := new(bytes.Buffer)
 	type writeReadCommandPacket struct {
 		Group       uint32
 		Offset      uint32
 		ReadLength  uint32
 		WriteLength uint32
 	}
-	var content = writeReadCommandPacket{
+	content := writeReadCommandPacket{
 		group,
 		offset,
 		readLength,
 		uint32(len(send)),
 	}
 
-	// Read	- ADS command id: 2
 	type readResponse struct {
 		Error  ReturnCode
 		Length uint32
 	}
 
 	err = binary.Write(request, binary.LittleEndian, content)
-	binary.Write(request, binary.LittleEndian, send)
+	if err != nil {
+		return nil, fmt.Errorf("binary.Write failed: %w", err)
+	}
+	err = binary.Write(request, binary.LittleEndian, send)
+	if err != nil {
+		return nil, fmt.Errorf("binary.Write failed: %w", err)
+	}
 
 	log.Trace().
 		Interface("request", request).
-		Msgf("Request")
-
-	if err != nil {
-		log.Error().
-			Err(err).
-			Msgf("binary.Write failed: %s", err)
-	}
+		Msg("request")
 
 	// Try to send the request
 	resp, err := conn.sendRequest(CommandIDReadWrite, request.Bytes())
@@ -51,12 +50,11 @@ func (conn *Connection) WriteRead(group uint32, offset uint32, readLength uint32
 	// Check the result error code
 	respBuff := bytes.NewBuffer(resp)
 	response := &readResponse{}
-	binary.Read(respBuff, binary.LittleEndian, response)
-	if response.Error > 0 {
-		err = fmt.Errorf("ADS error in WriteRead: %v", response.Error)
-		return
+	if err = binary.Read(respBuff, binary.LittleEndian, response); err != nil {
+		return nil, fmt.Errorf("failed to parse WriteRead response: %w", err)
 	}
-	// data = make([]byte, response.Length)
-	// err = binary.Read(respBuff, binary.LittleEndian, data)
-	return respBuff.Bytes(), err
+	if response.Error > 0 {
+		return nil, fmt.Errorf("ADS error in WriteRead: %w", response.Error)
+	}
+	return respBuff.Bytes(), nil
 }

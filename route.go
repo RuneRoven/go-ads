@@ -15,10 +15,10 @@ const (
 	routeCookie     = 0x71146603
 	routeServiceAdd = 6
 
-	tagPassword     uint16 = 2
-	tagComputerName uint16 = 5
-	tagNetID        uint16 = 7
-	tagRouteName    uint16 = 12
+	tagPassword      uint16 = 2
+	tagComputerName  uint16 = 5
+	tagNetID         uint16 = 7
+	tagRouteName     uint16 = 12
 	tagUsername      uint16 = 13
 	tagResponseError uint16 = 1
 )
@@ -43,7 +43,7 @@ func AddRemoteRoute(remoteHost string, localNetId [6]byte, routeName string, com
 	if err != nil {
 		return fmt.Errorf("failed to dial UDP: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Build the route request packet
 	packet := buildRoutePacket(localNetId, routeName, computerName, username, password)
@@ -54,7 +54,9 @@ func AddRemoteRoute(remoteHost string, localNetId [6]byte, routeName string, com
 	}
 
 	// Wait for response
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return fmt.Errorf("failed to set read deadline: %w", err)
+	}
 	respBuf := make([]byte, 1024)
 	n, err := conn.Read(respBuf)
 	if err != nil {
@@ -93,10 +95,10 @@ func buildRoutePacket(localNetId [6]byte, routeName string, computerName string,
 	return append(header, tagsData...)
 }
 
-// buildTag creates a single tag: tagId(2) + length(2) + data.
-func buildTag(tagId uint16, data []byte) []byte {
+// buildTag creates a single tag: tagID(2) + length(2) + data.
+func buildTag(tagID uint16, data []byte) []byte {
 	tag := make([]byte, 4+len(data))
-	binary.LittleEndian.PutUint16(tag[0:], tagId)
+	binary.LittleEndian.PutUint16(tag[0:], tagID)
 	binary.LittleEndian.PutUint16(tag[2:], uint16(len(data)))
 	copy(tag[4:], data)
 	return tag
@@ -131,14 +133,17 @@ func parseRouteResponse(data []byte) error {
 	tagCount := binary.LittleEndian.Uint32(data[20:])
 	log.Debug().Uint32("tagCount", tagCount).Msg("route response tags")
 	offset := 24
-	for i := uint32(0); i < tagCount && offset+4 <= len(data); i++ {
+	for i := uint32(0); i < tagCount; i++ {
+		if offset+4 > len(data) {
+			return fmt.Errorf("route response truncated: incomplete tag %d header", i)
+		}
 		tid := binary.LittleEndian.Uint16(data[offset:])
 		tlen := binary.LittleEndian.Uint16(data[offset+2:])
-		log.Debug().Uint16("tagId", tid).Uint16("tagLen", tlen).Hex("tagData", data[offset+4:offset+4+int(tlen)]).Msg("route response tag")
 		offset += 4
 		if offset+int(tlen) > len(data) {
-			break
+			return fmt.Errorf("route response truncated: tag %d data exceeds response", tid)
 		}
+		log.Debug().Uint16("tagID", tid).Uint16("tagLen", tlen).Hex("tagData", data[offset:offset+int(tlen)]).Msg("route response tag")
 		if tid == tagResponseError && tlen >= 4 {
 			errCode := binary.LittleEndian.Uint32(data[offset:])
 			if errCode != 0 {

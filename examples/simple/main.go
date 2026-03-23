@@ -1,17 +1,21 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/chzyer/readline"
 
 	ads "github.com/RuneRoven/go-ads"
 	"gopkg.in/yaml.v3"
@@ -31,6 +35,11 @@ type RouteConfig struct {
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
 	Name     string `yaml:"name"`
+}
+
+type browseState struct {
+	path    string                  // current browse path ("" = root)
+	entries []ads.SymbolBrowseEntry // last displayed entries
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -74,7 +83,10 @@ func discoverLocalIP(remoteHost string) (string, error) {
 		return "", err
 	}
 	defer conn.Close()
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return "", fmt.Errorf("unexpected address type: %T", conn.LocalAddr())
+	}
 	return localAddr.IP.String(), nil
 }
 
@@ -94,12 +106,25 @@ func main() {
 	defer cancel()
 
 	var conn *ads.Connection
+	var connMu sync.Mutex
 	updateCh := make(chan *ads.Update, 100)
+	bs := &browseState{}
+
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:      "> ",
+		HistoryFile: filepath.Join(os.TempDir(), ".go-ads-history"),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error initializing readline: %v\n", err)
+		os.Exit(1)
+	}
+	defer rl.Close()
 
 	// Background goroutine to print subscription updates
 	go func() {
 		for u := range updateCh {
-			fmt.Printf("\n  [%s] %s = %s\n> ", u.TimeStamp.Format("15:04:05.000"), u.Variable, u.Value)
+			fmt.Printf("\n  [%s] %s = %s\n", u.TimeStamp.Format("15:04:05.000"), u.Variable, u.Value)
+			rl.Refresh()
 		}
 	}()
 
@@ -107,9 +132,12 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		fmt.Println("\nShutting down...")
+		connMu.Lock()
 		if conn != nil {
 			conn.Close()
 		}
+		connMu.Unlock()
+		rl.Close()
 		os.Exit(0)
 	}()
 
@@ -117,13 +145,15 @@ func main() {
 	fmt.Println("Type 'help' for available commands")
 	fmt.Println()
 
-	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		fmt.Print("> ")
-		if !scanner.Scan() {
-			break
+		line, err := rl.Readline()
+		if err != nil {
+			if err == readline.ErrInterrupt || err == io.EOF {
+				break
+			}
+			continue
 		}
-		line := strings.TrimSpace(scanner.Text())
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
@@ -131,12 +161,20 @@ func main() {
 		parts := strings.Fields(line)
 		cmd := parts[0]
 
+		// Check if the command is a number (for numbered browsing)
+		if num, err := strconv.Atoi(cmd); err == nil && len(parts) == 1 {
+			handleBrowseByNumber(conn, bs, num)
+			continue
+		}
+
 		switch cmd {
 		case "help":
 			printHelp()
 
 		case "connect":
+			connMu.Lock()
 			if conn != nil {
+				connMu.Unlock()
 				fmt.Println("Already connected. Use 'quit' to disconnect first.")
 				continue
 			}
@@ -145,6 +183,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Connect failed: %v\n", err)
 				conn = nil
 			}
+			connMu.Unlock()
 
 		case "info":
 			if conn == nil {
@@ -171,12 +210,44 @@ func main() {
 			}
 			fmt.Printf("ADS State: %d  Device State: %d\n", state.AdsState, state.DeviceState)
 
+		case "discover":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			fmt.Println("Loading full symbol table...")
+			err := conn.LoadSymbols()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				continue
+			}
+			symbols, _ := conn.ListSymbols()
+			fmt.Printf("Loaded %d symbols.\n", len(symbols))
+
+		case "discover-slow":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			fmt.Println("Loading symbol table (slow/chunked)...")
+			err := conn.LoadSymbolsSlow(ads.SlowDiscoveryConfig{})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				continue
+			}
+			symbols, _ := conn.ListSymbols()
+			fmt.Printf("Loaded %d symbols.\n", len(symbols))
+
 		case "list":
 			if conn == nil {
 				fmt.Println("Not connected. Use 'connect' first.")
 				continue
 			}
-			symbols := conn.ListSymbols()
+			symbols, err := conn.ListSymbols()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v (run 'discover' first)\n", err)
+				continue
+			}
 			// Sort by name for stable output
 			names := make([]string, 0, len(symbols))
 			for name := range symbols {
@@ -189,22 +260,151 @@ func main() {
 				fmt.Printf("  %-50s  type=%-20s  size=%d\n", name, sym.DataType, sym.Length)
 			}
 
+		case "discover-symbols":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			fmt.Println("Loading symbol list only (browse mode)...")
+			err := conn.LoadSymbolList(ads.SlowDiscoveryConfig{})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				continue
+			}
+			fmt.Println("Symbol list loaded. Use 'browse' to navigate.")
+
+		case "discover-types":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			fmt.Println("Loading datatypes...")
+			err := conn.LoadDataTypes(ads.SlowDiscoveryConfig{})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				continue
+			}
+			fmt.Println("Datatypes loaded. Struct children can now be expanded with 'browse'.")
+
+		case "browse":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			path := ""
+			if len(parts) >= 2 {
+				path = parts[1]
+			}
+			doBrowse(conn, bs, path)
+
+		case "..", "back":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			handleBack(conn, bs)
+
 		case "read":
 			if conn == nil {
 				fmt.Println("Not connected. Use 'connect' first.")
 				continue
 			}
 			if len(parts) < 2 {
-				fmt.Println("Usage: read <symbol>")
+				fmt.Println("Usage: read <symbol|number>")
+				continue
+			}
+			// Check if argument is a number (read by index)
+			if num, err := strconv.Atoi(parts[1]); err == nil {
+				handleReadByNumber(conn, bs, num)
+			} else {
+				symbolName := parts[1]
+				value, err := conn.ReadFromSymbol(symbolName)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					continue
+				}
+				fmt.Printf("%s = %s\n", symbolName, value)
+			}
+
+		case "write":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			if len(parts) < 3 {
+				fmt.Println("Usage: write <symbol|number> <value>")
 				continue
 			}
 			symbolName := parts[1]
-			value, err := conn.ReadFromSymbol(symbolName)
+			value := strings.Join(parts[2:], " ")
+			// Resolve browse index to symbol name
+			if num, err := strconv.Atoi(symbolName); err == nil {
+				if len(bs.entries) == 0 {
+					fmt.Println("No browse results. Use 'browse' first.")
+					continue
+				}
+				if num < 0 || num >= len(bs.entries) {
+					fmt.Printf("Index %d out of range (0-%d)\n", num, len(bs.entries)-1)
+					continue
+				}
+				symbolName = bs.entries[num].FullName
+			}
+			err := conn.WriteToSymbol(symbolName, value)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
+				if strings.Contains(err.Error(), "aliased type") {
+					fmt.Println("  hint: run 'discover' first to load type definitions")
+				}
 				continue
 			}
-			fmt.Printf("%s = %s\n", symbolName, value)
+			fmt.Printf("Wrote %q to %s\n", value, symbolName)
+			// Read back to confirm
+			readBack, err := conn.ReadFromSymbol(symbolName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Read-back error: %v\n", err)
+				continue
+			}
+			fmt.Printf("  confirmed: %s = %s\n", symbolName, readBack)
+
+		case "writemulti":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			if len(parts) < 2 {
+				fmt.Println("Usage: writemulti <sym1>=<val1> <sym2>=<val2> ...")
+				continue
+			}
+			values := make(map[string]string)
+			for _, pair := range parts[1:] {
+				eqIdx := strings.IndexByte(pair, '=')
+				if eqIdx < 0 {
+					fmt.Printf("Invalid pair %q (expected key=value)\n", pair)
+					continue
+				}
+				values[pair[:eqIdx]] = pair[eqIdx+1:]
+			}
+			if len(values) == 0 {
+				fmt.Println("No valid key=value pairs provided.")
+				continue
+			}
+			codes, err := conn.WriteMultipleSymbols(values)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "WriteMultiple error: %v\n", err)
+				continue
+			}
+			for name, code := range codes {
+				fmt.Printf("  %s: return code %d\n", name, code)
+			}
+			// Read back each symbol to confirm
+			for name := range values {
+				readBack, err := conn.ReadFromSymbol(name)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "  read-back %s error: %v\n", name, err)
+					continue
+				}
+				fmt.Printf("  confirmed: %s = %s\n", name, readBack)
+			}
 
 		case "subscribe":
 			if conn == nil {
@@ -212,7 +412,7 @@ func main() {
 				continue
 			}
 			if len(parts) < 2 {
-				fmt.Println("Usage: subscribe <symbol> [cycleTime_ms] [maxDelay_ms]")
+				fmt.Println("Usage: subscribe <symbol> [cycle_ms] [delay_ms]")
 				continue
 			}
 			symbolName := parts[1]
@@ -228,12 +428,12 @@ func main() {
 					maxDelay = v
 				}
 			}
-			err := conn.AddSymbolNotification(symbolName, maxDelay, cycleTime, ads.TransModeServerOnChange, updateCh)
+			handle, err := conn.AddSymbolNotification(symbolName, maxDelay, cycleTime, ads.TransModeServerOnChange, updateCh)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				continue
 			}
-			fmt.Printf("Subscribed to %s (cycle=%dms, maxDelay=%dms)\n", symbolName, cycleTime, maxDelay)
+			fmt.Printf("Subscribed to %s (handle=%d, cycle=%dms, maxDelay=%dms)\n", symbolName, handle, cycleTime, maxDelay)
 
 		case "quit", "exit":
 			fmt.Println("Shutting down...")
@@ -248,13 +448,124 @@ func main() {
 	}
 }
 
+func doBrowse(conn *ads.Connection, bs *browseState, path string) {
+	// Reset browse state when explicitly browsing
+	bs.path = path
+
+	entries, err := conn.BrowseSymbols(bs.path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		bs.entries = nil
+		return
+	}
+	if len(entries) == 0 {
+		fmt.Println("No entries found.")
+		bs.entries = nil
+		return
+	}
+
+	bs.entries = entries
+	printBrowseEntries(bs.path, entries)
+}
+
+func printBrowseEntries(path string, entries []ads.SymbolBrowseEntry) {
+	if path == "" {
+		fmt.Printf("Root entries (%d):\n", len(entries))
+	} else {
+		fmt.Printf("Children of %s (%d):\n", path, len(entries))
+	}
+	for i, e := range entries {
+		children := ""
+		if e.HasChildren {
+			children = "  [+]"
+		}
+		if e.DataType != "" {
+			fmt.Printf("  [%d] %-45s %-20s %d%s\n", i, e.FullName, e.DataType, e.Size, children)
+		} else {
+			fmt.Printf("  [%d] %-45s%s\n", i, e.FullName, children)
+		}
+	}
+}
+
+func handleBrowseByNumber(conn *ads.Connection, bs *browseState, num int) {
+	if conn == nil {
+		fmt.Println("Not connected. Use 'connect' first.")
+		return
+	}
+	if len(bs.entries) == 0 {
+		fmt.Println("No browse results. Use 'browse' first.")
+		return
+	}
+	if num < 0 || num >= len(bs.entries) {
+		fmt.Printf("Index %d out of range (0-%d)\n", num, len(bs.entries)-1)
+		return
+	}
+
+	entry := bs.entries[num]
+	if entry.HasChildren {
+		doBrowse(conn, bs, entry.FullName)
+	} else {
+		// No children — try to read the value
+		value, err := conn.ReadFromSymbol(entry.FullName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", entry.FullName, err)
+			return
+		}
+		fmt.Printf("%s = %s\n", entry.FullName, value)
+	}
+}
+
+func handleReadByNumber(conn *ads.Connection, bs *browseState, num int) {
+	if len(bs.entries) == 0 {
+		fmt.Println("No browse results. Use 'browse' first.")
+		return
+	}
+	if num < 0 || num >= len(bs.entries) {
+		fmt.Printf("Index %d out of range (0-%d)\n", num, len(bs.entries)-1)
+		return
+	}
+
+	entry := bs.entries[num]
+	value, err := conn.ReadFromSymbol(entry.FullName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", entry.FullName, err)
+		return
+	}
+	fmt.Printf("%s = %s\n", entry.FullName, value)
+}
+
+func handleBack(conn *ads.Connection, bs *browseState) {
+	if bs.path == "" {
+		fmt.Println("Already at root.")
+		return
+	}
+
+	// Trim the last segment from the path
+	dot := strings.LastIndexByte(bs.path, '.')
+	if dot < 0 {
+		// Going back to root
+		doBrowse(conn, bs, "")
+	} else {
+		doBrowse(conn, bs, bs.path[:dot])
+	}
+}
+
 func printHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  connect                                  Register route + connect + show device info")
+	fmt.Println("  discover                                 Load full symbol table from PLC")
+	fmt.Println("  discover-slow                            Load symbol table in chunks (PLC-friendly)")
+	fmt.Println("  discover-symbols                         Load symbol list only (for browse mode)")
+	fmt.Println("  discover-types                           Load datatypes only (enables struct expansion)")
 	fmt.Println("  info                                     Read device info")
 	fmt.Println("  state                                    Read device state")
-	fmt.Println("  list                                     List all symbols")
-	fmt.Println("  read <symbol>                            Read a symbol value")
+	fmt.Println("  list                                     List all symbols (requires discover first)")
+	fmt.Println("  browse [path]                            Browse symbol hierarchy (requires discover-symbols)")
+	fmt.Println("  <number>                                 Browse into entry by index from last browse result")
+	fmt.Println("  ..  / back                               Navigate up one level in browse hierarchy")
+	fmt.Println("  read <symbol|number>                     Read a symbol value (by name or browse index)")
+	fmt.Println("  write <symbol|number> <value>            Write a value to a symbol (by name or browse index)")
+	fmt.Println("  writemulti <sym1>=<val1> <sym2>=<val2>   Write multiple symbols in one round-trip")
 	fmt.Println("  subscribe <symbol> [cycle_ms] [delay_ms] Subscribe to symbol changes")
 	fmt.Println("  quit                                     Graceful shutdown")
 }

@@ -10,8 +10,10 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-const windowsTick int64 = 10000000
-const secToUnixEpoch int64 = 11644473600
+const (
+	windowsTick    int64 = 10000000
+	secToUnixEpoch int64 = 11644473600
+)
 
 type NotificationStream struct {
 	Length uint32
@@ -39,64 +41,92 @@ func (conn *Connection) DeviceNotification(ctx context.Context, in []byte) error
 
 	err := binary.Read(data, binary.LittleEndian, &stream)
 	if err != nil {
-		return fmt.Errorf("unable to read notification %v", err)
+		return fmt.Errorf("unable to read notification: %w", err)
 	}
 	for i := uint32(0); i < stream.Stamps; i++ {
 		// Read stamp header
-		binary.Read(data, binary.LittleEndian, &header)
+		if err = binary.Read(data, binary.LittleEndian, &header); err != nil {
+			return fmt.Errorf("error reading stamp header: %w", err)
+		}
 
 		for j := uint32(0); j < header.Samples; j++ {
-			err := binary.Read(data, binary.LittleEndian, &sample)
-			if err != nil {
-				log.Error().
-					Err(err).
-					Msg("Error during notification read")
-				break
+			if err = binary.Read(data, binary.LittleEndian, &sample); err != nil {
+				return fmt.Errorf("error reading notification sample: %w", err)
+			}
+			if sample.Size > uint32(data.Len()) {
+				return fmt.Errorf("notification sample size %d exceeds remaining data %d", sample.Size, data.Len())
 			}
 			content = make([]byte, sample.Size)
-			data.Read(content)
+			n, err := data.Read(content)
+			if err != nil {
+				return fmt.Errorf("error reading notification content: %w", err)
+			}
+			if n != int(sample.Size) {
+				return fmt.Errorf("short read on notification content: got %d of %d bytes", n, sample.Size)
+			}
 			conn.handleNotification(ctx, sample.Handle, header.Timestamp, content)
 		}
 	}
-	return err
+	return nil
 }
 
 func (conn *Connection) handleNotification(ctx context.Context, handle uint32, timestamp uint64, content []byte) error {
+	// Read all needed data under the lock, then release before channel send
+	// to avoid deadlock if the receiver calls back into Connection methods.
 	conn.symbolLock.Lock()
-	defer conn.symbolLock.Unlock()
 	symbol, ok := conn.activeNotifications[handle]
 	if !ok {
+		conn.symbolLock.Unlock()
 		log.Error().
 			Int("handle", int(handle)).
 			Msg("Can't find notification handle")
 		return nil
 	}
+	datatypes := conn.datatypes
+	notification := symbol.Notification
+	fullName := symbol.FullName
+
 	timeStamp := int64(timestamp)/windowsTick - secToUnixEpoch
 	notificationTime := time.Unix(timeStamp, int64(timestamp)%(windowsTick)*100)
-	value, err := symbol.parse(content, 0)
+	// parse() mutates Symbol fields (Value, Changed, Valid, etc.) so it must
+	// run under lock. This is safe because parse is pure CPU work (no I/O).
+	value, err := symbol.parse(content, 0, datatypes)
 	if err != nil {
+		conn.symbolLock.Unlock()
 		log.Error().
 			Err(err).
 			Msg("error during parse of notification")
 		return nil
 	}
-	symbol.Value = value
+	conn.symbolLock.Unlock()
+
 	log.Trace().
-		Str("update", symbol.Value).
-		Msgf("update received")
+		Str("update", value).
+		Msg("update received")
 	updateStruct := &Update{
-		Variable:  symbol.FullName,
+		Variable:  fullName,
 		Value:     value,
 		TimeStamp: notificationTime,
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	// Try to send the response to the waiting request function
+	// Try to send the notification to the user's channel.
+	// Use a timeout to avoid blocking the notification handler indefinitely
+	// if the receiver is slow.
+	// TODO: Consider adding a ring buffer or overflow queue so notifications
+	// are cached when the receiver is slow, and re-sent when it catches up,
+	// instead of dropping them on timeout.
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-	case symbol.Notification <- updateStruct:
+	case notification <- updateStruct:
 		log.Debug().
-			Msgf("Successfully delivered notification for handle %d", handle)
+			Uint32("handle", handle).
+			Msg("Successfully delivered notification")
+	case <-timer.C:
+		log.Warn().
+			Uint32("handle", handle).
+			Str("symbol", fullName).
+			Msg("notification channel send timed out, receiver may be slow")
 	}
 	return nil
 }

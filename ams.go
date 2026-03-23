@@ -3,6 +3,7 @@ package ads
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -26,15 +27,21 @@ type amsHeader struct {
 }
 
 // StringToNetID converts a dotted notation NetID string (e.g. "192.168.1.1.1.1") to a 6-byte array.
-func StringToNetID(source string) (result [6]byte) {
+// Returns an error if the string is malformed (wrong number of parts or non-numeric values).
+func StringToNetID(source string) ([6]byte, error) {
 	return stringToNetID(source)
 }
 
-func stringToNetID(source string) (result [6]byte) {
-	splitLocalhost := strings.Split(source, ".")
-
-	for i, a := range splitLocalhost {
-		value, _ := strconv.ParseUint(a, 10, 8)
+func stringToNetID(source string) (result [6]byte, err error) {
+	parts := strings.Split(source, ".")
+	if len(parts) != 6 {
+		return result, fmt.Errorf("invalid NetID %q: expected 6 dot-separated parts, got %d", source, len(parts))
+	}
+	for i, a := range parts {
+		value, e := strconv.ParseUint(a, 10, 8)
+		if e != nil {
+			return result, fmt.Errorf("invalid NetID %q: part %d (%q): %w", source, i, a, e)
+		}
 		result[i] = byte(value)
 	}
 	return
@@ -49,21 +56,21 @@ func (conn *Connection) encode(command CommandID, data []byte, invokeID uint32) 
 		Int("length of data", len(data)).
 		Msg("Starting encoding of AMS header")
 	tcpHeader := &amsTCPHeader{
-		0,
-		0,
-		uint32(32 + len(data)),
+		Unknown1: 0,
+		System:   0,
+		Length:   uint32(32 + len(data)),
 	}
 	header := &amsHeader{
-		conn.target,
-		conn.source,
-		command,
-		uint16(4),
-		uint32(len(data)),
-		uint32(0),
-		invokeID,
+		Target:    conn.target,
+		Source:    conn.source,
+		Command:   command,
+		State:     uint16(4),
+		Length:    uint32(len(data)),
+		ErrorCode: uint32(0),
+		InvokeID:  invokeID,
 	}
 
-	buff := &bytes.Buffer{}
+	buff := new(bytes.Buffer)
 	err := binary.Write(buff, binary.LittleEndian, tcpHeader)
 	if err != nil {
 		return nil, err
