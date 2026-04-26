@@ -148,9 +148,16 @@ func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 
 // downloadInChunks reads a large ADS data blob in smaller pieces using
 // the offset parameter of the ADS Read command.
+// If chunked downloads are already known to be unsupported (e.g. TwinCAT 2),
+// this returns an error immediately so the caller can use the single-request fallback.
 func (conn *Connection) downloadInChunks(group uint32, totalLength uint32, chunkSize uint32, delay time.Duration) ([]byte, error) {
 	if totalLength == 0 {
 		return []byte{}, nil
+	}
+
+	// Skip if already known unsupported
+	if conn.chunkedDownloadChecked.Load() && !conn.chunkedDownloadSupported.Load() {
+		return nil, fmt.Errorf("chunked download not supported by this PLC")
 	}
 
 	const maxDownloadSize = 64 * 1024 * 1024 // 64 MB sanity limit
@@ -170,6 +177,10 @@ func (conn *Connection) downloadInChunks(group uint32, totalLength uint32, chunk
 
 		chunk, err := conn.Read(group, offset, readLen)
 		if err != nil {
+			if !conn.chunkedDownloadChecked.Load() {
+				conn.chunkedDownloadSupported.Store(false)
+				conn.chunkedDownloadChecked.Store(true)
+			}
 			return nil, fmt.Errorf("chunk read at offset %d failed: %w", offset, err)
 		}
 		if len(chunk) == 0 {
@@ -182,6 +193,11 @@ func (conn *Connection) downloadInChunks(group uint32, totalLength uint32, chunk
 		if offset < totalLength && delay > 0 {
 			time.Sleep(delay)
 		}
+	}
+
+	if !conn.chunkedDownloadChecked.Load() {
+		conn.chunkedDownloadSupported.Store(true)
+		conn.chunkedDownloadChecked.Store(true)
 	}
 
 	if uint32(len(result)) != totalLength {
@@ -591,6 +607,30 @@ type NotificationConfig struct {
 	TransmissionMode TransMode
 }
 
+// symbolSumAddress returns the index group and offset to use for a symbol
+// inside a sum command (batch read/write).
+//
+// It prefers handle-based addressing (ADSIGRP_SYM_VALBYHND / 0xF005) because
+// direct group/offset addressing with process image groups (e.g. 0x4040) does
+// not work inside sum read commands on some TwinCAT versions, even with correct
+// absolute offsets.
+//
+// Falls back to direct group/offset with accumulated absolute offsets when no
+// handle is available (e.g. before handle acquisition).
+func symbolSumAddress(sym *Symbol) (group, offset uint32) {
+	if sym.Handle != 0 {
+		return uint32(GroupSymbolValueByHandle), sym.Handle
+	}
+	if sym.Group != 0 {
+		absOffset := sym.Offset
+		for p := sym.Parent; p != nil; p = p.Parent {
+			absOffset += p.Offset
+		}
+		return sym.Group, absOffset
+	}
+	return uint32(GroupSymbolValueByHandle), sym.Handle
+}
+
 // ReadMultipleSymbols reads multiple symbols in a single ADS round-trip using SumRead.
 // Returns a map of symbol name to parsed string value.
 func (conn *Connection) ReadMultipleSymbols(names []string) (map[string]string, error) {
@@ -613,11 +653,8 @@ func (conn *Connection) ReadMultipleSymbols(names []string) (map[string]string, 
 			continue
 		}
 		infos = append(infos, symbolInfo{name: name, symbol: symbol})
-		requests = append(requests, SumReadRequest{
-			Group:  uint32(GroupSymbolValueByHandle),
-			Offset: symbol.Handle,
-			Length: symbol.Length,
-		})
+		group, offset := symbolSumAddress(symbol)
+		requests = append(requests, SumReadRequest{Group: group, Offset: offset, Length: symbol.Length})
 	}
 
 	if len(requests) == 0 {
@@ -689,12 +726,8 @@ func (conn *Connection) WriteMultipleSymbols(values map[string]string) (map[stri
 			continue
 		}
 
-		var req SumWriteRequest
-		if symbol.Group != 0 {
-			req = SumWriteRequest{Group: symbol.Group, Offset: symbol.Offset, Data: data}
-		} else {
-			req = SumWriteRequest{Group: uint32(GroupSymbolValueByHandle), Offset: symbol.Handle, Data: data}
-		}
+		group, offset := symbolSumAddress(symbol)
+		req := SumWriteRequest{Group: group, Offset: offset, Data: data}
 
 		infos = append(infos, symbolInfo{name: name, symbol: symbol})
 		requests = append(requests, req)

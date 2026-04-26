@@ -69,15 +69,14 @@ func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, err
 
 	results := make([]SumReadResult, n)
 
-	// Parse error codes (N × 4 bytes)
-	for i := 0; i < n; i++ {
-		results[i].Error = ReturnCode(binary.LittleEndian.Uint32(resp[i*4:]))
-	}
-
-	// Parse actual lengths (N × 4 bytes)
+	// TC2 COMPATIBILITY: The SumReadEx2 (0xF084) response uses interleaved
+	// (error, length) pairs, confirmed working on TwinCAT 3. If TwinCAT 2
+	// uses separate arrays ([all errors] then [all lengths]) instead, change
+	// the parsing below from i*8/i*8+4 to i*4/n*4+i*4.
 	lengths := make([]uint32, n)
 	for i := 0; i < n; i++ {
-		lengths[i] = binary.LittleEndian.Uint32(resp[n*4+i*4:])
+		results[i].Error = ReturnCode(binary.LittleEndian.Uint32(resp[i*8:]))
+		lengths[i] = binary.LittleEndian.Uint32(resp[i*8+4:])
 	}
 
 	// Parse concatenated data

@@ -62,8 +62,10 @@ type Connection struct {
 	onDemandSymbols    map[string]bool // tracks symbol names resolved on-demand (for reconnect)
 
 	// Feature support flags (detected at runtime)
-	sumReadSupported atomic.Bool
-	sumReadChecked   atomic.Bool
+	sumReadSupported          atomic.Bool
+	sumReadChecked            atomic.Bool
+	chunkedDownloadSupported  atomic.Bool
+	chunkedDownloadChecked    atomic.Bool
 
 	reconnecting  atomic.Bool // prevents concurrent reconnect attempts
 	reconnectDone chan struct{}
@@ -303,6 +305,7 @@ func (conn *Connection) Reconnect() error {
 	conn.activeNotifications = make(map[uint32]*Symbol)
 	conn.symbolLock.Unlock()
 	conn.sumReadChecked.Store(false)
+	conn.chunkedDownloadChecked.Store(false)
 
 	var lastErr error
 	attempts := 0

@@ -4,7 +4,9 @@ package ads
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -19,8 +21,11 @@ import (
 //   ADS_PLC_IP       - PLC IP address (default: 192.168.3.224)
 //   ADS_TARGET_AMS   - PLC AMS NetID (default: 5.154.236.19.1.1)
 //   ADS_TARGET_PORT  - PLC AMS port (default: 851)
-//   ADS_LOCAL_AMS    - Local AMS NetID (default: auto)
+//   ADS_LOCAL_AMS    - Local AMS NetID (default: auto-derived from local IP)
+//   ADS_HOST_IP      - Local IP the PLC should use to reach us (default: auto-derived)
 //   ADS_SYMBOL_NAME  - Symbol to read (default: first found)
+//   ADS_ROUTE_USER   - PLC admin username for auto-creating AMS route (optional)
+//   ADS_ROUTE_PASS   - PLC admin password for auto-creating AMS route (optional)
 
 func getEnvOrDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -90,6 +95,46 @@ func setupConnection(t *testing.T) *Connection {
 		t.Fatalf("invalid ADS_TARGET_PORT %q: %v", targetPortStr, err)
 	}
 	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
+
+	// Auto-create AMS route if credentials are provided
+	routeUser := os.Getenv("ADS_ROUTE_USER")
+	routePass := os.Getenv("ADS_ROUTE_PASS")
+	if routeUser != "" && routePass != "" {
+		// Determine local AMS NetID for route registration
+		var localNetID [6]byte
+		if localAMS != "auto" && localAMS != "" {
+			netIDBytes, err := stringToNetID(localAMS)
+			if err != nil {
+				t.Fatalf("invalid ADS_LOCAL_AMS %q: %v", localAMS, err)
+			}
+			localNetID = netIDBytes
+		} else {
+			// Auto-derive from local IP facing the PLC
+			udpConn, err := net.DialTimeout("udp4", ip+":48899", 2*time.Second)
+			if err != nil {
+				t.Fatalf("failed to determine local IP for route: %v", err)
+			}
+			localAddr := udpConn.LocalAddr().(*net.UDPAddr)
+			udpConn.Close()
+			ipv4 := localAddr.IP.To4()
+			localNetID = [6]byte{ipv4[0], ipv4[1], ipv4[2], ipv4[3], 1, 1}
+		}
+
+		// Determine the IP the PLC should use to reach us
+		hostIP := os.Getenv("ADS_HOST_IP")
+		if hostIP == "" {
+			hostIP = fmt.Sprintf("%d.%d.%d.%d", localNetID[0], localNetID[1], localNetID[2], localNetID[3])
+		}
+
+		t.Logf("adding AMS route on %s (local NetID: %d.%d.%d.%d.%d.%d, host IP: %s)", ip,
+			localNetID[0], localNetID[1], localNetID[2], localNetID[3], localNetID[4], localNetID[5], hostIP)
+		err := AddRemoteRoute(ip, localNetID, "go-ads-test", hostIP, routeUser, routePass)
+		if err != nil {
+			t.Logf("warning: AddRemoteRoute failed (may already exist): %v", err)
+		} else {
+			t.Log("AMS route added successfully")
+		}
+	}
 
 	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second)
 	if err != nil {
@@ -824,8 +869,8 @@ func TestIntegrationReadMultipleSymbols(t *testing.T) {
 		t.Fatalf("ReadMultipleSymbols failed: %v", err)
 	}
 
-	if len(values) == 0 {
-		t.Error("expected at least one result from ReadMultipleSymbols")
+	if len(values) != len(names) {
+		t.Errorf("expected %d results from ReadMultipleSymbols, got %d", len(names), len(values))
 	}
 
 	for name, val := range values {
