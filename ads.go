@@ -464,15 +464,16 @@ func (conn *Connection) GetUploadSymbolInfoDataTypes(length uint32) (data []byte
 }
 
 // GetSymbolVersion reads the current symbol version from the PLC.
-func (conn *Connection) GetSymbolVersion() (uint32, error) {
-	data, err := conn.Read(uint32(GroupSymbolVersion), 0, 4)
+// The symbol version is a single byte (uint8) that increments on online-change or download.
+func (conn *Connection) GetSymbolVersion() (uint8, error) {
+	data, err := conn.Read(uint32(GroupSymbolVersion), 0, 1)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read symbol version: %w", err)
 	}
-	if len(data) < 4 {
+	if len(data) < 1 {
 		return 0, fmt.Errorf("symbol version response too short: %d bytes", len(data))
 	}
-	return binary.LittleEndian.Uint32(data), nil
+	return data[0], nil
 }
 
 // CheckSymbolVersion compares the current PLC symbol version against the stored version.

@@ -47,7 +47,7 @@ type Connection struct {
 	notificationChannel chan *Update
 
 	// Symbol version tracking
-	symbolVersion uint32
+	symbolVersion uint8
 
 	// Reconnection settings
 	reconnectInterval    time.Duration
