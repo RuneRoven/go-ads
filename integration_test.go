@@ -1034,19 +1034,21 @@ func TestIntegrationReadProcessData(t *testing.T) {
 	}
 }
 
-// waitForReconnect polls IsDisconnected until the connection is re-established or the timeout expires.
+// waitForReconnect polls until both disconnected=false AND reconnecting=false,
+// meaning the reconnect has fully completed (symbols reloaded, notifications re-subscribed).
 func waitForReconnect(t *testing.T, conn *Connection, timeout time.Duration) {
 	t.Helper()
 	deadline := time.After(timeout)
 	tick := time.NewTicker(100 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		if !conn.IsDisconnected() {
+		if !conn.IsDisconnected() && !conn.reconnecting.Load() {
 			return
 		}
 		select {
 		case <-deadline:
-			t.Fatal("reconnect did not complete within timeout")
+			t.Fatalf("reconnect did not complete within timeout (disconnected=%v, reconnecting=%v)",
+				conn.IsDisconnected(), conn.reconnecting.Load())
 		case <-tick.C:
 		}
 	}

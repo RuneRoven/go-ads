@@ -71,6 +71,11 @@ type Connection struct {
 	reconnectDone chan struct{}
 	reconnectMu   sync.Mutex // protects reconnectDone
 
+	closed   atomic.Bool
+	closedCh chan struct{} // closed by Close(), never written to
+
+	ctxMu sync.RWMutex // protects conn.ctx and conn.shutdown against concurrent access
+
 	logger *slog.Logger
 }
 
@@ -112,6 +117,7 @@ func NewConnection(ctx context.Context, ip string, port int, netid string, amsPo
 	conn.sendChannel = make(chan []byte)
 	conn.symbols = map[string]*Symbol{}
 	conn.onDemandSymbols = map[string]bool{}
+	conn.closedCh = make(chan struct{})
 	// Use an independent context so that Close() can still send cleanup commands
 	// even after the parent context is canceled (e.g. on SIGTERM)
 	conn.ctx, conn.shutdown = context.WithCancel(context.Background())
@@ -193,6 +199,10 @@ func (conn *Connection) Connect(local bool) error {
 
 // Close closes connection and waits for completion
 func (conn *Connection) Close() {
+	if !conn.closed.CompareAndSwap(false, true) {
+		return // already closed
+	}
+	close(conn.closedCh)
 	conn.logger.Info("Close called, shutting down")
 
 	// Delete all active notifications (uses sum command with automatic fallback to individual)
@@ -237,7 +247,9 @@ func (conn *Connection) Close() {
 			conn.logger.Info("handle deleted", "handle", h)
 		}
 	}
+	conn.ctxMu.RLock()
 	conn.shutdown()
+	conn.ctxMu.RUnlock()
 	// Close the TCP connection to unblock listen() which may be stuck in ReadFull
 	conn.connMu.Lock()
 	if conn.connection != nil {
@@ -246,24 +258,63 @@ func (conn *Connection) Close() {
 	conn.connMu.Unlock()
 	conn.logger.Info("Waiting for workers to close")
 	conn.waitGroup.Wait()
+	// Wait for any in-progress reconnect to stop.
+	// The closedCh signal makes Reconnect exit its retry loop promptly.
+	for conn.reconnecting.Load() {
+		time.Sleep(50 * time.Millisecond)
+	}
 	conn.logger.Info("Close DONE")
 }
 
 // ErrDisconnected is returned when attempting to send on a closed connection.
 var ErrDisconnected = fmt.Errorf("connection is disconnected")
 
+// reconnectSleep sleeps for the reconnect interval but returns early if Close() is called.
+// Returns an error if the connection was closed during the sleep.
+func (conn *Connection) reconnectSleep() error {
+	select {
+	case <-time.After(conn.reconnectInterval):
+		return nil
+	case <-conn.closedCh:
+		return fmt.Errorf("connection closed during reconnect")
+	}
+}
+
+// triggerReconnect prepares the connection state for reconnection and launches
+// the Reconnect goroutine. It sets disconnected=true and creates the reconnectDone
+// channel BEFORE launching the goroutine, eliminating the race window where callers
+// could see a "healthy" connection between the trigger and Reconnect() being scheduled.
+func (conn *Connection) triggerReconnect() {
+	if conn.closed.Load() {
+		return
+	}
+	conn.disconnected.Store(true)
+	conn.reconnectMu.Lock()
+	if conn.reconnectDone == nil {
+		conn.reconnectDone = make(chan struct{})
+	}
+	conn.reconnectMu.Unlock()
+	go conn.Reconnect()
+}
+
 // Reconnect attempts to re-establish the TCP connection, reload symbols,
 // and re-subscribe to previously registered notifications.
 func (conn *Connection) Reconnect() error {
+	if conn.closed.Load() {
+		return fmt.Errorf("connection closed")
+	}
 	// Prevent concurrent reconnect attempts
 	if !conn.reconnecting.CompareAndSwap(false, true) {
 		conn.logger.Info("reconnect already in progress, skipping")
 		return nil
 	}
 
-	// Create a channel that waiters (sendRequest) can block on
+	// Create a channel that waiters (sendRequest) can block on.
+	// triggerReconnect() may have already created it — only create if nil.
 	conn.reconnectMu.Lock()
-	conn.reconnectDone = make(chan struct{})
+	if conn.reconnectDone == nil {
+		conn.reconnectDone = make(chan struct{})
+	}
 	conn.reconnectMu.Unlock()
 
 	defer func() {
@@ -287,11 +338,15 @@ func (conn *Connection) Reconnect() error {
 	conn.connMu.Unlock()
 
 	// Cancel old goroutines and wait
+	conn.ctxMu.RLock()
 	conn.shutdown()
+	conn.ctxMu.RUnlock()
 	conn.waitGroup.Wait()
 
 	// Reset context
+	conn.ctxMu.Lock()
 	conn.ctx, conn.shutdown = context.WithCancel(context.Background())
+	conn.ctxMu.Unlock()
 
 	// Reset channels, feature flags, and active notifications (old handles are invalid)
 	conn.sendChannel = make(chan []byte)
@@ -308,6 +363,9 @@ func (conn *Connection) Reconnect() error {
 	var lastErr error
 	attempts := 0
 	for {
+		if conn.closed.Load() {
+			return fmt.Errorf("connection closed during reconnect")
+		}
 		attempts++
 		if conn.maxReconnectAttempts > 0 && attempts > conn.maxReconnectAttempts {
 			return fmt.Errorf("reconnect failed after %d attempts: %w", conn.maxReconnectAttempts, lastErr)
@@ -318,7 +376,9 @@ func (conn *Connection) Reconnect() error {
 		if err != nil {
 			lastErr = err
 			conn.logger.Warn("reconnect dial failed, retrying", "error", err, "attempt", attempts)
-			time.Sleep(conn.reconnectInterval)
+			if err := conn.reconnectSleep(); err != nil {
+				return err
+			}
 			continue
 		}
 		conn.connMu.Lock()
@@ -368,7 +428,9 @@ func (conn *Connection) Reconnect() error {
 			lastErr = err
 			conn.logger.Warn("reconnect symbol reload failed, retrying", "error", err, "attempt", attempts)
 			conn.resetForRetry()
-			time.Sleep(conn.reconnectInterval)
+			if err := conn.reconnectSleep(); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -460,14 +522,18 @@ func (conn *Connection) reloadSymbols() error {
 // channels/state so the next retry iteration starts clean.
 func (conn *Connection) resetForRetry() {
 	conn.disconnected.Store(true)
+	conn.ctxMu.RLock()
 	conn.shutdown()
+	conn.ctxMu.RUnlock()
 	conn.connMu.Lock()
 	if conn.connection != nil {
 		conn.connection.Close()
 	}
 	conn.connMu.Unlock()
 	conn.waitGroup.Wait()
+	conn.ctxMu.Lock()
 	conn.ctx, conn.shutdown = context.WithCancel(context.Background())
+	conn.ctxMu.Unlock()
 	conn.sendChannel = make(chan []byte)
 	conn.systemResponse = make(chan []byte)
 	conn.activeRequestLock.Lock()

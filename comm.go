@@ -48,13 +48,16 @@ func (conn *Connection) sendRequest(command CommandID, data []byte) (response []
 		conn.reconnectMu.Unlock()
 		if ch != nil {
 			conn.logger.Debug("sendRequest waiting for reconnect to complete")
+			conn.ctxMu.RLock()
+			ctxDone := conn.ctx.Done()
+			conn.ctxMu.RUnlock()
 			select {
 			case <-ch:
 				// Reconnect finished — check if we're still disconnected
 				if conn.disconnected.Load() {
 					return nil, ErrDisconnected
 				}
-			case <-conn.ctx.Done():
+			case <-ctxDone:
 				return nil, ErrDisconnected
 			}
 		} else {
@@ -82,7 +85,10 @@ func (conn *Connection) sendRequest(command CommandID, data []byte) (response []
 		conn.logger.Error("Error during sendrequest encode", "error", err)
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(conn.ctx, conn.RequestTimeout)
+	conn.ctxMu.RLock()
+	currentCtx := conn.ctx
+	conn.ctxMu.RUnlock()
+	ctx, cancel := context.WithTimeout(currentCtx, conn.RequestTimeout)
 	defer cancel()
 	select {
 	case <-ctx.Done():
@@ -132,7 +138,7 @@ func (conn *Connection) listen() {
 				default:
 				}
 				conn.logger.Error("listen read error, triggering reconnect", "error", err)
-				go conn.Reconnect()
+				conn.triggerReconnect()
 				return
 			}
 		}
@@ -145,7 +151,7 @@ func (conn *Connection) listen() {
 		const maxAMSPacket = 4 * 1024 * 1024 // 4 MB sanity limit
 		if tcpHeader.Length > maxAMSPacket {
 			conn.logger.Error("AMS packet length exceeds sanity limit, triggering reconnect", "length", tcpHeader.Length)
-			go conn.Reconnect()
+			conn.triggerReconnect()
 			return
 		}
 		data = make([]byte, tcpHeader.Length)
@@ -161,7 +167,7 @@ func (conn *Connection) listen() {
 				default:
 				}
 				conn.logger.Error("listen body read error, triggering reconnect", "error", err)
-				go conn.Reconnect()
+				conn.triggerReconnect()
 				return
 			}
 		}
@@ -246,12 +252,12 @@ func (conn *Connection) transmitWorker() {
 			_, err := writer.Write(data)
 			if err != nil {
 				conn.logger.Error("error sending data on conn, triggering reconnect", "error", err)
-				go conn.Reconnect()
+				conn.triggerReconnect()
 				return
 			}
 			if err := writer.Flush(); err != nil {
 				conn.logger.Error("error flushing data on conn, triggering reconnect", "error", err)
-				go conn.Reconnect()
+				conn.triggerReconnect()
 				return
 			}
 		}
