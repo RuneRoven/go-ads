@@ -15,7 +15,7 @@ A pure Go library for communicating with Beckhoff TwinCAT PLCs using the ADS (Au
 ## Install
 
 ```bash
-go get github.com/RuneRoven/go-ads
+go get github.com/RuneRoven/go-ads/v2
 ```
 
 ## Quick start
@@ -28,7 +28,7 @@ import (
 	"fmt"
 	"time"
 
-	ads "github.com/RuneRoven/go-ads"
+	ads "github.com/RuneRoven/go-ads/v2"
 )
 
 func main() {
