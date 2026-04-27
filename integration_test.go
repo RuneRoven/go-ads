@@ -1099,8 +1099,10 @@ func TestIntegrationReconnect(t *testing.T) {
 		t.Log("no pre-reconnect notification (continuing)")
 	}
 
-	// 3. Simulate network drop by closing TCP connection
-	t.Log("simulating network drop...")
+	// 3. Simulate network drop by closing TCP connection.
+	// Expect "listen read error, triggering reconnect" in logs — this is the
+	// detection mechanism firing after we deliberately close the socket.
+	t.Log("simulating network drop (expect 'listen read error' log)...")
 	conn.connMu.Lock()
 	conn.connection.Close()
 	conn.connMu.Unlock()
@@ -1148,8 +1150,10 @@ func TestIntegrationReconnectDuringBatchRead(t *testing.T) {
 		t.Logf("  %s = %s", name, val)
 	}
 
-	// 2. Simulate network drop
-	t.Log("simulating network drop...")
+	// 2. Simulate network drop.
+	// Expect "listen read error, triggering reconnect" in logs — this is the
+	// detection mechanism firing after we deliberately close the socket.
+	t.Log("simulating network drop (expect 'listen read error' log)...")
 	conn.connMu.Lock()
 	conn.connection.Close()
 	conn.connMu.Unlock()
@@ -1198,8 +1202,10 @@ func TestIntegrationReconnectReadDuringDisconnect(t *testing.T) {
 	}
 	t.Logf("pre-disconnect: %s = %s", symbolName, val1)
 
-	// 2. Kill TCP — triggers reconnect in background
-	t.Log("simulating network drop...")
+	// 2. Kill TCP — triggers reconnect in background.
+	// Expect "listen read error, triggering reconnect" in logs — this is the
+	// detection mechanism firing after we deliberately close the socket.
+	t.Log("simulating network drop (expect 'listen read error' log)...")
 	conn.connMu.Lock()
 	conn.connection.Close()
 	conn.connMu.Unlock()
@@ -1211,4 +1217,8 @@ func TestIntegrationReconnectReadDuringDisconnect(t *testing.T) {
 		t.Fatalf("read during reconnect failed (sendRequest retry should have handled this): %v", err)
 	}
 	t.Logf("read during reconnect succeeded: %s = %s", symbolName, val2)
+
+	// 4. Wait for reconnect to fully complete before Close() runs,
+	// so handle cleanup can succeed cleanly.
+	waitForReconnect(t, conn, 15*time.Second)
 }

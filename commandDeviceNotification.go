@@ -75,7 +75,7 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 	symbol, ok := conn.activeNotifications[handle]
 	if !ok {
 		conn.symbolLock.Unlock()
-		conn.logger.Error("Can't find notification handle", "handle", handle)
+		conn.logger.Warn("received notification for unknown handle (may be stale after reconnect)", "handle", handle)
 		return nil
 	}
 	datatypes := conn.datatypes
