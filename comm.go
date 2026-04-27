@@ -12,12 +12,16 @@ import (
 
 func (conn *Connection) send(data []byte) (response []byte, err error) {
 	conn.currentRequest.Inc()
+	conn.chanMu.RLock()
+	sendCh := conn.sendChannel
+	sysCh := conn.systemResponse
+	conn.chanMu.RUnlock()
 	ctx, cancel := context.WithCancel(conn.ctx)
 	defer cancel()
 	select {
 	case <-ctx.Done():
 		return nil, fmt.Errorf("send aborted, context canceled: %w", ctx.Err())
-	case conn.sendChannel <- data:
+	case sendCh <- data:
 	}
 
 	ctx, cancel = context.WithCancel(ctx)
@@ -32,7 +36,7 @@ func (conn *Connection) send(data []byte) (response []byte, err error) {
 			conn.logger.Error("sendRequest aborted due to shutdown", "error", err)
 		}
 		return nil, err
-	case response = <-conn.systemResponse:
+	case response = <-sysCh:
 		return response, nil
 	}
 }
@@ -131,6 +135,9 @@ func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (respons
 	conn.ctxMu.RLock()
 	currentCtx := conn.ctx
 	conn.ctxMu.RUnlock()
+	conn.chanMu.RLock()
+	sendCh := conn.sendChannel
+	conn.chanMu.RUnlock()
 	ctx, cancel := context.WithTimeout(currentCtx, conn.RequestTimeout)
 	defer cancel()
 	select {
@@ -141,7 +148,7 @@ func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (respons
 			conn.logger.Info("sendRequest aborted due to shutdown")
 		}
 		return nil, ctx.Err()
-	case conn.sendChannel <- pack:
+	case sendCh <- pack:
 	}
 	// Capture channel reference under lock to avoid concurrent map read
 	conn.activeRequestLock.Lock()

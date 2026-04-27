@@ -137,7 +137,7 @@ func TestParseRouteResponse_Success(t *testing.T) {
 	binary.LittleEndian.PutUint16(resp[26:], 4)
 	binary.LittleEndian.PutUint32(resp[28:], 0) // success
 
-	err := parseRouteResponse(defaultLogger,resp)
+	err := parseRouteResponse(getDefaultLogger(),resp)
 	if err != nil {
 		t.Errorf("expected success, got error: %v", err)
 	}
@@ -152,14 +152,14 @@ func TestParseRouteResponse_ErrorCode(t *testing.T) {
 	binary.LittleEndian.PutUint16(resp[26:], 4)
 	binary.LittleEndian.PutUint32(resp[28:], 7) // error code 7
 
-	err := parseRouteResponse(defaultLogger,resp)
+	err := parseRouteResponse(getDefaultLogger(),resp)
 	if err == nil {
 		t.Error("expected error for non-zero error code")
 	}
 }
 
 func TestParseRouteResponse_TooShort(t *testing.T) {
-	err := parseRouteResponse(defaultLogger,[]byte{1, 2, 3})
+	err := parseRouteResponse(getDefaultLogger(),[]byte{1, 2, 3})
 	if err == nil {
 		t.Error("expected error for short response")
 	}
@@ -170,7 +170,7 @@ func TestParseRouteResponse_WrongCookie(t *testing.T) {
 	binary.LittleEndian.PutUint32(resp[0:], 0xDEADBEEF) // wrong cookie
 	binary.LittleEndian.PutUint32(resp[8:], 0x80000000|routeServiceAdd)
 
-	err := parseRouteResponse(defaultLogger,resp)
+	err := parseRouteResponse(getDefaultLogger(),resp)
 	if err == nil {
 		t.Error("expected error for wrong cookie")
 	}
@@ -181,7 +181,7 @@ func TestParseRouteResponse_WrongServiceID(t *testing.T) {
 	binary.LittleEndian.PutUint32(resp[0:], routeCookie)
 	binary.LittleEndian.PutUint32(resp[8:], 0x12345678) // wrong serviceId
 
-	err := parseRouteResponse(defaultLogger,resp)
+	err := parseRouteResponse(getDefaultLogger(),resp)
 	if err == nil {
 		t.Error("expected error for wrong serviceId")
 	}

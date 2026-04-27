@@ -3,6 +3,7 @@ package ads
 import (
 	"encoding/hex"
 	"log/slog"
+	"sync/atomic"
 )
 
 // LevelTrace is a custom slog level for trace-level logging,
@@ -28,15 +29,24 @@ func WithLogger(logger *slog.Logger) ConnectionOption {
 	}
 }
 
-// defaultLogger is used by package-level functions (e.g., AddRemoteRoute)
+// defaultLoggerPtr is used by package-level functions (e.g., AddRemoteRoute)
 // that are not associated with a Connection instance.
-var defaultLogger = slog.Default()
+var defaultLoggerPtr atomic.Pointer[slog.Logger]
+
+func init() {
+	d := slog.Default()
+	defaultLoggerPtr.Store(d)
+}
+
+func getDefaultLogger() *slog.Logger {
+	return defaultLoggerPtr.Load()
+}
 
 // SetDefaultLogger sets the package-level logger used by standalone functions
 // like AddRemoteRoute. Call this before creating any connections if you want
 // package-level functions to use a custom logger.
 func SetDefaultLogger(logger *slog.Logger) {
 	if logger != nil {
-		defaultLogger = logger
+		defaultLoggerPtr.Store(logger)
 	}
 }

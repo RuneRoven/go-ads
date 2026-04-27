@@ -47,10 +47,15 @@ func stringToNetID(source string) (result [6]byte, err error) {
 }
 
 func (conn *Connection) encode(command CommandID, data []byte, invokeID uint32) ([]byte, error) {
+	// Snapshot source under lock to avoid race with Reconnect writing conn.source.
+	// target is write-once (set in NewConnection), so no lock needed.
+	conn.connMu.Lock()
+	source := conn.source
+	conn.connMu.Unlock()
 	conn.logger.Log(context.Background(), LevelTrace, "Starting encoding of AMS header",
 		"command", command,
 		"target", conn.target,
-		"source", conn.source,
+		"source", source,
 		"ID", invokeID,
 		"length of data", len(data))
 	tcpHeader := &amsTCPHeader{
@@ -60,7 +65,7 @@ func (conn *Connection) encode(command CommandID, data []byte, invokeID uint32) 
 	}
 	header := &amsHeader{
 		Target:    conn.target,
-		Source:    conn.source,
+		Source:    source,
 		Command:   command,
 		State:     uint16(4),
 		Length:    uint32(len(data)),

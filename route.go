@@ -33,7 +33,7 @@ const (
 //   - username: PLC admin username (typically "Administrator")
 //   - password: PLC admin password
 func AddRemoteRoute(remoteHost string, localNetId [6]byte, routeName string, computerName string, username string, password string) error {
-	return AddRemoteRouteWithLogger(defaultLogger, remoteHost, localNetId, routeName, computerName, username, password)
+	return AddRemoteRouteWithLogger(getDefaultLogger(), remoteHost, localNetId, routeName, computerName, username, password)
 }
 
 // AddRemoteRouteWithLogger is like AddRemoteRoute but accepts an explicit logger.

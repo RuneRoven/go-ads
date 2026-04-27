@@ -1153,10 +1153,7 @@ func (conn *Connection) symbolHasChildren(sym *Symbol) bool {
 
 	// Heuristic: if the datatype is not a primitive parseable type, it's likely a struct
 	if sym.DataType != "" && !slices.Contains(parseableTypes, sym.DataType) {
-		// Exclude known non-struct types
-		if sym.DataType != "TIME" && sym.DataType != "TOD" && sym.DataType != "DATE" && sym.DataType != "DT" {
-			return true
-		}
+		return true
 	}
 
 	return false

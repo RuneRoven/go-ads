@@ -74,7 +74,8 @@ type Connection struct {
 	closed   atomic.Bool
 	closedCh chan struct{} // closed by Close(), never written to
 
-	ctxMu sync.RWMutex // protects conn.ctx and conn.shutdown against concurrent access
+	ctxMu  sync.RWMutex // protects conn.ctx and conn.shutdown against concurrent access
+	chanMu sync.RWMutex // protects sendChannel and systemResponse against concurrent access during reconnect
 
 	logger *slog.Logger
 }
@@ -132,7 +133,7 @@ func (conn *Connection) Connect(local bool) error {
 		conn.target.NetID = [6]byte{127, 0, 0, 1, 1, 1}
 		conn.ip = "127.0.0.1"
 	}
-	tcpConn, err := net.Dial("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)))
+	tcpConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.RequestTimeout)
 	if err != nil {
 		conn.logger.Error("Error connecting", "error", err)
 		return err
@@ -183,7 +184,9 @@ func (conn *Connection) Connect(local bool) error {
 			return fmt.Errorf("local mode binary read failed: %w", err)
 		}
 		conn.logger.Info("local mode handshake result", "result", result)
+		conn.connMu.Lock()
 		conn.source = result
+		conn.connMu.Unlock()
 	}
 	// Read symbol version for later change detection (best-effort, don't fail connect)
 	version, err := conn.GetSymbolVersion()
@@ -260,8 +263,11 @@ func (conn *Connection) Close() {
 	conn.waitGroup.Wait()
 	// Wait for any in-progress reconnect to stop.
 	// The closedCh signal makes Reconnect exit its retry loop promptly.
-	for conn.reconnecting.Load() {
-		time.Sleep(50 * time.Millisecond)
+	conn.reconnectMu.Lock()
+	ch := conn.reconnectDone
+	conn.reconnectMu.Unlock()
+	if ch != nil {
+		<-ch
 	}
 	conn.logger.Info("Close DONE")
 }
@@ -349,8 +355,10 @@ func (conn *Connection) Reconnect() error {
 	conn.ctxMu.Unlock()
 
 	// Reset channels, feature flags, and active notifications (old handles are invalid)
+	conn.chanMu.Lock()
 	conn.sendChannel = make(chan []byte)
 	conn.systemResponse = make(chan []byte)
+	conn.chanMu.Unlock()
 	conn.activeRequestLock.Lock()
 	conn.activeRequests = map[uint32]chan []byte{}
 	conn.activeRequestLock.Unlock()
@@ -372,7 +380,7 @@ func (conn *Connection) Reconnect() error {
 		}
 
 		var err error
-		newConn, err := net.Dial("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)))
+		newConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.RequestTimeout)
 		if err != nil {
 			lastErr = err
 			conn.logger.Warn("reconnect dial failed, retrying", "error", err, "attempt", attempts)
@@ -409,7 +417,9 @@ func (conn *Connection) Reconnect() error {
 				lastErr = err
 				conn.logger.Warn("reconnect local handshake failed, retrying", "error", err, "attempt", attempts)
 				conn.resetForRetry()
-				time.Sleep(conn.reconnectInterval)
+				if err := conn.reconnectSleep(); err != nil {
+					return err
+				}
 				continue
 			}
 			buf := bytes.NewBuffer(resp)
@@ -417,10 +427,14 @@ func (conn *Connection) Reconnect() error {
 			if err = binary.Read(buf, binary.LittleEndian, &result); err != nil {
 				conn.logger.Warn("reconnect local handshake parse failed, retrying", "error", err, "attempt", attempts)
 				conn.resetForRetry()
-				time.Sleep(conn.reconnectInterval)
+				if err := conn.reconnectSleep(); err != nil {
+					return err
+				}
 				continue
 			}
+			conn.connMu.Lock()
 			conn.source = result
+			conn.connMu.Unlock()
 		}
 
 		// Re-load symbols based on discovery mode
@@ -450,7 +464,9 @@ func (conn *Connection) Reconnect() error {
 				conn.notificationChannel = savedChannel
 				conn.symbolLock.Unlock()
 				conn.resetForRetry()
-				time.Sleep(conn.reconnectInterval)
+				if err := conn.reconnectSleep(); err != nil {
+					return err
+				}
 				continue
 			}
 		}
@@ -534,8 +550,10 @@ func (conn *Connection) resetForRetry() {
 	conn.ctxMu.Lock()
 	conn.ctx, conn.shutdown = context.WithCancel(context.Background())
 	conn.ctxMu.Unlock()
+	conn.chanMu.Lock()
 	conn.sendChannel = make(chan []byte)
 	conn.systemResponse = make(chan []byte)
+	conn.chanMu.Unlock()
 	conn.activeRequestLock.Lock()
 	conn.activeRequests = map[uint32]chan []byte{}
 	conn.activeRequestLock.Unlock()
