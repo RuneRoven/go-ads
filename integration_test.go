@@ -1034,17 +1034,26 @@ func TestIntegrationReadProcessData(t *testing.T) {
 	}
 }
 
-// waitForReconnect polls until both disconnected=false AND reconnecting=false,
-// meaning the reconnect has fully completed (symbols reloaded, notifications re-subscribed).
+// waitForReconnect waits for the full reconnect cycle: first waits for the
+// connection to become disconnected (confirming the error was detected), then
+// waits for reconnect to fully complete (disconnected=false AND reconnecting=false).
 func waitForReconnect(t *testing.T, conn *Connection, timeout time.Duration) {
 	t.Helper()
 	deadline := time.After(timeout)
-	tick := time.NewTicker(100 * time.Millisecond)
+	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
-	for {
-		if !conn.IsDisconnected() && !conn.reconnecting.Load() {
-			return
+
+	// Phase 1: wait for disconnect to be detected
+	for !conn.IsDisconnected() && !conn.reconnecting.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("reconnect was never triggered within timeout")
+		case <-tick.C:
 		}
+	}
+
+	// Phase 2: wait for reconnect to fully complete
+	for conn.IsDisconnected() || conn.reconnecting.Load() {
 		select {
 		case <-deadline:
 			t.Fatalf("reconnect did not complete within timeout (disconnected=%v, reconnecting=%v)",
@@ -1162,4 +1171,44 @@ func TestIntegrationReconnectDuringBatchRead(t *testing.T) {
 	if len(values2) != len(names) {
 		t.Errorf("expected %d results after reconnect, got %d", len(names), len(values2))
 	}
+}
+
+// TestIntegrationReconnectReadDuringDisconnect verifies that sendRequest's
+// built-in retry handles the race window between TCP death and reconnect
+// completion. Instead of waiting for reconnect first, we issue a read
+// immediately after killing the connection — the library must retry
+// transparently.
+func TestIntegrationReconnectReadDuringDisconnect(t *testing.T) {
+	conn := setupConnection(t)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	symbols, _ := conn.ListSymbols()
+	symbolName := pickParseableSymbol(symbols)
+	if symbolName == "" {
+		t.Skip("no parseable symbols available")
+	}
+
+	// 1. Confirm connection works
+	val1, err := conn.ReadFromSymbol(symbolName)
+	if err != nil {
+		t.Fatalf("pre-disconnect ReadFromSymbol(%q) failed: %v", symbolName, err)
+	}
+	t.Logf("pre-disconnect: %s = %s", symbolName, val1)
+
+	// 2. Kill TCP — triggers reconnect in background
+	t.Log("simulating network drop...")
+	conn.connMu.Lock()
+	conn.connection.Close()
+	conn.connMu.Unlock()
+
+	// 3. Immediately read WITHOUT waiting for reconnect.
+	// sendRequest's retry loop should handle this transparently.
+	val2, err := conn.ReadFromSymbol(symbolName)
+	if err != nil {
+		t.Fatalf("read during reconnect failed (sendRequest retry should have handled this): %v", err)
+	}
+	t.Logf("read during reconnect succeeded: %s = %s", symbolName, val2)
 }

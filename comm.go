@@ -41,6 +41,49 @@ func (conn *Connection) sendRequest(command CommandID, data []byte) (response []
 	if conn == nil {
 		return nil, fmt.Errorf("sendRequest called on nil connection")
 	}
+	const maxAttempts = 2
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		response, err = conn.sendRequestOnce(command, data)
+		if err == nil {
+			return response, nil
+		}
+		// Only retry on context.Canceled (reconnect killed our context),
+		// never on DeadlineExceeded (that's the caller's RequestTimeout).
+		if !errors.Is(err, context.Canceled) {
+			return nil, err
+		}
+		// Don't retry if the connection is permanently closed.
+		if conn.closed.Load() {
+			return nil, err
+		}
+		// Only retry if a reconnect is actually in progress.
+		if !conn.reconnecting.Load() {
+			return nil, err
+		}
+		// Wait for reconnect to finish before retrying.
+		conn.reconnectMu.Lock()
+		ch := conn.reconnectDone
+		conn.reconnectMu.Unlock()
+		if ch == nil {
+			return nil, err
+		}
+		conn.logger.Info("sendRequest retrying after reconnect",
+			"attempt", attempt+1,
+			"command", command)
+		select {
+		case <-ch:
+			// Reconnect finished — loop will retry if connection is healthy.
+			if conn.disconnected.Load() {
+				return nil, ErrDisconnected
+			}
+		case <-conn.closedCh:
+			return nil, fmt.Errorf("connection closed while waiting for reconnect: %w", err)
+		}
+	}
+	return nil, err
+}
+
+func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (response []byte, err error) {
 	if conn.disconnected.Load() {
 		// If a reconnect is in progress, wait for it to finish before giving up
 		conn.reconnectMu.Lock()
