@@ -212,6 +212,102 @@ func TestIntegrationListSymbols(t *testing.T) {
 	}
 }
 
+func TestIntegrationReadStructWithEnum(t *testing.T) {
+	conn := setupConnection(t)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	symbols, err := conn.ListSymbols()
+	if err != nil {
+		t.Fatalf("ListSymbols failed: %v", err)
+	}
+
+	structName := os.Getenv("ADS_READ_STRUCT")
+	var hasEnumChild bool
+
+	if structName == "" {
+		// Auto-discover: prefer struct with enum/alias child
+		for name, sym := range symbols {
+			if len(sym.Children) == 0 || sym.Parent != nil {
+				continue
+			}
+			for _, child := range sym.Children {
+				if !parseableSet[child.DataType] {
+					hasEnumChild = true
+					break
+				}
+			}
+			if hasEnumChild {
+				structName = name
+				break
+			}
+		}
+	}
+
+	if structName == "" {
+		// Fallback: any struct symbol
+		for name, sym := range symbols {
+			if len(sym.Children) > 0 && sym.Parent == nil {
+				structName = name
+				break
+			}
+		}
+	}
+
+	if structName == "" {
+		t.Skip("no struct symbols found on PLC (set ADS_READ_STRUCT)")
+	}
+
+	sym, ok := symbols[structName]
+	if !ok || sym == nil {
+		t.Skipf("struct symbol %q not found in symbol table (PLC may not have this variable)", structName)
+	}
+	// Check if chosen symbol has enum/alias children
+	if !hasEnumChild {
+		for _, child := range sym.Children {
+			if !parseableSet[child.DataType] {
+				hasEnumChild = true
+				break
+			}
+		}
+	}
+
+	t.Logf("testing struct %s (type=%s, children=%d, hasEnumChild=%v)",
+		structName, sym.DataType, len(sym.Children), hasEnumChild)
+
+	// Dump datatype table info for each child, especially enum/alias types
+	conn.symbolLock.Lock()
+	datatypes := conn.datatypes
+	conn.symbolLock.Unlock()
+	for childName, child := range sym.Children {
+		t.Logf("  child %s (type=%s, length=%d)", childName, child.DataType, child.Length)
+		if !parseableSet[child.DataType] && datatypes != nil {
+			if dt, ok := datatypes[child.DataType]; ok {
+				t.Logf("    datatype %q: baseType=%q, size=%d, arrayDim=%d, subItems=%d, children=%d",
+					dt.Name, dt.DataType, dt.DatatypeEntry.Size, dt.DatatypeEntry.ArrayDim,
+					dt.DatatypeEntry.SubItems, len(dt.Children))
+			} else {
+				t.Logf("    datatype %q: NOT FOUND in datatype table", child.DataType)
+			}
+		}
+	}
+
+	value, err := conn.ReadFromSymbol(structName)
+	if err != nil {
+		t.Fatalf("ReadFromSymbol(%q) failed: %v", structName, err)
+	}
+	t.Logf("%s = %s", structName, value)
+
+	// Every child must have a parsed value after reading the struct
+	for childName, child := range sym.Children {
+		if child.Value == "" {
+			t.Errorf("child %q has empty Value after struct read", childName)
+		}
+	}
+}
+
 func TestIntegrationReadSymbol(t *testing.T) {
 	conn := setupConnection(t)
 	symbolName := os.Getenv("ADS_SYMBOL_NAME")

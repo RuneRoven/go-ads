@@ -865,6 +865,205 @@ func TestAddOffsetArrayFullName(t *testing.T) {
 	}
 }
 
+func TestParseEnumNestedInStruct(t *testing.T) {
+	// Non-strict enum: TwinCAT includes enum constants as sub-items.
+	// Without the isEnumDataType guard, addOffset would expand these
+	// constants as struct children, breaking parse.
+	t.Run("non-strict enum with children", func(t *testing.T) {
+		datatypes := map[string]SymbolUploadDataType{
+			"E_MotorState": {
+				Name:     "E_MotorState",
+				DataType: "DINT",
+				DatatypeEntry: datatypeEntry{
+					Size:     4,
+					SubItems: 3, // enum has 3 constants
+				},
+				Children: map[string]*SymbolUploadDataType{
+					"Idle":    {Name: "Idle", DataType: "DINT", DatatypeEntry: datatypeEntry{Size: 4}},
+					"Running": {Name: "Running", DataType: "DINT", DatatypeEntry: datatypeEntry{Size: 4}},
+					"Error":   {Name: "Error", DataType: "DINT", DatatypeEntry: datatypeEntry{Size: 4}},
+				},
+			},
+			"ST_Motor": {
+				Name:     "ST_Motor",
+				DataType: "",
+				DatatypeEntry: datatypeEntry{
+					Size:     8,
+					SubItems: 2,
+				},
+				Children: map[string]*SymbolUploadDataType{
+					"state": {Name: "state", DataType: "E_MotorState", DatatypeEntry: datatypeEntry{Size: 4, Offs: 0}},
+					"speed": {Name: "speed", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2, Offs: 4}},
+				},
+			},
+		}
+
+		motorSym := &Symbol{
+			Name: "motor", FullName: "MAIN.motor",
+			DataType: "ST_Motor", Length: 8, Group: 0x4040,
+		}
+		dt := datatypes["ST_Motor"]
+		motorSym.Children = dt.addOffset(motorSym, datatypes, motorSym.Group, motorSym.Offset)
+
+		// Wire data: state=2 (Running, DINT), speed=1500 (INT)
+		data := make([]byte, 8)
+		binary.LittleEndian.PutUint32(data[0:4], 2)
+		binary.LittleEndian.PutUint16(data[4:6], 1500)
+
+		value, err := motorSym.parse(data, 0, datatypes)
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		t.Logf("parsed value: %s", value)
+
+		stateChild := motorSym.Children["state"]
+		if stateChild == nil {
+			t.Fatal("expected child 'state'")
+		}
+		if stateChild.Value != "2" {
+			t.Errorf("state value = %q, want %q", stateChild.Value, "2")
+		}
+		// Enum child must NOT have children (enum constants must not be expanded)
+		if len(stateChild.Children) != 0 {
+			t.Errorf("enum child should have 0 children, got %d", len(stateChild.Children))
+		}
+
+		speedChild := motorSym.Children["speed"]
+		if speedChild == nil {
+			t.Fatal("expected child 'speed'")
+		}
+		if speedChild.Value != "1500" {
+			t.Errorf("speed value = %q, want %q", speedChild.Value, "1500")
+		}
+	})
+
+	// Strict enum (TC3 with {attribute 'strict'}): no sub-items in datatype,
+	// just a base type. This is what TC3 actually reports for qualified enums.
+	t.Run("strict enum no children", func(t *testing.T) {
+		datatypes := map[string]SymbolUploadDataType{
+			"E_MachineState": {
+				Name:     "E_MachineState",
+				DataType: "DINT",
+				DatatypeEntry: datatypeEntry{
+					Size:     4,
+					SubItems: 0, // strict: no enum constants exposed
+				},
+			},
+			"ST_Motor": {
+				Name:     "ST_Motor",
+				DataType: "",
+				DatatypeEntry: datatypeEntry{
+					Size:     8,
+					SubItems: 2,
+				},
+				Children: map[string]*SymbolUploadDataType{
+					"state": {Name: "state", DataType: "E_MachineState", DatatypeEntry: datatypeEntry{Size: 4, Offs: 0}},
+					"speed": {Name: "speed", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2, Offs: 4}},
+				},
+			},
+		}
+
+		motorSym := &Symbol{
+			Name: "motor", FullName: "MAIN.motor",
+			DataType: "ST_Motor", Length: 8, Group: 0x4040,
+		}
+		dt := datatypes["ST_Motor"]
+		motorSym.Children = dt.addOffset(motorSym, datatypes, motorSym.Group, motorSym.Offset)
+
+		data := make([]byte, 8)
+		binary.LittleEndian.PutUint32(data[0:4], 4) // ERROR=4
+		binary.LittleEndian.PutUint16(data[4:6], 750)
+
+		value, err := motorSym.parse(data, 0, datatypes)
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		t.Logf("parsed value: %s", value)
+
+		stateChild := motorSym.Children["state"]
+		if stateChild == nil {
+			t.Fatal("expected child 'state'")
+		}
+		if stateChild.Value != "4" {
+			t.Errorf("state value = %q, want %q", stateChild.Value, "4")
+		}
+	})
+}
+
+func TestArrayTypedefNotMistakenForEnum(t *testing.T) {
+	// A typedef array like "TYPE MyInts : ARRAY[0..2] OF INT;" has
+	// Children (array elements) and DataType="INT" — same as an enum.
+	// ArrayDim distinguishes them: arrays have ArrayDim > 0.
+	datatypes := map[string]SymbolUploadDataType{
+		"MyInts": {
+			Name:     "MyInts",
+			DataType: "INT",
+			DatatypeEntry: datatypeEntry{
+				Size:     6, // 3 x INT(2)
+				ArrayDim: 1,
+			},
+			Children: map[string]*SymbolUploadDataType{
+				"[0]": {Name: "[0]", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2, Offs: 0}},
+				"[1]": {Name: "[1]", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2, Offs: 2}},
+				"[2]": {Name: "[2]", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2, Offs: 4}},
+			},
+		},
+		"ST_WithArray": {
+			Name:     "ST_WithArray",
+			DataType: "",
+			DatatypeEntry: datatypeEntry{
+				Size:     8,
+				SubItems: 2,
+			},
+			Children: map[string]*SymbolUploadDataType{
+				"values": {Name: "values", DataType: "MyInts", DatatypeEntry: datatypeEntry{Size: 6, Offs: 0}},
+				"count":  {Name: "count", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2, Offs: 6}},
+			},
+		},
+	}
+
+	parent := &Symbol{
+		Name:     "s",
+		FullName: "MAIN.s",
+		DataType: "ST_WithArray",
+		Length:   8,
+		Group:    0x4040,
+		Offset:   0,
+	}
+	dt := datatypes["ST_WithArray"]
+	parent.Children = dt.addOffset(parent, datatypes, parent.Group, parent.Offset)
+
+	// "values" child must have array element children expanded
+	valuesChild, ok := parent.Children["values"]
+	if !ok {
+		t.Fatal("expected child 'values'")
+	}
+	if len(valuesChild.Children) != 3 {
+		t.Fatalf("expected 3 array children for 'values', got %d", len(valuesChild.Children))
+	}
+
+	// Parse: values=[10, 20, 30], count=3
+	data := make([]byte, 8)
+	binary.LittleEndian.PutUint16(data[0:2], 10)
+	binary.LittleEndian.PutUint16(data[2:4], 20)
+	binary.LittleEndian.PutUint16(data[4:6], 30)
+	binary.LittleEndian.PutUint16(data[6:8], 3)
+
+	value, err := parent.parse(data, 0, datatypes)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	t.Logf("parsed: %s", value)
+
+	countChild, ok := parent.Children["count"]
+	if !ok {
+		t.Fatal("expected child 'count'")
+	}
+	if countChild.Value != "3" {
+		t.Errorf("count = %q, want %q", countChild.Value, "3")
+	}
+}
+
 func TestAddChildren(t *testing.T) {
 	child := &Symbol{Name: "x", FullName: "s.x", DataType: "INT", Length: 2}
 	parent := &Symbol{

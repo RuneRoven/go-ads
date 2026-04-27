@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -199,9 +200,10 @@ func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string
 			Parent: parent,
 		}
 
-		// Check if subitems exist
-		dt, ok := datatypes[segment.DataType]
-		if ok {
+		// Check if subitems exist — but skip enum types.
+		// Enums have children (enum constants) but should be parsed as
+		// their base type (e.g. INT), not expanded as struct fields.
+		if dt, ok := datatypes[segment.DataType]; ok && !isEnumDataType(&dt) {
 			child.Children = dt.addOffset(&child, datatypes, child.Group, child.Offset)
 		}
 
@@ -209,6 +211,16 @@ func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string
 	}
 
 	return
+}
+
+// isEnumDataType returns true if a datatype represents an enum.
+// Enums have a parseable base type (e.g. INT, UINT), children
+// (enum constants), and ArrayDim == 0. Arrays of parseable types
+// also have children and a parseable base type but have ArrayDim > 0.
+func isEnumDataType(dt *SymbolUploadDataType) bool {
+	return len(dt.Children) > 0 &&
+		dt.DatatypeEntry.ArrayDim == 0 &&
+		slices.Contains(parseableTypes, dt.DataType)
 }
 
 func ParseUploadSymbolInfoDataTypes(data []byte) (datatypes map[string]SymbolUploadDataType, err error) {

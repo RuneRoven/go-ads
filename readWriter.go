@@ -144,13 +144,18 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 
 		newValue = t.Truncate(time.Millisecond).Format("2006-01-02 15:04:05")
 	default:
-		// Try resolving type alias via datatype table
+		// Try resolving type alias via datatype table (enums, type aliases)
 		if datatypes != nil {
 			if dt, ok := datatypes[symbol.DataType]; ok {
 				if slices.Contains(parseableTypes, dt.DataType) {
 					resolved := *symbol
 					resolved.DataType = dt.DataType
-					return resolved.parse(data, offset, nil)
+					val, err := resolved.parse(data, offset, nil)
+					if err != nil {
+						return "", err
+					}
+					symbol.updateValue(val)
+					return symbol.Value, nil
 				}
 			}
 		}
