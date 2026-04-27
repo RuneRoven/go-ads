@@ -119,7 +119,7 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 		t := time.Unix(0, int64(uint64(i)*uint64(time.Millisecond))).UTC()
 
 		newValue = t.Truncate(time.Millisecond).Format("15:04:05.999999999")
-	case "TOD":
+	case "TOD", "TIME_OF_DAY":
 		if stop-start != 4 {
 			return "", fmt.Errorf("TOD Size Wrong")
 		}
@@ -135,7 +135,7 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 		t := time.Unix(int64(i), 0).UTC()
 
 		newValue = t.Format("2006-01-02")
-	case "DT":
+	case "DT", "DATE_AND_TIME":
 		if stop-start != 4 {
 			return "", fmt.Errorf("DT Size Wrong")
 		}
@@ -198,8 +198,10 @@ var parseableTypes = []string{
 	"STRING",
 	"TIME",
 	"TOD",
+	"TIME_OF_DAY",
 	"DATE",
 	"DT",
+	"DATE_AND_TIME",
 	"LINT",
 	"ULINT",
 	"LWORD",
@@ -373,7 +375,7 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		if err := binary.Write(buf, binary.LittleEndian, &ms); err != nil {
 			return nil, fmt.Errorf("binary.Write TIME failed: %w", err)
 		}
-	case "TOD":
+	case "TOD", "TIME_OF_DAY":
 		t, e := time.Parse("15:04", value)
 		if e != nil {
 			return nil, fmt.Errorf("TOD: expected format 15:04: %w", e)
@@ -394,7 +396,7 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		if err := binary.Write(buf, binary.LittleEndian, &secs); err != nil {
 			return nil, fmt.Errorf("binary.Write DATE failed: %w", err)
 		}
-	case "DT":
+	case "DT", "DATE_AND_TIME":
 		t, e := time.Parse("2006-01-02 15:04:05", value)
 		if e != nil {
 			return nil, fmt.Errorf("DT: expected format 2006-01-02 15:04:05: %w", e)

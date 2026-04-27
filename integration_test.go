@@ -677,7 +677,7 @@ var writeTestCases = []writeTestCase{
 	{"ADS_WRITE_WORD", "43690", "21845"},
 	{"ADS_WRITE_DWORD", "2863311530", "1431655765"},
 	// Time types
-	{"ADS_WRITE_TIME", "01:23:45.678000000", "00:00:01"},
+	{"ADS_WRITE_TIME", "01:23:45.678", "00:00:01"},
 	{"ADS_WRITE_DATE", "2024-06-15", "2000-01-01"},
 	{"ADS_WRITE_DT", "2024-06-15 13:30:00", "2000-01-01 00:00:00"},
 	{"ADS_WRITE_TOD", "13:45", "00:01"},
