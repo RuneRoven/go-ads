@@ -3,10 +3,9 @@ package ads
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"net"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 // UDP route registration constants
@@ -34,6 +33,11 @@ const (
 //   - username: PLC admin username (typically "Administrator")
 //   - password: PLC admin password
 func AddRemoteRoute(remoteHost string, localNetId [6]byte, routeName string, computerName string, username string, password string) error {
+	return AddRemoteRouteWithLogger(getDefaultLogger(), remoteHost, localNetId, routeName, computerName, username, password)
+}
+
+// AddRemoteRouteWithLogger is like AddRemoteRoute but accepts an explicit logger.
+func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetId [6]byte, routeName string, computerName string, username string, password string) error {
 	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", remoteHost, routePort))
 	if err != nil {
 		return fmt.Errorf("failed to resolve remote host: %w", err)
@@ -63,7 +67,7 @@ func AddRemoteRoute(remoteHost string, localNetId [6]byte, routeName string, com
 		return fmt.Errorf("failed to read route response: %w", err)
 	}
 
-	return parseRouteResponse(respBuf[:n])
+	return parseRouteResponse(logger, respBuf[:n])
 }
 
 // buildRoutePacket constructs a UDP route registration packet.
@@ -111,8 +115,8 @@ func appendNull(data []byte) []byte {
 
 // parseRouteResponse validates the route registration response.
 // Response format: cookie(4) + invokeId(4) + serviceId(4) + AmsAddr(8) + tagCount(4) + tags...
-func parseRouteResponse(data []byte) error {
-	log.Debug().Hex("response", data).Int("length", len(data)).Msg("route response raw bytes")
+func parseRouteResponse(logger *slog.Logger, data []byte) error {
+	logger.Debug("route response raw bytes", hexAttr("response", data), "length", len(data))
 
 	if len(data) < 24 {
 		return fmt.Errorf("route response too short: %d bytes", len(data))
@@ -131,7 +135,7 @@ func parseRouteResponse(data []byte) error {
 
 	// Skip AmsAddr (8 bytes at offset 12), tagCount is at offset 20
 	tagCount := binary.LittleEndian.Uint32(data[20:])
-	log.Debug().Uint32("tagCount", tagCount).Msg("route response tags")
+	logger.Debug("route response tags", "tagCount", tagCount)
 	offset := 24
 	for i := uint32(0); i < tagCount; i++ {
 		if offset+4 > len(data) {
@@ -143,18 +147,18 @@ func parseRouteResponse(data []byte) error {
 		if offset+int(tlen) > len(data) {
 			return fmt.Errorf("route response truncated: tag %d data exceeds response", tid)
 		}
-		log.Debug().Uint16("tagID", tid).Uint16("tagLen", tlen).Hex("tagData", data[offset:offset+int(tlen)]).Msg("route response tag")
+		logger.Debug("route response tag", "tagID", tid, "tagLen", tlen, hexAttr("tagData", data[offset:offset+int(tlen)]))
 		if tid == tagResponseError && tlen >= 4 {
 			errCode := binary.LittleEndian.Uint32(data[offset:])
 			if errCode != 0 {
 				return fmt.Errorf("route registration failed with error code: %d", errCode)
 			}
-			log.Info().Msg("route registration successful")
+			logger.Info("route registration successful")
 			return nil
 		}
 		offset += int(tlen)
 	}
 
-	log.Info().Msg("route registration response received (no error tag found, assuming success)")
+	logger.Info("route registration response received (no error tag found, assuming success)")
 	return nil
 }

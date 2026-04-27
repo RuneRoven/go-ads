@@ -17,8 +17,9 @@ import (
 
 	"github.com/chzyer/readline"
 
-	ads "github.com/RuneRoven/go-ads"
 	"gopkg.in/yaml.v3"
+
+	ads "github.com/RuneRoven/go-ads"
 )
 
 type Config struct {

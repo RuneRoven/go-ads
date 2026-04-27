@@ -2,11 +2,10 @@ package ads
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 func (conn *Connection) AddDeviceNotification(
@@ -53,20 +52,14 @@ func (conn *Connection) AddDeviceNotification(
 	notificationResponse := addDeviceNotificationResponse{}
 	err = binary.Read(respBuffer, binary.LittleEndian, &notificationResponse)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Msg("failed to parse notification response")
+		conn.logger.Error("failed to parse notification response", "error", err)
 		return 0, err
 	}
 	if notificationResponse.Error != 0 {
-		log.Error().
-			Uint32("errorCode", uint32(notificationResponse.Error)).
-			Msg("failed to add notification handler")
+		conn.logger.Error("failed to add notification handler", "errorCode", uint32(notificationResponse.Error))
 		return 0, fmt.Errorf("unable to create notification: %w", notificationResponse.Error)
 	}
-	log.Trace().
-		Uint32("handle", notificationResponse.Handle).
-		Msg("added notification handler")
+	conn.logger.Log(context.Background(), LevelTrace, "added notification handler", "handle", notificationResponse.Handle)
 
 	return notificationResponse.Handle, nil
 }

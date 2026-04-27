@@ -2,10 +2,9 @@ package ads
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
-
-	"github.com/rs/zerolog/log"
 )
 
 func (conn *Connection) WriteRead(group uint32, offset uint32, readLength uint32, send []byte) (data []byte, err error) {
@@ -37,9 +36,7 @@ func (conn *Connection) WriteRead(group uint32, offset uint32, readLength uint32
 		return nil, fmt.Errorf("binary.Write failed: %w", err)
 	}
 
-	log.Trace().
-		Interface("request", request).
-		Msg("request")
+	conn.logger.Log(context.Background(), LevelTrace, "request", "request", request)
 
 	// Try to send the request
 	resp, err := conn.sendRequest(CommandIDReadWrite, request.Bytes())

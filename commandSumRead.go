@@ -3,8 +3,6 @@ package ads
 import (
 	"encoding/binary"
 	"fmt"
-
-	"github.com/rs/zerolog/log"
 )
 
 // SumReadRequest represents a single read request within a sum/batch read.
@@ -51,11 +49,12 @@ func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, err
 	resp, err := conn.WriteRead(uint32(GroupSumupReadEx2), uint32(n), readLen, writeData)
 	if err != nil {
 		if !conn.sumReadChecked.Load() && isSumCommandUnsupportedError(err) {
-			log.Warn().Err(err).Msg("SumRead not supported by PLC, using individual reads")
+			conn.logger.Warn("SumRead not supported by PLC, using individual reads", "error", err)
 			conn.sumReadSupported.Store(false)
 			conn.sumReadChecked.Store(true)
+			return conn.sumReadFallback(requests)
 		}
-		return conn.sumReadFallback(requests)
+		return nil, fmt.Errorf("SumRead failed: %w", err)
 	}
 
 	if !conn.sumReadChecked.Load() {
@@ -69,15 +68,14 @@ func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, err
 
 	results := make([]SumReadResult, n)
 
-	// Parse error codes (N × 4 bytes)
-	for i := 0; i < n; i++ {
-		results[i].Error = ReturnCode(binary.LittleEndian.Uint32(resp[i*4:]))
-	}
-
-	// Parse actual lengths (N × 4 bytes)
+	// TC2 COMPATIBILITY: The SumReadEx2 (0xF084) response uses interleaved
+	// (error, length) pairs, confirmed working on TwinCAT 3. If TwinCAT 2
+	// uses separate arrays ([all errors] then [all lengths]) instead, change
+	// the parsing below from i*8/i*8+4 to i*4/n*4+i*4.
 	lengths := make([]uint32, n)
 	for i := 0; i < n; i++ {
-		lengths[i] = binary.LittleEndian.Uint32(resp[n*4+i*4:])
+		results[i].Error = ReturnCode(binary.LittleEndian.Uint32(resp[i*8:]))
+		lengths[i] = binary.LittleEndian.Uint32(resp[i*8+4:])
 	}
 
 	// Parse concatenated data
@@ -103,7 +101,7 @@ func (conn *Connection) sumReadFallback(requests []SumReadRequest) ([]SumReadRes
 		data, err := conn.Read(req.Group, req.Offset, req.Length)
 		if err != nil {
 			results[i].Error = ReturnCodeDeviceError
-			log.Warn().Err(err).Int("index", i).Msg("individual read failed in SumRead fallback")
+			conn.logger.Warn("individual read failed in SumRead fallback", "error", err, "index", i)
 		} else {
 			results[i].Error = ReturnCodeNoErrors
 			results[i].Data = data

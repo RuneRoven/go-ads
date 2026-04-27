@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-
-	"github.com/rs/zerolog/log"
 )
 
 // Write - ADS command id: 3
@@ -24,21 +22,19 @@ func (conn *Connection) Write(group uint32, offset uint32, data []byte) error {
 
 	err := binary.Write(request, binary.LittleEndian, writeRequest)
 	if err != nil {
-		log.Error().Err(err).Msg("binary.Write failed")
+		conn.logger.Error("binary.Write failed", "error", err)
 		return err
 	}
 	err = binary.Write(request, binary.LittleEndian, data)
 	if err != nil {
-		log.Error().Err(err).Msg("binary.Write failed")
+		conn.logger.Error("binary.Write failed", "error", err)
 		return err
 	}
 
 	// Try to send the request
 	resp, err := conn.sendRequest(CommandIDWrite, request.Bytes())
 	if err != nil {
-		log.Error().
-			Err(err).
-			Msg("error during send request for write")
+		conn.logger.Error("error during send request for write", "error", err)
 		return err
 	}
 	respBuffer := bytes.NewBuffer(resp)

@@ -3,8 +3,6 @@ package ads
 import (
 	"encoding/binary"
 	"fmt"
-
-	"github.com/rs/zerolog/log"
 )
 
 // SumWriteRequest represents a single write request within a sum/batch write.
@@ -61,7 +59,7 @@ func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, 
 	resp, err := conn.WriteRead(uint32(GroupSumupWrite), uint32(n), readLen, writeData)
 	if err != nil {
 		if !conn.sumReadChecked.Load() && isSumCommandUnsupportedError(err) {
-			log.Warn().Err(err).Msg("SumWrite not supported by PLC, using individual writes")
+			conn.logger.Warn("SumWrite not supported by PLC, using individual writes", "error", err)
 			conn.sumReadSupported.Store(false)
 			conn.sumReadChecked.Store(true)
 			return conn.sumWriteFallback(requests)
@@ -95,7 +93,7 @@ func (conn *Connection) sumWriteFallback(requests []SumWriteRequest) ([]SumWrite
 		err := conn.Write(req.Group, req.Offset, req.Data)
 		if err != nil {
 			results[i].Error = ReturnCodeDeviceError
-			log.Warn().Err(err).Int("index", i).Msg("individual write failed in SumWrite fallback")
+			conn.logger.Warn("individual write failed in SumWrite fallback", "error", err, "index", i)
 		} else {
 			results[i].Error = ReturnCodeNoErrors
 		}

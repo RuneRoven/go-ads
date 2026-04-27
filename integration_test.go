@@ -4,7 +4,9 @@ package ads
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -19,8 +21,11 @@ import (
 //   ADS_PLC_IP       - PLC IP address (default: 192.168.3.224)
 //   ADS_TARGET_AMS   - PLC AMS NetID (default: 5.154.236.19.1.1)
 //   ADS_TARGET_PORT  - PLC AMS port (default: 851)
-//   ADS_LOCAL_AMS    - Local AMS NetID (default: auto)
+//   ADS_LOCAL_AMS    - Local AMS NetID (default: auto-derived from local IP)
+//   ADS_HOST_IP      - Local IP the PLC should use to reach us (default: auto-derived)
 //   ADS_SYMBOL_NAME  - Symbol to read (default: first found)
+//   ADS_ROUTE_USER   - PLC admin username for auto-creating AMS route (optional)
+//   ADS_ROUTE_PASS   - PLC admin password for auto-creating AMS route (optional)
 
 func getEnvOrDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -90,6 +95,46 @@ func setupConnection(t *testing.T) *Connection {
 		t.Fatalf("invalid ADS_TARGET_PORT %q: %v", targetPortStr, err)
 	}
 	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
+
+	// Auto-create AMS route if credentials are provided
+	routeUser := os.Getenv("ADS_ROUTE_USER")
+	routePass := os.Getenv("ADS_ROUTE_PASS")
+	if routeUser != "" && routePass != "" {
+		// Determine local AMS NetID for route registration
+		var localNetID [6]byte
+		if localAMS != "auto" && localAMS != "" {
+			netIDBytes, err := stringToNetID(localAMS)
+			if err != nil {
+				t.Fatalf("invalid ADS_LOCAL_AMS %q: %v", localAMS, err)
+			}
+			localNetID = netIDBytes
+		} else {
+			// Auto-derive from local IP facing the PLC
+			udpConn, err := net.DialTimeout("udp4", ip+":48899", 2*time.Second)
+			if err != nil {
+				t.Fatalf("failed to determine local IP for route: %v", err)
+			}
+			localAddr := udpConn.LocalAddr().(*net.UDPAddr)
+			udpConn.Close()
+			ipv4 := localAddr.IP.To4()
+			localNetID = [6]byte{ipv4[0], ipv4[1], ipv4[2], ipv4[3], 1, 1}
+		}
+
+		// Determine the IP the PLC should use to reach us
+		hostIP := os.Getenv("ADS_HOST_IP")
+		if hostIP == "" {
+			hostIP = fmt.Sprintf("%d.%d.%d.%d", localNetID[0], localNetID[1], localNetID[2], localNetID[3])
+		}
+
+		t.Logf("adding AMS route on %s (local NetID: %d.%d.%d.%d.%d.%d, host IP: %s)", ip,
+			localNetID[0], localNetID[1], localNetID[2], localNetID[3], localNetID[4], localNetID[5], hostIP)
+		err := AddRemoteRoute(ip, localNetID, "go-ads-test", hostIP, routeUser, routePass)
+		if err != nil {
+			t.Logf("warning: AddRemoteRoute failed (may already exist): %v", err)
+		} else {
+			t.Log("AMS route added successfully")
+		}
+	}
 
 	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second)
 	if err != nil {
@@ -612,11 +657,30 @@ type writeTestCase struct {
 }
 
 var writeTestCases = []writeTestCase{
+	// Boolean
 	{"ADS_WRITE_BOOL", "true", "false"},
+	// Signed integers
+	{"ADS_WRITE_SINT", "-42", "100"},
 	{"ADS_WRITE_INT", "42", "100"},
+	{"ADS_WRITE_DINT", "100000", "200000"},
+	// Unsigned integers
+	{"ADS_WRITE_USINT", "200", "100"},
+	{"ADS_WRITE_UINT", "50000", "30000"},
+	{"ADS_WRITE_UDINT", "3000000", "1000000"},
+	// Floating point
 	{"ADS_WRITE_REAL", "3.14", "6.28"},
-	{"ADS_WRITE_STRING", "hello", "world"},
 	{"ADS_WRITE_LREAL", "2.718281828", "1.414213562"},
+	// String
+	{"ADS_WRITE_STRING", "hello", "world"},
+	// Bit fields
+	{"ADS_WRITE_BYTE", "170", "85"},
+	{"ADS_WRITE_WORD", "43690", "21845"},
+	{"ADS_WRITE_DWORD", "2863311530", "1431655765"},
+	// Time types
+	{"ADS_WRITE_TIME", "01:23:45.678", "00:00:01"},
+	{"ADS_WRITE_DATE", "2024-06-15", "2000-01-01"},
+	{"ADS_WRITE_DT", "2024-06-15 13:30:00", "2000-01-01 00:00:00"},
+	{"ADS_WRITE_TOD", "13:45", "00:01"},
 }
 
 // valuesApproxEqual compares two value strings. For float types (REAL/LREAL),
@@ -824,8 +888,8 @@ func TestIntegrationReadMultipleSymbols(t *testing.T) {
 		t.Fatalf("ReadMultipleSymbols failed: %v", err)
 	}
 
-	if len(values) == 0 {
-		t.Error("expected at least one result from ReadMultipleSymbols")
+	if len(values) != len(names) {
+		t.Errorf("expected %d results from ReadMultipleSymbols, got %d", len(names), len(values))
 	}
 
 	for name, val := range values {
@@ -900,4 +964,261 @@ func TestIntegrationCheckSymbolVersion(t *testing.T) {
 	if changed2 {
 		t.Error("symbol version should not change between two consecutive calls")
 	}
+}
+
+func TestIntegrationReadProcessData(t *testing.T) {
+	conn := setupConnection(t)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	// Read counter twice with delay to verify live data
+	counterName := os.Getenv("ADS_READ_COUNTER")
+	if counterName != "" {
+		val1, err := conn.ReadFromSymbol(counterName)
+		if err != nil {
+			t.Fatalf("ReadFromSymbol(%q) failed: %v", counterName, err)
+		}
+		t.Logf("counter read 1: %s = %s", counterName, val1)
+
+		time.Sleep(1100 * time.Millisecond) // counter updates every cycle (10ms), but value may be cached
+
+		val2, err := conn.ReadFromSymbol(counterName)
+		if err != nil {
+			t.Fatalf("ReadFromSymbol(%q) second read failed: %v", counterName, err)
+		}
+		t.Logf("counter read 2: %s = %s", counterName, val2)
+
+		// Parse as integers and verify increment
+		n1, err1 := strconv.ParseUint(val1, 10, 64)
+		n2, err2 := strconv.ParseUint(val2, 10, 64)
+		if err1 == nil && err2 == nil {
+			if n2 <= n1 {
+				t.Errorf("counter did not increment: %d -> %d", n1, n2)
+			} else {
+				t.Logf("counter incremented: %d -> %d (delta=%d)", n1, n2, n2-n1)
+			}
+		}
+	}
+
+	// Read a REAL value
+	realName := os.Getenv("ADS_READ_REAL")
+	if realName != "" {
+		val, err := conn.ReadFromSymbol(realName)
+		if err != nil {
+			t.Fatalf("ReadFromSymbol(%q) failed: %v", realName, err)
+		}
+		t.Logf("real: %s = %s", realName, val)
+		// Verify it parses as a float
+		if _, err := strconv.ParseFloat(val, 64); err != nil {
+			t.Errorf("expected float value for %s, got %q", realName, val)
+		}
+	}
+
+	// Read a STRING value
+	stringName := os.Getenv("ADS_READ_STRING")
+	if stringName != "" {
+		val, err := conn.ReadFromSymbol(stringName)
+		if err != nil {
+			t.Fatalf("ReadFromSymbol(%q) failed: %v", stringName, err)
+		}
+		t.Logf("string: %s = %q", stringName, val)
+		if val == "" {
+			t.Errorf("expected non-empty string for %s", stringName)
+		}
+	}
+
+	if counterName == "" && realName == "" && stringName == "" {
+		t.Skip("no ADS_READ_* env vars set")
+	}
+}
+
+// waitForReconnect waits for the full reconnect cycle: first waits for the
+// connection to become disconnected (confirming the error was detected), then
+// waits for reconnect to fully complete (disconnected=false AND reconnecting=false).
+func waitForReconnect(t *testing.T, conn *Connection, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+
+	// Phase 1: wait for disconnect to be detected
+	for !conn.IsDisconnected() && !conn.reconnecting.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("reconnect was never triggered within timeout")
+		case <-tick.C:
+		}
+	}
+
+	// Phase 2: wait for reconnect to fully complete
+	for conn.IsDisconnected() || conn.reconnecting.Load() {
+		select {
+		case <-deadline:
+			t.Fatalf("reconnect did not complete within timeout (disconnected=%v, reconnecting=%v)",
+				conn.IsDisconnected(), conn.reconnecting.Load())
+		case <-tick.C:
+		}
+	}
+}
+
+func TestIntegrationReconnect(t *testing.T) {
+	conn := setupConnection(t)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	symbols, _ := conn.ListSymbols()
+	symbolName := pickParseableSymbol(symbols)
+	if symbolName == "" {
+		t.Skip("no parseable symbols available")
+	}
+
+	// 1. Read symbol to confirm connection works
+	val1, err := conn.ReadFromSymbol(symbolName)
+	if err != nil {
+		t.Fatalf("pre-reconnect ReadFromSymbol(%q) failed: %v", symbolName, err)
+	}
+	t.Logf("pre-reconnect: %s = %s", symbolName, val1)
+
+	// 2. Subscribe to notification
+	ch := make(chan *Update, 10)
+	handle, err := conn.AddSymbolNotification(symbolName, 100, 100, TransModeServerOnChange, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotification failed: %v", err)
+	}
+	t.Logf("notification handle: %d", handle)
+
+	// Wait for initial notification to confirm subscription works
+	select {
+	case update := <-ch:
+		t.Logf("pre-reconnect notification: %s = %s", update.Variable, update.Value)
+	case <-time.After(3 * time.Second):
+		t.Log("no pre-reconnect notification (continuing)")
+	}
+
+	// 3. Simulate network drop by closing TCP connection.
+	// Expect "listen read error, triggering reconnect" in logs — this is the
+	// detection mechanism firing after we deliberately close the socket.
+	t.Log("simulating network drop (expect 'listen read error' log)...")
+	conn.connMu.Lock()
+	conn.connection.Close()
+	conn.connMu.Unlock()
+
+	// 4. Wait for reconnect to complete
+	waitForReconnect(t, conn, 15*time.Second)
+	t.Log("reconnect completed")
+
+	// 5. Read symbol again — must succeed after reconnect
+	val2, err := conn.ReadFromSymbol(symbolName)
+	if err != nil {
+		t.Fatalf("post-reconnect ReadFromSymbol(%q) failed: %v", symbolName, err)
+	}
+	t.Logf("post-reconnect: %s = %s", symbolName, val2)
+
+	// 6. Wait for notification — proves notifications were re-subscribed
+	select {
+	case update := <-ch:
+		t.Logf("post-reconnect notification: %s = %s", update.Variable, update.Value)
+	case <-time.After(5 * time.Second):
+		t.Log("no post-reconnect notification within 5s (may be expected if value doesn't change)")
+	}
+}
+
+func TestIntegrationReconnectDuringBatchRead(t *testing.T) {
+	conn := setupConnection(t)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	symbols, _ := conn.ListSymbols()
+	names := pickParseableSymbols(symbols, 5)
+	if len(names) < 2 {
+		t.Skip("need at least 2 parseable symbols")
+	}
+
+	// 1. Successful batch read before reconnect
+	values1, err := conn.ReadMultipleSymbols(names)
+	if err != nil {
+		t.Fatalf("pre-reconnect ReadMultipleSymbols failed: %v", err)
+	}
+	t.Logf("pre-reconnect batch read: %d symbols", len(values1))
+	for name, val := range values1 {
+		t.Logf("  %s = %s", name, val)
+	}
+
+	// 2. Simulate network drop.
+	// Expect "listen read error, triggering reconnect" in logs — this is the
+	// detection mechanism firing after we deliberately close the socket.
+	t.Log("simulating network drop (expect 'listen read error' log)...")
+	conn.connMu.Lock()
+	conn.connection.Close()
+	conn.connMu.Unlock()
+
+	// 3. Wait for reconnect
+	waitForReconnect(t, conn, 15*time.Second)
+	t.Log("reconnect completed")
+
+	// 4. Batch read again — must succeed, proving handles and SumRead work after reconnect
+	values2, err := conn.ReadMultipleSymbols(names)
+	if err != nil {
+		t.Fatalf("post-reconnect ReadMultipleSymbols failed: %v", err)
+	}
+	t.Logf("post-reconnect batch read: %d symbols", len(values2))
+	for name, val := range values2 {
+		t.Logf("  %s = %s", name, val)
+	}
+
+	if len(values2) != len(names) {
+		t.Errorf("expected %d results after reconnect, got %d", len(names), len(values2))
+	}
+}
+
+// TestIntegrationReconnectReadDuringDisconnect verifies that sendRequest's
+// built-in retry handles the race window between TCP death and reconnect
+// completion. Instead of waiting for reconnect first, we issue a read
+// immediately after killing the connection — the library must retry
+// transparently.
+func TestIntegrationReconnectReadDuringDisconnect(t *testing.T) {
+	conn := setupConnection(t)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	symbols, _ := conn.ListSymbols()
+	symbolName := pickParseableSymbol(symbols)
+	if symbolName == "" {
+		t.Skip("no parseable symbols available")
+	}
+
+	// 1. Confirm connection works
+	val1, err := conn.ReadFromSymbol(symbolName)
+	if err != nil {
+		t.Fatalf("pre-disconnect ReadFromSymbol(%q) failed: %v", symbolName, err)
+	}
+	t.Logf("pre-disconnect: %s = %s", symbolName, val1)
+
+	// 2. Kill TCP — triggers reconnect in background.
+	// Expect "listen read error, triggering reconnect" in logs — this is the
+	// detection mechanism firing after we deliberately close the socket.
+	t.Log("simulating network drop (expect 'listen read error' log)...")
+	conn.connMu.Lock()
+	conn.connection.Close()
+	conn.connMu.Unlock()
+
+	// 3. Immediately read WITHOUT waiting for reconnect.
+	// sendRequest's retry loop should handle this transparently.
+	val2, err := conn.ReadFromSymbol(symbolName)
+	if err != nil {
+		t.Fatalf("read during reconnect failed (sendRequest retry should have handled this): %v", err)
+	}
+	t.Logf("read during reconnect succeeded: %s = %s", symbolName, val2)
+
+	// 4. Wait for reconnect to fully complete before Close() runs,
+	// so handle cleanup can succeed cleanly.
+	waitForReconnect(t, conn, 15*time.Second)
 }

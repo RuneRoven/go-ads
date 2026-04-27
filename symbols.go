@@ -8,8 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 type datatypeEntry struct {
@@ -234,13 +232,13 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 
 	if totalSize < 48 {
 		err = fmt.Errorf("%s - wrong size < 48 bytes", parent)
-		log.Error().Err(err).Hex("data", data.Bytes()).Msg("error during binary read")
+		getDefaultLogger().Error("error during binary read", "error", err, hexAttr("data", data.Bytes()))
 		return
 	}
 
 	err = binary.Read(data, binary.LittleEndian, &result)
 	if err != nil {
-		log.Error().Err(err).Msg("error during binary read")
+		getDefaultLogger().Error("error during binary read", "error", err)
 		return
 	}
 	name := make([]byte, result.NameLength)
@@ -249,19 +247,19 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 
 	err = binary.Read(data, binary.LittleEndian, name)
 	if err != nil {
-		log.Error().Err(err).Msg("error during binary read")
+		getDefaultLogger().Error("error during binary read", "error", err)
 		return
 	}
 	data.Next(1)
 	err = binary.Read(data, binary.LittleEndian, dt)
 	if err != nil {
-		log.Error().Err(err).Msg("error during binary read")
+		getDefaultLogger().Error("error during binary read", "error", err)
 		return
 	}
 	data.Next(1)
 	err = binary.Read(data, binary.LittleEndian, comment)
 	if err != nil {
-		log.Error().Err(err).Msg("error during binary read")
+		getDefaultLogger().Error("error during binary read", "error", err)
 		return
 	}
 	data.Next(1)
@@ -356,13 +354,15 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (chil
 // GetJSON (onlyChanged bool) string
 func (symbol *Symbol) GetJSON(onlyChanged bool) string {
 	data := symbol.parseSymbol(onlyChanged)
-	if jsonData, err := json.Marshal(data); err == nil {
-		return string(jsonData)
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		getDefaultLogger().Warn("GetJSON marshal error", "symbol", symbol.Name, "error", err)
+		return ""
 	}
-	return ""
+	return string(jsonData)
 }
 
-var stringsList = map[string]struct{}{"STRING": {}, "TIME": {}, "TOD": {}, "DATE": {}, "DT": {}}
+var stringsList = map[string]struct{}{"STRING": {}, "TIME": {}, "TOD": {}, "TIME_OF_DAY": {}, "DATE": {}, "DT": {}, "DATE_AND_TIME": {}}
 
 // parseSymbol returns JSON interface for symbol
 func (symbol *Symbol) parseSymbol(onlyChanged bool) (rData interface{}) {
