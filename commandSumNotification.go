@@ -53,8 +53,9 @@ func (conn *Connection) SumAddDeviceNotification(requests []SumNotificationReque
 			conn.logger.Warn("Sum commands not supported by PLC, using individual calls", "error", err)
 			conn.sumReadSupported.Store(false)
 			conn.sumReadChecked.Store(true)
+			return conn.sumAddNotificationFallback(requests)
 		}
-		return conn.sumAddNotificationFallback(requests)
+		return nil, nil, fmt.Errorf("SumAddDeviceNotification failed: %w", err)
 	}
 
 	if !conn.sumReadChecked.Load() {
@@ -106,8 +107,9 @@ func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnC
 			conn.logger.Warn("Sum commands not supported by PLC, using individual calls", "error", err)
 			conn.sumReadSupported.Store(false)
 			conn.sumReadChecked.Store(true)
+			return conn.sumDeleteNotificationFallback(handles)
 		}
-		return conn.sumDeleteNotificationFallback(handles)
+		return nil, fmt.Errorf("SumDeleteDeviceNotification failed: %w", err)
 	}
 
 	if !conn.sumReadChecked.Load() {

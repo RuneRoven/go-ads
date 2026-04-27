@@ -52,8 +52,9 @@ func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, err
 			conn.logger.Warn("SumRead not supported by PLC, using individual reads", "error", err)
 			conn.sumReadSupported.Store(false)
 			conn.sumReadChecked.Store(true)
+			return conn.sumReadFallback(requests)
 		}
-		return conn.sumReadFallback(requests)
+		return nil, fmt.Errorf("SumRead failed: %w", err)
 	}
 
 	if !conn.sumReadChecked.Load() {
