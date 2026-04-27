@@ -19,7 +19,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	ads "github.com/RuneRoven/go-ads"
+	ads "github.com/RuneRoven/go-ads/v2"
 )
 
 type Config struct {
