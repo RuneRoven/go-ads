@@ -3,8 +3,6 @@ package ads
 import (
 	"encoding/binary"
 	"fmt"
-
-	"github.com/rs/zerolog/log"
 )
 
 // SumReadRequest represents a single read request within a sum/batch read.
@@ -51,7 +49,7 @@ func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, err
 	resp, err := conn.WriteRead(uint32(GroupSumupReadEx2), uint32(n), readLen, writeData)
 	if err != nil {
 		if !conn.sumReadChecked.Load() && isSumCommandUnsupportedError(err) {
-			log.Warn().Err(err).Msg("SumRead not supported by PLC, using individual reads")
+			conn.logger.Warn("SumRead not supported by PLC, using individual reads", "error", err)
 			conn.sumReadSupported.Store(false)
 			conn.sumReadChecked.Store(true)
 		}
@@ -102,7 +100,7 @@ func (conn *Connection) sumReadFallback(requests []SumReadRequest) ([]SumReadRes
 		data, err := conn.Read(req.Group, req.Offset, req.Length)
 		if err != nil {
 			results[i].Error = ReturnCodeDeviceError
-			log.Warn().Err(err).Int("index", i).Msg("individual read failed in SumRead fallback")
+			conn.logger.Warn("individual read failed in SumRead fallback", "error", err, "index", i)
 		} else {
 			results[i].Error = ReturnCodeNoErrors
 			results[i].Data = data

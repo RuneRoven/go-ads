@@ -2,12 +2,11 @@ package ads
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"strconv"
 	"strings"
-
-	"github.com/rs/zerolog/log"
 )
 
 type amsTCPHeader struct {
@@ -48,13 +47,12 @@ func stringToNetID(source string) (result [6]byte, err error) {
 }
 
 func (conn *Connection) encode(command CommandID, data []byte, invokeID uint32) ([]byte, error) {
-	log.Trace().
-		Interface("command", command).
-		Interface("target", conn.target).
-		Interface("source", conn.source).
-		Uint32("ID", invokeID).
-		Int("length of data", len(data)).
-		Msg("Starting encoding of AMS header")
+	conn.logger.Log(context.Background(), LevelTrace, "Starting encoding of AMS header",
+		"command", command,
+		"target", conn.target,
+		"source", conn.source,
+		"ID", invokeID,
+		"length of data", len(data))
 	tcpHeader := &amsTCPHeader{
 		Unknown1: 0,
 		System:   0,
@@ -80,19 +78,13 @@ func (conn *Connection) encode(command CommandID, data []byte, invokeID uint32) 
 		return nil, err
 	}
 	err = binary.Write(buff, binary.LittleEndian, data)
-	log.Trace().
-		Bytes("data", data).
-		Msg("data to transmit")
+	conn.logger.Log(context.Background(), LevelTrace, "data to transmit", "data", data)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Msg("binary.Write failed")
+		conn.logger.Error("binary.Write failed", "error", err)
 		return nil, err
 	}
 
-	log.Trace().
-		Hex("bytes", buff.Bytes()).
-		Msg("The encoded AMS header:")
+	conn.logger.Log(context.Background(), LevelTrace, "The encoded AMS header:", hexAttr("bytes", buff.Bytes()))
 
 	return buff.Bytes(), nil
 }

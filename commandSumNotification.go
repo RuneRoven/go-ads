@@ -4,8 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 // SumNotificationRequest represents a single notification add request within a batch.
@@ -52,7 +50,7 @@ func (conn *Connection) SumAddDeviceNotification(requests []SumNotificationReque
 	resp, err := conn.WriteRead(uint32(GroupSumupAddDeviceNotification), uint32(n), readLen, writeData)
 	if err != nil {
 		if !conn.sumReadChecked.Load() && isSumCommandUnsupportedError(err) {
-			log.Warn().Err(err).Msg("Sum commands not supported by PLC, using individual calls")
+			conn.logger.Warn("Sum commands not supported by PLC, using individual calls", "error", err)
 			conn.sumReadSupported.Store(false)
 			conn.sumReadChecked.Store(true)
 		}
@@ -105,7 +103,7 @@ func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnC
 	resp, err := conn.WriteRead(uint32(GroupSumupDeleteDeviceNotification), uint32(n), readLen, writeData)
 	if err != nil {
 		if !conn.sumReadChecked.Load() && isSumCommandUnsupportedError(err) {
-			log.Warn().Err(err).Msg("Sum commands not supported by PLC, using individual calls")
+			conn.logger.Warn("Sum commands not supported by PLC, using individual calls", "error", err)
 			conn.sumReadSupported.Store(false)
 			conn.sumReadChecked.Store(true)
 		}
@@ -131,7 +129,7 @@ func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnC
 	for i, h := range handles {
 		if errors[i] == ReturnCodeNoErrors {
 			delete(conn.activeNotifications, h)
-			log.Info().Uint32("handle", h).Msg("batch deleted notification handle")
+			conn.logger.Info("batch deleted notification handle", "handle", h)
 		}
 	}
 	conn.symbolLock.Unlock()
@@ -148,16 +146,15 @@ func (conn *Connection) sumAddNotificationFallback(requests []SumNotificationReq
 		// Downgrade v2 modes for older PLCs that don't support them
 		transMode := downgradeTransMode(req.TransmissionMode)
 		if transMode != req.TransmissionMode {
-			log.Info().
-				Str("from", req.TransmissionMode.String()).
-				Str("to", transMode.String()).
-				Int("index", i).
-				Msg("downgraded transmission mode for older PLC")
+			conn.logger.Info("downgraded transmission mode for older PLC",
+				"from", req.TransmissionMode.String(),
+				"to", transMode.String(),
+				"index", i)
 		}
 		h, err := conn.AddDeviceNotification(req.Group, req.Offset, req.Length, transMode, req.MaxDelay, req.CycleTime)
 		if err != nil {
 			errors[i] = ReturnCodeDeviceError
-			log.Warn().Err(err).Int("index", i).Msg("individual AddDeviceNotification failed in fallback")
+			conn.logger.Warn("individual AddDeviceNotification failed in fallback", "error", err, "index", i)
 		} else {
 			errors[i] = ReturnCodeNoErrors
 			handles[i] = h
@@ -173,7 +170,7 @@ func (conn *Connection) sumDeleteNotificationFallback(handles []uint32) ([]Retur
 		err := conn.DeleteDeviceNotification(h)
 		if err != nil {
 			errors[i] = ReturnCodeDeviceError
-			log.Warn().Err(err).Uint32("handle", h).Msg("individual DeleteDeviceNotification failed in fallback")
+			conn.logger.Warn("individual DeleteDeviceNotification failed in fallback", "error", err, "handle", h)
 		} else {
 			errors[i] = ReturnCodeNoErrors
 		}

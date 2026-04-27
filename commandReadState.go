@@ -2,10 +2,9 @@ package ads
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
-
-	"github.com/rs/zerolog/log"
 )
 
 // ReadStateResponse - ADS command id: 4
@@ -19,14 +18,10 @@ func (conn *Connection) ReadState() (response States, err error) {
 	// Try to send the request
 	resp, err := conn.sendRequest(CommandIDReadState, []byte{})
 	if err != nil {
-		log.Error().
-			Err(err).
-			Msg("Error during read state")
+		conn.logger.Error("Error during read state", "error", err)
 		return
 	}
-	log.Trace().
-		Bytes("data", resp).
-		Msg("response from plc for state")
+	conn.logger.Log(context.Background(), LevelTrace, "response from plc for state", "data", resp)
 	type readStateResponse struct {
 		Error ReturnCode
 		States
@@ -39,10 +34,9 @@ func (conn *Connection) ReadState() (response States, err error) {
 	if stateResponse.Error > 0 {
 		return response, fmt.Errorf("ADS error in ReadState: %w", stateResponse.Error)
 	}
-	log.Debug().
-		Uint16("adsState", uint16(stateResponse.AdsState)).
-		Uint16("deviceState", stateResponse.DeviceState).
-		Msg("read state response")
+	conn.logger.Debug("read state response",
+		"adsState", uint16(stateResponse.AdsState),
+		"deviceState", stateResponse.DeviceState)
 
 	return stateResponse.States, nil
 }

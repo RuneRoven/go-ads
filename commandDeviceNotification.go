@@ -6,8 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 const (
@@ -77,9 +75,7 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 	symbol, ok := conn.activeNotifications[handle]
 	if !ok {
 		conn.symbolLock.Unlock()
-		log.Error().
-			Int("handle", int(handle)).
-			Msg("Can't find notification handle")
+		conn.logger.Error("Can't find notification handle", "handle", handle)
 		return nil
 	}
 	datatypes := conn.datatypes
@@ -93,16 +89,12 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 	value, err := symbol.parse(content, 0, datatypes)
 	if err != nil {
 		conn.symbolLock.Unlock()
-		log.Error().
-			Err(err).
-			Msg("error during parse of notification")
+		conn.logger.Error("error during parse of notification", "error", err)
 		return nil
 	}
 	conn.symbolLock.Unlock()
 
-	log.Trace().
-		Str("update", value).
-		Msg("update received")
+	conn.logger.Log(context.Background(), LevelTrace, "update received", "update", value)
 	updateStruct := &Update{
 		Variable:  fullName,
 		Value:     value,
@@ -119,14 +111,11 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 	select {
 	case <-ctx.Done():
 	case notification <- updateStruct:
-		log.Debug().
-			Uint32("handle", handle).
-			Msg("Successfully delivered notification")
+		conn.logger.Debug("Successfully delivered notification", "handle", handle)
 	case <-timer.C:
-		log.Warn().
-			Uint32("handle", handle).
-			Str("symbol", fullName).
-			Msg("notification channel send timed out, receiver may be slow")
+		conn.logger.Warn("notification channel send timed out, receiver may be slow",
+			"handle", handle,
+			"symbol", fullName)
 	}
 	return nil
 }

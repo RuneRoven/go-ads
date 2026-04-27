@@ -9,8 +9,6 @@ import (
 	"slices"
 	"strconv"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]SymbolUploadDataType) (string, error) {
@@ -160,9 +158,6 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 	}
 
 	symbol.updateValue(newValue)
-	log.Trace().
-		Str("value", newValue).
-		Msg("parse value")
 	return symbol.Value, nil
 }
 

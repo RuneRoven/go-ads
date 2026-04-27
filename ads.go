@@ -3,13 +3,12 @@ package ads
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"slices"
 	"strings"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 // ListSymbols returns the full symbol table.
@@ -73,7 +72,7 @@ func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	// Step 1: Read symbol version
 	version, err := conn.GetSymbolVersion()
 	if err != nil {
-		log.Warn().Err(err).Msg("failed to read symbol version during slow discovery")
+		conn.logger.Warn("failed to read symbol version during slow discovery", "error", err)
 	} else {
 		conn.symbolLock.Lock()
 		conn.symbolVersion = version
@@ -97,7 +96,7 @@ func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	)
 	if err != nil {
 		// Fallback: download datatypes in one request
-		log.Info().Err(err).Msg("chunked datatype download failed, falling back to single request")
+		conn.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
 		datatypesData, err = conn.GetUploadSymbolInfoDataTypes(uploadInfo.DataTypeLength)
 		if err != nil {
 			return fmt.Errorf("failed to download datatypes: %w", err)
@@ -119,7 +118,7 @@ func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	)
 	if err != nil {
 		// Fallback: download symbols in one request
-		log.Info().Err(err).Msg("chunked symbol download failed, falling back to single request")
+		conn.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
 		symbolsData, err = conn.GetUploadSymbolInfoSymbols(uploadInfo.SymbolLength)
 		if err != nil {
 			return fmt.Errorf("failed to download symbols: %w", err)
@@ -138,10 +137,9 @@ func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	conn.onDemandSymbols = map[string]bool{}
 	conn.symbolLock.Unlock()
 
-	log.Info().
-		Uint32("symbolCount", uploadInfo.SymbolCount).
-		Uint32("datatypeCount", uploadInfo.DataTypeCount).
-		Msg("slow symbol discovery complete")
+	conn.logger.Info("slow symbol discovery complete",
+		"symbolCount", uploadInfo.SymbolCount,
+		"datatypeCount", uploadInfo.DataTypeCount)
 
 	return nil
 }
@@ -225,9 +223,7 @@ func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 			localSymbol.Handle = handle
 			conn.symbolLock.Unlock()
 		}
-		log.Trace().
-			Interface("symbol", localSymbol).
-			Msg("symbol got")
+		conn.logger.Log(context.Background(), LevelTrace, "symbol got", "symbol", localSymbol)
 		return localSymbol, nil
 	}
 
@@ -257,11 +253,10 @@ func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 	conn.onDemandSymbols[symbolName] = true
 	conn.symbolLock.Unlock()
 
-	log.Info().
-		Str("symbol", symbolName).
-		Str("dataType", sym.DataType).
-		Uint32("length", sym.Length).
-		Msg("symbol resolved on-demand")
+	conn.logger.Info("symbol resolved on-demand",
+		"symbol", symbolName,
+		"dataType", sym.DataType,
+		"length", sym.Length)
 
 	return sym, nil
 }
@@ -365,10 +360,9 @@ func (conn *Connection) WriteToSymbol(symbolName string, value string) error {
 	symbol.ValueParsed = false
 	conn.symbolLock.Unlock()
 
-	log.Trace().
-		Str("symbol", symbolName).
-		Str("value", value).
-		Msg("wrote to symbol")
+	conn.logger.Log(context.Background(), LevelTrace, "wrote to symbol",
+		"symbol", symbolName,
+		"value", value)
 	return nil
 }
 
@@ -409,10 +403,9 @@ func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
 	symbol.Value = value
 	conn.symbolLock.Unlock()
 
-	log.Trace().
-		Str("symbol", symbolName).
-		Str("Value", value).
-		Msg("Read from symbol")
+	conn.logger.Log(context.Background(), LevelTrace, "Read from symbol",
+		"symbol", symbolName,
+		"Value", value)
 
 	return value, nil
 }
@@ -421,7 +414,7 @@ func (conn *Connection) GetSymbolUploadInfo() (uploadInfo SymbolUploadInfo, err 
 	// Try extended info (0xF00F) first, fall back to basic info (0xF00C)
 	res, err := conn.Read(uint32(GroupSymbolUploadInfo2), 0, 24)
 	if err != nil {
-		log.Debug().Err(err).Msg("GroupSymbolUploadInfo2 not supported, falling back to GroupSymbolUploadInfo")
+		conn.logger.Debug("GroupSymbolUploadInfo2 not supported, falling back to GroupSymbolUploadInfo", "error", err)
 		res, err = conn.Read(uint32(GroupSymbolUploadInfo), 0, 16)
 		if err != nil {
 			return uploadInfo, fmt.Errorf("GetSymbolUploadInfo failed: %w", err)
@@ -493,10 +486,9 @@ func (conn *Connection) CheckSymbolVersion() (changed bool, err error) {
 	oldVersion := conn.symbolVersion
 	conn.symbolLock.Unlock()
 	if version != oldVersion {
-		log.Info().
-			Uint32("old", oldVersion).
-			Uint32("new", version).
-			Msg("symbol version changed")
+		conn.logger.Info("symbol version changed",
+			"old", oldVersion,
+			"new", version)
 		return true, nil
 	}
 	return false, nil
@@ -529,7 +521,7 @@ func (conn *Connection) RefreshSymbols() error {
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, h)
 		if err := conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
-			log.Warn().Err(err).Uint32("handle", h).Msg("failed to release symbol handle")
+			conn.logger.Warn("failed to release symbol handle", "error", err, "handle", h)
 		}
 	}
 
@@ -542,7 +534,7 @@ func (conn *Connection) RefreshSymbols() error {
 	conn.symbolLock.Lock()
 	v := conn.symbolVersion
 	conn.symbolLock.Unlock()
-	log.Info().Uint32("version", v).Msg("symbols refreshed")
+	conn.logger.Info("symbols refreshed", "version", v)
 	return nil
 }
 
@@ -572,10 +564,9 @@ func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, c
 	if err != nil {
 		return 0, err
 	}
-	log.Info().
-		Int("handle", int(handle)).
-		Str("symbol", symbolName).
-		Msg("notification created")
+	conn.logger.Info("notification created",
+		"handle", handle,
+		"symbol", symbolName)
 	conn.symbolLock.Lock()
 	defer conn.symbolLock.Unlock()
 	symbol.Notification = updateReceiver
@@ -649,7 +640,7 @@ func (conn *Connection) ReadMultipleSymbols(names []string) (map[string]string, 
 	for _, name := range names {
 		symbol, err := conn.GetSymbol(name)
 		if err != nil {
-			log.Error().Err(err).Str("symbol", name).Msg("error getting symbol for batch read")
+			conn.logger.Error("error getting symbol for batch read", "error", err, "symbol", name)
 			continue
 		}
 		infos = append(infos, symbolInfo{name: name, symbol: symbol})
@@ -672,15 +663,14 @@ func (conn *Connection) ReadMultipleSymbols(names []string) (map[string]string, 
 
 	for i, result := range results {
 		if result.Error != ReturnCodeNoErrors {
-			log.Warn().
-				Str("symbol", infos[i].name).
-				Uint32("error", uint32(result.Error)).
-				Msg("symbol read error in batch")
+			conn.logger.Warn("symbol read error in batch",
+				"symbol", infos[i].name,
+				"errorCode", uint32(result.Error))
 			continue
 		}
 		value, err := infos[i].symbol.parse(result.Data, 0, conn.datatypes)
 		if err != nil {
-			log.Error().Err(err).Str("symbol", infos[i].name).Msg("error parsing symbol in batch read")
+			conn.logger.Error("error parsing symbol in batch read", "error", err, "symbol", infos[i].name)
 			continue
 		}
 		now := time.Now()
@@ -716,13 +706,13 @@ func (conn *Connection) WriteMultipleSymbols(values map[string]string) (map[stri
 	for name, value := range values {
 		symbol, err := conn.GetSymbol(name)
 		if err != nil {
-			log.Error().Err(err).Str("symbol", name).Msg("error getting symbol for batch write")
+			conn.logger.Error("error getting symbol for batch write", "error", err, "symbol", name)
 			continue
 		}
 
 		data, err := symbol.writeToNode(value, 0, datatypes)
 		if err != nil {
-			log.Error().Err(err).Str("symbol", name).Msg("error serializing symbol for batch write")
+			conn.logger.Error("error serializing symbol for batch write", "error", err, "symbol", name)
 			continue
 		}
 
@@ -774,7 +764,7 @@ func (conn *Connection) AddSymbolNotifications(configs []NotificationConfig, ch 
 	for _, cfg := range configs {
 		symbol, err := conn.GetSymbol(cfg.SymbolName)
 		if err != nil {
-			log.Error().Err(err).Str("symbol", cfg.SymbolName).Msg("error getting symbol for batch notification")
+			conn.logger.Error("error getting symbol for batch notification", "error", err, "symbol", cfg.SymbolName)
 			continue
 		}
 		infos = append(infos, symbolInfo{config: cfg, symbol: symbol})
@@ -802,18 +792,16 @@ func (conn *Connection) AddSymbolNotifications(configs []NotificationConfig, ch 
 
 	for i, h := range handles {
 		if errors[i] != ReturnCodeNoErrors {
-			log.Error().
-				Str("symbol", infos[i].config.SymbolName).
-				Uint32("error", uint32(errors[i])).
-				Msg("error adding notification in batch")
+			conn.logger.Error("error adding notification in batch",
+				"symbol", infos[i].config.SymbolName,
+				"errorCode", uint32(errors[i]))
 			continue
 		}
 		infos[i].symbol.Notification = ch
 		conn.activeNotifications[h] = infos[i].symbol
-		log.Info().
-			Uint32("handle", h).
-			Str("symbol", infos[i].config.SymbolName).
-			Msg("batch notification created")
+		conn.logger.Info("batch notification created",
+			"handle", h,
+			"symbol", infos[i].config.SymbolName)
 	}
 
 	// Store notification configs and channel for reconnect
@@ -848,7 +836,7 @@ func (conn *Connection) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	// Read symbol version
 	version, err := conn.GetSymbolVersion()
 	if err != nil {
-		log.Warn().Err(err).Msg("failed to read symbol version during LoadSymbolList")
+		conn.logger.Warn("failed to read symbol version during LoadSymbolList", "error", err)
 	} else {
 		conn.symbolLock.Lock()
 		conn.symbolVersion = version
@@ -872,7 +860,7 @@ func (conn *Connection) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	)
 	if err != nil {
 		// Fallback: download symbols in one request
-		log.Info().Err(err).Msg("chunked symbol download failed, falling back to single request")
+		conn.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
 		symbolsData, err = conn.GetUploadSymbolInfoSymbols(uploadInfo.SymbolLength)
 		if err != nil {
 			return fmt.Errorf("failed to download symbols: %w", err)
@@ -896,9 +884,8 @@ func (conn *Connection) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	}
 	conn.symbolLock.Unlock()
 
-	log.Info().
-		Uint32("symbolCount", uploadInfo.SymbolCount).
-		Msg("symbol list loaded (browse mode)")
+	conn.logger.Info("symbol list loaded (browse mode)",
+		"symbolCount", uploadInfo.SymbolCount)
 
 	return nil
 }
@@ -931,7 +918,7 @@ func (conn *Connection) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	)
 	if err != nil {
 		// Fallback: download datatypes in one request
-		log.Info().Err(err).Msg("chunked datatype download failed, falling back to single request")
+		conn.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
 		datatypesData, err = conn.GetUploadSymbolInfoDataTypes(uploadInfo.DataTypeLength)
 		if err != nil {
 			return fmt.Errorf("failed to download datatypes: %w", err)
@@ -953,9 +940,8 @@ func (conn *Connection) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	}
 	conn.symbolLock.Unlock()
 
-	log.Info().
-		Uint32("datatypeCount", uploadInfo.DataTypeCount).
-		Msg("datatypes loaded")
+	conn.logger.Info("datatypes loaded",
+		"datatypeCount", uploadInfo.DataTypeCount)
 
 	return nil
 }
@@ -982,7 +968,7 @@ func (conn *Connection) rebuildSymbolChildrenLocked() {
 		}
 	}
 
-	log.Info().Int("symbols", len(conn.symbols)).Msg("symbol children rebuilt from datatypes")
+	conn.logger.Info("symbol children rebuilt from datatypes", "symbols", len(conn.symbols))
 }
 
 // BrowseSymbols returns browsable entries at the given path in the symbol hierarchy.

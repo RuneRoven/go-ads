@@ -8,8 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 type datatypeEntry struct {
@@ -234,13 +232,13 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 
 	if totalSize < 48 {
 		err = fmt.Errorf("%s - wrong size < 48 bytes", parent)
-		log.Error().Err(err).Hex("data", data.Bytes()).Msg("error during binary read")
+		defaultLogger.Error("error during binary read", "error", err, hexAttr("data", data.Bytes()))
 		return
 	}
 
 	err = binary.Read(data, binary.LittleEndian, &result)
 	if err != nil {
-		log.Error().Err(err).Msg("error during binary read")
+		defaultLogger.Error("error during binary read", "error", err)
 		return
 	}
 	name := make([]byte, result.NameLength)
@@ -249,19 +247,19 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 
 	err = binary.Read(data, binary.LittleEndian, name)
 	if err != nil {
-		log.Error().Err(err).Msg("error during binary read")
+		defaultLogger.Error("error during binary read", "error", err)
 		return
 	}
 	data.Next(1)
 	err = binary.Read(data, binary.LittleEndian, dt)
 	if err != nil {
-		log.Error().Err(err).Msg("error during binary read")
+		defaultLogger.Error("error during binary read", "error", err)
 		return
 	}
 	data.Next(1)
 	err = binary.Read(data, binary.LittleEndian, comment)
 	if err != nil {
-		log.Error().Err(err).Msg("error during binary read")
+		defaultLogger.Error("error during binary read", "error", err)
 		return
 	}
 	data.Next(1)
