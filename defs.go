@@ -20,8 +20,25 @@ const (
 	TransModeClientOnChange  TransMode = 2
 	TransModeServerCycle     TransMode = 3
 	TransModeServerOnChange  TransMode = 4
-	TransModeServerCycle2    TransMode = 5
-	TransModeServerOnChange2 TransMode = 6
+	// ServerCycle2 / ServerOnChange2 are the "InContext" variants (called CyclicInContext
+	// and OnChangeInContext in Beckhoff's .NET SDK). They execute the notification check
+	// within the PLC task cycle instead of a separate ADS server thread, giving more
+	// deterministic timing. Both modes are part of the same feature — if one is supported,
+	// the other is too.
+	//
+	// InContext modes require the target symbol to have a non-zero ContextMask (bits 8-11
+	// of the symbol flags). ContextMask indicates which PLC task owns the variable. If
+	// ContextMask is 0, the PLC rejects the request with 0x070B (invalid parameter) on TC3,
+	// or silently ignores it on TC2 (notifications never fire, no error).
+	//
+	// ContextMask is non-zero only for variables local to a PROGRAM POU assigned to a
+	// single task in a multi-task PLC project. GVL variables and single-task projects
+	// always have ContextMask=0. Most PLC projects are single-task.
+	//
+	// AddSymbolNotification and AddSymbolNotifications automatically fall back to
+	// ServerCycle/ServerOnChange when the symbol's ContextMask is 0.
+	TransModeServerCycle2    TransMode = 5 // CyclicInContext
+	TransModeServerOnChange2 TransMode = 6 // OnChangeInContext
 	TransModeClient1Request  TransMode = 10
 )
 
@@ -39,9 +56,9 @@ func (tm TransMode) String() string {
 	case TransModeServerOnChange:
 		return "ServerOnChange"
 	case TransModeServerCycle2:
-		return "ServerCycle2"
+		return "ServerCycle2/CyclicInContext"
 	case TransModeServerOnChange2:
-		return "ServerOnChange2"
+		return "ServerOnChange2/OnChangeInContext"
 	case TransModeClient1Request:
 		return "Client1Request"
 	default:
@@ -60,6 +77,54 @@ func downgradeTransMode(mode TransMode) TransMode {
 	default:
 		return mode
 	}
+}
+
+// SymbolFlag represents bits in the symbol flags field returned by INFOBYNAMEEX (0xF009)
+// and the bulk symbol upload. These flags control how extended symbol info is parsed
+// and which notification modes are available.
+type SymbolFlag uint32
+
+const (
+	// SymbolFlagPersistent indicates the symbol value survives PLC restarts.
+	SymbolFlagPersistent SymbolFlag = 0x0001
+	// SymbolFlagBitValue indicates the symbol is a single bit within a byte.
+	SymbolFlagBitValue SymbolFlag = 0x0002
+	// SymbolFlagReferenceTo indicates the symbol is a reference/pointer.
+	SymbolFlagReferenceTo SymbolFlag = 0x0004
+	// SymbolFlagTypeGuid indicates a 16-byte type GUID follows after the name/type/comment strings.
+	SymbolFlagTypeGuid SymbolFlag = 0x0008
+	// SymbolFlagTComObj indicates the symbol is a TcCOM object.
+	SymbolFlagTComObj SymbolFlag = 0x0010
+	// SymbolFlagReadOnly indicates the symbol is read-only.
+	SymbolFlagReadOnly SymbolFlag = 0x0020
+	// SymbolFlagContextMask extracts the PLC task context index from bits 8-11.
+	// Non-zero means the variable is bound to a specific PLC task, enabling
+	// InContext notification modes (TransMode 5/6). The value corresponds to the
+	// task's index in the global TASKINFOARRAY.
+	// Zero means no task binding — InContext modes will be rejected (0x070B on TC3)
+	// or silently ignored (TC2).
+	//
+	// ContextMask is non-zero only when:
+	//   - The PLC project has multiple tasks (Referenced Tasks in Solution Explorer)
+	//   - The variable is local to a PROGRAM POU assigned to a single task
+	// GVL (Global Variable List) variables always have ContextMask=0.
+	// Single-task projects (the default) always have ContextMask=0 for all symbols.
+	SymbolFlagContextMask SymbolFlag = 0x0F00
+	// SymbolFlagAttributes indicates attribute key-value pairs follow after the type GUID.
+	SymbolFlagAttributes SymbolFlag = 0x1000
+	// SymbolFlagExtendedFlags indicates additional extended flags are present.
+	SymbolFlagExtendedFlags SymbolFlag = 0x8000
+)
+
+// ContextMask extracts the PLC task context index from symbol flags (bits 8-11).
+// Returns 0 if the symbol is not bound to a specific task.
+func (f SymbolFlag) ContextMask() uint8 {
+	return uint8((f >> 8) & 0x0F)
+}
+
+// Has returns true if the flag set contains the given flag(s).
+func (f SymbolFlag) Has(flag SymbolFlag) bool {
+	return f&flag == flag
 }
 
 type AdsState uint16

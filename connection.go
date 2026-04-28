@@ -22,6 +22,7 @@ type Connection struct {
 	connMu      sync.Mutex // protects connection field against concurrent Close/Reconnect
 	target      AmsAddress
 	source      AmsAddress
+	callbackIP  string // IP PLC uses to reach us (for Docker/VPN; set via WithHostIP)
 	sendChannel chan []byte
 
 	symbols             map[string]*Symbol
@@ -171,6 +172,23 @@ func (conn *Connection) Connect(local bool) error {
 			conn.source.NetID = [6]byte{ip[0], ip[1], ip[2], ip[3], 1, 1}
 			conn.logger.Info("auto-derived source AMS NetID from local IP",
 				"netid", fmt.Sprintf("%d.%d.%d.%d.1.1", ip[0], ip[1], ip[2], ip[3]))
+		}
+
+		// NAT/Docker detection: compare TCP and UDP source IPs
+		if conn.callbackIP == "" && ip != nil {
+			udpConn, udpErr := net.DialTimeout("udp4", net.JoinHostPort(conn.ip, strconv.Itoa(routePort)), 2*time.Second)
+			if udpErr == nil {
+				udpAddr, ok := udpConn.LocalAddr().(*net.UDPAddr)
+				udpConn.Close()
+				if ok {
+					udpIP := udpAddr.IP.To4()
+					if udpIP != nil && !ip.Equal(udpIP) {
+						conn.logger.Warn("TCP and UDP source IPs differ — possible NAT/Docker/VPN",
+							"tcpIP", ip.String(), "udpIP", udpIP.String(),
+							"hint", "set WithHostIP() to the IP the PLC can reach")
+					}
+				}
+			}
 		}
 	}
 
@@ -392,7 +410,7 @@ func (conn *Connection) Reconnect() error {
 		newConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.RequestTimeout)
 		if err != nil {
 			lastErr = err
-			conn.logger.Warn("reconnect dial failed, retrying", "error", err, "attempt", attempts)
+			conn.logger.Warn("reconnect dial failed, retrying", "error", err, "ip", conn.ip, "port", conn.port, "attempt", attempts)
 			if err := conn.reconnectSleep(); err != nil {
 				return err
 			}
@@ -605,6 +623,19 @@ func (conn *Connection) loadSymbols() error {
 	conn.symbols = symbols
 	conn.symbolLock.Unlock()
 	return nil
+}
+
+// AddRoute registers a route on the remote PLC using this connection's settings.
+// It uses callbackIP (from WithHostIP) if set, otherwise derives the callback
+// address from the source AMS NetID (first 4 bytes = IP).
+func (conn *Connection) AddRoute(routeName, username, password string) error {
+	hostIP := conn.callbackIP
+	if hostIP == "" {
+		hostIP = fmt.Sprintf("%d.%d.%d.%d",
+			conn.source.NetID[0], conn.source.NetID[1],
+			conn.source.NetID[2], conn.source.NetID[3])
+	}
+	return AddRemoteRouteWithLogger(conn.logger, conn.ip, conn.source.NetID, routeName, hostIP, username, password)
 }
 
 // IsDisconnected returns whether the connection is currently in a disconnected state.

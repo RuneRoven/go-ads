@@ -3,11 +3,10 @@
 package ads
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
-	"fmt"
 	"math"
-	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -99,47 +98,14 @@ func setupConnection(t *testing.T) *Connection {
 	}
 	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
 
-	// Auto-create AMS route if credentials are provided
-	routeUser := os.Getenv("ADS_ROUTE_USER")
-	routePass := os.Getenv("ADS_ROUTE_PASS")
-	if routeUser != "" && routePass != "" {
-		// Determine local AMS NetID for route registration
-		var localNetID [6]byte
-		if localAMS != "auto" && localAMS != "" {
-			netIDBytes, err := stringToNetID(localAMS)
-			if err != nil {
-				t.Fatalf("invalid ADS_LOCAL_AMS %q: %v", localAMS, err)
-			}
-			localNetID = netIDBytes
-		} else {
-			// Auto-derive from local IP facing the PLC
-			udpConn, err := net.DialTimeout("udp4", ip+":48899", 2*time.Second)
-			if err != nil {
-				t.Fatalf("failed to determine local IP for route: %v", err)
-			}
-			localAddr := udpConn.LocalAddr().(*net.UDPAddr)
-			udpConn.Close()
-			ipv4 := localAddr.IP.To4()
-			localNetID = [6]byte{ipv4[0], ipv4[1], ipv4[2], ipv4[3], 1, 1}
-		}
-
-		// Determine the IP the PLC should use to reach us
-		hostIP := os.Getenv("ADS_HOST_IP")
-		if hostIP == "" {
-			hostIP = fmt.Sprintf("%d.%d.%d.%d", localNetID[0], localNetID[1], localNetID[2], localNetID[3])
-		}
-
-		t.Logf("adding AMS route on %s (local NetID: %d.%d.%d.%d.%d.%d, host IP: %s)", ip,
-			localNetID[0], localNetID[1], localNetID[2], localNetID[3], localNetID[4], localNetID[5], hostIP)
-		err := AddRemoteRoute(ip, localNetID, "go-ads-test", hostIP, routeUser, routePass)
-		if err != nil {
-			t.Logf("warning: AddRemoteRoute failed (may already exist): %v", err)
-		} else {
-			t.Log("AMS route added successfully")
-		}
+	// Build connection options
+	var opts []ConnectionOption
+	hostIP := os.Getenv("ADS_HOST_IP")
+	if hostIP != "" {
+		opts = append(opts, WithHostIP(hostIP))
 	}
 
-	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second)
+	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second, opts...)
 	if err != nil {
 		t.Fatalf("NewConnection failed: %v", err)
 	}
@@ -147,6 +113,18 @@ func setupConnection(t *testing.T) *Connection {
 	err = conn.Connect(false)
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
+	}
+
+	// Auto-create AMS route if credentials are provided (after Connect so source NetID is resolved)
+	routeUser := os.Getenv("ADS_ROUTE_USER")
+	routePass := os.Getenv("ADS_ROUTE_PASS")
+	if routeUser != "" && routePass != "" {
+		err := conn.AddRoute("go-ads-test", routeUser, routePass)
+		if err != nil {
+			t.Logf("warning: AddRoute failed (may already exist): %v", err)
+		} else {
+			t.Log("AMS route added successfully")
+		}
 	}
 
 	t.Cleanup(func() {
@@ -1723,6 +1701,14 @@ func TestIntegrationSumNotifFallbackDowngrade(t *testing.T) {
 		t.Skip("no parseable symbol")
 	}
 
+	// Check ContextMask — with ContextMask=0, InContext mode gets downgraded at AddSymbolNotifications level.
+	// Then we also force the sum command fallback path which has its own downgrade.
+	sym, err := conn.GetSymbol(symbolName)
+	if err != nil {
+		t.Fatalf("GetSymbol failed: %v", err)
+	}
+	t.Logf("symbol %q: ContextMask=%d flags=0x%04X (fallback test)", symbolName, sym.ContextMask, uint32(sym.Flags))
+
 	// Force notification fallback — v2 modes should be downgraded to v1
 	conn.sumNotifChecked.Store(true)
 	conn.sumNotifSupported.Store(false)
@@ -1735,7 +1721,7 @@ func TestIntegrationSumNotifFallbackDowngrade(t *testing.T) {
 		TransmissionMode: TransModeServerCycle2, // should be downgraded to ServerCycle
 	}}
 
-	err := conn.AddSymbolNotifications(configs, ch)
+	err = conn.AddSymbolNotifications(configs, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotifications (downgrade) failed: %v", err)
 	}
@@ -1904,6 +1890,91 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 }
 
 // ============================================================
+// SumWrite raw debug diagnostic
+// ============================================================
+
+// TestIntegrationSumWriteRawDebug compares raw SumWrite vs WriteMultipleSymbols
+// byte-for-byte to diagnose why raw SumWrite silently fails on some PLCs.
+// This test logs diagnostics — it does not assert on the raw SumWrite result
+// since the root cause is under investigation.
+func TestIntegrationSumWriteRawDebug(t *testing.T) {
+	symbolName := os.Getenv("ADS_WRITE_INT")
+	if symbolName == "" {
+		t.Skip("ADS_WRITE_INT not set")
+	}
+
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	sym, err := conn.GetSymbol(symbolName)
+	if err != nil {
+		t.Fatalf("GetSymbol(%s) failed: %v", symbolName, err)
+	}
+
+	// Log addressing info
+	group, offset := symbolSumAddress(sym)
+	t.Logf("symbol=%s type=%s length=%d handle=%d group=0x%X offset=0x%X",
+		symbolName, sym.DataType, sym.Length, sym.Handle, group, offset)
+
+	// Compare writeToNode output: nil vs real datatypes
+	conn.symbolLock.Lock()
+	datatypes := conn.datatypes
+	conn.symbolLock.Unlock()
+
+	dataNil, errNil := sym.writeToNode("42", 0, nil)
+	dataReal, errReal := sym.writeToNode("42", 0, datatypes)
+	t.Logf("writeToNode(nil):  data=%X err=%v", dataNil, errNil)
+	t.Logf("writeToNode(real): data=%X err=%v", dataReal, errReal)
+	t.Logf("data match: %v", bytes.Equal(dataNil, dataReal))
+
+	// Reset to known value first
+	if err := conn.WriteToSymbol(symbolName, "0"); err != nil {
+		t.Fatalf("WriteToSymbol reset failed: %v", err)
+	}
+
+	// Raw SumWrite with real datatypes data
+	results, err := conn.SumWrite([]SumWriteRequest{{Group: group, Offset: offset, Data: dataReal}})
+	if err != nil {
+		t.Logf("raw SumWrite error: %v", err)
+	} else {
+		t.Logf("raw SumWrite result: 0x%X", uint32(results[0].Error))
+	}
+	readBack, _ := conn.ReadFromSymbol(symbolName)
+	rawWorked := readBack == "42"
+	t.Logf("raw SumWrite readback: %s (expected 42, worked=%v)", readBack, rawWorked)
+
+	// Reset and try WriteMultipleSymbols for comparison
+	if err := conn.WriteToSymbol(symbolName, "0"); err != nil {
+		t.Fatalf("WriteToSymbol reset failed: %v", err)
+	}
+	codes, err := conn.WriteMultipleSymbols(map[string]string{symbolName: "42"})
+	if err != nil {
+		t.Logf("WriteMultipleSymbols error: %v", err)
+	} else {
+		t.Logf("WriteMultipleSymbols result: 0x%X", uint32(codes[symbolName]))
+	}
+	readBack2, _ := conn.ReadFromSymbol(symbolName)
+	apiWorked := readBack2 == "42"
+	t.Logf("WriteMultipleSymbols readback: %s (expected 42, worked=%v)", readBack2, apiWorked)
+
+	// Summary
+	if rawWorked && apiWorked {
+		t.Log("BOTH paths work — no discrepancy on this PLC")
+	} else if !rawWorked && apiWorked {
+		t.Log("DISCREPANCY: raw SumWrite fails but WriteMultipleSymbols works")
+	} else if rawWorked && !apiWorked {
+		t.Log("UNEXPECTED: raw SumWrite works but WriteMultipleSymbols fails")
+	} else {
+		t.Log("BOTH paths fail — SumWrite broken on this PLC")
+	}
+
+	// Restore
+	_ = conn.WriteToSymbol(symbolName, "0")
+}
+
+// ============================================================
 // SumRead/SumWrite functional verification
 // ============================================================
 
@@ -2066,6 +2137,17 @@ func TestIntegrationWrite64BitTypes(t *testing.T) {
 	}{
 		{"ADS_WRITE_LINT", "-9223372036854775000", "42"},
 		{"ADS_WRITE_LWORD", "18446744073709551000", "100"},
+	}
+
+	var hasAny bool
+	for _, tc := range testCases {
+		if os.Getenv(tc.envVar) != "" {
+			hasAny = true
+			break
+		}
+	}
+	if !hasAny {
+		t.Skip("no 64-bit type env vars set (ADS_WRITE_LINT/ADS_WRITE_LWORD) — TC2 lacks 64-bit support")
 	}
 
 	for _, tc := range testCases {
@@ -2287,7 +2369,7 @@ func TestIntegrationStructMultipleEnumChildren(t *testing.T) {
 	findEnums(sym)
 
 	if len(enums) < 2 {
-		t.Skipf("found only %d enum children, need 2+", len(enums))
+		t.Skipf("found %d typed enum children (need 2+) — TC2 uses plain INT for enums, no E_* typed children in structs", len(enums))
 	}
 
 	t.Logf("found %d enum children in %s", len(enums), structName)
@@ -2358,11 +2440,21 @@ func TestIntegrationNotificationServerCycle2(t *testing.T) {
 		t.Skip("no parseable symbol")
 	}
 
+	// Check ContextMask before subscribing — determines if InContext or fallback
+	sym, err := conn.GetSymbol(symbolName)
+	if err != nil {
+		t.Fatalf("GetSymbol failed: %v", err)
+	}
+	if sym.ContextMask == 0 {
+		t.Logf("symbol %q has ContextMask=0 (flags=0x%04X) — CyclicInContext will auto-fallback to ServerCycle", symbolName, uint32(sym.Flags))
+	} else {
+		t.Logf("symbol %q has ContextMask=%d (flags=0x%04X) — CyclicInContext should work natively", symbolName, sym.ContextMask, uint32(sym.Flags))
+	}
+
 	ch := make(chan *Update, 50)
 	handle, err := conn.AddSymbolNotification(symbolName, 100, 100, TransModeServerCycle2, ch)
 	if err != nil {
-		// TC2 may reject this mode
-		t.Skipf("ServerCycle2 not supported: %v", err)
+		t.Fatalf("AddSymbolNotification failed: %v", err)
 	}
 
 	var count int
@@ -2372,19 +2464,23 @@ func TestIntegrationNotificationServerCycle2(t *testing.T) {
 		case u := <-ch:
 			count++
 			if count == 1 {
-				t.Logf("first ServerCycle2 notification: %s = %s", u.Variable, u.Value)
+				t.Logf("first notification: %s = %s", u.Variable, u.Value)
 			}
 		case <-timeout:
 			goto done
 		}
 	}
 done:
-	t.Logf("ServerCycle2: received %d notifications in 3s", count)
-	if count < 2 {
-		t.Logf("ServerCycle2: only %d updates (may need downgrade on this PLC)", count)
-	}
-
 	_ = conn.DeleteDeviceNotification(handle)
+
+	if sym.ContextMask == 0 {
+		t.Logf("CyclicInContext fallback to ServerCycle: received %d notifications in 3s", count)
+	} else {
+		t.Logf("CyclicInContext native: received %d notifications in 3s", count)
+	}
+	if count == 0 {
+		t.Error("expected notifications (with or without fallback), got 0")
+	}
 }
 
 func TestIntegrationNotificationServerOnChange2(t *testing.T) {
@@ -2398,10 +2494,21 @@ func TestIntegrationNotificationServerOnChange2(t *testing.T) {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
+	// Check ContextMask — determines if InContext or fallback
+	sym, err := conn.GetSymbol(symbolName)
+	if err != nil {
+		t.Fatalf("GetSymbol failed: %v", err)
+	}
+	if sym.ContextMask == 0 {
+		t.Logf("symbol %q has ContextMask=0 (flags=0x%04X) — OnChangeInContext will auto-fallback to ServerOnChange", symbolName, uint32(sym.Flags))
+	} else {
+		t.Logf("symbol %q has ContextMask=%d (flags=0x%04X) — OnChangeInContext should work natively", symbolName, sym.ContextMask, uint32(sym.Flags))
+	}
+
 	ch := make(chan *Update, 10)
 	handle, err := conn.AddSymbolNotification(symbolName, 100, 100, TransModeServerOnChange2, ch)
 	if err != nil {
-		t.Skipf("ServerOnChange2 not supported: %v", err)
+		t.Fatalf("AddSymbolNotification failed: %v", err)
 	}
 
 	// Read original, write a different value to trigger change
@@ -2416,19 +2523,24 @@ func TestIntegrationNotificationServerOnChange2(t *testing.T) {
 		t.Fatalf("WriteToSymbol failed: %v", err)
 	}
 
+	var received bool
 	select {
 	case update := <-ch:
-		t.Logf("ServerOnChange2 delivered: %s = %s", update.Variable, update.Value)
+		if sym.ContextMask == 0 {
+			t.Logf("OnChangeInContext fallback to ServerOnChange delivered: %s = %s", update.Variable, update.Value)
+		} else {
+			t.Logf("OnChangeInContext native delivered: %s = %s", update.Variable, update.Value)
+		}
+		received = true
 	case <-time.After(3 * time.Second):
-		// TC2 silently ignores v2 transmission modes without returning an error.
-		// The notification handle is created but no notifications arrive.
-		// This is documented Beckhoff behavior, not a library bug.
-		t.Log("no ServerOnChange2 notification within 3s — TC2 silently ignores v2 modes (expected on older PLCs)")
 	}
 
 	// Restore
 	_ = conn.WriteToSymbol(symbolName, original)
 	_ = conn.DeleteDeviceNotification(handle)
+	if !received {
+		t.Error("expected notification (with or without fallback) after write, got none")
+	}
 }
 
 func TestIntegrationNotificationBatchTransModes(t *testing.T) {
@@ -2442,6 +2554,17 @@ func TestIntegrationNotificationBatchTransModes(t *testing.T) {
 		t.Skip("need at least 3 parseable symbols")
 	}
 
+	// Check ContextMask on the symbol that will use CyclicInContext
+	sym2, err := conn.GetSymbol(names[2])
+	if err != nil {
+		t.Fatalf("GetSymbol(%s) failed: %v", names[2], err)
+	}
+	if sym2.ContextMask == 0 {
+		t.Logf("batch CyclicInContext: %s has ContextMask=0 — will auto-fallback to ServerCycle", names[2])
+	} else {
+		t.Logf("batch CyclicInContext: %s has ContextMask=%d — will use native InContext", names[2], sym2.ContextMask)
+	}
+
 	ch := make(chan *Update, 100)
 	configs := []NotificationConfig{
 		{SymbolName: names[0], MaxDelay: 100, CycleTime: 100, TransmissionMode: TransModeServerCycle},
@@ -2449,7 +2572,7 @@ func TestIntegrationNotificationBatchTransModes(t *testing.T) {
 		{SymbolName: names[2], MaxDelay: 100, CycleTime: 200, TransmissionMode: TransModeServerCycle2},
 	}
 
-	err := conn.AddSymbolNotifications(configs, ch)
+	err = conn.AddSymbolNotifications(configs, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotifications (mixed modes) failed: %v", err)
 	}

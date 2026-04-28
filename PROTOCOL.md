@@ -10,6 +10,8 @@ Reference documentation for the Beckhoff ADS (Automation Device Specification) p
 - [AMS Header (32 bytes)](#ams-header-32-bytes)
 - [ADS Commands](#ads-commands)
 - [Index Groups](#index-groups)
+- [Symbol Entry Structure](#symbol-entry-structure)
+- [Symbol Flags](#symbol-flags)
 - [Sum Commands (Batch Operations)](#sum-commands-batch-operations)
 - [Transmission Modes](#transmission-modes)
 - [ADS States](#ads-states)
@@ -299,6 +301,77 @@ Timestamp conversion to Unix: `unixSeconds = (filetime / 10000000) - 11644473600
 | 0xF00F | SymbolUploadInfo2       | Extended symbol upload info (TC3 only)        |
 | 0xF010 | SymbolNotification      | Notification of named handle                  |
 
+### Symbol Entry Structure
+
+The symbol entry (returned by SymbolUpload 0xF00B and SymbolInfoByNameEx 0xF009) has a fixed 30-byte header followed by variable-length strings and optional extended data.
+
+**Header (30 bytes):**
+
+| Offset | Size | Field         | Description                          |
+|--------|------|---------------|--------------------------------------|
+| 0      | 4    | EntryLength   | Total entry length in bytes          |
+| 4      | 4    | IndexGroup    | Index group for read/write           |
+| 8      | 4    | IndexOffset   | Index offset for read/write          |
+| 12     | 4    | Size          | Data size in bytes                   |
+| 16     | 4    | DataType      | Data type ID                         |
+| 20     | 4    | Flags         | Symbol flags (see [Symbol Flags](#symbol-flags)) |
+| 24     | 2    | NameLength    | Length of symbol name (excl. null)   |
+| 26     | 2    | TypeLength    | Length of type name (excl. null)     |
+| 28     | 2    | CommentLength | Length of comment (excl. null)       |
+
+**Strings (variable length):**
+
+```text
+Name (NameLength bytes) + \0
+Type (TypeLength bytes) + \0
+Comment (CommentLength bytes) + \0
+```
+
+**Extended data (TC3 only, conditional on flags):**
+
+After the strings, additional data may follow based on which flags are set:
+
+1. If `TypeGuid` flag (0x0008) is set: 16-byte type GUID
+2. If `Attributes` flag (0x1000) is set: attribute key-value pairs
+3. If `ExtendedFlags` flag (0x8000) is set: additional extended flags
+
+TwinCAT 2 does not include extended data after the strings.
+
+### Symbol Flags
+
+The Flags field (offset 20) in the symbol entry is a bitfield:
+
+| Bit(s) | Mask   | Name          | Description                                  |
+|--------|--------|---------------|----------------------------------------------|
+| 0      | 0x0001 | Persistent    | Value survives PLC restarts                  |
+| 1      | 0x0002 | BitValue      | Symbol is a single bit within a byte         |
+| 2      | 0x0004 | ReferenceTo   | Symbol is a reference/pointer                |
+| 3      | 0x0008 | TypeGuid      | 16-byte type GUID follows after strings      |
+| 4      | 0x0010 | TComObj       | Symbol is a TcCOM object                     |
+| 5      | 0x0020 | ReadOnly      | Symbol is read-only                          |
+| 8-11   | 0x0F00 | ContextMask   | PLC task context index (0 = no task binding) |
+| 12     | 0x1000 | Attributes    | Attribute pairs follow after type GUID       |
+| 15     | 0x8000 | ExtendedFlags | Additional extended flags present            |
+
+**ContextMask (bits 8-11):**
+
+The ContextMask identifies which PLC task owns the variable. It corresponds to the task's index in the global TASKINFOARRAY. A value of 0 means the variable is not bound to any specific task.
+
+ContextMask is non-zero only when:
+- The PLC project has multiple tasks (Referenced Tasks)
+- The variable is local to a PROGRAM POU assigned to a single task
+
+GVL variables, single-task projects, and TwinCAT 2 always have ContextMask=0.
+
+**Observed flag distributions (empirical):**
+
+| Flags  | Meaning                          | Typical count |
+|--------|----------------------------------|---------------|
+| 0x0008 | TypeGuid only                    | Most symbols  |
+| 0x1008 | TypeGuid + Attributes            | Some symbols  |
+| 0x8008 | TypeGuid + ExtendedFlags         | Few symbols   |
+| 0x0000 | No extended info                 | TC2 symbols   |
+
 ### I/O Image
 
 | Group  | Name           | Purpose                              |
@@ -450,18 +523,41 @@ Error(1), ReadLen(1), ..., Error(N), ReadLen(N), ReadData(1..N)
 
 Used in AddDeviceNotification (Command 6) and SumAddDeviceNotification (0xF085).
 
-| Value | Name             | Description                                   |
-|-------|------------------|-----------------------------------------------|
-| 0     | NoTransmission   | No notifications                              |
-| 1     | ClientCycle      | Client-side cyclic check (deprecated)         |
-| 2     | ClientOnChange   | Client-side on-change (deprecated)            |
-| 3     | ServerCycle      | Server sends at fixed intervals               |
-| 4     | ServerOnChange   | Server sends only when value changes          |
-| 5     | ServerCycle2     | ServerCycle with timestamp (TC3 only)         |
-| 6     | ServerOnChange2  | ServerOnChange with timestamp (TC3 only)      |
-| 10    | Client1Request   | Single notification then auto-delete          |
+| Value | Name             | Beckhoff .NET Name   | Description                                       |
+|-------|------------------|----------------------|---------------------------------------------------|
+| 0     | NoTransmission   | —                    | No notifications                                  |
+| 1     | ClientCycle      | —                    | Client-side cyclic check (deprecated)             |
+| 2     | ClientOnChange   | —                    | Client-side on-change (deprecated)                |
+| 3     | ServerCycle      | Cyclic               | Server sends at fixed intervals                   |
+| 4     | ServerOnChange   | OnChange             | Server sends only when value changes              |
+| 5     | ServerCycle2     | CyclicInContext      | Cyclic within PLC task cycle (requires ContextMask) |
+| 6     | ServerOnChange2  | OnChangeInContext    | OnChange within PLC task cycle (requires ContextMask) |
+| 10    | Client1Request   | —                    | Single notification then auto-delete              |
 
-The v2 modes (5, 6) include higher-resolution timestamps and were introduced in TwinCAT 3. TwinCAT 2 **silently ignores** v2 modes — notifications will never fire, without returning an error.
+### Standard Modes (3, 4)
+
+ServerCycle and ServerOnChange are the standard notification modes supported on both TwinCAT 2 and TwinCAT 3. The notification check runs in a dedicated ADS server thread, separate from the PLC task cycle.
+
+### InContext Modes (5, 6)
+
+ServerCycle2 (CyclicInContext) and ServerOnChange2 (OnChangeInContext) execute the notification value-check inside the PLC task cycle that owns the variable, giving deterministic timing synchronized with the control loop.
+
+**ContextMask requirement:** InContext modes require the target symbol to have a non-zero ContextMask (bits 8-11 of the symbol flags). The ContextMask identifies which PLC task owns the variable. See [Symbol Flags](#symbol-flags) for details.
+
+**Behavior when ContextMask is 0:**
+
+| Platform | Error returned | Behavior |
+|----------|---------------|----------|
+| TwinCAT 3 | `0x070B` (InvalidParam) | Request explicitly rejected |
+| TwinCAT 2 | None | Silently accepted but notifications never fire |
+
+**When to get non-zero ContextMask:**
+- PLC project must have **multiple tasks** (Referenced Tasks in TwinCAT Solution Explorer)
+- Variable must be **local to a PROGRAM POU** assigned to a single task
+- GVL (Global Variable List) variables always have ContextMask=0
+- Single-task projects (the default) always have ContextMask=0
+
+Most PLC projects use a single task, so ContextMask=0 is the common case. The `go-ads` library automatically falls back to ServerCycle/ServerOnChange when ContextMask is 0.
 
 ---
 
@@ -707,14 +803,14 @@ Unsupported commands return `0x0701` (service not supported).
 
 ### Transmission Modes
 
-| Mode             | TC2                | TC3     |
-|------------------|--------------------|---------|
-| ServerCycle (3)  | Works              | Works   |
-| ServerOnChange (4)| Works             | Works   |
-| ServerCycle2 (5) | Silently ignored   | Works   |
-| ServerOnChange2 (6)| Silently ignored | Works   |
+| Mode             | TC2                | TC3 (ContextMask=0) | TC3 (ContextMask>0) |
+|------------------|--------------------|----------------------|---------------------|
+| ServerCycle (3)  | Works              | Works                | Works               |
+| ServerOnChange (4)| Works             | Works                | Works               |
+| ServerCycle2 (5) | Silently ignored   | Rejected (0x070B)    | Works               |
+| ServerOnChange2 (6)| Silently ignored | Rejected (0x070B)    | Works               |
 
-TC2 does not return an error for v2 modes — notifications simply never fire.
+TC2 does not return an error for v2 modes — notifications silently never fire. TC3 rejects v2 modes with `0x070B` (InvalidParam) when the symbol's ContextMask is 0. The `go-ads` library auto-falls back to modes 3/4 in both cases.
 
 ### Symbol System
 
@@ -724,6 +820,8 @@ TC2 does not return an error for v2 modes — notifications simply never fire.
 | SymbolUploadInfo (0xF00C)  | Available         | Available            |
 | Enum types                 | Flattened to base INT/DINT | Full enum metadata |
 | Chunked symbol download    | May not support   | Supported            |
+| Extended symbol data       | Not present       | TypeGuid, Attributes, ExtendedFlags |
+| ContextMask in flags       | Always 0          | 0 (single-task) or 1-15 (multi-task) |
 
 ### Ports
 

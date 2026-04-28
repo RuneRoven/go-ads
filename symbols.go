@@ -80,6 +80,8 @@ type Symbol struct {
 	Group             uint32
 	Offset            uint32
 	Length            uint32
+	Flags             SymbolFlag
+	ContextMask       uint8 // PLC task context (bits 8-11 of Flags); 0 = no task binding
 	Changed           bool
 
 	Value       string
@@ -152,6 +154,7 @@ func addChildren(symbol *Symbol, symbols map[string]*Symbol) {
 }
 
 func addSymbol(symbol symbolUploadSymbol, datatypes map[string]SymbolUploadDataType) *Symbol {
+	flags := SymbolFlag(symbol.SymbolEntry.Flags)
 	sym := &Symbol{
 		Name:              symbol.Name,
 		LastUpdateTime:    time.Now(),
@@ -162,6 +165,8 @@ func addSymbol(symbol symbolUploadSymbol, datatypes map[string]SymbolUploadDataT
 		Length:            symbol.SymbolEntry.Size,
 		Group:             symbol.SymbolEntry.IGroup,
 		Offset:            symbol.SymbolEntry.IOffs,
+		Flags:             flags,
+		ContextMask:       flags.ContextMask(),
 	}
 
 	dt, ok := datatypes[symbol.DataType]

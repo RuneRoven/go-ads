@@ -5,7 +5,6 @@ package ads
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"sort"
 	"strconv"
@@ -99,41 +98,14 @@ func browseSetupConnection(t *testing.T) *Connection {
 	}
 	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
 
-	// Auto-create AMS route if credentials are provided
-	routeUser := os.Getenv("ADS_ROUTE_USER")
-	routePass := os.Getenv("ADS_ROUTE_PASS")
-	if routeUser != "" && routePass != "" {
-		var localNetID [6]byte
-		if localAMS != "auto" && localAMS != "" {
-			netIDBytes, err := stringToNetID(localAMS)
-			if err != nil {
-				t.Fatalf("invalid ADS_LOCAL_AMS %q: %v", localAMS, err)
-			}
-			localNetID = netIDBytes
-		} else {
-			udpConn, err := net.DialTimeout("udp4", ip+":48899", 2*time.Second)
-			if err != nil {
-				t.Fatalf("failed to determine local IP for route: %v", err)
-			}
-			localAddr := udpConn.LocalAddr().(*net.UDPAddr)
-			udpConn.Close()
-			ipv4 := localAddr.IP.To4()
-			localNetID = [6]byte{ipv4[0], ipv4[1], ipv4[2], ipv4[3], 1, 1}
-		}
-
-		hostIP := os.Getenv("ADS_HOST_IP")
-		if hostIP == "" {
-			hostIP = fmt.Sprintf("%d.%d.%d.%d", localNetID[0], localNetID[1], localNetID[2], localNetID[3])
-		}
-
-		t.Logf("adding AMS route on %s", ip)
-		err := AddRemoteRoute(ip, localNetID, "go-ads-browse", hostIP, routeUser, routePass)
-		if err != nil {
-			t.Logf("warning: AddRemoteRoute failed (may already exist): %v", err)
-		}
+	// Build connection options
+	var opts []ConnectionOption
+	hostIP := os.Getenv("ADS_HOST_IP")
+	if hostIP != "" {
+		opts = append(opts, WithHostIP(hostIP))
 	}
 
-	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second)
+	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second, opts...)
 	if err != nil {
 		t.Fatalf("NewConnection failed: %v", err)
 	}
@@ -141,6 +113,16 @@ func browseSetupConnection(t *testing.T) *Connection {
 	err = conn.Connect(false)
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
+	}
+
+	// Auto-create AMS route if credentials are provided (after Connect so source NetID is resolved)
+	routeUser := os.Getenv("ADS_ROUTE_USER")
+	routePass := os.Getenv("ADS_ROUTE_PASS")
+	if routeUser != "" && routePass != "" {
+		err := conn.AddRoute("go-ads-browse", routeUser, routePass)
+		if err != nil {
+			t.Logf("warning: AddRoute failed (may already exist): %v", err)
+		}
 	}
 
 	t.Cleanup(func() {

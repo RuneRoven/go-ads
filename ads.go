@@ -305,6 +305,7 @@ func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) 
 		dataType = "STRING"
 	}
 
+	flags := SymbolFlag(entry.Flags)
 	sym := &Symbol{
 		FullName:          symbolName,
 		Name:              string(name),
@@ -313,6 +314,8 @@ func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) 
 		Group:             entry.IGroup,
 		Offset:            entry.IOffs,
 		Length:            entry.Size,
+		Flags:             flags,
+		ContextMask:       flags.ContextMask(),
 		LastUpdateTime:    time.Now(),
 		MinUpdateInterval: 50 * time.Millisecond,
 	}
@@ -555,11 +558,25 @@ func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, c
 	if err != nil {
 		return 0, fmt.Errorf("notification for %q: %w", symbolName, err)
 	}
+
+	// Auto-fallback: InContext modes (5/6) require non-zero ContextMask on the symbol.
+	// If ContextMask is 0 (single-task PLC, TC2, or variable not bound to a task),
+	// downgrade to the regular mode (3/4) to avoid 0x070B errors or silent failures.
+	actualMode := transMode
+	if (transMode == TransModeServerCycle2 || transMode == TransModeServerOnChange2) && symbol.ContextMask == 0 {
+		actualMode = downgradeTransMode(transMode)
+		conn.logger.Warn("InContext mode not available for symbol (ContextMask=0), falling back",
+			"symbol", symbolName,
+			"requested", transMode.String(),
+			"using", actualMode.String(),
+			"flags", fmt.Sprintf("0x%04X", uint32(symbol.Flags)))
+	}
+
 	handle, err := conn.AddDeviceNotification(
 		uint32(GroupSymbolValueByHandle),
 		symbol.Handle,
 		symbol.Length,
-		transMode,
+		actualMode,
 		time.Duration(maxDelay)*time.Millisecond,
 		time.Duration(cycleTime)*time.Millisecond)
 	if err != nil {
@@ -567,7 +584,8 @@ func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, c
 	}
 	conn.logger.Info("notification created",
 		"handle", handle,
-		"symbol", symbolName)
+		"symbol", symbolName,
+		"mode", actualMode.String())
 	conn.symbolLock.Lock()
 	defer conn.symbolLock.Unlock()
 	symbol.Notification = updateReceiver
@@ -769,11 +787,23 @@ func (conn *Connection) AddSymbolNotifications(configs []NotificationConfig, ch 
 			continue
 		}
 		infos = append(infos, symbolInfo{config: cfg, symbol: symbol})
+
+		// Auto-fallback: InContext modes require non-zero ContextMask
+		actualMode := cfg.TransmissionMode
+		if (actualMode == TransModeServerCycle2 || actualMode == TransModeServerOnChange2) && symbol.ContextMask == 0 {
+			actualMode = downgradeTransMode(actualMode)
+			conn.logger.Warn("InContext mode not available for symbol (ContextMask=0), falling back",
+				"symbol", cfg.SymbolName,
+				"requested", cfg.TransmissionMode.String(),
+				"using", actualMode.String(),
+				"flags", fmt.Sprintf("0x%04X", uint32(symbol.Flags)))
+		}
+
 		requests = append(requests, SumNotificationRequest{
 			Group:            uint32(GroupSymbolValueByHandle),
 			Offset:           symbol.Handle,
 			Length:           symbol.Length,
-			TransmissionMode: cfg.TransmissionMode,
+			TransmissionMode: actualMode,
 			MaxDelay:         time.Duration(cfg.MaxDelay) * time.Millisecond,
 			CycleTime:        time.Duration(cfg.CycleTime) * time.Millisecond,
 		})

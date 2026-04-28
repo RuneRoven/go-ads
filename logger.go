@@ -29,6 +29,16 @@ func WithLogger(logger *slog.Logger) ConnectionOption {
 	}
 }
 
+// WithHostIP sets the IP address the PLC should use to reach this client.
+// Required in Docker/VPN/NAT scenarios where the local TCP socket address
+// differs from the externally routable IP. When set, AddRoute uses this IP
+// as the callback address instead of deriving it from the AMS NetID.
+func WithHostIP(ip string) ConnectionOption {
+	return func(c *Connection) {
+		c.callbackIP = ip
+	}
+}
+
 // defaultLoggerPtr is used by package-level functions (e.g., AddRemoteRoute)
 // that are not associated with a Connection instance.
 var defaultLoggerPtr atomic.Pointer[slog.Logger]

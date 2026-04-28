@@ -218,11 +218,47 @@ func TestTransModeString(t *testing.T) {
 	if s := TransModeServerOnChange.String(); s != "ServerOnChange" {
 		t.Errorf("got %q, want %q", s, "ServerOnChange")
 	}
-	if s := TransModeServerCycle2.String(); s != "ServerCycle2" {
-		t.Errorf("got %q, want %q", s, "ServerCycle2")
+	if s := TransModeServerCycle2.String(); s != "ServerCycle2/CyclicInContext" {
+		t.Errorf("got %q, want %q", s, "ServerCycle2/CyclicInContext")
 	}
 	if s := TransMode(99).String(); s != "Unknown(99)" {
 		t.Errorf("got %q, want %q", s, "Unknown(99)")
+	}
+}
+
+// --- SymbolFlag ---
+
+func TestSymbolFlagContextMask(t *testing.T) {
+	tests := []struct {
+		flags   SymbolFlag
+		ctxMask uint8
+	}{
+		{0x0008, 0},           // TypeGuid only, no context
+		{0x0108, 1},           // ContextMask=1
+		{0x0F08, 15},          // ContextMask=15 (max)
+		{0x1008, 0},           // Attributes flag, no context
+		{0x0308, 3},           // ContextMask=3
+		{SymbolFlag(0), 0},    // No flags
+		{0x8F08, 15},          // ExtendedFlags + max ContextMask
+	}
+	for _, tt := range tests {
+		got := tt.flags.ContextMask()
+		if got != tt.ctxMask {
+			t.Errorf("SymbolFlag(0x%04X).ContextMask() = %d, want %d", uint32(tt.flags), got, tt.ctxMask)
+		}
+	}
+}
+
+func TestSymbolFlagHas(t *testing.T) {
+	f := SymbolFlag(0x1008) // TypeGuid + Attributes
+	if !f.Has(SymbolFlagTypeGuid) {
+		t.Error("expected Has(TypeGuid) = true")
+	}
+	if !f.Has(SymbolFlagAttributes) {
+		t.Error("expected Has(Attributes) = true")
+	}
+	if f.Has(SymbolFlagExtendedFlags) {
+		t.Error("expected Has(ExtendedFlags) = false")
 	}
 }
 
