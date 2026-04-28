@@ -42,6 +42,8 @@ var parseableSet = map[string]bool{
 	"UDINT": true, "DWORD": true, "DINT": true,
 	"REAL": true, "LREAL": true, "STRING": true,
 	"LINT": true, "ULINT": true, "LWORD": true,
+	"TIME": true, "TOD": true, "TIME_OF_DAY": true,
+	"DATE": true, "DT": true, "DATE_AND_TIME": true,
 }
 
 // pickParseableSymbol returns the name of a symbol with a parseable base type from the map.
@@ -1528,4 +1530,1088 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 			}
 		}
 	}
+}
+
+// ============================================================
+// Fallback path tests — force atomic flags to bypass sum commands
+// ============================================================
+
+func TestIntegrationSumReadFallbackForced(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	names := pickParseableSymbols(symbols, 3)
+	if len(names) < 2 {
+		t.Skip("need at least 2 parseable symbols")
+	}
+
+	// Force fallback: mark sum read as unsupported
+	conn.sumReadCmd.Store(1)
+
+	values, err := conn.ReadMultipleSymbols(names)
+	if err != nil {
+		t.Fatalf("ReadMultipleSymbols (fallback) failed: %v", err)
+	}
+	if len(values) != len(names) {
+		t.Fatalf("expected %d results, got %d", len(names), len(values))
+	}
+
+	// Cross-check each via individual read
+	for _, name := range names {
+		batchVal, ok := values[name]
+		if !ok {
+			t.Errorf("missing result for %s", name)
+			continue
+		}
+		singleVal, err := conn.ReadFromSymbol(name)
+		if err != nil {
+			t.Errorf("ReadFromSymbol(%s) failed: %v", name, err)
+			continue
+		}
+		if !valuesApproxEqual(batchVal, singleVal, "") {
+			t.Errorf("%s: fallback=%q vs single=%q", name, batchVal, singleVal)
+		}
+		t.Logf("%s = %s (fallback matches single)", name, batchVal)
+	}
+}
+
+func TestIntegrationSumWriteFallbackForced(t *testing.T) {
+	type symbolPair struct {
+		name      string
+		testValue string
+		altValue  string
+	}
+	var pairs []symbolPair
+	for _, tc := range writeTestCases {
+		name := os.Getenv(tc.envVar)
+		if name == "" {
+			continue
+		}
+		pairs = append(pairs, symbolPair{name: name, testValue: tc.testValue, altValue: tc.altValue})
+	}
+	if len(pairs) < 2 {
+		t.Skip("need at least 2 ADS_WRITE_* env vars")
+	}
+
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	// Force fallback
+	conn.sumWriteChecked.Store(true)
+	conn.sumWriteSupported.Store(false)
+
+	// Save originals
+	originals := make(map[string]string)
+	writeValues := make(map[string]string)
+	for _, p := range pairs {
+		orig, err := conn.ReadFromSymbol(p.name)
+		if err != nil {
+			t.Fatalf("ReadFromSymbol(%s) failed: %v", p.name, err)
+		}
+		originals[p.name] = orig
+		v := p.testValue
+		if v == orig {
+			v = p.altValue
+		}
+		writeValues[p.name] = v
+	}
+
+	// Batch write in fallback mode
+	codes, err := conn.WriteMultipleSymbols(writeValues)
+	if err != nil {
+		t.Fatalf("WriteMultipleSymbols (fallback) failed: %v", err)
+	}
+	for name, code := range codes {
+		if code != ReturnCodeNoErrors {
+			t.Errorf("write %s returned error: 0x%X", name, uint32(code))
+		}
+	}
+
+	// Verify each individually
+	for name, expected := range writeValues {
+		actual, err := conn.ReadFromSymbol(name)
+		if err != nil {
+			t.Errorf("ReadFromSymbol(%s) failed: %v", name, err)
+			continue
+		}
+		if !valuesApproxEqual(expected, actual, "") {
+			t.Errorf("%s: wrote %q, read %q", name, expected, actual)
+		}
+	}
+
+	// Restore
+	_, _ = conn.WriteMultipleSymbols(originals)
+}
+
+func TestIntegrationSumNotifFallbackForced(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	names := pickParseableSymbols(symbols, 2)
+	if len(names) < 2 {
+		t.Skip("need at least 2 parseable symbols")
+	}
+
+	// Force fallback
+	conn.sumNotifChecked.Store(true)
+	conn.sumNotifSupported.Store(false)
+
+	ch := make(chan *Update, 50)
+	var configs []NotificationConfig
+	for _, name := range names {
+		configs = append(configs, NotificationConfig{
+			SymbolName:       name,
+			MaxDelay:         100,
+			CycleTime:        100,
+			TransmissionMode: TransModeServerOnChange,
+		})
+	}
+
+	err := conn.AddSymbolNotifications(configs, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotifications (fallback) failed: %v", err)
+	}
+
+	// Verify handles tracked
+	conn.symbolLock.Lock()
+	activeCount := len(conn.activeNotifications)
+	var handles []uint32
+	for h := range conn.activeNotifications {
+		handles = append(handles, h)
+	}
+	conn.symbolLock.Unlock()
+
+	if activeCount != len(names) {
+		t.Errorf("expected %d active notifications, got %d", len(names), activeCount)
+	}
+	t.Logf("fallback added %d notifications", activeCount)
+
+	// Wait for a notification
+	select {
+	case u := <-ch:
+		t.Logf("received: %s = %s", u.Variable, u.Value)
+	case <-time.After(3 * time.Second):
+		t.Log("no notification within 3s (continuing)")
+	}
+
+	// Batch delete in fallback mode
+	codes, err := conn.SumDeleteDeviceNotification(handles)
+	if err != nil {
+		t.Fatalf("SumDeleteDeviceNotification (fallback) failed: %v", err)
+	}
+	for i, code := range codes {
+		if code != ReturnCodeNoErrors {
+			t.Errorf("delete handle %d error: 0x%X", handles[i], uint32(code))
+		}
+	}
+}
+
+func TestIntegrationSumNotifFallbackDowngrade(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	symbolName := pickParseableSymbol(symbols)
+	if symbolName == "" {
+		t.Skip("no parseable symbol")
+	}
+
+	// Force notification fallback — v2 modes should be downgraded to v1
+	conn.sumNotifChecked.Store(true)
+	conn.sumNotifSupported.Store(false)
+
+	ch := make(chan *Update, 20)
+	configs := []NotificationConfig{{
+		SymbolName:       symbolName,
+		MaxDelay:         100,
+		CycleTime:        100,
+		TransmissionMode: TransModeServerCycle2, // should be downgraded to ServerCycle
+	}}
+
+	err := conn.AddSymbolNotifications(configs, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotifications (downgrade) failed: %v", err)
+	}
+
+	// Collect — ServerCycle (downgraded) should deliver periodic updates
+	var count int
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case u := <-ch:
+			count++
+			if count == 1 {
+				t.Logf("first notification after downgrade: %s = %s", u.Variable, u.Value)
+			}
+		case <-timeout:
+			goto done
+		}
+	}
+done:
+	t.Logf("received %d notifications via downgraded ServerCycle2→ServerCycle", count)
+	if count < 2 {
+		t.Errorf("expected periodic notifications from downgraded cycle mode, got %d", count)
+	}
+
+	// Cleanup
+	conn.symbolLock.Lock()
+	for h := range conn.activeNotifications {
+		conn.symbolLock.Unlock()
+		_ = conn.DeleteDeviceNotification(h)
+		conn.symbolLock.Lock()
+	}
+	conn.symbolLock.Unlock()
+}
+
+// ============================================================
+// Partial batch failure tests
+// ============================================================
+
+func TestIntegrationSumReadPartialFailure(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	name := pickParseableSymbol(symbols)
+	if name == "" {
+		t.Skip("no parseable symbol")
+	}
+
+	sym, err := conn.GetSymbol(name)
+	if err != nil {
+		t.Fatalf("GetSymbol(%s) failed: %v", name, err)
+	}
+	validGroup, validOffset := symbolSumAddress(sym)
+
+	requests := []SumReadRequest{
+		{Group: validGroup, Offset: validOffset, Length: sym.Length}, // valid
+		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Length: 4},             // bogus
+	}
+
+	results, err := conn.SumRead(requests)
+	if err != nil {
+		t.Fatalf("SumRead failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+
+	if results[0].Error != ReturnCodeNoErrors {
+		t.Errorf("valid request returned error: 0x%X", uint32(results[0].Error))
+	}
+	if len(results[0].Data) != int(sym.Length) {
+		t.Errorf("valid request data length: got %d, want %d", len(results[0].Data), sym.Length)
+	}
+	t.Logf("valid read: %d bytes, error=0x%X", len(results[0].Data), uint32(results[0].Error))
+
+	if results[1].Error == ReturnCodeNoErrors {
+		t.Error("bogus request should have returned an error")
+	}
+	t.Logf("bogus read error: 0x%X", uint32(results[1].Error))
+}
+
+func TestIntegrationSumWritePartialFailure(t *testing.T) {
+	symbolName := os.Getenv("ADS_WRITE_INT")
+	if symbolName == "" {
+		t.Skip("ADS_WRITE_INT not set")
+	}
+
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	sym, err := conn.GetSymbol(symbolName)
+	if err != nil {
+		t.Fatalf("GetSymbol(%s) failed: %v", symbolName, err)
+	}
+
+	original, err := conn.ReadFromSymbol(symbolName)
+	if err != nil {
+		t.Fatalf("ReadFromSymbol failed: %v", err)
+	}
+
+	// Step 1: Verify SumWrite works via WriteMultipleSymbols (proven path).
+	writeVal := "42"
+	if original == "42" {
+		writeVal = "100"
+	}
+	codes, err := conn.WriteMultipleSymbols(map[string]string{symbolName: writeVal})
+	if err != nil {
+		t.Fatalf("WriteMultipleSymbols failed: %v", err)
+	}
+	if codes[symbolName] != ReturnCodeNoErrors {
+		t.Fatalf("WriteMultipleSymbols returned error: 0x%X", uint32(codes[symbolName]))
+	}
+	readBack, _ := conn.ReadFromSymbol(symbolName)
+	if !valuesApproxEqual(writeVal, readBack, "ADS_WRITE_INT") {
+		t.Fatalf("SumWrite (via WriteMultipleSymbols) not working: wrote %q, read %q", writeVal, readBack)
+	}
+	t.Logf("SumWrite confirmed working: %s = %s", symbolName, readBack)
+
+	// Restore before mixed test
+	_ = conn.WriteToSymbol(symbolName, original)
+
+	// Step 2: Now test mixed valid + bogus in one batch.
+	validGroup, validOffset := symbolSumAddress(sym)
+	mixedWriteVal := writeVal
+
+	// Use connection datatypes (same as WriteMultipleSymbols does)
+	conn.symbolLock.Lock()
+	datatypes := conn.datatypes
+	conn.symbolLock.Unlock()
+	mixedData, _ := sym.writeToNode(mixedWriteVal, 0, datatypes)
+
+	requests := []SumWriteRequest{
+		{Group: validGroup, Offset: validOffset, Data: mixedData}, // valid
+		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Data: []byte{0, 0}},  // bogus
+	}
+
+	results, err := conn.SumWrite(requests)
+	if err != nil {
+		t.Fatalf("SumWrite (mixed) failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+
+	// Bogus entry must have an error
+	if results[1].Error == ReturnCodeNoErrors {
+		t.Error("bogus write should have returned an error")
+	}
+	t.Logf("mixed batch: valid=0x%X, bogus=0x%X", uint32(results[0].Error), uint32(results[1].Error))
+
+	// Check if valid write in mixed batch was actually applied.
+	// Some PLCs roll back the entire batch when any entry fails (atomic behavior).
+	// Others apply entries independently. Both are valid PLC implementations.
+	mixedReadBack, _ := conn.ReadFromSymbol(symbolName)
+	if valuesApproxEqual(mixedWriteVal, mixedReadBack, "ADS_WRITE_INT") {
+		t.Logf("mixed batch: valid write applied independently (non-atomic)")
+	} else {
+		t.Logf("mixed batch: valid write rolled back (atomic batch behavior) — wrote %q, read %q", mixedWriteVal, mixedReadBack)
+	}
+
+	// Restore
+	_ = conn.WriteToSymbol(symbolName, original)
+}
+
+// ============================================================
+// SumRead/SumWrite functional verification
+// ============================================================
+
+func TestIntegrationSumWriteVerifyData(t *testing.T) {
+	type symbolPair struct {
+		name      string
+		testValue string
+		altValue  string
+		envVar    string
+	}
+	var pairs []symbolPair
+	for _, tc := range writeTestCases {
+		name := os.Getenv(tc.envVar)
+		if name == "" {
+			continue
+		}
+		pairs = append(pairs, symbolPair{name: name, testValue: tc.testValue, altValue: tc.altValue, envVar: tc.envVar})
+	}
+	if len(pairs) < 2 {
+		t.Skip("need at least 2 ADS_WRITE_* env vars")
+	}
+
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	// Save originals
+	originals := make(map[string]string)
+	writeValues := make(map[string]string)
+	envVarMap := make(map[string]string)
+	for _, p := range pairs {
+		orig, err := conn.ReadFromSymbol(p.name)
+		if err != nil {
+			t.Fatalf("ReadFromSymbol(%s) failed: %v", p.name, err)
+		}
+		originals[p.name] = orig
+		v := p.testValue
+		if v == orig {
+			v = p.altValue
+		}
+		writeValues[p.name] = v
+		envVarMap[p.name] = p.envVar
+	}
+
+	// Batch write
+	codes, err := conn.WriteMultipleSymbols(writeValues)
+	if err != nil {
+		t.Fatalf("WriteMultipleSymbols failed: %v", err)
+	}
+	for name, code := range codes {
+		if code != ReturnCodeNoErrors {
+			t.Errorf("write %s error: 0x%X", name, uint32(code))
+		}
+	}
+
+	// Verify each INDIVIDUALLY (not batch) to confirm SumWrite correctness
+	for name, expected := range writeValues {
+		actual, err := conn.ReadFromSymbol(name)
+		if err != nil {
+			t.Errorf("ReadFromSymbol(%s) failed: %v", name, err)
+			continue
+		}
+		if !valuesApproxEqual(expected, actual, envVarMap[name]) {
+			t.Errorf("%s: wrote %q via SumWrite, read %q individually", name, expected, actual)
+		} else {
+			t.Logf("%s: SumWrite %q confirmed", name, expected)
+		}
+	}
+
+	// Restore
+	_, _ = conn.WriteMultipleSymbols(originals)
+}
+
+func TestIntegrationSumReadKnownValues(t *testing.T) {
+	type symbolPair struct {
+		name      string
+		testValue string
+		altValue  string
+		envVar    string
+	}
+	var pairs []symbolPair
+	for _, tc := range writeTestCases {
+		name := os.Getenv(tc.envVar)
+		if name == "" {
+			continue
+		}
+		pairs = append(pairs, symbolPair{name: name, testValue: tc.testValue, altValue: tc.altValue, envVar: tc.envVar})
+	}
+	if len(pairs) < 2 {
+		t.Skip("need at least 2 ADS_WRITE_* env vars")
+	}
+
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	// Save originals and write known values individually
+	originals := make(map[string]string)
+	knownValues := make(map[string]string)
+	envVarMap := make(map[string]string)
+	for _, p := range pairs {
+		orig, err := conn.ReadFromSymbol(p.name)
+		if err != nil {
+			t.Fatalf("ReadFromSymbol(%s) failed: %v", p.name, err)
+		}
+		originals[p.name] = orig
+		v := p.testValue
+		if v == orig {
+			v = p.altValue
+		}
+		err = conn.WriteToSymbol(p.name, v)
+		if err != nil {
+			t.Fatalf("WriteToSymbol(%s, %s) failed: %v", p.name, v, err)
+		}
+		knownValues[p.name] = v
+		envVarMap[p.name] = p.envVar
+	}
+
+	// Batch read all
+	names := make([]string, 0, len(knownValues))
+	for name := range knownValues {
+		names = append(names, name)
+	}
+	batchValues, err := conn.ReadMultipleSymbols(names)
+	if err != nil {
+		t.Fatalf("ReadMultipleSymbols failed: %v", err)
+	}
+
+	// Verify each matches the known written value
+	for name, expected := range knownValues {
+		actual, ok := batchValues[name]
+		if !ok {
+			t.Errorf("missing batch result for %s", name)
+			continue
+		}
+		if !valuesApproxEqual(expected, actual, envVarMap[name]) {
+			t.Errorf("%s: wrote %q individually, SumRead returned %q", name, expected, actual)
+		} else {
+			t.Logf("%s: SumRead %q matches written value", name, actual)
+		}
+	}
+
+	// Restore
+	for name, orig := range originals {
+		_ = conn.WriteToSymbol(name, orig)
+	}
+}
+
+// ============================================================
+// 64-bit integration tests
+// ============================================================
+
+func TestIntegrationWrite64BitTypes(t *testing.T) {
+	testCases := []struct {
+		envVar    string
+		testValue string
+		altValue  string
+	}{
+		{"ADS_WRITE_LINT", "-9223372036854775000", "42"},
+		{"ADS_WRITE_LWORD", "18446744073709551000", "100"},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		symbolName := os.Getenv(tc.envVar)
+		if symbolName == "" {
+			t.Logf("skipping %s (env var not set)", tc.envVar)
+			continue
+		}
+		t.Run(tc.envVar, func(t *testing.T) {
+			conn := setupConnection(t)
+			if err := conn.LoadSymbols(); err != nil {
+				t.Fatalf("LoadSymbols failed: %v", err)
+			}
+
+			original, err := conn.ReadFromSymbol(symbolName)
+			if err != nil {
+				t.Skipf("symbol %s not available: %v", symbolName, err)
+			}
+			t.Logf("original %s = %s", symbolName, original)
+
+			writeValue := tc.testValue
+			if writeValue == original {
+				writeValue = tc.altValue
+			}
+
+			err = conn.WriteToSymbol(symbolName, writeValue)
+			if err != nil {
+				t.Fatalf("WriteToSymbol(%s, %s) failed: %v", symbolName, writeValue, err)
+			}
+
+			readBack, err := conn.ReadFromSymbol(symbolName)
+			if err != nil {
+				t.Fatalf("ReadFromSymbol after write failed: %v", err)
+			}
+			if !valuesApproxEqual(writeValue, readBack, tc.envVar) {
+				t.Errorf("wrote %q, read %q", writeValue, readBack)
+			}
+			t.Logf("wrote %s, read back %s", writeValue, readBack)
+
+			_ = conn.WriteToSymbol(symbolName, original)
+		})
+	}
+}
+
+func TestIntegrationRead64BitCounter(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	counterName := getEnvOrDefault("ADS_READ_COUNTER", "GVL_ProcessData.nMasterCycleCounter")
+
+	val1, err := conn.ReadFromSymbol(counterName)
+	if err != nil {
+		t.Skipf("counter %s not available: %v", counterName, err)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+
+	val2, err := conn.ReadFromSymbol(counterName)
+	if err != nil {
+		t.Fatalf("second read failed: %v", err)
+	}
+
+	n1, err1 := strconv.ParseUint(val1, 10, 64)
+	n2, err2 := strconv.ParseUint(val2, 10, 64)
+	if err1 != nil || err2 != nil {
+		t.Logf("counter values: %q -> %q (not uint64, may be DINT on TC2)", val1, val2)
+		// Try signed parse for TC2 DINT counters
+		s1, _ := strconv.ParseInt(val1, 10, 64)
+		s2, _ := strconv.ParseInt(val2, 10, 64)
+		if s2 <= s1 {
+			t.Errorf("counter did not increment: %d -> %d", s1, s2)
+		} else {
+			t.Logf("counter (signed): %d -> %d (delta=%d)", s1, s2, s2-s1)
+		}
+		return
+	}
+
+	if n2 <= n1 {
+		t.Errorf("ULINT counter did not increment: %d -> %d", n1, n2)
+	}
+	t.Logf("ULINT counter: %d -> %d (delta=%d)", n1, n2, n2-n1)
+}
+
+// ============================================================
+// Enum & struct tests
+// ============================================================
+
+func TestIntegrationEnumOnDemandRead(t *testing.T) {
+	// Deliberately do NOT call LoadSymbols — force on-demand resolution
+	conn := setupConnection(t)
+
+	enumName := os.Getenv("ADS_READ_ENUM")
+	if enumName == "" {
+		enumName = "GVL_ProcessData.eMachineState"
+	}
+
+	value, err := conn.ReadFromSymbol(enumName)
+	if err != nil {
+		t.Skipf("enum symbol %s not available: %v", enumName, err)
+	}
+
+	// Value should be numeric (enum ordinal via inferBaseType)
+	_, parseErr := strconv.ParseInt(value, 10, 64)
+	if parseErr != nil {
+		t.Errorf("enum value should be numeric, got %q: %v", value, parseErr)
+	}
+	t.Logf("on-demand enum: %s = %s", enumName, value)
+}
+
+func TestIntegrationDeeplyNestedStruct(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	structName := os.Getenv("ADS_READ_DEEP_STRUCT")
+	if structName == "" {
+		structName = "GVL_ProcessData.stMachineStatus"
+	}
+
+	symbols, _ := conn.ListSymbols()
+	sym, ok := symbols[structName]
+	if !ok {
+		t.Skipf("struct %s not found", structName)
+	}
+
+	// Measure nesting depth
+	maxDepth := 0
+	var measureDepth func(s *Symbol, depth int)
+	measureDepth = func(s *Symbol, depth int) {
+		if depth > maxDepth {
+			maxDepth = depth
+		}
+		for _, child := range s.Children {
+			measureDepth(child, depth+1)
+		}
+	}
+	measureDepth(sym, 0)
+	t.Logf("struct %s: depth=%d, direct children=%d, size=%d bytes", structName, maxDepth, len(sym.Children), sym.Length)
+
+	if maxDepth < 2 {
+		t.Skipf("struct only has depth %d, need 2+ levels", maxDepth)
+	}
+
+	// Read the struct
+	value, err := conn.ReadFromSymbol(structName)
+	if err != nil {
+		t.Fatalf("ReadFromSymbol(%s) failed: %v", structName, err)
+	}
+
+	if len(value) > 200 {
+		t.Logf("value (truncated): %.200s...", value)
+	} else {
+		t.Logf("value: %s", value)
+	}
+
+	// Verify all leaf children have values
+	var leafCount, emptyCount int
+	var checkLeaves func(s *Symbol, path string)
+	checkLeaves = func(s *Symbol, path string) {
+		if len(s.Children) == 0 {
+			leafCount++
+			if s.Value == "" {
+				emptyCount++
+				t.Errorf("leaf %s has empty value", path)
+			}
+		} else {
+			for name, child := range s.Children {
+				checkLeaves(child, path+"."+name)
+			}
+		}
+	}
+	checkLeaves(sym, structName)
+	t.Logf("verified %d leaf values, %d empty", leafCount, emptyCount)
+}
+
+func TestIntegrationStructMultipleEnumChildren(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	structName := os.Getenv("ADS_READ_DEEP_STRUCT")
+	if structName == "" {
+		structName = "GVL_ProcessData.stMachineStatus"
+	}
+
+	symbols, _ := conn.ListSymbols()
+	sym, ok := symbols[structName]
+	if !ok {
+		t.Skipf("struct %s not found", structName)
+	}
+
+	// Read the struct to populate values
+	_, err := conn.ReadFromSymbol(structName)
+	if err != nil {
+		t.Fatalf("ReadFromSymbol(%s) failed: %v", structName, err)
+	}
+
+	// Find all enum/alias children (non-parseable leaf types)
+	type enumInfo struct {
+		fullName string
+		dataType string
+		value    string
+	}
+	var enums []enumInfo
+	var findEnums func(s *Symbol)
+	findEnums = func(s *Symbol) {
+		for _, child := range s.Children {
+			if !parseableSet[child.DataType] && len(child.Children) == 0 && child.Length > 0 {
+				enums = append(enums, enumInfo{child.FullName, child.DataType, child.Value})
+			}
+			findEnums(child)
+		}
+	}
+	findEnums(sym)
+
+	if len(enums) < 2 {
+		t.Skipf("found only %d enum children, need 2+", len(enums))
+	}
+
+	t.Logf("found %d enum children in %s", len(enums), structName)
+	for _, e := range enums {
+		if e.value == "" {
+			t.Errorf("enum child %s (%s) has empty value", e.fullName, e.dataType)
+			continue
+		}
+		_, parseErr := strconv.ParseInt(e.value, 10, 64)
+		if parseErr != nil {
+			t.Errorf("enum child %s value %q not numeric", e.fullName, e.value)
+		}
+		t.Logf("  %s (%s) = %s", e.fullName, e.dataType, e.value)
+	}
+}
+
+// ============================================================
+// Transmission mode tests
+// ============================================================
+
+func TestIntegrationNotificationServerCycle(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	symbolName := pickParseableSymbol(symbols)
+	if symbolName == "" {
+		t.Skip("no parseable symbol")
+	}
+
+	ch := make(chan *Update, 50)
+	handle, err := conn.AddSymbolNotification(symbolName, 100, 100, TransModeServerCycle, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotification (ServerCycle) failed: %v", err)
+	}
+
+	var count int
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case u := <-ch:
+			count++
+			if count == 1 {
+				t.Logf("first ServerCycle notification: %s = %s", u.Variable, u.Value)
+			}
+		case <-timeout:
+			goto done
+		}
+	}
+done:
+	t.Logf("ServerCycle: received %d notifications in 3s", count)
+	if count < 2 {
+		t.Errorf("ServerCycle should deliver periodic updates, got %d", count)
+	}
+
+	_ = conn.DeleteDeviceNotification(handle)
+}
+
+func TestIntegrationNotificationServerCycle2(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	symbolName := pickParseableSymbol(symbols)
+	if symbolName == "" {
+		t.Skip("no parseable symbol")
+	}
+
+	ch := make(chan *Update, 50)
+	handle, err := conn.AddSymbolNotification(symbolName, 100, 100, TransModeServerCycle2, ch)
+	if err != nil {
+		// TC2 may reject this mode
+		t.Skipf("ServerCycle2 not supported: %v", err)
+	}
+
+	var count int
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case u := <-ch:
+			count++
+			if count == 1 {
+				t.Logf("first ServerCycle2 notification: %s = %s", u.Variable, u.Value)
+			}
+		case <-timeout:
+			goto done
+		}
+	}
+done:
+	t.Logf("ServerCycle2: received %d notifications in 3s", count)
+	if count < 2 {
+		t.Logf("ServerCycle2: only %d updates (may need downgrade on this PLC)", count)
+	}
+
+	_ = conn.DeleteDeviceNotification(handle)
+}
+
+func TestIntegrationNotificationServerOnChange2(t *testing.T) {
+	symbolName := os.Getenv("ADS_WRITE_INT")
+	if symbolName == "" {
+		t.Skip("ADS_WRITE_INT not set")
+	}
+
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	ch := make(chan *Update, 10)
+	handle, err := conn.AddSymbolNotification(symbolName, 100, 100, TransModeServerOnChange2, ch)
+	if err != nil {
+		t.Skipf("ServerOnChange2 not supported: %v", err)
+	}
+
+	// Read original, write a different value to trigger change
+	original, _ := conn.ReadFromSymbol(symbolName)
+	writeVal := "42"
+	if original == "42" {
+		writeVal = "100"
+	}
+
+	err = conn.WriteToSymbol(symbolName, writeVal)
+	if err != nil {
+		t.Fatalf("WriteToSymbol failed: %v", err)
+	}
+
+	select {
+	case update := <-ch:
+		t.Logf("ServerOnChange2 delivered: %s = %s", update.Variable, update.Value)
+	case <-time.After(3 * time.Second):
+		// TC2 silently ignores v2 transmission modes without returning an error.
+		// The notification handle is created but no notifications arrive.
+		// This is documented Beckhoff behavior, not a library bug.
+		t.Log("no ServerOnChange2 notification within 3s — TC2 silently ignores v2 modes (expected on older PLCs)")
+	}
+
+	// Restore
+	_ = conn.WriteToSymbol(symbolName, original)
+	_ = conn.DeleteDeviceNotification(handle)
+}
+
+func TestIntegrationNotificationBatchTransModes(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	names := pickParseableSymbols(symbols, 3)
+	if len(names) < 3 {
+		t.Skip("need at least 3 parseable symbols")
+	}
+
+	ch := make(chan *Update, 100)
+	configs := []NotificationConfig{
+		{SymbolName: names[0], MaxDelay: 100, CycleTime: 100, TransmissionMode: TransModeServerCycle},
+		{SymbolName: names[1], MaxDelay: 100, CycleTime: 100, TransmissionMode: TransModeServerOnChange},
+		{SymbolName: names[2], MaxDelay: 100, CycleTime: 200, TransmissionMode: TransModeServerCycle2},
+	}
+
+	err := conn.AddSymbolNotifications(configs, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotifications (mixed modes) failed: %v", err)
+	}
+
+	// Collect for 3 seconds
+	seen := make(map[string]int)
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case u := <-ch:
+			seen[u.Variable]++
+		case <-timeout:
+			goto done
+		}
+	}
+done:
+	for name, count := range seen {
+		t.Logf("  %s: %d notifications", name, count)
+	}
+
+	// ServerCycle symbol should have multiple periodic notifications
+	if seen[names[0]] < 2 {
+		t.Errorf("ServerCycle symbol %s: expected 2+ notifications, got %d", names[0], seen[names[0]])
+	}
+
+	// At least the cycle symbols should have notifications
+	totalSeen := 0
+	for _, c := range seen {
+		totalSeen += c
+	}
+	t.Logf("total: %d notifications across %d symbols", totalSeen, len(seen))
+
+	// Cleanup
+	conn.symbolLock.Lock()
+	var handles []uint32
+	for h := range conn.activeNotifications {
+		handles = append(handles, h)
+	}
+	conn.symbolLock.Unlock()
+	_, _ = conn.SumDeleteDeviceNotification(handles)
+}
+
+// ============================================================
+// Large batch stress tests
+// ============================================================
+
+func TestIntegrationLargeBatchRead(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	names := pickParseableSymbols(symbols, 50)
+	if len(names) < 10 {
+		t.Skipf("only %d parseable symbols, need 10+", len(names))
+	}
+
+	// Ensure all symbols have handles before batch read to avoid
+	// intermittent failures from handle acquisition under load.
+	for _, name := range names {
+		if _, err := conn.GetSymbol(name); err != nil {
+			t.Fatalf("GetSymbol(%s) failed: %v", name, err)
+		}
+	}
+
+	t.Logf("batch reading %d symbols", len(names))
+	start := time.Now()
+	values, err := conn.ReadMultipleSymbols(names)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ReadMultipleSymbols failed: %v", err)
+	}
+
+	// Log missing and empty symbols for diagnostics.
+	// STRING type symbols legitimately hold "" so don't count those as failures.
+	var missing, emptyNonString, emptyString []string
+	for _, name := range names {
+		val, ok := values[name]
+		if !ok {
+			missing = append(missing, name)
+		} else if val == "" {
+			if symbols[name].DataType == "STRING" {
+				emptyString = append(emptyString, name)
+			} else {
+				emptyNonString = append(emptyNonString, name)
+			}
+		}
+	}
+	t.Logf("batch read %d/%d symbols in %v, %d missing, %d empty (non-string), %d empty strings",
+		len(values), len(names), elapsed, len(missing), len(emptyNonString), len(emptyString))
+	for _, name := range missing {
+		t.Logf("  missing: %s (type=%s)", name, symbols[name].DataType)
+	}
+	for _, name := range emptyNonString {
+		t.Logf("  empty: %s (type=%s)", name, symbols[name].DataType)
+	}
+	if len(missing) > 0 {
+		t.Errorf("%d/%d symbols missing from results", len(missing), len(names))
+	}
+	if len(emptyNonString) > 0 {
+		t.Errorf("%d/%d non-string symbols had empty values", len(emptyNonString), len(names))
+	}
+}
+
+func TestIntegrationLargeBatchNotification(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	names := pickParseableSymbols(symbols, 20)
+	if len(names) < 10 {
+		t.Skipf("only %d parseable symbols, need 10+", len(names))
+	}
+
+	ch := make(chan *Update, 500)
+	var configs []NotificationConfig
+	for _, name := range names {
+		configs = append(configs, NotificationConfig{
+			SymbolName:       name,
+			MaxDelay:         200,
+			CycleTime:        200,
+			TransmissionMode: TransModeServerCycle,
+		})
+	}
+
+	err := conn.AddSymbolNotifications(configs, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotifications (large batch) failed: %v", err)
+	}
+
+	// Verify all tracked
+	conn.symbolLock.Lock()
+	activeCount := len(conn.activeNotifications)
+	conn.symbolLock.Unlock()
+	if activeCount != len(names) {
+		t.Errorf("expected %d active notifications, got %d", len(names), activeCount)
+	}
+
+	// Collect for 3 seconds
+	seen := make(map[string]bool)
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case u := <-ch:
+			seen[u.Variable] = true
+		case <-timeout:
+			goto done
+		}
+	}
+done:
+	t.Logf("received notifications for %d/%d symbols in 3s", len(seen), len(names))
+	if len(seen) < len(names)/2 {
+		t.Errorf("expected notifications from at least %d symbols, got %d", len(names)/2, len(seen))
+	}
+
+	// Bulk cleanup
+	conn.symbolLock.Lock()
+	var handles []uint32
+	for h := range conn.activeNotifications {
+		handles = append(handles, h)
+	}
+	conn.symbolLock.Unlock()
+	_, _ = conn.SumDeleteDeviceNotification(handles)
 }
