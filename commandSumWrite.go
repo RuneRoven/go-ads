@@ -25,11 +25,8 @@ func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, 
 		return nil, nil
 	}
 
-	// Skip SumWrite if we already know sum commands are not supported.
-	// We reuse sumReadChecked/sumReadSupported because PLCs that lack SumRead
-	// (GroupSumupRead 0xF080) also lack SumWrite (GroupSumupWrite 0xF081) —
-	// both were introduced together in the ADS sum command extension.
-	if conn.sumReadChecked.Load() && !conn.sumReadSupported.Load() {
+	// Skip SumWrite if we already know it's not supported.
+	if conn.sumWriteChecked.Load() && !conn.sumWriteSupported.Load() {
 		return conn.sumWriteFallback(requests)
 	}
 
@@ -58,10 +55,10 @@ func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, 
 
 	resp, err := conn.WriteRead(uint32(GroupSumupWrite), uint32(n), readLen, writeData)
 	if err != nil {
-		if !conn.sumReadChecked.Load() && isSumCommandUnsupportedError(err) {
+		if !conn.sumWriteChecked.Load() && isSumCommandUnsupportedError(err) {
 			conn.logger.Warn("SumWrite not supported by PLC, using individual writes", "error", err)
-			conn.sumReadSupported.Store(false)
-			conn.sumReadChecked.Store(true)
+			conn.sumWriteSupported.Store(false)
+			conn.sumWriteChecked.Store(true)
 			return conn.sumWriteFallback(requests)
 		}
 		// Don't fall back for transient errors — writes are not idempotent
@@ -69,9 +66,9 @@ func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, 
 		return nil, fmt.Errorf("SumWrite failed: %w", err)
 	}
 
-	if !conn.sumReadChecked.Load() {
-		conn.sumReadSupported.Store(true)
-		conn.sumReadChecked.Store(true)
+	if !conn.sumWriteChecked.Load() {
+		conn.sumWriteSupported.Store(true)
+		conn.sumWriteChecked.Store(true)
 	}
 
 	if len(resp) < n*4 {

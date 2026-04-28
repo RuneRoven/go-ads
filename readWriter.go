@@ -159,6 +159,19 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 				}
 			}
 		}
+		// Fallback: infer base type from symbol size when datatypes table is
+		// not available (on-demand mode). This handles enums and simple type
+		// aliases whose underlying type matches a standard integer size.
+		if inferred := inferBaseType(symbol.Length); inferred != "" {
+			resolved := *symbol
+			resolved.DataType = inferred
+			val, err := resolved.parse(data, offset, nil)
+			if err != nil {
+				return "", err
+			}
+			symbol.updateValue(val)
+			return symbol.Value, nil
+		}
 		return "", fmt.Errorf("unknown format cannot parse: %s", symbol.DataType)
 	}
 
@@ -210,6 +223,24 @@ var parseableTypes = []string{
 	"LINT",
 	"ULINT",
 	"LWORD",
+}
+
+// inferBaseType guesses a parseable base type from a symbol's byte size.
+// Used as a last resort when the datatype table is unavailable (on-demand mode)
+// to parse enums and simple type aliases. Returns "" if no match.
+func inferBaseType(size uint32) string {
+	switch size {
+	case 1:
+		return "SINT"
+	case 2:
+		return "INT"
+	case 4:
+		return "DINT"
+	case 8:
+		return "LINT"
+	default:
+		return ""
+	}
 }
 
 func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string]SymbolUploadDataType) (data []byte, err error) {

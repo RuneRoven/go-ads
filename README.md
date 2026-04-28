@@ -66,8 +66,8 @@ See `examples/simple/main.go` for all available flags.
 
 ### Prerequisites
 
-- Go 1.21+
-- [golangci-lint](https://golangci-lint.run/docs/welcome/install/) v2+
+- Go 1.26+
+- [golangci-lint](https://golangci-lint.run/docs/welcome/install/) v2.11+
 - [gofumpt](https://github.com/mvdan/gofumpt) (`go install mvdan.cc/gofumpt@latest`)
 
 ### Before pushing
@@ -90,9 +90,59 @@ make test-cover # run tests with coverage report
 make build      # build all packages
 ```
 
+### Integration tests
+
+Integration tests require a real Beckhoff PLC on the network. They are gated behind a build tag and skipped by default.
+
+**Environment file format** (`.env.integration.XXX`):
+
+```bash
+## Required
+ADS_PLC_IP=192.168.0.1          # PLC IP address
+ADS_TARGET_AMS=5.0.0.1.1.1      # PLC AMS NetID
+ADS_TARGET_PORT=851              # AMS port (851 for TC3, 801 for TC2)
+
+## Optional — auto-derived if omitted
+ADS_LOCAL_AMS=192.168.0.100.1.1 # Local AMS NetID (default: auto from local IP)
+ADS_HOST_IP=192.168.0.100       # IP the PLC uses to reach us
+
+## Optional — for auto-creating AMS route
+ADS_ROUTE_USER=Administrator     # PLC admin username
+ADS_ROUTE_PASS=1                 # PLC admin password
+
+## Optional — test-specific symbol names
+ADS_WRITE_BOOL=GVL_WriteTest.bWriteBool
+ADS_READ_COUNTER=GVL_ProcessData.nMasterCycleCounter
+```
+
+**Running integration tests:**
+
+```bash
+# Source env and run all integration tests against a PLC
+set -a && source .env.integration && set +a
+go test -tags integration -v -timeout 60s
+
+# Run a specific test
+go test -tags integration -run TestIntegrationConnect -v -timeout 30s
+```
+
+**Symbol browse test** (`browse_test.go`) — connects to a PLC, loads all symbols slowly (chunked reads with delays to avoid disrupting real-time tasks), and writes a `.var` file documenting every symbol:
+
+```bash
+set -a && source .env.integration && set +a
+go test -tags integration -run TestBrowseAllSymbols -v -timeout 60s
+# → writes plc_192_168_0_1.var (filename derived from ADS_PLC_IP)
+```
+
+The `.var` files list all symbols with name, datatype, size, index group, offset, and comment.
+
 ### CI
 
 CI runs automatically on pull requests to `main` with 4 parallel jobs: lint, test, test-race, and build. All must pass before merging.
+
+## TODO
+
+- **Enum string resolution**: Add an option to return enum constant names (e.g. `"RUNNING"`) instead of numeric values (e.g. `"2"`). Requires parsing enum constant values from the datatype table's extra data. Only possible for TC3 non-strict enums; TC3 strict enums and TC2 do not expose constant names in the datatype table.
 
 ## License
 

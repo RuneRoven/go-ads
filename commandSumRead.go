@@ -18,16 +18,24 @@ type SumReadResult struct {
 	Data  []byte
 }
 
-// SumRead performs a batch read using GroupSumupReadEx2 (0xF084).
-// This reads multiple index group/offset/length combinations in a single ADS round-trip.
-// If the sum command fails (e.g. on older PLCs), it falls back to individual reads.
+// SumRead performs a batch read of multiple index group/offset/length combinations
+// in a single ADS round-trip.
+//
+// Beckhoff recommends using the newest command versions, so this tries:
+//  1. SumReadEx2 (0xF084) — preferred, TC3 only
+//  2. SumReadEx  (0xF083) — works on TC2 + TC3
+//  3. Individual reads     — final fallback
+//
+// Both 0xF084 and 0xF083 use the same response format: [N × (error(4), length(4))][data].
+// The detected command level is cached for subsequent calls and reset on reconnect.
 func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, error) {
 	if len(requests) == 0 {
 		return nil, nil
 	}
 
-	// Skip SumRead if we already know it's not supported
-	if conn.sumReadChecked.Load() && !conn.sumReadSupported.Load() {
+	cmd := conn.sumReadCmd.Load()
+	if cmd == 1 {
+		// Already determined: no sum read support
 		return conn.sumReadFallback(requests)
 	}
 
@@ -43,42 +51,72 @@ func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, err
 		totalReadLen += req.Length
 	}
 
-	// Read data: N × 4 bytes error codes + N × 4 bytes actual lengths + concatenated data
+	// Response: [N × (error(4), length(4))][data]
 	readLen := uint32(n*8) + totalReadLen
 
-	resp, err := conn.WriteRead(uint32(GroupSumupReadEx2), uint32(n), readLen, writeData)
-	if err != nil {
-		if !conn.sumReadChecked.Load() && isSumCommandUnsupportedError(err) {
-			conn.logger.Warn("SumRead not supported by PLC, using individual reads", "error", err)
-			conn.sumReadSupported.Store(false)
-			conn.sumReadChecked.Store(true)
-			return conn.sumReadFallback(requests)
-		}
+	if cmd != 0 {
+		// Already probed — use cached command
+		return conn.sumReadExec(Group(cmd), uint32(n), readLen, writeData, requests)
+	}
+
+	// First call: probe starting with Ex2, then Ex
+	return conn.sumReadProbe(uint32(n), readLen, writeData, requests)
+}
+
+// sumReadProbe tries SumReadEx2 then SumReadEx, caching the first that works.
+func (conn *Connection) sumReadProbe(count uint32, readLen uint32, writeData []byte, requests []SumReadRequest) ([]SumReadResult, error) {
+	// Try SumReadEx2 (0xF084) first
+	resp, err := conn.WriteRead(uint32(GroupSumupReadEx2), count, readLen, writeData)
+	if err == nil {
+		conn.sumReadCmd.Store(uint32(GroupSumupReadEx2))
+		conn.logger.Info("SumRead using SumReadEx2 (0xF084)")
+		return conn.parseSumReadResponse(resp, int(count), requests)
+	}
+	if !isSumCommandUnsupportedError(err) {
 		return nil, fmt.Errorf("SumRead failed: %w", err)
 	}
+	conn.logger.Info("SumReadEx2 not supported, trying SumReadEx", "error", err)
 
-	if !conn.sumReadChecked.Load() {
-		conn.sumReadSupported.Store(true)
-		conn.sumReadChecked.Store(true)
+	// Try SumReadEx (0xF083)
+	resp, err = conn.WriteRead(uint32(GroupSumupReadEx), count, readLen, writeData)
+	if err == nil {
+		conn.sumReadCmd.Store(uint32(GroupSumupReadEx))
+		conn.logger.Info("SumRead using SumReadEx (0xF083)")
+		return conn.parseSumReadResponse(resp, int(count), requests)
 	}
+	if !isSumCommandUnsupportedError(err) {
+		return nil, fmt.Errorf("SumRead failed: %w", err)
+	}
+	conn.logger.Warn("SumReadEx not supported, using individual reads", "error", err)
 
+	// No sum read support
+	conn.sumReadCmd.Store(1)
+	return conn.sumReadFallback(requests)
+}
+
+// sumReadExec performs a sum read with a known-good command.
+func (conn *Connection) sumReadExec(group Group, count uint32, readLen uint32, writeData []byte, requests []SumReadRequest) ([]SumReadResult, error) {
+	resp, err := conn.WriteRead(uint32(group), count, readLen, writeData)
+	if err != nil {
+		return nil, fmt.Errorf("SumRead failed: %w", err)
+	}
+	return conn.parseSumReadResponse(resp, int(count), requests)
+}
+
+// parseSumReadResponse parses the [N × (error, length)][data] response format
+// shared by both SumReadEx (0xF083) and SumReadEx2 (0xF084).
+func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumReadRequest) ([]SumReadResult, error) {
 	if len(resp) < n*8 {
 		return nil, fmt.Errorf("SumRead response too short: got %d bytes, expected at least %d", len(resp), n*8)
 	}
 
 	results := make([]SumReadResult, n)
-
-	// TC2 COMPATIBILITY: The SumReadEx2 (0xF084) response uses interleaved
-	// (error, length) pairs, confirmed working on TwinCAT 3. If TwinCAT 2
-	// uses separate arrays ([all errors] then [all lengths]) instead, change
-	// the parsing below from i*8/i*8+4 to i*4/n*4+i*4.
 	lengths := make([]uint32, n)
 	for i := 0; i < n; i++ {
 		results[i].Error = ReturnCode(binary.LittleEndian.Uint32(resp[i*8:]))
 		lengths[i] = binary.LittleEndian.Uint32(resp[i*8+4:])
 	}
 
-	// Parse concatenated data
 	dataOffset := n * 8
 	for i := 0; i < n; i++ {
 		end := dataOffset + int(lengths[i])
@@ -94,7 +132,7 @@ func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, err
 	return results, nil
 }
 
-// sumReadFallback performs individual reads when sum read is not supported.
+// sumReadFallback performs individual reads when no sum read command is supported.
 func (conn *Connection) sumReadFallback(requests []SumReadRequest) ([]SumReadResult, error) {
 	results := make([]SumReadResult, len(requests))
 	for i, req := range requests {

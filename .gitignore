@@ -5,3 +5,5 @@ examples/simple/config-office.yaml
 .DS_Store
 coverage.out
 coverage.html
+*.pdf
+*.var

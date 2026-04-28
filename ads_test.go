@@ -387,8 +387,10 @@ func TestSymbolParseSTRING(t *testing.T) {
 }
 
 func TestSymbolParseUnknownType(t *testing.T) {
-	sym := &Symbol{DataType: "UNKNOWN_TYPE", Length: 4}
-	_, err := sym.parse([]byte{0, 0, 0, 0}, 0, nil)
+	// Use size 3 which doesn't match any standard integer size,
+	// so inferBaseType won't resolve it
+	sym := &Symbol{DataType: "UNKNOWN_TYPE", Length: 3}
+	_, err := sym.parse([]byte{0, 0, 0}, 0, nil)
 	if err == nil {
 		t.Error("expected error for unknown data type")
 	}
@@ -986,6 +988,54 @@ func TestParseEnumNestedInStruct(t *testing.T) {
 		}
 		if stateChild.Value != "4" {
 			t.Errorf("state value = %q, want %q", stateChild.Value, "4")
+		}
+	})
+}
+
+func TestParseEnumWithoutDatatypes(t *testing.T) {
+	// When datatypes table is nil (on-demand mode), enum types should still
+	// parse by inferring the base type from the symbol's byte size.
+	tests := []struct {
+		name     string
+		dataType string
+		size     uint32
+		data     []byte
+		want     string
+	}{
+		{"1-byte enum", "E_SmallState", 1, []byte{42}, "42"},
+		{"2-byte enum", "E_WordState", 2, func() []byte { b := make([]byte, 2); binary.LittleEndian.PutUint16(b, 1500); return b }(), "1500"},
+		{"4-byte enum DINT", "E_MachineState", 4, func() []byte { b := make([]byte, 4); binary.LittleEndian.PutUint32(b, 2); return b }(), "2"},
+		{"4-byte enum negative", "E_MachineState", 4, func() []byte { b := make([]byte, 4); v := int32(-1); binary.LittleEndian.PutUint32(b, uint32(v)); return b }(), "-1"},
+		{"8-byte enum", "E_BigState", 8, func() []byte { b := make([]byte, 8); binary.LittleEndian.PutUint64(b, 99); return b }(), "99"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sym := &Symbol{
+				Name:     "testEnum",
+				FullName: "MAIN.testEnum",
+				DataType: tt.dataType,
+				Length:   tt.size,
+			}
+			// Pass nil datatypes — simulates on-demand mode
+			value, err := sym.parse(tt.data, 0, nil)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			if value != tt.want {
+				t.Errorf("got %q, want %q", value, tt.want)
+			}
+		})
+	}
+
+	// Verify non-standard sizes still error
+	t.Run("3-byte unknown type still errors", func(t *testing.T) {
+		sym := &Symbol{
+			Name: "weird", FullName: "MAIN.weird",
+			DataType: "UNKNOWN_TYPE", Length: 3,
+		}
+		_, err := sym.parse([]byte{1, 2, 3}, 0, nil)
+		if err == nil {
+			t.Fatal("expected error for 3-byte unknown type")
 		}
 	})
 }

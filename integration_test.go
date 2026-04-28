@@ -4,6 +4,7 @@ package ads
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"net"
@@ -1317,4 +1318,214 @@ func TestIntegrationReconnectReadDuringDisconnect(t *testing.T) {
 	// 4. Wait for reconnect to fully complete before Close() runs,
 	// so handle cleanup can succeed cleanly.
 	waitForReconnect(t, conn, 15*time.Second)
+}
+
+func TestIntegrationBatchNotification(t *testing.T) {
+	conn := setupConnection(t)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	names := pickParseableSymbols(symbols, 3)
+	if len(names) < 2 {
+		t.Skip("need at least 2 parseable symbols")
+	}
+
+	ch := make(chan *Update, 50)
+
+	var configs []NotificationConfig
+	for _, name := range names {
+		configs = append(configs, NotificationConfig{
+			SymbolName:       name,
+			MaxDelay:         100,
+			CycleTime:        100,
+			TransmissionMode: TransModeServerOnChange,
+		})
+	}
+
+	err := conn.AddSymbolNotifications(configs, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotifications failed: %v", err)
+	}
+
+	// Verify all handles tracked
+	conn.symbolLock.Lock()
+	activeCount := len(conn.activeNotifications)
+	conn.symbolLock.Unlock()
+	if activeCount != len(names) {
+		t.Errorf("expected %d active notifications, got %d", len(names), activeCount)
+	}
+	t.Logf("batch added %d notifications successfully", activeCount)
+
+	// Wait for at least one notification
+	select {
+	case update := <-ch:
+		t.Logf("received notification: %s = %s", update.Variable, update.Value)
+	case <-time.After(5 * time.Second):
+		t.Log("no notification received within 5s (value may not be changing)")
+	}
+
+	// Batch delete via SumDeleteDeviceNotification
+	conn.symbolLock.Lock()
+	var handles []uint32
+	for h := range conn.activeNotifications {
+		handles = append(handles, h)
+	}
+	conn.symbolLock.Unlock()
+
+	codes, err := conn.SumDeleteDeviceNotification(handles)
+	if err != nil {
+		t.Fatalf("SumDeleteDeviceNotification failed: %v", err)
+	}
+	for i, code := range codes {
+		if code != ReturnCodeNoErrors {
+			t.Errorf("delete handle %d returned error: 0x%X", handles[i], uint32(code))
+		}
+	}
+
+	conn.symbolLock.Lock()
+	finalCount := len(conn.activeNotifications)
+	conn.symbolLock.Unlock()
+	if finalCount != 0 {
+		t.Errorf("expected 0 active notifications after batch delete, got %d", finalCount)
+	}
+	t.Logf("batch deleted %d notifications successfully", len(handles))
+}
+
+func TestIntegrationProbeSumCommands(t *testing.T) {
+	conn := setupConnection(t)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	symbols, _ := conn.ListSymbols()
+	names := pickParseableSymbols(symbols, 3)
+	if len(names) < 2 {
+		t.Skip("need at least 2 parseable symbols")
+	}
+
+	// Build requests for 2 symbols
+	type symReq struct {
+		name   string
+		symbol *Symbol
+		group  uint32
+		offset uint32
+	}
+	var reqs []symReq
+	for _, name := range names[:2] {
+		sym := symbols[name]
+		g, o := symbolSumAddress(sym)
+		reqs = append(reqs, symReq{name: name, symbol: sym, group: g, offset: o})
+		t.Logf("symbol: %s (type=%s, length=%d, group=0x%X, offset=0x%X)",
+			name, sym.DataType, sym.Length, g, o)
+	}
+
+	n := len(reqs)
+
+	// Build write data for sum read commands: N × 12 bytes
+	writeData := make([]byte, n*12)
+	var totalLen uint32
+	for i, r := range reqs {
+		binary.LittleEndian.PutUint32(writeData[i*12:], r.group)
+		binary.LittleEndian.PutUint32(writeData[i*12+4:], r.offset)
+		binary.LittleEndian.PutUint32(writeData[i*12+8:], r.symbol.Length)
+		totalLen += r.symbol.Length
+	}
+
+	// Probe each sum read command
+	sumCommands := []struct {
+		name  string
+		group Group
+		// readLen for SumRead (0xF080): N*4 (errors) + data
+		// readLen for SumReadEx2 (0xF084): N*8 (error+length pairs) + data
+	}{
+		{"SumRead (0xF080)", GroupSumupRead},
+		{"SumReadEx (0xF083)", GroupSumupReadEx},
+		{"SumReadEx2 (0xF084)", GroupSumupReadEx2},
+	}
+
+	for _, cmd := range sumCommands {
+		var readLen uint32
+		switch cmd.group {
+		case GroupSumupRead:
+			readLen = uint32(n*4) + totalLen // [n errors][data]
+		case GroupSumupReadEx, GroupSumupReadEx2:
+			readLen = uint32(n*8) + totalLen // [n*(error,length)][data]
+		}
+
+		resp, err := conn.WriteRead(uint32(cmd.group), uint32(n), readLen, writeData)
+		if err != nil {
+			t.Logf("%s: NOT SUPPORTED (error: %v)", cmd.name, err)
+			continue
+		}
+
+		t.Logf("%s: SUPPORTED (response %d bytes)", cmd.name, len(resp))
+		// Hex dump first 64 bytes for format analysis
+		dumpLen := len(resp)
+		if dumpLen > 64 {
+			dumpLen = 64
+		}
+		t.Logf("  raw response (first %d bytes): %x", dumpLen, resp[:dumpLen])
+
+		// Try parsing as separate arrays (TC2 format): [n*error(4)][data]
+		if cmd.group == GroupSumupRead {
+			t.Log("  --- parsing as SumRead format [errors][data] ---")
+			for i := 0; i < n; i++ {
+				if (i+1)*4 <= len(resp) {
+					errCode := binary.LittleEndian.Uint32(resp[i*4:])
+					t.Logf("  item[%d] error=0x%X", i, errCode)
+				}
+			}
+			dataStart := n * 4
+			for i, r := range reqs {
+				end := dataStart + int(r.symbol.Length)
+				if end <= len(resp) {
+					t.Logf("  item[%d] data=%x", i, resp[dataStart:end])
+				}
+				dataStart = end
+			}
+		}
+
+		// Try parsing as interleaved (TC3 format): [n*(error,length)][data]
+		if cmd.group == GroupSumupReadEx2 {
+			t.Log("  --- parsing as interleaved [error,length] pairs ---")
+			for i := 0; i < n; i++ {
+				if (i+1)*8 <= len(resp) {
+					errCode := binary.LittleEndian.Uint32(resp[i*8:])
+					length := binary.LittleEndian.Uint32(resp[i*8+4:])
+					t.Logf("  item[%d] error=0x%X, length=%d", i, errCode, length)
+				}
+			}
+		}
+	}
+
+	// Probe sum notification commands
+	t.Log("--- Probing Sum Notification Commands ---")
+
+	// Build a single notification request
+	notifWriteData := make([]byte, 40)
+	binary.LittleEndian.PutUint32(notifWriteData[0:], reqs[0].group)
+	binary.LittleEndian.PutUint32(notifWriteData[4:], reqs[0].offset)
+	binary.LittleEndian.PutUint32(notifWriteData[8:], reqs[0].symbol.Length)
+	binary.LittleEndian.PutUint32(notifWriteData[12:], uint32(TransModeServerOnChange))
+	binary.LittleEndian.PutUint32(notifWriteData[16:], 1000000) // maxDelay 100ms in 100ns units
+	binary.LittleEndian.PutUint32(notifWriteData[20:], 1000000) // cycleTime 100ms in 100ns units
+
+	resp, err := conn.WriteRead(uint32(GroupSumupAddDeviceNotification), 1, 8, notifWriteData)
+	if err != nil {
+		t.Logf("SumAddDeviceNotification (0xF085): NOT SUPPORTED (error: %v)", err)
+	} else {
+		t.Logf("SumAddDeviceNotification (0xF085): SUPPORTED (response %d bytes): %x", len(resp), resp)
+		if len(resp) >= 8 {
+			errCode := binary.LittleEndian.Uint32(resp[0:])
+			handle := binary.LittleEndian.Uint32(resp[4:])
+			t.Logf("  error=0x%X, handle=%d", errCode, handle)
+			// Clean up: delete the notification
+			if errCode == 0 && handle != 0 {
+				_ = conn.DeleteDeviceNotification(handle)
+			}
+		}
+	}
 }
