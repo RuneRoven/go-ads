@@ -3011,8 +3011,14 @@ func TestWriteWSTRING_RoundTrip(t *testing.T) {
 // Bit-level operations tests
 // ==========================================================================
 
+// Bit symbols in TwinCAT have DataType="BOOL" — the BitValue flag affects
+// addressing (offset encodes bit position) but NOT parsing. Handle-based
+// reads return data matching the declared DataType. Tests verify that
+// BitValue flag does NOT interfere with normal type parsing.
+
 func TestParseBitSymbol_True(t *testing.T) {
-	sym := &Symbol{DataType: "BYTE", Length: 1, Flags: SymbolFlagBitValue}
+	// Real bit symbol: DataType=BOOL, BitValue flag set
+	sym := &Symbol{DataType: "BOOL", Length: 1, Flags: SymbolFlagBitValue}
 	data := []byte{0x01}
 	val, err := sym.parse(data, 0, nil)
 	if err != nil {
@@ -3024,7 +3030,7 @@ func TestParseBitSymbol_True(t *testing.T) {
 }
 
 func TestParseBitSymbol_False(t *testing.T) {
-	sym := &Symbol{DataType: "BYTE", Length: 1, Flags: SymbolFlagBitValue}
+	sym := &Symbol{DataType: "BOOL", Length: 1, Flags: SymbolFlagBitValue}
 	data := []byte{0x00}
 	val, err := sym.parse(data, 0, nil)
 	if err != nil {
@@ -3036,7 +3042,7 @@ func TestParseBitSymbol_False(t *testing.T) {
 }
 
 func TestWriteBitSymbol_True(t *testing.T) {
-	sym := &Symbol{DataType: "BYTE", Length: 1, Flags: SymbolFlagBitValue}
+	sym := &Symbol{DataType: "BOOL", Length: 1, Flags: SymbolFlagBitValue}
 	data, err := sym.writeToNode("true", 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -3047,13 +3053,41 @@ func TestWriteBitSymbol_True(t *testing.T) {
 }
 
 func TestWriteBitSymbol_False(t *testing.T) {
-	sym := &Symbol{DataType: "BYTE", Length: 1, Flags: SymbolFlagBitValue}
+	sym := &Symbol{DataType: "BOOL", Length: 1, Flags: SymbolFlagBitValue}
 	data, err := sym.writeToNode("false", 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(data) != 1 || data[0] != 0x00 {
 		t.Errorf("got %v, want [0x00]", data)
+	}
+}
+
+// BitValue flag must NOT override parsing of non-BOOL types.
+// TC2 can set flag 0x0002 on UDINT, LREAL, etc.
+func TestBitValueFlag_DoesNotOverrideUDINT(t *testing.T) {
+	sym := &Symbol{DataType: "UDINT", Length: 4, Flags: SymbolFlagBitValue}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, 12345)
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "12345" {
+		t.Errorf("got %q, want %q", val, "12345")
+	}
+}
+
+func TestBitValueFlag_DoesNotOverrideLREAL(t *testing.T) {
+	sym := &Symbol{DataType: "LREAL", Length: 8, Flags: SymbolFlagBitValue}
+	data := make([]byte, 8)
+	binary.LittleEndian.PutUint64(data, math.Float64bits(3.14))
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "3.14" {
+		t.Errorf("got %q, want %q", val, "3.14")
 	}
 }
 

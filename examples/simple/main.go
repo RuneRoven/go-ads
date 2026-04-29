@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -436,6 +437,174 @@ func main() {
 			}
 			fmt.Printf("Subscribed to %s (handle=%d, cycle=%dms, maxDelay=%dms)\n", symbolName, handle, cycleTime, maxDelay)
 
+		case "readio":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			if len(parts) < 3 {
+				fmt.Println("Usage: readio <in|out> <byte_offset> [length]")
+				continue
+			}
+			direction := parts[1]
+			offset, err := strconv.ParseUint(parts[2], 10, 32)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Invalid offset: %v\n", err)
+				continue
+			}
+			length := uint32(1)
+			if len(parts) >= 4 {
+				l, err := strconv.ParseUint(parts[3], 10, 32)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Invalid length: %v\n", err)
+					continue
+				}
+				length = uint32(l)
+			}
+			var data []byte
+			switch direction {
+			case "in":
+				data, err = conn.ReadProcessInput(uint32(offset), length)
+			case "out":
+				data, err = conn.ReadProcessOutput(uint32(offset), length)
+			default:
+				fmt.Println("Direction must be 'in' or 'out'")
+				continue
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				continue
+			}
+			fmt.Printf("Process %s [%d..%d]: %s\n", direction, offset, uint32(offset)+length-1, hex.EncodeToString(data))
+
+		case "writeio":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			if len(parts) < 3 {
+				fmt.Println("Usage: writeio <byte_offset> <hex_bytes>")
+				fmt.Println("  Example: writeio 0 FF00A5")
+				continue
+			}
+			offset, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Invalid offset: %v\n", err)
+				continue
+			}
+			data, err := hex.DecodeString(parts[2])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Invalid hex: %v\n", err)
+				continue
+			}
+			fmt.Printf("WARNING: Writing %d bytes (%s) to output process image at offset %d\n", len(data), parts[2], offset)
+			fmt.Print("This may cause physical outputs to change. Continue? [y/N]: ")
+			confirm, _ := rl.Readline()
+			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
+				fmt.Println("Cancelled.")
+				continue
+			}
+			err = conn.WriteProcessOutput(uint32(offset), data)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				continue
+			}
+			fmt.Printf("Wrote %d bytes to output process image at offset %d\n", len(data), offset)
+
+		case "readbit":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			if len(parts) < 3 {
+				fmt.Println("Usage: readbit <in|out> <byte_offset> <bit_index>")
+				continue
+			}
+			if len(parts) < 4 {
+				fmt.Println("Usage: readbit <in|out> <byte_offset> <bit_index>")
+				continue
+			}
+			direction := parts[1]
+			offset, err := strconv.ParseUint(parts[2], 10, 32)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Invalid offset: %v\n", err)
+				continue
+			}
+			bitIdx, err := strconv.ParseUint(parts[3], 10, 8)
+			if err != nil || bitIdx > 7 {
+				fmt.Fprintf(os.Stderr, "Invalid bit index (0-7): %v\n", parts[3])
+				continue
+			}
+			switch direction {
+			case "in":
+				val, err := conn.ReadProcessInputBit(uint32(offset), uint8(bitIdx))
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					continue
+				}
+				fmt.Printf("Input bit %d.%d = %v\n", offset, bitIdx, val)
+			case "out":
+				data, err := conn.ReadProcessOutput(uint32(offset), 1)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					continue
+				}
+				val := ads.ReadBit(data, int(bitIdx))
+				fmt.Printf("Output bit %d.%d = %v\n", offset, bitIdx, val)
+			default:
+				fmt.Println("Direction must be 'in' or 'out'")
+			}
+
+		case "writebit":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			if len(parts) < 4 {
+				fmt.Println("Usage: writebit <byte_offset> <bit_index> <true|false>")
+				continue
+			}
+			offset, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Invalid offset: %v\n", err)
+				continue
+			}
+			bitIdx, err := strconv.ParseUint(parts[2], 10, 8)
+			if err != nil || bitIdx > 7 {
+				fmt.Fprintf(os.Stderr, "Invalid bit index (0-7): %v\n", parts[2])
+				continue
+			}
+			val, err := strconv.ParseBool(parts[3])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Invalid value (true/false): %v\n", parts[3])
+				continue
+			}
+			fmt.Printf("WARNING: Writing bit %d.%d = %v to output process image\n", offset, bitIdx, val)
+			fmt.Print("This may cause physical outputs to change. Continue? [y/N]: ")
+			confirm, _ := rl.Readline()
+			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
+				fmt.Println("Cancelled.")
+				continue
+			}
+			err = conn.WriteProcessOutputBit(uint32(offset), uint8(bitIdx), val)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				continue
+			}
+			fmt.Printf("Wrote output bit %d.%d = %v\n", offset, bitIdx, val)
+
+		case "iosize":
+			if conn == nil {
+				fmt.Println("Not connected. Use 'connect' first.")
+				continue
+			}
+			size, err := conn.ReadProcessInputSize()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				continue
+			}
+			fmt.Printf("Process input image size: %d bytes\n", size)
+
 		case "quit", "exit":
 			fmt.Println("Shutting down...")
 			if conn != nil {
@@ -568,6 +737,14 @@ func printHelp() {
 	fmt.Println("  write <symbol|number> <value>            Write a value to a symbol (by name or browse index)")
 	fmt.Println("  writemulti <sym1>=<val1> <sym2>=<val2>   Write multiple symbols in one round-trip")
 	fmt.Println("  subscribe <symbol> [cycle_ms] [delay_ms] Subscribe to symbol changes")
+	fmt.Println()
+	fmt.Println("Process Image I/O:")
+	fmt.Println("  readio <in|out> <offset> [length]        Read bytes from process image")
+	fmt.Println("  writeio <offset> <hex_bytes>             Write hex bytes to output process image")
+	fmt.Println("  readbit <in|out> <offset> <bit>          Read single bit (bit 0-7)")
+	fmt.Println("  writebit <offset> <bit> <true|false>     Write single output bit")
+	fmt.Println("  iosize                                   Show input process image size")
+	fmt.Println()
 	fmt.Println("  quit                                     Graceful shutdown")
 }
 

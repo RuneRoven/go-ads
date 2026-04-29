@@ -35,13 +35,7 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 		return "", fmt.Errorf("data too short for %s at offset %d: need %d bytes, got %d", symbol.DataType, start, symbol.Length, len(data)-start)
 	}
 
-	// BitValue symbols are single bits — always parse as BOOL
-	parseType := symbol.DataType
-	if symbol.Flags.Has(SymbolFlagBitValue) {
-		parseType = "BOOL"
-	}
-
-	switch parseType {
+	switch symbol.DataType {
 	case "BOOL":
 		if stop-start != 1 {
 			return "", fmt.Errorf("BOOL Size Wrong")
@@ -304,11 +298,6 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 
 	buf := new(bytes.Buffer)
 	dt := symbol.DataType
-
-	// BitValue symbols are single bits — always write as BOOL
-	if symbol.Flags.Has(SymbolFlagBitValue) {
-		dt = "BOOL"
-	}
 
 	if !slices.Contains(parseableTypes, dt) {
 		if datatypes == nil {

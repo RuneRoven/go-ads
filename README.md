@@ -82,6 +82,27 @@ If you see `"notification dropped (channel full)"` warnings, either:
 2. Consume notifications faster (dedicated drain goroutine)
 3. Reduce the notification cycle time on the PLC side
 
+## Process image I/O (experimental)
+
+> **Warning:** Direct process image access bypasses the symbol table and writes raw bytes to I/O memory. Writing to the wrong offset can cause unexpected physical output changes (motors, valves, actuators). The PLC runtime may overwrite your changes on the next scan cycle. **For normal operation, use symbol-based access (`ReadFromSymbol`/`WriteToSymbol`).**
+
+Convenience methods for diagnostics, commissioning, and I/O wiring verification:
+
+```go
+// Read 4 bytes from input image at byte offset 0
+data, _ := conn.ReadProcessInput(0, 4)
+
+// Read a single input bit (byte 2, bit 3)
+val, _ := conn.ReadProcessInputBit(2, 3)
+
+// Write to output image (use with extreme caution)
+conn.WriteProcessOutput(10, []byte{0xFF})
+conn.WriteProcessOutputBit(10, 0, true)
+
+// Query input image size
+size, _ := conn.ReadProcessInputSize()
+```
+
 ## Development
 
 ### Prerequisites
