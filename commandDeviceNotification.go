@@ -100,20 +100,16 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 		Value:     value,
 		TimeStamp: notificationTime,
 	}
-	// Try to send the notification to the user's channel.
-	// Use a timeout to avoid blocking the notification handler indefinitely
-	// if the receiver is slow.
-	// TODO: Consider adding a ring buffer or overflow queue so notifications
-	// are cached when the receiver is slow, and re-sent when it catches up,
-	// instead of dropping them on timeout.
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
+	// Non-blocking send: deliver notification instantly or drop if channel full.
+	// Caller controls backpressure by sizing the channel buffer appropriately
+	// (e.g. make(chan *Update, 1024) for burst absorption).
+	// This prevents goroutine accumulation and never blocks the receive pipeline.
 	select {
 	case <-ctx.Done():
 	case notification <- updateStruct:
 		conn.logger.Debug("Successfully delivered notification", "handle", handle)
-	case <-timer.C:
-		conn.logger.Warn("notification channel send timed out, receiver may be slow",
+	default:
+		conn.logger.Warn("notification dropped (channel full, receiver too slow)",
 			"handle", handle,
 			"symbol", fullName)
 	}

@@ -62,6 +62,26 @@ go run . -ip 192.168.1.100 -netid 5.1.2.3.1.1 -list
 
 See `examples/simple/main.go` for all available flags.
 
+## Notifications and backpressure
+
+Notification delivery is **non-blocking**: if the receiver's channel is full, the notification is dropped and a warning is logged. This prevents goroutine accumulation and ensures the receive pipeline is never stalled by a slow consumer.
+
+**Sizing your channel buffer:**
+
+```go
+// Small buffer — fine for low-frequency or on-change notifications
+ch := make(chan *ads.Update, 64)
+
+// Large buffer — recommended for high-frequency cyclic notifications
+// (e.g. 100 symbols × 10ms cycle = 10,000 notifications/sec)
+ch := make(chan *ads.Update, 4096)
+```
+
+If you see `"notification dropped (channel full)"` warnings, either:
+1. Increase the channel buffer size
+2. Consume notifications faster (dedicated drain goroutine)
+3. Reduce the notification cycle time on the PLC side
+
 ## Development
 
 ### Prerequisites
