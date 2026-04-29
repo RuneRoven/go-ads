@@ -90,6 +90,34 @@ make test-cover # run tests with coverage report
 make build      # build all packages
 ```
 
+### Network requirements
+
+| Port | Protocol | Direction | Purpose | Configurable |
+|------|----------|-----------|---------|--------------|
+| 48898 | TCP | Client → PLC | ADS data (commands, responses, notifications) | Yes (`NewConnection` port param) |
+| 48899 | UDP | Client → PLC | AMS route registration (`WithRoute`) | No (Beckhoff fixed) |
+
+Both ports must be open in firewalls between the client and PLC. If only TCP 48898 is open,
+ADS works with pre-existing routes but `WithRoute` cannot register new ones.
+
+### Docker / Container deployment
+
+Only route credentials are needed — `WithHostIP` and `ADS_LOCAL_AMS` are optional:
+
+```go
+conn, _ := ads.NewConnection(ctx, plcIP, 48898, targetAMS, 851, "auto", 10500, 5*time.Second,
+    ads.WithRoute("my-route", "Administrator", "password"),
+)
+conn.Connect(false)
+```
+
+The PLC stores the UDP source IP (post-NAT) for the route, not the `computerName` from the
+packet. Auto-derived NetID from the container IP works because ADS uses the existing TCP
+connection for all communication including notifications.
+
+> **Note:** Tested with TwinCAT 3 via Colima on macOS. More extensive testing across
+> TwinCAT versions and container runtimes is ongoing. See `PROTOCOL.md` for details.
+
 ### Integration tests
 
 Integration tests require a real Beckhoff PLC on the network. They are gated behind a build tag and skipped by default.
@@ -143,6 +171,7 @@ CI runs automatically on pull requests to `main` with 4 parallel jobs: lint, tes
 ## TODO
 
 - **Enum string resolution**: Add an option to return enum constant names (e.g. `"RUNNING"`) instead of numeric values (e.g. `"2"`). Requires parsing enum constant values from the datatype table's extra data. Only possible for TC3 non-strict enums; TC3 strict enums and TC2 do not expose constant names in the datatype table.
+- **TCP-based route registration**: Investigate whether AMS routes can be created via ADS system service commands over the existing TCP connection (AMS port 10000) instead of the UDP protocol (port 48899). This would eliminate the UDP 48899 firewall requirement and simplify deployment in locked-down networks. The Beckhoff `TcAmsRemoteMgr` service handles UDP route requests — a TCP equivalent may exist via the ADS system service but is unconfirmed.
 
 ## License
 

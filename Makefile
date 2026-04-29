@@ -1,4 +1,4 @@
-.PHONY: all lint fmt vet test test-race test-cover build build-examples clean
+.PHONY: all lint fmt vet test test-race test-cover build build-examples test-docker test-docker-tc3 test-docker-tc2 clean
 
 all: fmt lint vet test
 
@@ -28,6 +28,14 @@ build:
 
 build-examples:
 	cd examples/simple && go build ./...
+
+test-docker-tc3:
+	docker/run-tests.sh .env.integration.224
+
+test-docker-tc2:
+	docker/run-tests.sh .env.integration.70
+
+test-docker: test-docker-tc3 test-docker-tc2
 
 clean:
 	rm -f coverage.out coverage.html

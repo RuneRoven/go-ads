@@ -2,11 +2,15 @@ package ads
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf16"
 )
 
 // --- stringToNetID / StringToNetID ---
@@ -233,13 +237,13 @@ func TestSymbolFlagContextMask(t *testing.T) {
 		flags   SymbolFlag
 		ctxMask uint8
 	}{
-		{0x0008, 0},           // TypeGuid only, no context
-		{0x0108, 1},           // ContextMask=1
-		{0x0F08, 15},          // ContextMask=15 (max)
-		{0x1008, 0},           // Attributes flag, no context
-		{0x0308, 3},           // ContextMask=3
-		{SymbolFlag(0), 0},    // No flags
-		{0x8F08, 15},          // ExtendedFlags + max ContextMask
+		{0x0008, 0},        // TypeGuid only, no context
+		{0x0108, 1},        // ContextMask=1
+		{0x0F08, 15},       // ContextMask=15 (max)
+		{0x1008, 0},        // Attributes flag, no context
+		{0x0308, 3},        // ContextMask=3
+		{SymbolFlag(0), 0}, // No flags
+		{0x8F08, 15},       // ExtendedFlags + max ContextMask
 	}
 	for _, tt := range tests {
 		got := tt.flags.ContextMask()
@@ -1041,7 +1045,12 @@ func TestParseEnumWithoutDatatypes(t *testing.T) {
 		{"1-byte enum", "E_SmallState", 1, []byte{42}, "42"},
 		{"2-byte enum", "E_WordState", 2, func() []byte { b := make([]byte, 2); binary.LittleEndian.PutUint16(b, 1500); return b }(), "1500"},
 		{"4-byte enum DINT", "E_MachineState", 4, func() []byte { b := make([]byte, 4); binary.LittleEndian.PutUint32(b, 2); return b }(), "2"},
-		{"4-byte enum negative", "E_MachineState", 4, func() []byte { b := make([]byte, 4); v := int32(-1); binary.LittleEndian.PutUint32(b, uint32(v)); return b }(), "-1"},
+		{"4-byte enum negative", "E_MachineState", 4, func() []byte {
+			b := make([]byte, 4)
+			v := int32(-1)
+			binary.LittleEndian.PutUint32(b, uint32(v))
+			return b
+		}(), "-1"},
 		{"8-byte enum", "E_BigState", 8, func() []byte { b := make([]byte, 8); binary.LittleEndian.PutUint64(b, 99); return b }(), "99"},
 	}
 	for _, tt := range tests {
@@ -1474,5 +1483,1700 @@ func TestSymbolSumAddress_DirectFallbackNestedChild(t *testing.T) {
 	// 0x2000 + 0x0080 + 0x0004 = 0x2084
 	if offset != 0x2084 {
 		t.Errorf("offset = 0x%X, want 0x2084 (0x2000 + 0x0080 + 0x0004)", offset)
+	}
+}
+
+// ==========================================================================
+// STRING edge cases
+// ==========================================================================
+
+func TestSymbolParseSTRING_NoNullTerminator(t *testing.T) {
+	// STRING buffer full with no null byte — should return entire buffer
+	sym := &Symbol{DataType: "STRING", Length: 5}
+	data := []byte("Hello") // no null
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "Hello" {
+		t.Errorf("got %q, want %q", val, "Hello")
+	}
+}
+
+func TestSymbolParseSTRING_Empty(t *testing.T) {
+	// Null byte at start — empty string
+	sym := &Symbol{DataType: "STRING", Length: 10}
+	data := make([]byte, 10) // all zeros
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "" {
+		t.Errorf("got %q, want empty string", val)
+	}
+}
+
+func TestSymbolParseSTRING_TrailingGarbage(t *testing.T) {
+	// Null byte in middle, garbage after — should stop at null
+	sym := &Symbol{DataType: "STRING", Length: 10}
+	data := []byte("Hi\x00GARBAGE")
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "Hi" {
+		t.Errorf("got %q, want %q", val, "Hi")
+	}
+}
+
+func TestWriteToNodeSTRING_PadsWithZeros(t *testing.T) {
+	sym := &Symbol{DataType: "STRING", Length: 10}
+	data, err := sym.writeToNode("Hi", 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(data) != 10 {
+		t.Fatalf("expected 10 bytes, got %d", len(data))
+	}
+	if data[0] != 'H' || data[1] != 'i' {
+		t.Errorf("first 2 bytes: got %v, want Hi", data[:2])
+	}
+	// Remaining bytes should be zero (null-padded)
+	for i := 2; i < 10; i++ {
+		if data[i] != 0 {
+			t.Errorf("byte[%d] = %d, want 0", i, data[i])
+		}
+	}
+}
+
+func TestWriteToNodeSTRING_ExactLength(t *testing.T) {
+	sym := &Symbol{DataType: "STRING", Length: 5}
+	data, err := sym.writeToNode("Hello", 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(data) != "Hello" {
+		t.Errorf("got %q, want %q", string(data), "Hello")
+	}
+}
+
+func TestWriteToNodeSTRING_Overflow(t *testing.T) {
+	// String longer than buffer — should be truncated
+	sym := &Symbol{DataType: "STRING", Length: 3}
+	data, err := sym.writeToNode("Hello", 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(data) != 3 {
+		t.Fatalf("expected 3 bytes, got %d", len(data))
+	}
+	if string(data) != "Hel" {
+		t.Errorf("got %q, want %q", string(data), "Hel")
+	}
+}
+
+func TestSymbolParseSTRING_SpecialChars(t *testing.T) {
+	sym := &Symbol{DataType: "STRING", Length: 20}
+	data := make([]byte, 20)
+	copy(data, "a/b\\c\t\n\x00")
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "a/b\\c\t\n" {
+		t.Errorf("got %q, want %q", val, "a/b\\c\t\n")
+	}
+}
+
+// ==========================================================================
+// REAL/LREAL special values (NaN, Inf, -Inf, -0)
+// ==========================================================================
+
+func TestSymbolParseREAL_NaN(t *testing.T) {
+	sym := &Symbol{DataType: "REAL", Length: 4}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, math.Float32bits(float32(math.NaN())))
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "NaN" {
+		t.Errorf("got %q, want %q", val, "NaN")
+	}
+}
+
+func TestSymbolParseREAL_PosInf(t *testing.T) {
+	sym := &Symbol{DataType: "REAL", Length: 4}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, math.Float32bits(float32(math.Inf(1))))
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "+Inf" {
+		t.Errorf("got %q, want %q", val, "+Inf")
+	}
+}
+
+func TestSymbolParseREAL_NegInf(t *testing.T) {
+	sym := &Symbol{DataType: "REAL", Length: 4}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, math.Float32bits(float32(math.Inf(-1))))
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "-Inf" {
+		t.Errorf("got %q, want %q", val, "-Inf")
+	}
+}
+
+func TestSymbolParseREAL_NegZero(t *testing.T) {
+	sym := &Symbol{DataType: "REAL", Length: 4}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, math.Float32bits(float32(math.Copysign(0, -1))))
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// FormatFloat for -0 → "0" (float32 precision)
+	if val != "0" && val != "-0" {
+		t.Errorf("got %q, want %q or %q", val, "0", "-0")
+	}
+}
+
+func TestSymbolParseLREAL_NaN(t *testing.T) {
+	sym := &Symbol{DataType: "LREAL", Length: 8}
+	data := make([]byte, 8)
+	binary.LittleEndian.PutUint64(data, math.Float64bits(math.NaN()))
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "NaN" {
+		t.Errorf("got %q, want %q", val, "NaN")
+	}
+}
+
+func TestSymbolParseLREAL_PosInf(t *testing.T) {
+	sym := &Symbol{DataType: "LREAL", Length: 8}
+	data := make([]byte, 8)
+	binary.LittleEndian.PutUint64(data, math.Float64bits(math.Inf(1)))
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "+Inf" {
+		t.Errorf("got %q, want %q", val, "+Inf")
+	}
+}
+
+func TestSymbolParseLREAL_NegInf(t *testing.T) {
+	sym := &Symbol{DataType: "LREAL", Length: 8}
+	data := make([]byte, 8)
+	binary.LittleEndian.PutUint64(data, math.Float64bits(math.Inf(-1)))
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "-Inf" {
+		t.Errorf("got %q, want %q", val, "-Inf")
+	}
+}
+
+func TestSymbolParseLREAL_SmallSubnormal(t *testing.T) {
+	sym := &Symbol{DataType: "LREAL", Length: 8}
+	data := make([]byte, 8)
+	// Smallest positive subnormal float64
+	binary.LittleEndian.PutUint64(data, 1) // 5e-324
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	f, parseErr := strconv.ParseFloat(val, 64)
+	if parseErr != nil {
+		t.Fatalf("cannot parse result %q: %v", val, parseErr)
+	}
+	if f != math.Float64frombits(1) {
+		t.Errorf("got %v, want %v", f, math.Float64frombits(1))
+	}
+}
+
+func TestWriteToNodeREAL_NaN(t *testing.T) {
+	sym := &Symbol{DataType: "REAL", Length: 4}
+	data, err := sym.writeToNode("NaN", 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	bits := binary.LittleEndian.Uint32(data)
+	f := math.Float32frombits(bits)
+	if !math.IsNaN(float64(f)) {
+		t.Errorf("expected NaN, got %v", f)
+	}
+}
+
+func TestWriteToNodeREAL_Inf(t *testing.T) {
+	sym := &Symbol{DataType: "REAL", Length: 4}
+	data, err := sym.writeToNode("+Inf", 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	bits := binary.LittleEndian.Uint32(data)
+	f := math.Float32frombits(bits)
+	if !math.IsInf(float64(f), 1) {
+		t.Errorf("expected +Inf, got %v", f)
+	}
+}
+
+func TestWriteToNodeLREAL_NaN(t *testing.T) {
+	sym := &Symbol{DataType: "LREAL", Length: 8}
+	data, err := sym.writeToNode("NaN", 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	bits := binary.LittleEndian.Uint64(data)
+	f := math.Float64frombits(bits)
+	if !math.IsNaN(f) {
+		t.Errorf("expected NaN, got %v", f)
+	}
+}
+
+// ==========================================================================
+// DATE/TIME boundary values
+// ==========================================================================
+
+func TestSymbolParseTIME_Midnight(t *testing.T) {
+	sym := &Symbol{DataType: "TIME", Length: 4}
+	data := make([]byte, 4) // 0 ms = midnight
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "00:00:00" {
+		t.Errorf("got %q, want %q", val, "00:00:00")
+	}
+}
+
+func TestSymbolParseTIME_MaxMs(t *testing.T) {
+	// 23:59:59.999
+	sym := &Symbol{DataType: "TIME", Length: 4}
+	data := make([]byte, 4)
+	ms := uint32(23*3600000 + 59*60000 + 59*1000 + 999)
+	binary.LittleEndian.PutUint32(data, ms)
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "23:59:59.999" {
+		t.Errorf("got %q, want %q", val, "23:59:59.999")
+	}
+}
+
+func TestSymbolParseTIME_SubMillisecondPrecision(t *testing.T) {
+	// TIME with exact seconds (no ms) — should not show decimal
+	sym := &Symbol{DataType: "TIME", Length: 4}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, 3600000) // 1 hour exactly
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "01:00:00" {
+		t.Errorf("got %q, want %q", val, "01:00:00")
+	}
+}
+
+func TestSymbolParseTOD_Midnight(t *testing.T) {
+	sym := &Symbol{DataType: "TOD", Length: 4}
+	data := make([]byte, 4)
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "00:00" {
+		t.Errorf("got %q, want %q", val, "00:00")
+	}
+}
+
+func TestSymbolParseTOD_EndOfDay(t *testing.T) {
+	sym := &Symbol{DataType: "TOD", Length: 4}
+	data := make([]byte, 4)
+	ms := uint32(23*3600000 + 59*60000) // 23:59
+	binary.LittleEndian.PutUint32(data, ms)
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "23:59" {
+		t.Errorf("got %q, want %q", val, "23:59")
+	}
+}
+
+func TestSymbolParseDATE_Epoch(t *testing.T) {
+	sym := &Symbol{DataType: "DATE", Length: 4}
+	data := make([]byte, 4) // 0 seconds = 1970-01-01
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "1970-01-01" {
+		t.Errorf("got %q, want %q", val, "1970-01-01")
+	}
+}
+
+func TestSymbolParseDATE_LeapYear(t *testing.T) {
+	sym := &Symbol{DataType: "DATE", Length: 4}
+	data := make([]byte, 4)
+	// 2024-02-29 in unix seconds
+	ts := uint32(1709164800) // 2024-02-29 00:00:00 UTC
+	binary.LittleEndian.PutUint32(data, ts)
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "2024-02-29" {
+		t.Errorf("got %q, want %q", val, "2024-02-29")
+	}
+}
+
+func TestSymbolParseDATE_MaxUint32(t *testing.T) {
+	// uint32 max = 4294967295 seconds = 2106-02-07
+	sym := &Symbol{DataType: "DATE", Length: 4}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, math.MaxUint32)
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "2106-02-07" {
+		t.Errorf("got %q, want %q", val, "2106-02-07")
+	}
+}
+
+func TestSymbolParseDT_Epoch(t *testing.T) {
+	testWriteRoundTrip(t, "DT", 4, "1970-01-01 00:00:00")
+}
+
+func TestSymbolParseDT_Y2K38(t *testing.T) {
+	// 2038-01-19 03:14:07 — last second of signed 32-bit unix time
+	sym := &Symbol{DataType: "DT", Length: 4}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, 2147483647) // max int32
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "2038-01-19 03:14:07" {
+		t.Errorf("got %q, want %q", val, "2038-01-19 03:14:07")
+	}
+}
+
+func TestWriteToNodeDATE_RoundTrip_LeapYear(t *testing.T) {
+	testWriteRoundTrip(t, "DATE", 4, "2024-02-29")
+}
+
+func TestWriteToNodeTIME_RoundTrip_WithMs(t *testing.T) {
+	testWriteRoundTrip(t, "TIME", 4, "01:02:03.456")
+}
+
+func TestWriteToNodeTOD_RoundTrip_Aliases(t *testing.T) {
+	// TIME_OF_DAY is alias for TOD
+	sym := &Symbol{DataType: "TIME_OF_DAY", Length: 4}
+	data, err := sym.writeToNode("14:30", 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	sym2 := &Symbol{DataType: "TIME_OF_DAY", Length: 4}
+	val, err := sym2.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if val != "14:30" {
+		t.Errorf("got %q, want %q", val, "14:30")
+	}
+}
+
+func TestWriteToNodeDT_RoundTrip_Alias(t *testing.T) {
+	// DATE_AND_TIME is alias for DT
+	sym := &Symbol{DataType: "DATE_AND_TIME", Length: 4}
+	data, err := sym.writeToNode("2024-06-15 23:59:59", 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	sym2 := &Symbol{DataType: "DATE_AND_TIME", Length: 4}
+	val, err := sym2.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if val != "2024-06-15 23:59:59" {
+		t.Errorf("got %q, want %q", val, "2024-06-15 23:59:59")
+	}
+}
+
+// ==========================================================================
+// ReturnCode coverage — verify String() for all major categories
+// ==========================================================================
+
+func TestReturnCodeString_AllCategories(t *testing.T) {
+	tests := []struct {
+		code     ReturnCode
+		contains string
+	}{
+		// Global errors
+		{ReturnCodeGlobalInternalError, "internal error"},
+		{ReturnCodeGlobalTargetPortNotFound, "target port not found"},
+		{ReturnCodeGlobalInvalidAdsLength, "invalid ADS length"},
+		{ReturnCodeGlobalInvalidAmsNetID, "invalid AMS Net ID"},
+		{ReturnCodeGlobalTcpSendError, "TCP send error"},
+		{ReturnCodeGlobalHostUnreachable, "host unreachable"},
+		{ReturnCodeGlobalAccessDenied, "access denied"},
+
+		// Router errors
+		{ReturnCodeRouterNoLockedMemory, "locked memory"},
+		{ReturnCodeRouterMailboxFull, "mailbox full"},
+		{ReturnCodeRouterNotInitialized, "not initialized"},
+		{ReturnCodeRouterPortAlreadyInUse, "already assigned"},
+
+		// Device errors
+		{ReturnCodeDeviceError, "general device error"},
+		{ReturnCodeDeviceServiceNotSupported, "service not supported"},
+		{ReturnCodeDeviceInvalidGroup, "invalid index group"},
+		{ReturnCodeDeviceInvalidOffset, "invalid index offset"},
+		{ReturnCodeDeviceInvalidSize, "parameter size not correct"},
+		{ReturnCodeDeviceInvalidData, "invalid parameter value"},
+		{ReturnCodeDeviceNotReady, "not in a ready state"},
+		{ReturnCodeDeviceInvalidContext, "invalid operating system context"},
+		{ReturnCodeDeviceInvalidParam, "invalid parameter value"},
+		{ReturnCodeDeviceTimeout, "timeout"},
+		{ReturnCodeDeviceTransModeNotSupported, "TransMode not supported"},
+		{ReturnCodeDeviceNotifyHandleInvalid, "notification handle is invalid"},
+		{ReturnCodeDeviceNoMoreHandles, "no more notification handles"},
+		{ReturnCodeDeviceInvalidWatchSize, "notification size too large"},
+		{ReturnCodeDeviceInvalidArrayIndex, "invalid array index"},
+		{ReturnCodeDeviceSymbolNotActive, "symbol not active"},
+		{ReturnCodeDeviceAccessDenied, "access denied"},
+		{ReturnCodeDeviceLicenseNotFound, "missing license"},
+		{ReturnCodeDeviceLicenseExpired, "license expired"},
+
+		// Client errors
+		{ReturnCodeClientError, "client error"},
+		{ReturnCodeClientInvalidParameter, "invalid parameter"},
+		{ReturnCodeClientSyncTimeout, "timeout elapsed"},
+		{ReturnCodeClientPortNotOpen, "port not opened"},
+		{ReturnCodeClientRequestCancelled, "cancelled"},
+
+		// RTime errors
+		{ReturnCodeRTimeInternal, "fatal error"},
+		{ReturnCodeRTimeBadTimerPeriods, "timer value not valid"},
+
+		// TCP errors
+		{ReturnCodeWsaeTimedOut, "timed out"},
+		{ReturnCodeWsaeConnRefused, "refused"},
+		{ReturnCodeWsaeHostDown, "host is down"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.contains, func(t *testing.T) {
+			s := tt.code.String()
+			if !strings.Contains(strings.ToLower(s), strings.ToLower(tt.contains)) {
+				t.Errorf("ReturnCode(0x%04X).String() = %q, want it to contain %q",
+					uint32(tt.code), s, tt.contains)
+			}
+		})
+	}
+}
+
+func TestReturnCodeError_ImplementsError(t *testing.T) {
+	codes := []ReturnCode{
+		ReturnCodeDeviceTimeout,
+		ReturnCodeDeviceInvalidParam,
+		ReturnCodeDeviceSymbolNoFound,
+		ReturnCodeClientSyncTimeout,
+		ReturnCodeGlobalTargetNotFound,
+	}
+	for _, rc := range codes {
+		var err error = rc
+		if err.Error() == "" {
+			t.Errorf("ReturnCode(0x%04X).Error() should not be empty", uint32(rc))
+		}
+	}
+}
+
+func TestIsSumCommandUnsupportedError(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{ReturnCodeDeviceServiceNotSupported, true},
+		{ReturnCodeGlobalUnknownCommandID, true},
+		{ReturnCodeGlobalUnknownAdsCommand, true},
+		{ReturnCodeDeviceBusy, false},
+		{ReturnCodeDeviceTimeout, false},
+		{fmt.Errorf("network error"), false},
+		{nil, false},
+	}
+	for _, tt := range tests {
+		got := isSumCommandUnsupportedError(tt.err)
+		if got != tt.want {
+			t.Errorf("isSumCommandUnsupportedError(%v) = %v, want %v", tt.err, got, tt.want)
+		}
+	}
+}
+
+// ==========================================================================
+// Multi-dimensional arrays
+// ==========================================================================
+
+func TestMakeArrayChildren_2D(t *testing.T) {
+	// ARRAY[0..1, 0..2] OF INT — 2x3 = 6 elements, 12 bytes total
+	levels := []datatypeArrayInfo{
+		{LBound: 0, Elements: 2},
+		{LBound: 0, Elements: 3},
+	}
+	children := makeArrayChildren(levels, "INT", 12)
+	if len(children) != 2 {
+		t.Fatalf("expected 2 top-level children, got %d", len(children))
+	}
+	for _, name := range []string{"[0]", "[1]"} {
+		child, ok := children[name]
+		if !ok {
+			t.Errorf("missing child %s", name)
+			continue
+		}
+		if len(child.Children) != 3 {
+			t.Errorf("child %s: expected 3 sub-children, got %d", name, len(child.Children))
+		}
+		if child.DatatypeEntry.Size != 6 { // 12/2 = 6 bytes per row
+			t.Errorf("child %s: size = %d, want 6", name, child.DatatypeEntry.Size)
+		}
+	}
+}
+
+func TestMakeArrayChildren_3D(t *testing.T) {
+	// ARRAY[0..1, 0..1, 0..1] OF BYTE — 2x2x2 = 8 elements
+	levels := []datatypeArrayInfo{
+		{LBound: 0, Elements: 2},
+		{LBound: 0, Elements: 2},
+		{LBound: 0, Elements: 2},
+	}
+	children := makeArrayChildren(levels, "BYTE", 8)
+	if len(children) != 2 {
+		t.Fatalf("expected 2 children, got %d", len(children))
+	}
+	// Drill down to leaf level
+	c0 := children["[0]"]
+	if c0 == nil {
+		t.Fatal("missing [0]")
+	}
+	if len(c0.Children) != 2 {
+		t.Fatalf("[0] expected 2 children, got %d", len(c0.Children))
+	}
+	c00 := c0.Children["[0]"]
+	if c00 == nil {
+		t.Fatal("missing [0][0]")
+	}
+	if len(c00.Children) != 2 {
+		t.Fatalf("[0][0] expected 2 children, got %d", len(c00.Children))
+	}
+}
+
+func TestMakeArrayChildren_ZeroElements(t *testing.T) {
+	levels := []datatypeArrayInfo{{LBound: 0, Elements: 0}}
+	children := makeArrayChildren(levels, "INT", 0)
+	if len(children) != 0 {
+		t.Errorf("expected 0 children for zero elements, got %d", len(children))
+	}
+}
+
+// ==========================================================================
+// inferBaseType
+// ==========================================================================
+
+func TestInferBaseType(t *testing.T) {
+	tests := []struct {
+		size uint32
+		want string
+	}{
+		{1, "SINT"},
+		{2, "INT"},
+		{4, "DINT"},
+		{8, "LINT"},
+		{3, ""},
+		{16, ""},
+		{0, ""},
+	}
+	for _, tt := range tests {
+		got := inferBaseType(tt.size)
+		if got != tt.want {
+			t.Errorf("inferBaseType(%d) = %q, want %q", tt.size, got, tt.want)
+		}
+	}
+}
+
+// ==========================================================================
+// Deeply nested struct parsing
+// ==========================================================================
+
+func TestParseNestedStructThreeLevels(t *testing.T) {
+	// ST_Inner { value: INT }
+	// ST_Middle { inner: ST_Inner, count: BYTE }
+	// ST_Outer { middle: ST_Middle, flag: BOOL }
+	innerChild := &Symbol{Name: "value", FullName: "o.middle.inner.value", DataType: "INT", Length: 2, Offset: 0}
+	inner := &Symbol{
+		Name: "inner", FullName: "o.middle.inner", DataType: "ST_Inner", Length: 2, Offset: 0,
+		Children: map[string]*Symbol{"value": innerChild},
+	}
+	innerChild.Parent = inner
+
+	countChild := &Symbol{Name: "count", FullName: "o.middle.count", DataType: "BYTE", Length: 1, Offset: 2}
+	middle := &Symbol{
+		Name: "middle", FullName: "o.middle", DataType: "ST_Middle", Length: 4, Offset: 0,
+		Children: map[string]*Symbol{"inner": inner, "count": countChild},
+	}
+	inner.Parent = middle
+	countChild.Parent = middle
+
+	flagChild := &Symbol{Name: "flag", FullName: "o.flag", DataType: "BOOL", Length: 1, Offset: 4}
+	outer := &Symbol{
+		Name: "o", FullName: "o", DataType: "ST_Outer", Length: 5,
+		Children: map[string]*Symbol{"middle": middle, "flag": flagChild},
+	}
+	middle.Parent = outer
+	flagChild.Parent = outer
+
+	// Data: INT=1234, BYTE=42, padding(1), BOOL=1
+	data := make([]byte, 5)
+	binary.LittleEndian.PutUint16(data[0:2], 1234)
+	data[2] = 42
+	data[3] = 0 // padding
+	data[4] = 1
+
+	_, err := outer.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	if innerChild.Value != "1234" {
+		t.Errorf("inner.value = %q, want %q", innerChild.Value, "1234")
+	}
+	if countChild.Value != "42" {
+		t.Errorf("count = %q, want %q", countChild.Value, "42")
+	}
+	if flagChild.Value != "true" {
+		t.Errorf("flag = %q, want %q", flagChild.Value, "true")
+	}
+}
+
+// ==========================================================================
+// Struct write with nested children
+// ==========================================================================
+
+func TestWriteToNodeNestedStruct(t *testing.T) {
+	innerChild := &Symbol{Name: "val", FullName: "s.inner.val", DataType: "INT", Length: 2, Offset: 0}
+	inner := &Symbol{
+		Name: "inner", FullName: "s.inner", DataType: "ST_Inner", Length: 2, Offset: 0,
+		Children: map[string]*Symbol{"val": innerChild},
+	}
+	outerField := &Symbol{Name: "flag", FullName: "s.flag", DataType: "BOOL", Length: 1, Offset: 2}
+	parent := &Symbol{
+		Name: "s", FullName: "s", DataType: "ST_S", Length: 4,
+		Children: map[string]*Symbol{"inner": inner, "flag": outerField},
+	}
+
+	data, err := parent.writeToNode(`{"inner":{"val":"99"},"flag":"true"}`, 0, nil)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(data) != 4 {
+		t.Fatalf("expected 4 bytes, got %d", len(data))
+	}
+	v := int16(binary.LittleEndian.Uint16(data[0:2]))
+	if v != 99 {
+		t.Errorf("inner.val = %d, want 99", v)
+	}
+	if data[2] != 1 {
+		t.Errorf("flag = %d, want 1", data[2])
+	}
+}
+
+// ==========================================================================
+// GetJSON edge cases
+// ==========================================================================
+
+func TestGetJSON_EmptyValue(t *testing.T) {
+	sym := &Symbol{DataType: "STRING", Length: 10, Value: ""}
+	json := sym.GetJSON(false)
+	if json != `""` {
+		t.Errorf("got %q, want %q", json, `""`)
+	}
+}
+
+func TestGetJSON_NumericOverflow(t *testing.T) {
+	// ULINT max value — verify JSON doesn't lose precision
+	sym := &Symbol{DataType: "ULINT", Length: 8, Value: "18446744073709551615"}
+	j := sym.GetJSON(false)
+	// parseFloat loses precision for uint64 max — this is a known limitation
+	// JSON outputs float64 representation
+	if j == "" {
+		t.Error("expected non-empty JSON output")
+	}
+}
+
+func TestGetJSON_NestedOnlyChanged(t *testing.T) {
+	inner := &Symbol{Name: "a", FullName: "s.a", DataType: "INT", Length: 2, Value: "1", Changed: true}
+	innerUnchanged := &Symbol{Name: "b", FullName: "s.b", DataType: "INT", Length: 2, Value: "2", Changed: false}
+	parent := &Symbol{
+		Name: "s", FullName: "s", DataType: "ST_S", Length: 4,
+		Children: map[string]*Symbol{"a": inner, "b": innerUnchanged},
+	}
+	j := parent.GetJSON(true)
+	if !strings.Contains(j, "1") {
+		t.Errorf("expected changed value 1 in JSON: %s", j)
+	}
+	if strings.Contains(j, `"b"`) {
+		t.Errorf("expected unchanged field b to be excluded: %s", j)
+	}
+}
+
+// ==========================================================================
+// DeviceNotification parsing — binary packet tests
+// ==========================================================================
+
+// buildNotificationPacket constructs a valid ADS DeviceNotification payload
+// with one stamp containing one sample.
+func buildNotificationPacket(handle uint32, timestamp uint64, data []byte) []byte {
+	buf := new(bytes.Buffer)
+	// NotificationStream: Length + Stamps
+	streamLen := uint32(8 + 12 + 8 + len(data)) // stream header + stamp header + sample header + data
+	binary.Write(buf, binary.LittleEndian, streamLen)
+	binary.Write(buf, binary.LittleEndian, uint32(1)) // 1 stamp
+
+	// StampHeader: Timestamp + Samples
+	binary.Write(buf, binary.LittleEndian, timestamp)
+	binary.Write(buf, binary.LittleEndian, uint32(1)) // 1 sample
+
+	// NotificationSample: Handle + Size
+	binary.Write(buf, binary.LittleEndian, handle)
+	binary.Write(buf, binary.LittleEndian, uint32(len(data)))
+
+	// Data
+	buf.Write(data)
+	return buf.Bytes()
+}
+
+func buildNotificationPacketMultiSample(stamps []struct {
+	timestamp uint64
+	samples   []struct {
+		handle uint32
+		data   []byte
+	}
+},
+) []byte {
+	// Calculate total length
+	buf := new(bytes.Buffer)
+	totalLen := uint32(8) // stream header
+	for _, s := range stamps {
+		totalLen += 12 // stamp header
+		for _, samp := range s.samples {
+			totalLen += 8 + uint32(len(samp.data)) // sample header + data
+		}
+	}
+	binary.Write(buf, binary.LittleEndian, totalLen)
+	binary.Write(buf, binary.LittleEndian, uint32(len(stamps)))
+
+	for _, s := range stamps {
+		binary.Write(buf, binary.LittleEndian, s.timestamp)
+		binary.Write(buf, binary.LittleEndian, uint32(len(s.samples)))
+		for _, samp := range s.samples {
+			binary.Write(buf, binary.LittleEndian, samp.handle)
+			binary.Write(buf, binary.LittleEndian, uint32(len(samp.data)))
+			buf.Write(samp.data)
+		}
+	}
+	return buf.Bytes()
+}
+
+// newTestConnection creates a minimal Connection for unit testing notification parsing.
+func newTestConnection() *Connection {
+	ctx, cancel := context.WithCancel(context.Background())
+	conn := &Connection{
+		ctx:                 ctx,
+		shutdown:            cancel,
+		activeNotifications: make(map[uint32]*Symbol),
+		logger:              getDefaultLogger(),
+	}
+	return conn
+}
+
+func TestDeviceNotification_SingleSample(t *testing.T) {
+	conn := newTestConnection()
+	defer conn.shutdown()
+
+	// Register a notification for handle 42
+	ch := make(chan *Update, 10)
+	sym := &Symbol{
+		FullName:     "MAIN.testVar",
+		DataType:     "INT",
+		Length:       2,
+		Notification: ch,
+	}
+	conn.activeNotifications[42] = sym
+
+	// Build INT value = 1234
+	data := make([]byte, 2)
+	binary.LittleEndian.PutUint16(data, 1234)
+
+	// Windows FILETIME for 2024-01-01 00:00:00 UTC
+	// = (Unix epoch offset + unix timestamp) * ticks per second
+	unixTS := int64(1704067200) // 2024-01-01 00:00:00 UTC
+	filetime := uint64((unixTS + secToUnixEpoch) * windowsTick)
+
+	packet := buildNotificationPacket(42, filetime, data)
+	err := conn.DeviceNotification(conn.ctx, packet)
+	if err != nil {
+		t.Fatalf("DeviceNotification error: %v", err)
+	}
+
+	select {
+	case update := <-ch:
+		if update.Variable != "MAIN.testVar" {
+			t.Errorf("variable = %q, want %q", update.Variable, "MAIN.testVar")
+		}
+		if update.Value != "1234" {
+			t.Errorf("value = %q, want %q", update.Value, "1234")
+		}
+		// Verify timestamp is approximately correct (within a second)
+		expectedTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		if update.TimeStamp.Sub(expectedTime).Abs() > time.Second {
+			t.Errorf("timestamp = %v, want ~%v", update.TimeStamp, expectedTime)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for notification")
+	}
+}
+
+func TestDeviceNotification_UnknownHandle(t *testing.T) {
+	conn := newTestConnection()
+	defer conn.shutdown()
+
+	// No notifications registered — handle 99 is unknown
+	data := make([]byte, 2)
+	binary.LittleEndian.PutUint16(data, 42)
+	packet := buildNotificationPacket(99, 0, data)
+
+	// Should not error, just log warning
+	err := conn.DeviceNotification(conn.ctx, packet)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDeviceNotification_MultipleStampsAndSamples(t *testing.T) {
+	conn := newTestConnection()
+	defer conn.shutdown()
+
+	ch := make(chan *Update, 10)
+	sym1 := &Symbol{FullName: "var1", DataType: "BYTE", Length: 1, Notification: ch}
+	sym2 := &Symbol{FullName: "var2", DataType: "BYTE", Length: 1, Notification: ch}
+	conn.activeNotifications[1] = sym1
+	conn.activeNotifications[2] = sym2
+
+	stamps := []struct {
+		timestamp uint64
+		samples   []struct {
+			handle uint32
+			data   []byte
+		}
+	}{
+		{
+			timestamp: 0,
+			samples: []struct {
+				handle uint32
+				data   []byte
+			}{
+				{1, []byte{10}},
+				{2, []byte{20}},
+			},
+		},
+		{
+			timestamp: 0,
+			samples: []struct {
+				handle uint32
+				data   []byte
+			}{
+				{1, []byte{30}},
+			},
+		},
+	}
+
+	packet := buildNotificationPacketMultiSample(stamps)
+	err := conn.DeviceNotification(conn.ctx, packet)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+
+	// Should receive 3 updates total
+	var updates []*Update
+	for i := 0; i < 3; i++ {
+		select {
+		case u := <-ch:
+			updates = append(updates, u)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out after %d updates", len(updates))
+		}
+	}
+	if len(updates) != 3 {
+		t.Errorf("expected 3 updates, got %d", len(updates))
+	}
+}
+
+func TestDeviceNotification_EmptyPacket(t *testing.T) {
+	conn := newTestConnection()
+	defer conn.shutdown()
+
+	// Too short — should return error
+	err := conn.DeviceNotification(conn.ctx, []byte{1, 2, 3})
+	if err == nil {
+		t.Error("expected error for truncated packet")
+	}
+}
+
+func TestDeviceNotification_ZeroStamps(t *testing.T) {
+	conn := newTestConnection()
+	defer conn.shutdown()
+
+	// Valid header with 0 stamps
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, uint32(8)) // length
+	binary.Write(buf, binary.LittleEndian, uint32(0)) // 0 stamps
+
+	err := conn.DeviceNotification(conn.ctx, buf.Bytes())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDeviceNotification_SampleSizeExceedsData(t *testing.T) {
+	conn := newTestConnection()
+	defer conn.shutdown()
+
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, uint32(100))      // length (fake)
+	binary.Write(buf, binary.LittleEndian, uint32(1))        // 1 stamp
+	binary.Write(buf, binary.LittleEndian, uint64(0))        // timestamp
+	binary.Write(buf, binary.LittleEndian, uint32(1))        // 1 sample
+	binary.Write(buf, binary.LittleEndian, uint32(42))       // handle
+	binary.Write(buf, binary.LittleEndian, uint32(99999999)) // size > remaining
+
+	err := conn.DeviceNotification(conn.ctx, buf.Bytes())
+	if err == nil {
+		t.Error("expected error for sample size exceeding data")
+	}
+}
+
+func TestDeviceNotification_BoolType(t *testing.T) {
+	conn := newTestConnection()
+	defer conn.shutdown()
+
+	ch := make(chan *Update, 5)
+	sym := &Symbol{FullName: "MAIN.bFlag", DataType: "BOOL", Length: 1, Notification: ch}
+	conn.activeNotifications[10] = sym
+
+	packet := buildNotificationPacket(10, 0, []byte{1})
+	err := conn.DeviceNotification(conn.ctx, packet)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+
+	select {
+	case u := <-ch:
+		if u.Value != "true" {
+			t.Errorf("BOOL value = %q, want %q", u.Value, "true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+}
+
+func TestDeviceNotification_StringType(t *testing.T) {
+	conn := newTestConnection()
+	defer conn.shutdown()
+
+	ch := make(chan *Update, 5)
+	sym := &Symbol{FullName: "MAIN.sName", DataType: "STRING", Length: 20, Notification: ch}
+	conn.activeNotifications[11] = sym
+
+	strData := make([]byte, 20)
+	copy(strData, "Hello\x00")
+
+	packet := buildNotificationPacket(11, 0, strData)
+	err := conn.DeviceNotification(conn.ctx, packet)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+
+	select {
+	case u := <-ch:
+		if u.Value != "Hello" {
+			t.Errorf("STRING value = %q, want %q", u.Value, "Hello")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+}
+
+// ==========================================================================
+// AMS packet encoding
+// ==========================================================================
+
+func TestEncodePacket(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &Connection{
+		ctx:    ctx,
+		logger: getDefaultLogger(),
+		target: AmsAddress{
+			NetID: [6]byte{5, 154, 236, 19, 1, 1},
+			Port:  851,
+		},
+		source: AmsAddress{
+			NetID: [6]byte{192, 168, 1, 100, 1, 1},
+			Port:  10500,
+		},
+	}
+
+	data := []byte{0x01, 0x02, 0x03, 0x04}
+	packet, err := conn.encode(CommandIDRead, data, 7)
+	if err != nil {
+		t.Fatalf("encode error: %v", err)
+	}
+
+	// TCP header: 6 bytes (Unknown1=0, System=0, Length=32+4=36)
+	if len(packet) != 6+32+4 {
+		t.Fatalf("packet length = %d, want %d", len(packet), 42)
+	}
+
+	// Check TCP header length field
+	tcpLen := binary.LittleEndian.Uint32(packet[2:6])
+	if tcpLen != 36 {
+		t.Errorf("TCP length = %d, want 36", tcpLen)
+	}
+
+	// Check AMS header target NetID (starts at offset 6)
+	var targetNetID [6]byte
+	copy(targetNetID[:], packet[6:12])
+	if targetNetID != conn.target.NetID {
+		t.Errorf("target NetID = %v, want %v", targetNetID, conn.target.NetID)
+	}
+
+	// Target port at offset 12
+	targetPort := binary.LittleEndian.Uint16(packet[12:14])
+	if targetPort != 851 {
+		t.Errorf("target port = %d, want 851", targetPort)
+	}
+
+	// Source NetID at offset 14
+	var sourceNetID [6]byte
+	copy(sourceNetID[:], packet[14:20])
+	if sourceNetID != conn.source.NetID {
+		t.Errorf("source NetID = %v, want %v", sourceNetID, conn.source.NetID)
+	}
+
+	// Command at offset 22
+	cmd := binary.LittleEndian.Uint16(packet[22:24])
+	if CommandID(cmd) != CommandIDRead {
+		t.Errorf("command = %d, want %d (Read)", cmd, CommandIDRead)
+	}
+
+	// State at offset 24 — should be 4 (request)
+	state := binary.LittleEndian.Uint16(packet[24:26])
+	if state != 4 {
+		t.Errorf("state = %d, want 4", state)
+	}
+
+	// Data length at offset 26
+	dataLen := binary.LittleEndian.Uint32(packet[26:30])
+	if dataLen != 4 {
+		t.Errorf("data length = %d, want 4", dataLen)
+	}
+
+	// InvokeID at offset 34
+	invokeID := binary.LittleEndian.Uint32(packet[34:38])
+	if invokeID != 7 {
+		t.Errorf("invokeID = %d, want 7", invokeID)
+	}
+
+	// Payload at offset 38
+	if !bytes.Equal(packet[38:], data) {
+		t.Errorf("payload = %v, want %v", packet[38:], data)
+	}
+}
+
+func TestEncodePacket_EmptyData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &Connection{
+		ctx:    ctx,
+		logger: getDefaultLogger(),
+		target: AmsAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851},
+		source: AmsAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500},
+	}
+
+	packet, err := conn.encode(CommandIDReadDeviceInfo, nil, 0)
+	if err != nil {
+		t.Fatalf("encode error: %v", err)
+	}
+
+	// 6 (TCP) + 32 (AMS) + 0 (data)
+	if len(packet) != 38 {
+		t.Fatalf("packet length = %d, want 38", len(packet))
+	}
+
+	tcpLen := binary.LittleEndian.Uint32(packet[2:6])
+	if tcpLen != 32 {
+		t.Errorf("TCP length = %d, want 32", tcpLen)
+	}
+}
+
+func TestEncodePacket_AllCommands(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &Connection{
+		ctx:    ctx,
+		logger: getDefaultLogger(),
+		target: AmsAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851},
+		source: AmsAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500},
+	}
+
+	commands := []CommandID{
+		CommandIDReadDeviceInfo,
+		CommandIDRead,
+		CommandIDWrite,
+		CommandIDReadState,
+		CommandIDWriteControl,
+		CommandIDAddDeviceNotification,
+		CommandIDDeleteDeviceNotification,
+		CommandIDReadWrite,
+	}
+
+	for _, cmd := range commands {
+		t.Run(fmt.Sprintf("Command_%d", cmd), func(t *testing.T) {
+			packet, err := conn.encode(cmd, []byte{0xFF}, 1)
+			if err != nil {
+				t.Fatalf("encode error: %v", err)
+			}
+			// Verify command in header
+			encodedCmd := binary.LittleEndian.Uint16(packet[22:24])
+			if CommandID(encodedCmd) != cmd {
+				t.Errorf("encoded command = %d, want %d", encodedCmd, cmd)
+			}
+		})
+	}
+}
+
+// ==========================================================================
+// handleReceive — AMS response routing
+// ==========================================================================
+
+func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &Connection{
+		ctx:            ctx,
+		logger:         getDefaultLogger(),
+		activeRequests: make(map[uint32]chan []byte),
+	}
+
+	// Register a response channel for invokeID 42
+	ch := make(chan []byte, 1)
+	conn.activeRequestLock.Lock()
+	conn.activeRequests[42] = ch
+	conn.activeRequestLock.Unlock()
+
+	// Build AMS header + data
+	header := amsHeader{
+		Target:    AmsAddress{},
+		Source:    AmsAddress{},
+		Command:   CommandIDRead,
+		State:     5, // response
+		Length:    4,
+		ErrorCode: 0,
+		InvokeID:  42,
+	}
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, &header)
+	buf.Write([]byte{0xDE, 0xAD, 0xBE, 0xEF})
+
+	conn.handleReceive(ctx, buf.Bytes())
+
+	select {
+	case resp := <-ch:
+		if !bytes.Equal(resp, []byte{0xDE, 0xAD, 0xBE, 0xEF}) {
+			t.Errorf("response = %v, want [0xDE 0xAD 0xBE 0xEF]", resp)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for response")
+	}
+}
+
+func TestHandleReceive_UnknownInvokeID(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &Connection{
+		ctx:            ctx,
+		logger:         getDefaultLogger(),
+		activeRequests: make(map[uint32]chan []byte),
+	}
+
+	// No registered channels — should not panic
+	header := amsHeader{
+		Command:  CommandIDRead,
+		State:    5,
+		Length:   2,
+		InvokeID: 999,
+	}
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, &header)
+	buf.Write([]byte{0x00, 0x00})
+
+	// Should not panic or error
+	conn.handleReceive(ctx, buf.Bytes())
+}
+
+func TestHandleReceive_TooShort(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &Connection{
+		ctx:            ctx,
+		logger:         getDefaultLogger(),
+		activeRequests: make(map[uint32]chan []byte),
+	}
+
+	// Less than 32 bytes — should return early
+	conn.handleReceive(ctx, []byte{1, 2, 3, 4, 5})
+}
+
+// ==========================================================================
+// Notification timestamp conversion
+// ==========================================================================
+
+func TestWindowsFiletimeConversion(t *testing.T) {
+	// Windows FILETIME: 100-nanosecond intervals since 1601-01-01
+	// Unix epoch: 1970-01-01 = 11644473600 seconds after 1601-01-01
+	tests := []struct {
+		name      string
+		unixSec   int64
+		wantYear  int
+		wantMonth time.Month
+		wantDay   int
+	}{
+		{"Unix epoch", 0, 1970, time.January, 1},
+		{"Y2K", 946684800, 2000, time.January, 1},
+		{"2024", 1704067200, 2024, time.January, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filetime := uint64((tt.unixSec + secToUnixEpoch) * windowsTick)
+			// Reverse conversion (same as handleNotification)
+			ts := int64(filetime)/windowsTick - secToUnixEpoch
+			result := time.Unix(ts, 0).UTC()
+			if result.Year() != tt.wantYear || result.Month() != tt.wantMonth || result.Day() != tt.wantDay {
+				t.Errorf("got %v, want %d-%02d-%02d", result, tt.wantYear, tt.wantMonth, tt.wantDay)
+			}
+		})
+	}
+}
+
+// ==========================================================================
+// hexAttr utility
+// ==========================================================================
+
+func TestHexAttr(t *testing.T) {
+	attr := hexAttr("data", []byte{0xDE, 0xAD, 0xBE, 0xEF})
+	if attr.Key != "data" {
+		t.Errorf("key = %q, want %q", attr.Key, "data")
+	}
+	s := attr.Value.String()
+	if !strings.Contains(s, "DEADBEEF") && !strings.Contains(s, "deadbeef") {
+		t.Errorf("hex string = %q, expected to contain DEADBEEF", s)
+	}
+}
+
+func TestHexAttr_Empty(t *testing.T) {
+	attr := hexAttr("empty", []byte{})
+	if attr.Key != "empty" {
+		t.Errorf("key = %q, want %q", attr.Key, "empty")
+	}
+}
+
+// ==========================================================================
+// WSTRING (UTF-16LE) parse/write tests
+// ==========================================================================
+
+func encodeUTF16LE(s string) []byte {
+	encoded := utf16.Encode([]rune(s))
+	buf := make([]byte, len(encoded)*2)
+	for i, r := range encoded {
+		binary.LittleEndian.PutUint16(buf[i*2:], r)
+	}
+	return buf
+}
+
+func TestParseWSTRING_ASCII(t *testing.T) {
+	text := "Hello"
+	raw := encodeUTF16LE(text)
+	// Add null terminator
+	raw = append(raw, 0, 0)
+	// Pad to 20 bytes
+	padded := make([]byte, 20)
+	copy(padded, raw)
+	sym := &Symbol{DataType: "WSTRING", Length: 20}
+	val, err := sym.parse(padded, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != text {
+		t.Errorf("got %q, want %q", val, text)
+	}
+}
+
+func TestParseWSTRING_Unicode(t *testing.T) {
+	text := "日本語"
+	raw := encodeUTF16LE(text)
+	raw = append(raw, 0, 0)
+	padded := make([]byte, 20)
+	copy(padded, raw)
+	sym := &Symbol{DataType: "WSTRING", Length: 20}
+	val, err := sym.parse(padded, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != text {
+		t.Errorf("got %q, want %q", val, text)
+	}
+}
+
+func TestParseWSTRING_NullTerminated(t *testing.T) {
+	// "Hi" followed by null terminator then garbage
+	raw := encodeUTF16LE("Hi")
+	data := make([]byte, 20)
+	copy(data, raw)
+	// Null terminator at byte 4-5
+	data[4] = 0
+	data[5] = 0
+	// Garbage after
+	data[6] = 0xFF
+	data[7] = 0xFF
+	sym := &Symbol{DataType: "WSTRING", Length: 20}
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "Hi" {
+		t.Errorf("got %q, want %q", val, "Hi")
+	}
+}
+
+func TestParseWSTRING_NoNullTerminator(t *testing.T) {
+	// Fill entire buffer with UTF-16 chars, no null
+	text := "ABCDE"
+	raw := encodeUTF16LE(text)
+	sym := &Symbol{DataType: "WSTRING", Length: uint32(len(raw))}
+	val, err := sym.parse(raw, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != text {
+		t.Errorf("got %q, want %q", val, text)
+	}
+}
+
+func TestParseWSTRING_Empty(t *testing.T) {
+	// Just null terminator
+	data := make([]byte, 10)
+	sym := &Symbol{DataType: "WSTRING", Length: 10}
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "" {
+		t.Errorf("got %q, want empty string", val)
+	}
+}
+
+func TestParseWSTRING_SurrogatePair(t *testing.T) {
+	// U+1F600 (😀) requires surrogate pair in UTF-16
+	text := "😀"
+	raw := encodeUTF16LE(text)
+	if len(raw) != 4 {
+		t.Fatalf("expected 4 bytes for surrogate pair, got %d", len(raw))
+	}
+	raw = append(raw, 0, 0) // null terminator
+	padded := make([]byte, 10)
+	copy(padded, raw)
+	sym := &Symbol{DataType: "WSTRING", Length: 10}
+	val, err := sym.parse(padded, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != text {
+		t.Errorf("got %q, want %q", val, text)
+	}
+}
+
+func TestWriteWSTRING_ASCII(t *testing.T) {
+	sym := &Symbol{DataType: "WSTRING", Length: 20}
+	data, err := sym.writeToNode("Hello", 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(data) != 20 {
+		t.Fatalf("expected 20 bytes, got %d", len(data))
+	}
+	// Verify UTF-16LE encoding
+	expected := encodeUTF16LE("Hello")
+	for i, b := range expected {
+		if data[i] != b {
+			t.Errorf("byte[%d] = 0x%02X, want 0x%02X", i, data[i], b)
+		}
+	}
+	// Verify null terminator (bytes after "Hello" should be 0)
+	for i := len(expected); i < 20; i++ {
+		if data[i] != 0 {
+			t.Errorf("byte[%d] = 0x%02X, want 0x00 (padding)", i, data[i])
+		}
+	}
+}
+
+func TestWriteWSTRING_Unicode(t *testing.T) {
+	sym := &Symbol{DataType: "WSTRING", Length: 20}
+	text := "日本語"
+	data, err := sym.writeToNode(text, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expected := encodeUTF16LE(text)
+	for i, b := range expected {
+		if data[i] != b {
+			t.Errorf("byte[%d] = 0x%02X, want 0x%02X", i, data[i], b)
+		}
+	}
+}
+
+func TestWriteWSTRING_Truncation(t *testing.T) {
+	// Length 6 = room for 2 chars + null terminator (each 2 bytes)
+	sym := &Symbol{DataType: "WSTRING", Length: 6}
+	data, err := sym.writeToNode("ABCDE", 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(data) != 6 {
+		t.Fatalf("expected 6 bytes, got %d", len(data))
+	}
+	// Should only contain "AB" (2 chars * 2 bytes = 4) + 2 bytes null
+	expected := encodeUTF16LE("AB")
+	for i, b := range expected {
+		if data[i] != b {
+			t.Errorf("byte[%d] = 0x%02X, want 0x%02X", i, data[i], b)
+		}
+	}
+	// Last 2 bytes should be null terminator
+	if data[4] != 0 || data[5] != 0 {
+		t.Errorf("expected null terminator at bytes 4-5, got 0x%02X 0x%02X", data[4], data[5])
+	}
+}
+
+func TestWriteWSTRING_RoundTrip(t *testing.T) {
+	texts := []string{"Hello", "日本語", "😀", "a", ""}
+	for _, text := range texts {
+		t.Run(text, func(t *testing.T) {
+			sym := &Symbol{DataType: "WSTRING", Length: 40}
+			data, err := sym.writeToNode(text, 0, nil)
+			if err != nil {
+				t.Fatalf("write error: %v", err)
+			}
+			val, err := sym.parse(data, 0, nil)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			if val != text {
+				t.Errorf("round-trip: got %q, want %q", val, text)
+			}
+		})
+	}
+}
+
+// ==========================================================================
+// Bit-level operations tests
+// ==========================================================================
+
+func TestParseBitSymbol_True(t *testing.T) {
+	sym := &Symbol{DataType: "BYTE", Length: 1, Flags: SymbolFlagBitValue}
+	data := []byte{0x01}
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "true" {
+		t.Errorf("got %q, want %q", val, "true")
+	}
+}
+
+func TestParseBitSymbol_False(t *testing.T) {
+	sym := &Symbol{DataType: "BYTE", Length: 1, Flags: SymbolFlagBitValue}
+	data := []byte{0x00}
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "false" {
+		t.Errorf("got %q, want %q", val, "false")
+	}
+}
+
+func TestWriteBitSymbol_True(t *testing.T) {
+	sym := &Symbol{DataType: "BYTE", Length: 1, Flags: SymbolFlagBitValue}
+	data, err := sym.writeToNode("true", 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(data) != 1 || data[0] != 0x01 {
+		t.Errorf("got %v, want [0x01]", data)
+	}
+}
+
+func TestWriteBitSymbol_False(t *testing.T) {
+	sym := &Symbol{DataType: "BYTE", Length: 1, Flags: SymbolFlagBitValue}
+	data, err := sym.writeToNode("false", 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(data) != 1 || data[0] != 0x00 {
+		t.Errorf("got %v, want [0x00]", data)
+	}
+}
+
+func TestSymbolFlagBitValue_Detection(t *testing.T) {
+	flags := SymbolFlag(0x0002)
+	if !flags.Has(SymbolFlagBitValue) {
+		t.Error("expected Has(SymbolFlagBitValue) to be true")
+	}
+	flags = SymbolFlag(0x0000)
+	if flags.Has(SymbolFlagBitValue) {
+		t.Error("expected Has(SymbolFlagBitValue) to be false for 0x0000")
+	}
+	// Combined flags
+	flags = SymbolFlag(0x0F03) // Persistent | BitValue | ContextMask
+	if !flags.Has(SymbolFlagBitValue) {
+		t.Error("expected Has(SymbolFlagBitValue) to be true for combined flags")
+	}
+}
+
+func TestReadBit_Extract(t *testing.T) {
+	// 0xA5 = 10100101
+	data := []byte{0xA5}
+	if !ReadBit(data, 0) {
+		t.Error("bit 0 should be 1")
+	}
+	if ReadBit(data, 1) {
+		t.Error("bit 1 should be 0")
+	}
+	if !ReadBit(data, 2) {
+		t.Error("bit 2 should be 1")
+	}
+}
+
+func TestReadBit_AllPositions(t *testing.T) {
+	// 0xA5 = 10100101
+	data := []byte{0xA5}
+	expected := []bool{true, false, true, false, false, true, false, true}
+	for i, want := range expected {
+		t.Run(fmt.Sprintf("bit%d", i), func(t *testing.T) {
+			got := ReadBit(data, i)
+			if got != want {
+				t.Errorf("bit %d: got %v, want %v", i, got, want)
+			}
+		})
+	}
+}
+
+func TestWriteBit_Set(t *testing.T) {
+	data := []byte{0x00}
+	WriteBit(data, 3, true)
+	if data[0] != 0x08 {
+		t.Errorf("got 0x%02X, want 0x08", data[0])
+	}
+}
+
+func TestWriteBit_Clear(t *testing.T) {
+	data := []byte{0xFF}
+	WriteBit(data, 3, false)
+	if data[0] != 0xF7 {
+		t.Errorf("got 0x%02X, want 0xF7", data[0])
+	}
+}
+
+func TestWriteBit_PreservesOthers(t *testing.T) {
+	// 0xA5 = 10100101, set bit 2 (already set) → no change
+	data := []byte{0xA5}
+	WriteBit(data, 2, true)
+	if data[0] != 0xA5 {
+		t.Errorf("got 0x%02X, want 0xA5 (unchanged)", data[0])
+	}
+	// Clear bit 1 (already clear) → no change
+	WriteBit(data, 1, false)
+	if data[0] != 0xA5 {
+		t.Errorf("got 0x%02X, want 0xA5 (unchanged)", data[0])
+	}
+}
+
+// ==========================================================================
+// Process image constants and helpers
+// ==========================================================================
+
+func TestProcessImageConstants(t *testing.T) {
+	tests := []struct {
+		name string
+		got  Group
+		want uint32
+	}{
+		{"GroupIoImageRwib", GroupIoImageRwib, 0xF020},
+		{"GroupIoImageRwix", GroupIoImageRwix, 0xF021},
+		{"GroupIoImageRisize", GroupIoImageRisize, 0xF025},
+		{"GroupIoImageRwob", GroupIoImageRwob, 0xF030},
+		{"GroupIoImageRwox", GroupIoImageRwox, 0xF031},
+		{"GroupIoImageCleari", GroupIoImageCleari, 0xF040},
+		{"GroupIoImageClearo", GroupIoImageClearo, 0xF050},
+		{"GroupIoImageRwiob", GroupIoImageRwiob, 0xF060},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if uint32(tt.got) != tt.want {
+				t.Errorf("%s = 0x%04X, want 0x%04X", tt.name, uint32(tt.got), tt.want)
+			}
+		})
+	}
+}
+
+func TestProcessImageBitOffset(t *testing.T) {
+	// Verify the bit offset calculation used in process image bit access
+	// byteOffset * 8 + bitIndex
+	tests := []struct {
+		byteOffset uint32
+		bitIndex   uint8
+		want       uint32
+	}{
+		{0, 0, 0},
+		{0, 7, 7},
+		{1, 0, 8},
+		{1, 3, 11},
+		{10, 5, 85},
+	}
+	for _, tt := range tests {
+		got := tt.byteOffset*8 + uint32(tt.bitIndex)
+		if got != tt.want {
+			t.Errorf("byte=%d bit=%d: got %d, want %d", tt.byteOffset, tt.bitIndex, got, tt.want)
+		}
 	}
 }

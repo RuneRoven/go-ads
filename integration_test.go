@@ -98,11 +98,16 @@ func setupConnection(t *testing.T) *Connection {
 	}
 	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
 
-	// Build connection options
+	// Build connection options — WithRoute registers route BEFORE any ADS commands
 	var opts []ConnectionOption
 	hostIP := os.Getenv("ADS_HOST_IP")
 	if hostIP != "" {
 		opts = append(opts, WithHostIP(hostIP))
+	}
+	routeUser := os.Getenv("ADS_ROUTE_USER")
+	routePass := os.Getenv("ADS_ROUTE_PASS")
+	if routeUser != "" && routePass != "" {
+		opts = append(opts, WithRoute("go-ads-test", routeUser, routePass))
 	}
 
 	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second, opts...)
@@ -113,18 +118,6 @@ func setupConnection(t *testing.T) *Connection {
 	err = conn.Connect(false)
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
-	}
-
-	// Auto-create AMS route if credentials are provided (after Connect so source NetID is resolved)
-	routeUser := os.Getenv("ADS_ROUTE_USER")
-	routePass := os.Getenv("ADS_ROUTE_PASS")
-	if routeUser != "" && routePass != "" {
-		err := conn.AddRoute("go-ads-test", routeUser, routePass)
-		if err != nil {
-			t.Logf("warning: AddRoute failed (may already exist): %v", err)
-		} else {
-			t.Log("AMS route added successfully")
-		}
 	}
 
 	t.Cleanup(func() {
@@ -1779,7 +1772,7 @@ func TestIntegrationSumReadPartialFailure(t *testing.T) {
 
 	requests := []SumReadRequest{
 		{Group: validGroup, Offset: validOffset, Length: sym.Length}, // valid
-		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Length: 4},             // bogus
+		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Length: 4},               // bogus
 	}
 
 	results, err := conn.SumRead(requests)
@@ -1858,7 +1851,7 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 
 	requests := []SumWriteRequest{
 		{Group: validGroup, Offset: validOffset, Data: mixedData}, // valid
-		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Data: []byte{0, 0}},  // bogus
+		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Data: []byte{0, 0}},   // bogus
 	}
 
 	results, err := conn.SumWrite(requests)
@@ -2737,4 +2730,457 @@ done:
 	}
 	conn.symbolLock.Unlock()
 	_, _ = conn.SumDeleteDeviceNotification(handles)
+}
+
+// TestIntegrationNotificationCycleTimes verifies notifications at different cycle times.
+// Tests fast (10ms), standard (100ms), and slow (1000ms) cycles to validate
+// the PLC delivers at approximately the requested rate.
+func TestIntegrationNotificationCycleTimes(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	symbolName := pickParseableSymbol(symbols)
+	if symbolName == "" {
+		t.Skip("no parseable symbol")
+	}
+
+	tests := []struct {
+		name      string
+		cycleTime int
+		maxDelay  int
+		duration  time.Duration
+		minCount  int // minimum expected notifications
+	}{
+		{"fast_10ms", 10, 10, 2 * time.Second, 10},
+		{"standard_100ms", 100, 100, 3 * time.Second, 5},
+		{"slow_1000ms", 1000, 1000, 5 * time.Second, 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ch := make(chan *Update, 500)
+			handle, err := conn.AddSymbolNotification(symbolName, tt.cycleTime, tt.maxDelay, TransModeServerCycle, ch)
+			if err != nil {
+				t.Fatalf("AddSymbolNotification (cycle=%dms) failed: %v", tt.cycleTime, err)
+			}
+
+			var count int
+			timeout := time.After(tt.duration)
+			for {
+				select {
+				case <-ch:
+					count++
+				case <-timeout:
+					goto done
+				}
+			}
+		done:
+			_ = conn.DeleteDeviceNotification(handle)
+			t.Logf("cycle=%dms: received %d notifications in %v", tt.cycleTime, count, tt.duration)
+			if count < tt.minCount {
+				t.Errorf("expected at least %d notifications, got %d", tt.minCount, count)
+			}
+		})
+	}
+}
+
+// TestIntegrationNotificationMaxDelay verifies the maxDelay parameter affects
+// notification batching. With a long maxDelay and short cycleTime, the PLC
+// may batch multiple changes before sending.
+func TestIntegrationNotificationMaxDelay(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	symbolName := pickParseableSymbol(symbols)
+	if symbolName == "" {
+		t.Skip("no parseable symbol")
+	}
+
+	// Short cycle, long maxDelay — PLC may batch notifications
+	ch := make(chan *Update, 100)
+	handle, err := conn.AddSymbolNotification(symbolName, 50, 2000, TransModeServerCycle, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotification failed: %v", err)
+	}
+
+	var count int
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case <-ch:
+			count++
+		case <-timeout:
+			goto done
+		}
+	}
+done:
+	_ = conn.DeleteDeviceNotification(handle)
+	t.Logf("cycle=50ms, maxDelay=2000ms: received %d notifications in 5s", count)
+	// Should still receive notifications, just possibly batched
+	if count == 0 {
+		t.Error("expected notifications with maxDelay=2000ms, got 0")
+	}
+}
+
+// TestIntegrationNotificationZeroMaxDelay verifies maxDelay=0 delivers
+// notifications as fast as possible (no batching).
+func TestIntegrationNotificationZeroMaxDelay(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	symbolName := pickParseableSymbol(symbols)
+	if symbolName == "" {
+		t.Skip("no parseable symbol")
+	}
+
+	ch := make(chan *Update, 500)
+	handle, err := conn.AddSymbolNotification(symbolName, 100, 0, TransModeServerCycle, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotification (maxDelay=0) failed: %v", err)
+	}
+
+	var count int
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case <-ch:
+			count++
+		case <-timeout:
+			goto done
+		}
+	}
+done:
+	_ = conn.DeleteDeviceNotification(handle)
+	t.Logf("maxDelay=0: received %d notifications in 3s", count)
+	if count < 2 {
+		t.Errorf("expected notifications with maxDelay=0, got %d", count)
+	}
+}
+
+// TestIntegrationReadAllParseableTypes loads all symbols, groups them by datatype,
+// and reads at least one symbol of each parseable type. Validates that the library
+// can parse every supported ADS datatype from real PLC data.
+func TestIntegrationReadAllParseableTypes(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+
+	// Group symbols by base datatype
+	byType := make(map[string]string) // datatype → first symbol name
+	for name, sym := range symbols {
+		if parseableSet[sym.DataType] {
+			if _, exists := byType[sym.DataType]; !exists {
+				byType[sym.DataType] = name
+			}
+		}
+	}
+
+	t.Logf("found %d parseable types on PLC", len(byType))
+	for dt, name := range byType {
+		t.Run(dt, func(t *testing.T) {
+			val, err := conn.ReadFromSymbol(name)
+			if err != nil {
+				t.Fatalf("ReadFromSymbol(%s) [type=%s] failed: %v", name, dt, err)
+			}
+			if val == "" && dt != "STRING" {
+				t.Errorf("ReadFromSymbol(%s) [type=%s] returned empty", name, dt)
+			}
+			t.Logf("%s (%s) = %q", name, dt, val)
+		})
+	}
+
+	// Log which parseable types were NOT found on PLC
+	for dt := range parseableSet {
+		if _, found := byType[dt]; !found {
+			t.Logf("type %s: not present on PLC (no coverage)", dt)
+		}
+	}
+}
+
+// TestIntegrationWriteReadRoundTrip writes known values to writable symbols
+// and reads them back to verify end-to-end correctness for multiple types.
+func TestIntegrationWriteReadRoundTrip(t *testing.T) {
+	// Requires writable symbols configured via env vars
+	writeBool := os.Getenv("ADS_WRITE_BOOL")
+	writeInt := os.Getenv("ADS_WRITE_INT")
+	if writeBool == "" && writeInt == "" {
+		t.Skip("ADS_WRITE_BOOL and ADS_WRITE_INT not set — skipping write round-trip")
+	}
+
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	type writeTest struct {
+		name     string
+		symbol   string
+		write    string
+		restore  string
+		validate func(string) bool
+	}
+
+	var tests []writeTest
+	if writeBool != "" {
+		tests = append(tests, writeTest{
+			name: "BOOL", symbol: writeBool,
+			write: "true", restore: "false",
+			validate: func(v string) bool { return v == "true" },
+		})
+	}
+	if writeInt != "" {
+		tests = append(tests, writeTest{
+			name: "INT", symbol: writeInt,
+			write: "12345", restore: "0",
+			validate: func(v string) bool { return v == "12345" },
+		})
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Save original
+			original, err := conn.ReadFromSymbol(tt.symbol)
+			if err != nil {
+				t.Fatalf("initial read failed: %v", err)
+			}
+			t.Logf("original value: %q", original)
+
+			// Write test value
+			if err := conn.WriteToSymbol(tt.symbol, tt.write); err != nil {
+				t.Fatalf("write failed: %v", err)
+			}
+
+			// Read back
+			readBack, err := conn.ReadFromSymbol(tt.symbol)
+			if err != nil {
+				t.Fatalf("read-back failed: %v", err)
+			}
+			if !tt.validate(readBack) {
+				t.Errorf("read-back = %q, expected %q", readBack, tt.write)
+			}
+
+			// Restore
+			if err := conn.WriteToSymbol(tt.symbol, original); err != nil {
+				t.Logf("warning: failed to restore original value: %v", err)
+			}
+		})
+	}
+}
+
+// TestIntegrationRapidSubscribeUnsubscribe subscribes and unsubscribes quickly
+// in a loop to verify handle management under rapid lifecycle churn.
+func TestIntegrationRapidSubscribeUnsubscribe(t *testing.T) {
+	conn := setupConnection(t)
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	symbolName := pickParseableSymbol(symbols)
+	if symbolName == "" {
+		t.Skip("no parseable symbol")
+	}
+
+	const iterations = 10
+	for i := 0; i < iterations; i++ {
+		ch := make(chan *Update, 5)
+		handle, err := conn.AddSymbolNotification(symbolName, 100, 100, TransModeServerCycle, ch)
+		if err != nil {
+			t.Fatalf("iteration %d: AddSymbolNotification failed: %v", i, err)
+		}
+		err = conn.DeleteDeviceNotification(handle)
+		if err != nil {
+			t.Fatalf("iteration %d: DeleteDeviceNotification failed: %v", i, err)
+		}
+	}
+
+	// Verify clean state after rapid churn
+	conn.symbolLock.Lock()
+	remaining := len(conn.activeNotifications)
+	conn.symbolLock.Unlock()
+	if remaining != 0 {
+		t.Errorf("expected 0 active notifications after %d cycles, got %d", iterations, remaining)
+	}
+	t.Logf("completed %d rapid subscribe/unsubscribe cycles, 0 leaked handles", iterations)
+}
+
+// TestIntegrationDockerRoute validates route registration and ADS communication
+// from a Docker container. When ADS_HOST_IP is set, verifies the connection
+// uses it as callback IP. Always verifies ReadDeviceInfo + LoadSymbols work.
+func TestIntegrationDockerRoute(t *testing.T) {
+	conn := setupConnection(t)
+
+	t.Logf("source NetID: %d.%d.%d.%d.%d.%d",
+		conn.source.NetID[0], conn.source.NetID[1],
+		conn.source.NetID[2], conn.source.NetID[3],
+		conn.source.NetID[4], conn.source.NetID[5])
+	t.Logf("callbackIP: %q", conn.callbackIP)
+
+	hostIP := os.Getenv("ADS_HOST_IP")
+	if hostIP != "" && conn.callbackIP != hostIP {
+		t.Errorf("callbackIP=%q, want ADS_HOST_IP=%q", conn.callbackIP, hostIP)
+	}
+
+	// Verify connection works (proves route is valid)
+	info, err := conn.ReadDeviceInfo()
+	if err != nil {
+		t.Fatalf("ReadDeviceInfo failed: %v", err)
+	}
+	t.Logf("device: %s v%d.%d.%d", string(info.DeviceName[:]), info.Major, info.Minor, info.Version)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+	symbols, _ := conn.ListSymbols()
+	t.Logf("loaded %d symbols", len(symbols))
+}
+
+func TestIntegrationWSTRING(t *testing.T) {
+	conn := setupConnection(t)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	symbols, err := conn.ListSymbols()
+	if err != nil {
+		t.Fatalf("ListSymbols failed: %v", err)
+	}
+
+	// Find a WSTRING symbol
+	var wstringName string
+	for name, sym := range symbols {
+		if sym.DataType == "WSTRING" {
+			wstringName = name
+			break
+		}
+	}
+	if wstringName == "" {
+		t.Skip("no WSTRING symbol found on PLC")
+	}
+
+	t.Logf("found WSTRING symbol: %s", wstringName)
+
+	// Read current value
+	val, err := conn.ReadFromSymbol(wstringName)
+	if err != nil {
+		t.Fatalf("ReadFromSymbol(%s) failed: %v", wstringName, err)
+	}
+	t.Logf("current value: %q", val)
+
+	// Write a test value and read back
+	testVal := "WTest"
+	if err := conn.WriteToSymbol(wstringName, testVal); err != nil {
+		t.Logf("WriteToSymbol(%s) failed (may be read-only): %v", wstringName, err)
+		return
+	}
+
+	readBack, err := conn.ReadFromSymbol(wstringName)
+	if err != nil {
+		t.Fatalf("ReadFromSymbol after write failed: %v", err)
+	}
+	if readBack != testVal {
+		t.Errorf("got %q, want %q", readBack, testVal)
+	}
+
+	// Restore original value
+	if val != "" {
+		_ = conn.WriteToSymbol(wstringName, val)
+	}
+}
+
+func TestIntegrationBitSymbol(t *testing.T) {
+	conn := setupConnection(t)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("LoadSymbols failed: %v", err)
+	}
+
+	symbols, err := conn.ListSymbols()
+	if err != nil {
+		t.Fatalf("ListSymbols failed: %v", err)
+	}
+
+	// Find a symbol with BitValue flag
+	var bitName string
+	for name, sym := range symbols {
+		if sym.Flags.Has(SymbolFlagBitValue) {
+			bitName = name
+			break
+		}
+	}
+	if bitName == "" {
+		t.Skip("no BitValue symbol found on PLC")
+	}
+
+	t.Logf("found BitValue symbol: %s (flags=0x%04X)", bitName, uint32(symbols[bitName].Flags))
+
+	// Read should return "true" or "false"
+	val, err := conn.ReadFromSymbol(bitName)
+	if err != nil {
+		t.Fatalf("ReadFromSymbol(%s) failed: %v", bitName, err)
+	}
+	if val != "true" && val != "false" {
+		t.Errorf("expected 'true' or 'false', got %q", val)
+	}
+	t.Logf("value: %s", val)
+}
+
+func TestIntegrationReadProcessInputSize(t *testing.T) {
+	conn := setupConnection(t)
+
+	size, err := conn.ReadProcessInputSize()
+	if err != nil {
+		t.Fatalf("ReadProcessInputSize failed: %v", err)
+	}
+	if size == 0 {
+		t.Error("input image size is 0")
+	}
+	t.Logf("process input image size: %d bytes", size)
+}
+
+func TestIntegrationReadProcessInput(t *testing.T) {
+	conn := setupConnection(t)
+
+	// Read first 4 bytes of input image
+	data, err := conn.ReadProcessInput(0, 4)
+	if err != nil {
+		t.Fatalf("ReadProcessInput failed: %v", err)
+	}
+	if len(data) != 4 {
+		t.Errorf("expected 4 bytes, got %d", len(data))
+	}
+	t.Logf("first 4 input bytes: %02X", data)
+}
+
+func TestIntegrationReadProcessOutput(t *testing.T) {
+	conn := setupConnection(t)
+
+	// Read first 4 bytes of output image
+	data, err := conn.ReadProcessOutput(0, 4)
+	if err != nil {
+		t.Fatalf("ReadProcessOutput failed: %v", err)
+	}
+	if len(data) != 4 {
+		t.Errorf("expected 4 bytes, got %d", len(data))
+	}
+	t.Logf("first 4 output bytes: %02X", data)
+}
+
+func TestIntegrationReadProcessInputBit(t *testing.T) {
+	conn := setupConnection(t)
+
+	// Read bit 0 of first input byte
+	val, err := conn.ReadProcessInputBit(0, 0)
+	if err != nil {
+		t.Fatalf("ReadProcessInputBit failed: %v", err)
+	}
+	t.Logf("input bit 0.0 = %v", val)
 }

@@ -978,11 +978,92 @@ Introduced in TwinCAT 3.1 Build 4024.0. Uses **TLS 1.2 with mutual authenticatio
 | AMS/TCP header | 6 bytes | Fixed |
 | AMS header | 32 bytes | Fixed |
 
+### Network Ports
+
+| Port | Protocol | Purpose | Configurable |
+|------|----------|---------|--------------|
+| 48898 | TCP | ADS/AMS data channel — all ADS commands, responses, and notifications | Yes (TwinCAT System Manager) |
+| 48899 | UDP | AMS route registration — Beckhoff proprietary protocol | No (fixed by Beckhoff convention) |
+
+Both ports must be reachable from the client to the PLC. If UDP 48899 is blocked,
+route registration fails but ADS communication works if a route already exists on the PLC.
+
 ### Route Registration
 
 UDP port 48899 is used for route management. Packet format:
 - Header: cookie `0x71146603` + invoke ID + service ID + AMS address + tag count
 - Tags: NetID, password, computer name, route name, username
+
+#### Route Registration Behavior (Observed)
+
+**PLC stores the UDP source IP, not the `computerName` tag.** When a route is registered
+from inside a Docker container (bridge mode), the PLC records:
+- **AMS NetID**: from the packet's NetID tag (e.g., `172.17.0.2.1.1` — the container IP)
+- **IP address**: from the UDP packet's source IP after NAT (e.g., `192.168.3.52` — the host IP)
+
+The `computerName` tag in the packet appears to be ignored for IP resolution. This has
+important implications for containerized deployments.
+
+#### Docker / Container Deployment
+
+**Minimum configuration**: only route credentials are needed. `WithHostIP` and explicit
+AMS NetID (`ADS_LOCAL_AMS`) are both optional.
+
+```go
+conn, _ := NewConnection(ctx, plcIP, 48898, targetAMS, 851, "auto", 10500, 5*time.Second,
+    WithRoute("my-route", "Administrator", "password"),
+)
+conn.Connect(false)
+// Works from Docker, Kubernetes, VMs — no ADS_HOST_IP or ADS_LOCAL_AMS needed
+```
+
+**How it works:**
+1. TCP connects to PLC → auto-derive NetID from container IP (e.g., `172.17.0.2.1.1`)
+2. UDP route registration → PLC stores NetID + UDP source IP (post-NAT = host IP)
+3. TCP reconnects after route registration (PLC may reset pre-route connections)
+4. ADS commands use the auto-derived NetID → PLC matches route → accepts
+5. Notifications delivered over existing TCP → no reverse connection needed
+
+| Scenario | NetID | Route IP | Works? |
+|----------|-------|----------|--------|
+| Bare metal | Host IP-based (e.g., `192.168.3.52.1.1`) | Host IP | Yes |
+| Docker (auto-derived) | Container IP-based (e.g., `172.17.0.2.1.1`) | Host IP (via NAT) | Yes |
+| Docker (explicit AMS) | Any chosen NetID | Host IP (via NAT) | Yes |
+| Docker, no credentials | Any | No route created | **No** |
+| Docker, UDP port 48899 blocked | Any | Can't register | **No** |
+
+**Key findings from Docker bridge testing (Colima/macOS, April 2025):**
+1. Auto-derived NetID from container IP works — PLC accepts ADS commands
+   and sends notifications over the existing TCP connection
+2. `WithHostIP` / `ADS_HOST_IP` has no effect on route IP — PLC uses UDP source IP regardless
+3. Route credentials are **required** — without them, no route is created and the PLC
+   closes the TCP connection (EOF / connection reset) on the first ADS command
+4. `ADS_LOCAL_AMS` is **optional** — auto-derived NetID from container works fine
+5. UDP port 48899 must be open — route registration is UDP-based and cannot fall back to TCP
+6. TCP port 48898 is used for ADS data — must be open
+7. When the PLC has no route for a source NetID, it closes the TCP connection immediately.
+   The error appears as `EOF` or `connection reset by peer` — this typically means a
+   missing or expired AMS route, not a network issue
+
+**Note:** These observations are based on testing with TwinCAT 3 (TC3.1 build 4026) via
+Colima on macOS. More extensive testing across TwinCAT versions, native Linux Docker, and
+Kubernetes is needed to fully validate these findings. The `computerName` field may still
+be relevant for other route management scenarios (e.g., TwinCAT route manager UI display).
+
+#### Connect/Route Ordering
+
+Route registration must happen **before** any ADS commands. If no route exists when the
+first ADS command is sent (e.g., `GetSymbolVersion` during `Connect()`), the PLC closes
+the TCP connection, triggering a reconnect cycle.
+
+The `WithRoute(name, user, pass)` option handles this automatically:
+1. TCP connect + derive source NetID
+2. Register route via UDP (before starting listener goroutines)
+3. Reconnect TCP (PLC may reset connections from previously-unknown NetIDs)
+4. Start listeners + send first ADS command (`GetSymbolVersion`)
+
+Routes are also re-registered during reconnect if >30 seconds have passed since the last
+registration (handles PLC reboot losing routes without causing TCP reset loops).
 
 ---
 

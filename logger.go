@@ -39,6 +39,19 @@ func WithHostIP(ip string) ConnectionOption {
 	}
 }
 
+// WithRoute configures automatic AMS route registration during Connect().
+// The route is registered via UDP (port 48899) after the TCP connection is established
+// and the source AMS NetID is derived, but before any ADS commands are sent.
+// This eliminates the need to call AddRoute() manually after Connect().
+// The route is also re-registered automatically during reconnect (e.g., after PLC reboot).
+func WithRoute(routeName, username, password string) ConnectionOption {
+	return func(c *Connection) {
+		c.routeName = routeName
+		c.routeUsername = username
+		c.routePassword = password
+	}
+}
+
 // defaultLoggerPtr is used by package-level functions (e.g., AddRemoteRoute)
 // that are not associated with a Connection instance.
 var defaultLoggerPtr atomic.Pointer[slog.Logger]

@@ -123,10 +123,10 @@ func ParseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUpload
 		item := symbolUploadSymbol{}
 		item.Name = string(name)
 		item.DataType = string(dt)
-		if len(item.DataType) >= 6 {
-			if item.DataType[:6] == "STRING" {
-				item.DataType = "STRING"
-			}
+		if len(item.DataType) >= 7 && item.DataType[:7] == "WSTRING" {
+			item.DataType = "WSTRING"
+		} else if len(item.DataType) >= 6 && item.DataType[:6] == "STRING" {
+			item.DataType = "STRING"
 		}
 		item.Comment = string(comment)
 		item.SymbolEntry = result
@@ -287,7 +287,9 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 
 	header.DatatypeEntry = result
 
-	if len(header.DataType) >= 6 && header.DataType[:6] == "STRING" {
+	if len(header.DataType) >= 7 && header.DataType[:7] == "WSTRING" {
+		header.DataType = "WSTRING"
+	} else if len(header.DataType) >= 6 && header.DataType[:6] == "STRING" {
 		header.DataType = "STRING"
 	}
 

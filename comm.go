@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 func (conn *Connection) send(data []byte) (response []byte, err error) {
@@ -187,7 +188,17 @@ func (conn *Connection) listen() {
 					return
 				default:
 				}
-				conn.logger.Error("listen read error, triggering reconnect", "error", err)
+				// EOF or connection reset often means PLC has no AMS route for our NetID
+				hint := ""
+				if err.Error() == "EOF" || strings.Contains(err.Error(), "connection reset") {
+					hint = "PLC may not have an AMS route for this NetID — check route credentials or register route via WithRoute()"
+				}
+				if hint != "" {
+					conn.logger.Error("PLC closed connection, triggering reconnect", "error", err, "hint", hint,
+						"sourceNetID", fmt.Sprintf("%d.%d.%d.%d.%d.%d", conn.source.NetID[0], conn.source.NetID[1], conn.source.NetID[2], conn.source.NetID[3], conn.source.NetID[4], conn.source.NetID[5]))
+				} else {
+					conn.logger.Error("listen read error, triggering reconnect", "error", err)
+				}
 				conn.triggerReconnect()
 				return
 			}

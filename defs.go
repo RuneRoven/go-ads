@@ -15,11 +15,11 @@ type AmsAddress struct {
 type TransMode uint32
 
 const (
-	TransModeNoTransmission  TransMode = 0
-	TransModeClientCycle     TransMode = 1
-	TransModeClientOnChange  TransMode = 2
-	TransModeServerCycle     TransMode = 3
-	TransModeServerOnChange  TransMode = 4
+	TransModeNoTransmission TransMode = 0
+	TransModeClientCycle    TransMode = 1
+	TransModeClientOnChange TransMode = 2
+	TransModeServerCycle    TransMode = 3
+	TransModeServerOnChange TransMode = 4
 	// ServerCycle2 / ServerOnChange2 are the "InContext" variants (called CyclicInContext
 	// and OnChangeInContext in Beckhoff's .NET SDK). They execute the notification check
 	// within the PLC task cycle instead of a separate ADS server thread, giving more

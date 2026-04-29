@@ -76,7 +76,7 @@ func TestBrowseAllSymbols(t *testing.T) {
 	}
 
 	filename := fmt.Sprintf("plc_%s.var", strings.ReplaceAll(ip, ".", "_"))
-	err = os.WriteFile(filename, []byte(buf.String()), 0644)
+	err = os.WriteFile(filename, []byte(buf.String()), 0o644)
 	if err != nil {
 		t.Fatalf("failed to write %s: %v", filename, err)
 	}
@@ -98,11 +98,16 @@ func browseSetupConnection(t *testing.T) *Connection {
 	}
 	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
 
-	// Build connection options
+	// Build connection options — WithRoute registers route BEFORE any ADS commands
 	var opts []ConnectionOption
 	hostIP := os.Getenv("ADS_HOST_IP")
 	if hostIP != "" {
 		opts = append(opts, WithHostIP(hostIP))
+	}
+	routeUser := os.Getenv("ADS_ROUTE_USER")
+	routePass := os.Getenv("ADS_ROUTE_PASS")
+	if routeUser != "" && routePass != "" {
+		opts = append(opts, WithRoute("go-ads-browse", routeUser, routePass))
 	}
 
 	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second, opts...)
@@ -113,16 +118,6 @@ func browseSetupConnection(t *testing.T) *Connection {
 	err = conn.Connect(false)
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
-	}
-
-	// Auto-create AMS route if credentials are provided (after Connect so source NetID is resolved)
-	routeUser := os.Getenv("ADS_ROUTE_USER")
-	routePass := os.Getenv("ADS_ROUTE_PASS")
-	if routeUser != "" && routePass != "" {
-		err := conn.AddRoute("go-ads-browse", routeUser, routePass)
-		if err != nil {
-			t.Logf("warning: AddRoute failed (may already exist): %v", err)
-		}
 	}
 
 	t.Cleanup(func() {

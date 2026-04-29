@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -85,6 +87,12 @@ type Connection struct {
 	ctxMu  sync.RWMutex // protects conn.ctx and conn.shutdown against concurrent access
 	chanMu sync.RWMutex // protects sendChannel and systemResponse against concurrent access during reconnect
 
+	// Route registration config (set via WithRoute, used in Connect and reconnect)
+	routeName         string
+	routeUsername     string
+	routePassword     string
+	routeRegisteredAt time.Time // last successful route registration
+
 	logger *slog.Logger
 }
 
@@ -161,6 +169,11 @@ func (conn *Connection) Connect(local bool) error {
 			Count:    5,
 		})
 	}
+	// Log TCP socket (transport-level only — ADS route validation happens on first ADS command)
+	conn.logger.Info("TCP socket established (ADS route not yet verified)",
+		"local", conn.connection.LocalAddr().String(),
+		"remote", conn.connection.RemoteAddr().String())
+
 	// Auto-derive source AMS NetID from local IP if source NetID is all zeros
 	if conn.source.NetID == [6]byte{} {
 		localAddr, ok := conn.connection.LocalAddr().(*net.TCPAddr)
@@ -190,6 +203,52 @@ func (conn *Connection) Connect(local bool) error {
 				}
 			}
 		}
+	}
+
+	// Log container detection — auto-derived NetID works in containers because
+	// the PLC stores the UDP source IP (post-NAT) for routes, not the computerName tag.
+	if conn.callbackIP == "" && isRunningInContainer() {
+		conn.logger.Info("container detected — auto-derived NetID will be used for route registration",
+			"netidIP", fmt.Sprintf("%d.%d.%d.%d", conn.source.NetID[0], conn.source.NetID[1], conn.source.NetID[2], conn.source.NetID[3]))
+	}
+
+	// Log ADS-level addressing (what matters for AMS routing, may differ from TCP)
+	routeHostIP := conn.callbackIP
+	if routeHostIP == "" {
+		routeHostIP = fmt.Sprintf("%d.%d.%d.%d (from NetID, PLC will use UDP source IP)", conn.source.NetID[0], conn.source.NetID[1], conn.source.NetID[2], conn.source.NetID[3])
+	}
+	conn.logger.Info("ADS addressing",
+		"sourceNetID", fmt.Sprintf("%d.%d.%d.%d.%d.%d", conn.source.NetID[0], conn.source.NetID[1], conn.source.NetID[2], conn.source.NetID[3], conn.source.NetID[4], conn.source.NetID[5]),
+		"routeHostIP", routeHostIP,
+		"target", fmt.Sprintf("%d.%d.%d.%d.%d.%d:%d", conn.target.NetID[0], conn.target.NetID[1], conn.target.NetID[2], conn.target.NetID[3], conn.target.NetID[4], conn.target.NetID[5], conn.target.Port))
+
+	// Register route if configured (must happen before any ADS commands).
+	// Route registration is UDP-based and independent of the TCP connection,
+	// but it needs the source NetID to be derived first.
+	// After registration, reconnect TCP because the PLC may close the existing
+	// TCP connection that was established before the route existed.
+	if conn.routeName != "" {
+		if err := conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword); err != nil {
+			conn.logger.Warn("route registration failed during connect (may already exist)", "error", err)
+		} else {
+			// Reconnect TCP — PLC may reset connections from previously-unknown NetIDs
+			conn.connection.Close()
+			newConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.RequestTimeout)
+			if err != nil {
+				return fmt.Errorf("TCP reconnect after route registration failed: %w", err)
+			}
+			conn.connection = newConn
+			if tcpConn, ok := newConn.(*net.TCPConn); ok {
+				tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
+					Enable:   true,
+					Idle:     3 * time.Second,
+					Interval: 2 * time.Second,
+					Count:    5,
+				})
+			}
+			conn.logger.Info("TCP reconnected after route registration")
+		}
+		conn.routeRegisteredAt = time.Now()
 	}
 
 	conn.logger.Log(context.Background(), LevelTrace, "connected")
@@ -464,6 +523,17 @@ func (conn *Connection) Reconnect() error {
 			conn.connMu.Unlock()
 		}
 
+		// Re-register route after reconnect if enough time has passed (PLC reboot loses routes).
+		// Skip if recently registered — avoids TCP reset loop when PLC closes connections
+		// after route changes.
+		if conn.routeName != "" && time.Since(conn.routeRegisteredAt) > 30*time.Second {
+			if err := conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword); err != nil {
+				conn.logger.Warn("route re-registration failed during reconnect", "error", err)
+			} else {
+				conn.routeRegisteredAt = time.Now()
+			}
+		}
+
 		// Re-load symbols based on discovery mode
 		if err := conn.reloadSymbols(); err != nil {
 			lastErr = err
@@ -641,4 +711,22 @@ func (conn *Connection) AddRoute(routeName, username, password string) error {
 // IsDisconnected returns whether the connection is currently in a disconnected state.
 func (conn *Connection) IsDisconnected() bool {
 	return conn.disconnected.Load()
+}
+
+// isRunningInContainer returns true if the process is running inside a
+// Docker, Podman, or Kubernetes container. Uses filesystem markers rather
+// than IP range heuristics (10.x is common in industrial OT networks).
+func isRunningInContainer() bool {
+	// Docker/Podman marker file
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	// Check cgroup for container runtime (Linux only)
+	data, err := os.ReadFile("/proc/1/cgroup")
+	if err != nil {
+		return false
+	}
+	s := string(data)
+	return strings.Contains(s, "docker") || strings.Contains(s, "containerd") ||
+		strings.Contains(s, "kubepods") || strings.Contains(s, "lxc")
 }

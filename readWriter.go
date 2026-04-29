@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"time"
+	"unicode/utf16"
 )
 
 func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]SymbolUploadDataType) (string, error) {
@@ -34,7 +35,13 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 		return "", fmt.Errorf("data too short for %s at offset %d: need %d bytes, got %d", symbol.DataType, start, symbol.Length, len(data)-start)
 	}
 
-	switch symbol.DataType {
+	// BitValue symbols are single bits — always parse as BOOL
+	parseType := symbol.DataType
+	if symbol.Flags.Has(SymbolFlagBitValue) {
+		parseType = "BOOL"
+	}
+
+	switch parseType {
 	case "BOOL":
 		if stop-start != 1 {
 			return "", fmt.Errorf("BOOL Size Wrong")
@@ -111,6 +118,21 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 			idx = len(raw)
 		}
 		newValue = string(raw[:idx])
+	case "WSTRING":
+		raw := data[start:stop]
+		// Find UTF-16LE null terminator (0x0000 on 2-byte boundary)
+		n := len(raw) &^ 1 // round down to even
+		for i := 0; i+1 < len(raw); i += 2 {
+			if raw[i] == 0 && raw[i+1] == 0 {
+				n = i
+				break
+			}
+		}
+		runes := make([]uint16, n/2)
+		for i := 0; i < n; i += 2 {
+			runes[i/2] = binary.LittleEndian.Uint16(raw[i:])
+		}
+		newValue = string(utf16.Decode(runes))
 	case "TIME":
 		if stop-start != 4 {
 			return "", fmt.Errorf("TIME Size Wrong")
@@ -214,6 +236,7 @@ var parseableTypes = []string{
 	"REAL",
 	"LREAL",
 	"STRING",
+	"WSTRING",
 	"TIME",
 	"TOD",
 	"TIME_OF_DAY",
@@ -282,7 +305,12 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 	buf := new(bytes.Buffer)
 	dt := symbol.DataType
 
-	if !slices.Contains(parseableTypes, symbol.DataType) {
+	// BitValue symbols are single bits — always write as BOOL
+	if symbol.Flags.Has(SymbolFlagBitValue) {
+		dt = "BOOL"
+	}
+
+	if !slices.Contains(parseableTypes, dt) {
 		if datatypes == nil {
 			return nil, fmt.Errorf("cannot write to symbol with aliased type %q without full symbol discovery; call LoadSymbols() first", symbol.DataType)
 		}
@@ -446,8 +474,42 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		newBuf := make([]byte, symbol.Length)
 		copy(newBuf, []byte(value))
 		buf.Write(newBuf)
+	case "WSTRING":
+		encoded := utf16.Encode([]rune(value))
+		newBuf := make([]byte, symbol.Length)
+		maxChars := (int(symbol.Length) - 2) / 2 // reserve 2 bytes for null terminator
+		if maxChars < 0 {
+			maxChars = 0
+		}
+		if len(encoded) > maxChars {
+			encoded = encoded[:maxChars]
+		}
+		for i, r := range encoded {
+			binary.LittleEndian.PutUint16(newBuf[i*2:], r)
+		}
+		buf.Write(newBuf)
 	default:
 		return nil, fmt.Errorf("datatype %q write is not implemented yet", symbol.DataType)
 	}
 	return buf.Bytes(), nil
+}
+
+// ReadBit extracts a single bit from a byte slice.
+// bitIndex 0 is the least significant bit of the first byte.
+func ReadBit(data []byte, bitIndex int) bool {
+	byteIdx := bitIndex / 8
+	bitIdx := bitIndex % 8
+	return data[byteIdx]&(1<<uint(bitIdx)) != 0
+}
+
+// WriteBit sets or clears a single bit in a byte slice.
+// bitIndex 0 is the least significant bit of the first byte.
+func WriteBit(data []byte, bitIndex int, value bool) {
+	byteIdx := bitIndex / 8
+	bitIdx := bitIndex % 8
+	if value {
+		data[byteIdx] |= 1 << uint(bitIdx)
+	} else {
+		data[byteIdx] &^= 1 << uint(bitIdx)
+	}
 }
