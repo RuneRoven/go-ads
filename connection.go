@@ -98,6 +98,7 @@ type Connection struct {
 
 // NewConnection creates a new ADS connection. requestTimeout is the timeout for individual ADS requests.
 // If requestTimeout is 0, a default of 5000ms is used.
+// If localPort is 0, a default of 10500 is used (arbitrary AMS source port for protocol headers).
 func NewConnection(ctx context.Context, ip string, port int, netid string, amsPort int, localNetID string, localPort int, requestTimeout time.Duration, opts ...ConnectionOption) (conn *Connection, err error) {
 	if requestTimeout <= 0 {
 		requestTimeout = 5000 * time.Millisecond
@@ -127,6 +128,9 @@ func NewConnection(ctx context.Context, ip string, port int, netid string, amsPo
 		conn.source.NetID = localBytes
 	}
 	// If localNetID is "auto" or empty, source.NetID stays zero and will be auto-derived in Connect()
+	if localPort <= 0 {
+		localPort = 10500
+	}
 	conn.source.Port = uint16(localPort)
 	conn.systemResponse = make(chan []byte)
 	conn.activeRequests = map[uint32]chan []byte{}
