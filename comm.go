@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 func (conn *Connection) send(data []byte) (response []byte, err error) {
@@ -291,9 +292,17 @@ func (conn *Connection) handleReceive(ctx context.Context, data []byte) {
 					"command", header.Command)
 			}
 		} else {
-			conn.logger.Error("received packet with unknown invokeID",
-				"data", buff.Bytes(),
-				"invokeId", header.InvokeID)
+			// After reconnect, stale responses from previous connection may arrive
+			// for invokeIDs that no longer exist. Downgrade to Debug within 10s of
+			// reconnect to reduce log noise.
+			if time.Since(conn.lastReconnectTime) < 10*time.Second {
+				conn.logger.Debug("received stale packet after reconnect (expected)",
+					"invokeId", header.InvokeID)
+			} else {
+				conn.logger.Error("received packet with unknown invokeID",
+					"data", buff.Bytes(),
+					"invokeId", header.InvokeID)
+			}
 		}
 	}
 }

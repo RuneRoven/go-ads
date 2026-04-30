@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"sync/atomic"
+	"time"
 )
 
 // LevelTrace is a custom slog level for trace-level logging,
@@ -42,13 +43,98 @@ func WithHostIP(ip string) ConnectionOption {
 // WithRoute configures automatic AMS route registration during Connect().
 // The route is registered via UDP (port 48899) after the TCP connection is established
 // and the source AMS NetID is derived, but before any ADS commands are sent.
-// This eliminates the need to call AddRoute() manually after Connect().
-// The route is also re-registered automatically during reconnect (e.g., after PLC reboot).
+// By default, Connect and Reconnect probe the PLC first (via GetSymbolVersion) to check
+// if the route already exists, and only register with credentials if the probe fails.
+// Use WithForceRouteRegistration to always register without probing.
 func WithRoute(routeName, username, password string) ConnectionOption {
 	return func(c *Connection) {
 		c.routeName = routeName
 		c.routeUsername = username
 		c.routePassword = password
+	}
+}
+
+// BackoffConfig controls reconnect timing behavior.
+// Reconnection uses stepped intervals: fast retries first (for network blips),
+// then progressively slower intervals to avoid overwhelming the PLC.
+// Backoff resets on each successful reconnect.
+type BackoffConfig struct {
+	InitialInterval time.Duration // delay for first N attempts (default: 1s)
+	InitialAttempts int           // how many attempts at initial interval (default: 3)
+	MidInterval     time.Duration // delay for mid-tier attempts (default: 5s)
+	MidAttempts     int           // how many attempts at mid interval (default: 3)
+	SlowInterval    time.Duration // delay for slow-tier attempts (default: 15s)
+	SlowAttempts    int           // how many attempts at slow interval (default: 4)
+	MaxInterval     time.Duration // cap after all tiers exhausted (default: 30s)
+}
+
+// DefaultBackoffConfig returns the default reconnect backoff configuration.
+func DefaultBackoffConfig() BackoffConfig {
+	return BackoffConfig{
+		InitialInterval: 1 * time.Second,
+		InitialAttempts: 3,
+		MidInterval:     5 * time.Second,
+		MidAttempts:     3,
+		SlowInterval:    15 * time.Second,
+		SlowAttempts:    4,
+		MaxInterval:     30 * time.Second,
+	}
+}
+
+// WithBackoff sets the reconnect backoff configuration.
+// If not provided, DefaultBackoffConfig() is used.
+func WithBackoff(cfg BackoffConfig) ConnectionOption {
+	return func(c *Connection) {
+		c.backoffConfig = cfg
+	}
+}
+
+// WithForceRouteRegistration disables route probing and always registers the route
+// with credentials on every Connect and Reconnect. Use this in environments where
+// routes are not persistent or must be refreshed on each connection.
+func WithForceRouteRegistration() ConnectionOption {
+	return func(c *Connection) {
+		c.forceRouteRegistration = true
+	}
+}
+
+// WithStrictReconnect makes reconnection fail if any previously-resolved on-demand
+// symbol is no longer available on the PLC (e.g., after an online change).
+// By default, missing symbols are skipped gracefully during reconnect.
+// maxAttempts controls how many reconnect attempts are allowed before giving up:
+//   - 0 = fail immediately on first missing symbol
+//   - N > 0 = retry up to N times, then return error (connection closes)
+func WithStrictReconnect(maxAttempts int) ConnectionOption {
+	return func(c *Connection) {
+		c.strictReconnect = true
+		c.strictReconnectMaxAttempts = maxAttempts
+	}
+}
+
+// WithAutoReconnect controls whether the connection automatically reconnects
+// when the TCP connection drops. Default is true.
+// When disabled, triggerReconnect sets the disconnected flag but does not launch
+// a reconnect goroutine. sendRequest returns ErrDisconnected immediately.
+// The caller must call Reconnect() manually to re-establish the connection.
+func WithAutoReconnect(enabled bool) ConnectionOption {
+	return func(c *Connection) {
+		c.autoReconnect = enabled
+	}
+}
+
+// WithOnDisconnect registers a callback invoked when a disconnect is detected.
+// The callback runs in a separate goroutine and must not block.
+func WithOnDisconnect(fn func()) ConnectionOption {
+	return func(c *Connection) {
+		c.onDisconnect = fn
+	}
+}
+
+// WithOnReconnect registers a callback invoked after a successful reconnect.
+// The callback runs in a separate goroutine and must not block.
+func WithOnReconnect(fn func()) ConnectionOption {
+	return func(c *Connection) {
+		c.onReconnect = fn
 	}
 }
 

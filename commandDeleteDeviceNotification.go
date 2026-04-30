@@ -37,6 +37,9 @@ func (conn *Connection) DeleteDeviceNotification(handle uint32) error {
 	}
 	conn.symbolLock.Lock()
 	delete(conn.activeNotifications, handle)
+	if len(conn.activeNotifications) == 0 {
+		conn.notificationChannel = nil
+	}
 	conn.symbolLock.Unlock()
 	conn.logger.Info("deleted handle", "handle", handle)
 	return nil

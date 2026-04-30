@@ -134,6 +134,9 @@ func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnC
 			conn.logger.Info("batch deleted notification handle", "handle", h)
 		}
 	}
+	if len(conn.activeNotifications) == 0 {
+		conn.notificationChannel = nil
+	}
 	conn.symbolLock.Unlock()
 
 	return errors, nil

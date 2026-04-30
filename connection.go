@@ -55,8 +55,27 @@ type Connection struct {
 	// Reconnection settings
 	reconnectInterval    time.Duration
 	maxReconnectAttempts int // 0 = infinite
+	backoffConfig        BackoffConfig
 	isLocal              bool
 	disconnected         atomic.Bool
+	autoReconnect        bool // default true; when false, triggerReconnect does not launch goroutine
+
+	// Strict reconnect: fail if on-demand symbols are missing after reconnect
+	strictReconnect            bool
+	strictReconnectMaxAttempts int
+	strictReconnectFailures    int // tracks consecutive symbol-missing reconnect failures
+
+	// Reconnect generation counter for stale handle detection
+	reconnectGeneration atomic.Uint64
+	lastReconnectTime   time.Time
+
+	// Event callbacks (run in goroutine, must not block)
+	onDisconnect func()
+	onReconnect  func()
+
+	// Route probing
+	forceRouteRegistration bool
+	routeProbeFailures     int
 
 	// Symbol discovery mode tracking
 	symbolsFullyLoaded bool            // true after LoadSymbols() or LoadSymbolsSlow() completes
@@ -109,6 +128,8 @@ func NewConnection(ctx context.Context, ip string, port int, netid string, amsPo
 		RequestTimeout:       requestTimeout,
 		reconnectInterval:    5 * time.Second,
 		maxReconnectAttempts: 0, // 0 = infinite retries
+		backoffConfig:        DefaultBackoffConfig(),
+		autoReconnect:        true,
 		logger:               slog.Default(),
 	}
 	for _, opt := range opts {
@@ -226,35 +247,6 @@ func (conn *Connection) Connect(local bool) error {
 		"routeHostIP", routeHostIP,
 		"target", fmt.Sprintf("%d.%d.%d.%d.%d.%d:%d", conn.target.NetID[0], conn.target.NetID[1], conn.target.NetID[2], conn.target.NetID[3], conn.target.NetID[4], conn.target.NetID[5], conn.target.Port))
 
-	// Register route if configured (must happen before any ADS commands).
-	// Route registration is UDP-based and independent of the TCP connection,
-	// but it needs the source NetID to be derived first.
-	// After registration, reconnect TCP because the PLC may close the existing
-	// TCP connection that was established before the route existed.
-	if conn.routeName != "" {
-		if err := conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword); err != nil {
-			conn.logger.Warn("route registration failed during connect (may already exist)", "error", err)
-		} else {
-			// Reconnect TCP — PLC may reset connections from previously-unknown NetIDs
-			conn.connection.Close()
-			newConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.RequestTimeout)
-			if err != nil {
-				return fmt.Errorf("TCP reconnect after route registration failed: %w", err)
-			}
-			conn.connection = newConn
-			if tcpConn, ok := newConn.(*net.TCPConn); ok {
-				tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
-					Enable:   true,
-					Idle:     3 * time.Second,
-					Interval: 2 * time.Second,
-					Count:    5,
-				})
-			}
-			conn.logger.Info("TCP reconnected after route registration")
-		}
-		conn.routeRegisteredAt = time.Now()
-	}
-
 	conn.logger.Log(context.Background(), LevelTrace, "connected")
 	conn.waitGroup.Add(2)
 	go conn.listen()
@@ -276,6 +268,60 @@ func (conn *Connection) Connect(local bool) error {
 		conn.source = result
 		conn.connMu.Unlock()
 	}
+
+	// Smart route registration: probe PLC first, register only if route missing.
+	// Route registration is UDP-based but needs goroutines running for the probe
+	// (which sends an ADS command over TCP). If route is registered, TCP reconnect
+	// is needed because PLC may close connections from previously-unknown NetIDs.
+	if conn.routeName != "" {
+		registered, err := conn.ensureRouteOnConnect()
+		if err != nil {
+			conn.logger.Warn("route registration failed during connect", "error", err)
+		}
+		if registered {
+			// TCP reconnect — PLC may reset connections from previously-unknown NetIDs.
+			// Shut down goroutines, close TCP, redial, restart.
+			conn.ctxMu.RLock()
+			conn.shutdown()
+			conn.ctxMu.RUnlock()
+			conn.connMu.Lock()
+			conn.connection.Close()
+			conn.connMu.Unlock()
+			conn.waitGroup.Wait()
+			conn.ctxMu.Lock()
+			conn.ctx, conn.shutdown = context.WithCancel(context.Background())
+			conn.ctxMu.Unlock()
+			conn.chanMu.Lock()
+			conn.sendChannel = make(chan []byte)
+			conn.systemResponse = make(chan []byte)
+			conn.chanMu.Unlock()
+			conn.activeRequestLock.Lock()
+			conn.activeRequests = map[uint32]chan []byte{}
+			conn.activeRequestLock.Unlock()
+
+			newConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.RequestTimeout)
+			if err != nil {
+				return fmt.Errorf("TCP reconnect after route registration failed: %w", err)
+			}
+			conn.connMu.Lock()
+			conn.connection = newConn
+			conn.connMu.Unlock()
+			if tcpConn, ok := newConn.(*net.TCPConn); ok {
+				tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
+					Enable:   true,
+					Idle:     3 * time.Second,
+					Interval: 2 * time.Second,
+					Count:    5,
+				})
+			}
+			conn.waitGroup.Add(2)
+			go conn.listen()
+			go conn.transmitWorker()
+			conn.logger.Info("TCP reconnected after route registration")
+		}
+		conn.routeRegisteredAt = time.Now()
+	}
+
 	// Read symbol version for later change detection (best-effort, don't fail connect)
 	version, err := conn.GetSymbolVersion()
 	if err != nil {
@@ -286,6 +332,43 @@ func (conn *Connection) Connect(local bool) error {
 		conn.symbolLock.Unlock()
 	}
 	return nil
+}
+
+// ensureRouteOnConnect probes the PLC and registers a route if needed during Connect().
+// Returns (registered bool, err error) where registered=true means a route was added
+// and the caller should TCP-reconnect.
+func (conn *Connection) ensureRouteOnConnect() (registered bool, err error) {
+	if conn.closed.Load() {
+		return false, fmt.Errorf("connection closed")
+	}
+
+	// Force mode → always register
+	if conn.forceRouteRegistration {
+		conn.logger.Info("registering route (force mode)")
+		err = conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword)
+		return err == nil, err
+	}
+
+	// Probe: try a lightweight ADS command to see if route exists
+	_, probeErr := conn.GetSymbolVersion()
+	if probeErr == nil {
+		conn.logger.Info("route already exists on PLC, skipping registration")
+		conn.routeProbeFailures = 0
+		return false, nil
+	}
+
+	if conn.closed.Load() {
+		return false, fmt.Errorf("connection closed during route probe")
+	}
+
+	// Probe failed → register with credentials
+	conn.routeProbeFailures++
+	conn.logger.Info("route probe failed, registering route", "error", probeErr)
+	err = conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Close closes connection and waits for completion
@@ -363,11 +446,29 @@ func (conn *Connection) Close() {
 // ErrDisconnected is returned when attempting to send on a closed connection.
 var ErrDisconnected = fmt.Errorf("connection is disconnected")
 
-// reconnectSleep sleeps for the reconnect interval but returns early if Close() is called.
-// Returns an error if the connection was closed during the sleep.
-func (conn *Connection) reconnectSleep() error {
+// reconnectBackoff returns the delay for the given reconnect attempt number (1-indexed)
+// based on the configured BackoffConfig tiers.
+func (conn *Connection) reconnectBackoff(attempt int) time.Duration {
+	cfg := conn.backoffConfig
+	switch {
+	case attempt <= cfg.InitialAttempts:
+		return cfg.InitialInterval
+	case attempt <= cfg.InitialAttempts+cfg.MidAttempts:
+		return cfg.MidInterval
+	case attempt <= cfg.InitialAttempts+cfg.MidAttempts+cfg.SlowAttempts:
+		return cfg.SlowInterval
+	default:
+		return cfg.MaxInterval
+	}
+}
+
+// reconnectSleep sleeps for the appropriate backoff duration based on the attempt
+// number. Returns early if Close() is called.
+func (conn *Connection) reconnectSleep(attempt int) error {
+	delay := conn.reconnectBackoff(attempt)
+	conn.logger.Info("reconnect backoff", "attempt", attempt, "delay", delay)
 	select {
-	case <-time.After(conn.reconnectInterval):
+	case <-time.After(delay):
 		return nil
 	case <-conn.closedCh:
 		return fmt.Errorf("connection closed during reconnect")
@@ -375,9 +476,10 @@ func (conn *Connection) reconnectSleep() error {
 }
 
 // triggerReconnect prepares the connection state for reconnection and launches
-// the Reconnect goroutine. It sets disconnected=true and creates the reconnectDone
-// channel BEFORE launching the goroutine, eliminating the race window where callers
-// could see a "healthy" connection between the trigger and Reconnect() being scheduled.
+// the Reconnect goroutine (if auto-reconnect is enabled). It sets disconnected=true
+// and creates the reconnectDone channel BEFORE launching the goroutine, eliminating
+// the race window where callers could see a "healthy" connection between the trigger
+// and Reconnect() being scheduled.
 func (conn *Connection) triggerReconnect() {
 	if conn.closed.Load() {
 		return
@@ -388,11 +490,31 @@ func (conn *Connection) triggerReconnect() {
 		conn.reconnectDone = make(chan struct{})
 	}
 	conn.reconnectMu.Unlock()
-	go conn.Reconnect()
+
+	// Fire disconnect callback in goroutine (must not block).
+	// Callback must not call Connection methods — connection may be closing.
+	if conn.onDisconnect != nil && !conn.closed.Load() {
+		go conn.onDisconnect()
+	}
+
+	if conn.autoReconnect {
+		go conn.Reconnect()
+	} else {
+		// No auto-reconnect: close reconnectDone immediately so sendRequest
+		// waiters unblock with ErrDisconnected instead of hanging forever.
+		conn.reconnectMu.Lock()
+		if conn.reconnectDone != nil {
+			close(conn.reconnectDone)
+			conn.reconnectDone = nil
+		}
+		conn.reconnectMu.Unlock()
+	}
 }
 
 // Reconnect attempts to re-establish the TCP connection, reload symbols,
 // and re-subscribe to previously registered notifications.
+// Uses configurable backoff (see WithBackoff) with fast initial retries and
+// progressive slowdown. Backoff resets on each successful reconnect.
 func (conn *Connection) Reconnect() error {
 	if conn.closed.Load() {
 		return fmt.Errorf("connection closed")
@@ -474,7 +596,7 @@ func (conn *Connection) Reconnect() error {
 		if err != nil {
 			lastErr = err
 			conn.logger.Warn("reconnect dial failed, retrying", "error", err, "ip", conn.ip, "port", conn.port, "attempt", attempts)
-			if err := conn.reconnectSleep(); err != nil {
+			if err := conn.reconnectSleep(attempts); err != nil {
 				return err
 			}
 			continue
@@ -507,7 +629,7 @@ func (conn *Connection) Reconnect() error {
 				lastErr = err
 				conn.logger.Warn("reconnect local handshake failed, retrying", "error", err, "attempt", attempts)
 				conn.resetForRetry()
-				if err := conn.reconnectSleep(); err != nil {
+				if err := conn.reconnectSleep(attempts); err != nil {
 					return err
 				}
 				continue
@@ -517,7 +639,7 @@ func (conn *Connection) Reconnect() error {
 			if err = binary.Read(buf, binary.LittleEndian, &result); err != nil {
 				conn.logger.Warn("reconnect local handshake parse failed, retrying", "error", err, "attempt", attempts)
 				conn.resetForRetry()
-				if err := conn.reconnectSleep(); err != nil {
+				if err := conn.reconnectSleep(attempts); err != nil {
 					return err
 				}
 				continue
@@ -527,15 +649,15 @@ func (conn *Connection) Reconnect() error {
 			conn.connMu.Unlock()
 		}
 
-		// Re-register route after reconnect if enough time has passed (PLC reboot loses routes).
-		// Skip if recently registered — avoids TCP reset loop when PLC closes connections
-		// after route changes.
-		if conn.routeName != "" && time.Since(conn.routeRegisteredAt) > 30*time.Second {
-			if err := conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword); err != nil {
-				conn.logger.Warn("route re-registration failed during reconnect", "error", err)
-			} else {
-				conn.routeRegisteredAt = time.Now()
+		// Smart route registration: probe first, register only if needed.
+		if err := conn.ensureRoute(attempts); err != nil {
+			lastErr = err
+			conn.logger.Warn("route registration failed during reconnect, retrying", "error", err, "attempt", attempts)
+			conn.resetForRetry()
+			if err := conn.reconnectSleep(attempts); err != nil {
+				return err
 			}
+			continue
 		}
 
 		// Re-load symbols based on discovery mode
@@ -543,29 +665,34 @@ func (conn *Connection) Reconnect() error {
 			lastErr = err
 			conn.logger.Warn("reconnect symbol reload failed, retrying", "error", err, "attempt", attempts)
 			conn.resetForRetry()
-			if err := conn.reconnectSleep(); err != nil {
+			if err := conn.reconnectSleep(attempts); err != nil {
 				return err
 			}
 			continue
 		}
 
-		// Re-subscribe notifications using stored configs (don't re-append)
+		// Re-subscribe notifications using stored configs.
+		// Filter out symbols that no longer exist after reload to prevent failures.
 		conn.symbolLock.Lock()
 		savedConfigs := conn.notificationConfigs
 		savedChannel := conn.notificationChannel
 		conn.notificationConfigs = nil // Clear before re-adding to prevent duplicates
 		conn.symbolLock.Unlock()
 		if len(savedConfigs) > 0 && savedChannel != nil {
-			err = conn.AddSymbolNotifications(savedConfigs, savedChannel)
+			// Filter to only symbols that still exist
+			validConfigs := conn.filterValidNotificationConfigs(savedConfigs)
+			if len(validConfigs) > 0 {
+				err = conn.AddSymbolNotifications(validConfigs, savedChannel)
+			}
 			if err != nil {
 				conn.logger.Warn("reconnect notification re-subscribe failed, retrying", "error", err, "attempt", attempts)
-				// Restore configs so they can be retried on the next attempt
+				// Restore ALL configs (including filtered) so they can be retried
 				conn.symbolLock.Lock()
 				conn.notificationConfigs = savedConfigs
 				conn.notificationChannel = savedChannel
 				conn.symbolLock.Unlock()
 				conn.resetForRetry()
-				if err := conn.reconnectSleep(); err != nil {
+				if err := conn.reconnectSleep(attempts); err != nil {
 					return err
 				}
 				continue
@@ -573,9 +700,83 @@ func (conn *Connection) Reconnect() error {
 		}
 
 		conn.disconnected.Store(false)
+		conn.reconnectGeneration.Add(1)
+		conn.lastReconnectTime = time.Now()
+		conn.strictReconnectFailures = 0 // reset on success
 		conn.logger.Info("reconnect successful", "attempts", attempts)
+
+		// Fire reconnect callback in goroutine (must not block).
+		// Callback must not call Connection methods — connection may be closing.
+		if conn.onReconnect != nil && !conn.closed.Load() {
+			go conn.onReconnect()
+		}
 		return nil
 	}
+}
+
+// ensureRoute checks if the route exists (via probe) and registers if needed.
+// On force mode or after repeated probe failures, skips the probe.
+// Returns a non-nil error only if registration was attempted and failed critically
+// (requiring a TCP reset / retry).
+func (conn *Connection) ensureRoute(attempt int) error {
+	if conn.routeName == "" {
+		return nil
+	}
+	if conn.closed.Load() {
+		return fmt.Errorf("connection closed")
+	}
+
+	// Force mode or too many probe failures → always register
+	if conn.forceRouteRegistration || conn.routeProbeFailures >= 3 {
+		conn.logger.Info("registering route (forced/fallback)", "probeFailures", conn.routeProbeFailures)
+		if err := conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword); err != nil {
+			return fmt.Errorf("route registration failed: %w", err)
+		}
+		conn.routeRegisteredAt = time.Now()
+		conn.routeProbeFailures = 0
+		return nil
+	}
+
+	// Probe: try a lightweight ADS command to see if route already exists
+	_, probeErr := conn.GetSymbolVersion()
+	if probeErr == nil {
+		conn.logger.Debug("route still valid, skipping re-registration")
+		conn.routeProbeFailures = 0
+		return nil
+	}
+
+	if conn.closed.Load() {
+		return fmt.Errorf("connection closed during route probe")
+	}
+
+	// Probe failed → register with credentials
+	conn.routeProbeFailures++
+	conn.logger.Info("route probe failed, registering route", "error", probeErr, "probeFailures", conn.routeProbeFailures)
+	if err := conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword); err != nil {
+		return fmt.Errorf("route registration failed after probe: %w", err)
+	}
+	conn.routeRegisteredAt = time.Now()
+	return nil
+}
+
+// filterValidNotificationConfigs returns only configs whose symbols still exist
+// in the current symbol table. Logs a warning for dropped subscriptions.
+func (conn *Connection) filterValidNotificationConfigs(configs []NotificationConfig) []NotificationConfig {
+	conn.symbolLock.Lock()
+	defer conn.symbolLock.Unlock()
+
+	valid := make([]NotificationConfig, 0, len(configs))
+	for _, cfg := range configs {
+		if _, exists := conn.symbols[cfg.SymbolName]; exists {
+			valid = append(valid, cfg)
+		} else if _, onDemand := conn.onDemandSymbols[cfg.SymbolName]; onDemand {
+			valid = append(valid, cfg)
+		} else {
+			conn.logger.Warn("notification symbol gone after reconnect, dropping subscription",
+				"symbol", cfg.SymbolName)
+		}
+	}
+	return valid
 }
 
 // reloadSymbols re-establishes the symbol table after a reconnect, matching
@@ -607,7 +808,9 @@ func (conn *Connection) reloadSymbols() error {
 		}
 
 	case hasOnDemand:
-		// On-demand mode: re-resolve only the symbols that were previously loaded
+		// On-demand mode: re-resolve only the symbols that were previously loaded.
+		// By default, missing symbols are skipped gracefully (PLC may have done
+		// an online change). With WithStrictReconnect, missing symbols cause failure.
 		conn.symbolLock.Lock()
 		oldSymbols := conn.onDemandSymbols
 		conn.symbols = make(map[string]*Symbol)
@@ -616,7 +819,15 @@ func (conn *Connection) reloadSymbols() error {
 
 		for name := range oldSymbols {
 			if _, err := conn.GetSymbol(name); err != nil {
-				return fmt.Errorf("re-resolve symbol %q: %w", name, err)
+				if conn.strictReconnect {
+					conn.strictReconnectFailures++
+					if conn.strictReconnectMaxAttempts == 0 || conn.strictReconnectFailures > conn.strictReconnectMaxAttempts {
+						return fmt.Errorf("re-resolve symbol %q (strict mode, %d failures): %w", name, conn.strictReconnectFailures, err)
+					}
+					return fmt.Errorf("re-resolve symbol %q (strict mode, attempt %d/%d): %w", name, conn.strictReconnectFailures, conn.strictReconnectMaxAttempts, err)
+				}
+				conn.logger.Warn("on-demand symbol unavailable after reconnect, skipping",
+					"symbol", name, "error", err)
 			}
 		}
 
@@ -658,6 +869,8 @@ func (conn *Connection) resetForRetry() {
 	conn.activeRequestLock.Lock()
 	conn.activeRequests = map[uint32]chan []byte{}
 	conn.activeRequestLock.Unlock()
+	// Allow route re-registration on next attempt (PLC may have rebooted)
+	conn.routeRegisteredAt = time.Time{}
 }
 
 // loadSymbols loads symbol table and datatypes from the PLC, and saves the symbol version.
