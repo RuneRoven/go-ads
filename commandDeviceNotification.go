@@ -75,7 +75,14 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 	symbol, ok := conn.activeNotifications[handle]
 	if !ok {
 		conn.symbolLock.Unlock()
-		conn.logger.Warn("received notification for unknown handle (may be stale after reconnect)", "handle", handle)
+		// Stale notifications are expected during:
+		// - Close(): handles deleted from activeNotifications while listen() still drains
+		// - Reconnect: activeNotifications cleared (connection.go:575) before new subscriptions
+		if conn.closed.Load() || conn.reconnecting.Load() {
+			conn.logger.Debug("received notification for deleted handle (expected during close/reconnect)", "handle", handle)
+		} else {
+			conn.logger.Warn("received notification for unknown handle", "handle", handle)
+		}
 		return nil
 	}
 	datatypes := conn.datatypes

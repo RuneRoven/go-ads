@@ -557,7 +557,7 @@ ServerCycle2 (CyclicInContext) and ServerOnChange2 (OnChangeInContext) execute t
 - GVL (Global Variable List) variables always have ContextMask=0
 - Single-task projects (the default) always have ContextMask=0
 
-Most PLC projects use a single task, so ContextMask=0 is the common case. The `go-ads` library automatically falls back to ServerCycle/ServerOnChange when ContextMask is 0.
+Most PLC projects use a single task, so ContextMask=0 is the common case. Clients should fall back to ServerCycle/ServerOnChange when ContextMask is 0.
 
 ---
 
@@ -1053,17 +1053,14 @@ be relevant for other route management scenarios (e.g., TwinCAT route manager UI
 #### Connect/Route Ordering
 
 Route registration must happen **before** any ADS commands. If no route exists when the
-first ADS command is sent (e.g., `GetSymbolVersion` during `Connect()`), the PLC closes
-the TCP connection, triggering a reconnect cycle.
+first ADS command is sent, the PLC closes the TCP connection immediately (EOF or
+connection reset). A lightweight ADS command like `GetSymbolVersion` (index group 0xF008)
+can be used to probe whether a route already exists before attempting registration.
 
-The `WithRoute(name, user, pass)` option handles this automatically:
-1. TCP connect + derive source NetID
-2. Register route via UDP (before starting listener goroutines)
-3. Reconnect TCP (PLC may reset connections from previously-unknown NetIDs)
-4. Start listeners + send first ADS command (`GetSymbolVersion`)
+Routes persist across PLC reboots in most configurations but may be lost in some environments
+(e.g., TwinCAT CE devices, certain VM configurations).
 
-Routes are also re-registered during reconnect if >30 seconds have passed since the last
-registration (handles PLC reboot losing routes without causing TCP reset loops).
+See [IMPLEMENTATION.md](IMPLEMENTATION.md) for how go-ads handles route registration and reconnection.
 
 ---
 

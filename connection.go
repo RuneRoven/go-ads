@@ -67,7 +67,6 @@ type Connection struct {
 
 	// Reconnect generation counter for stale handle detection
 	reconnectGeneration atomic.Uint64
-	lastReconnectTime   time.Time
 
 	// Event callbacks (run in goroutine, must not block)
 	onDisconnect func()
@@ -110,7 +109,6 @@ type Connection struct {
 	routeName         string
 	routeUsername     string
 	routePassword     string
-	routeRegisteredAt time.Time // last successful route registration
 
 	logger *slog.Logger
 }
@@ -319,7 +317,7 @@ func (conn *Connection) Connect(local bool) error {
 			go conn.transmitWorker()
 			conn.logger.Info("TCP reconnected after route registration")
 		}
-		conn.routeRegisteredAt = time.Now()
+
 	}
 
 	// Read symbol version for later change detection (best-effort, don't fail connect)
@@ -683,6 +681,12 @@ func (conn *Connection) Reconnect() error {
 			validConfigs := conn.filterValidNotificationConfigs(savedConfigs)
 			if len(validConfigs) > 0 {
 				err = conn.AddSymbolNotifications(validConfigs, savedChannel)
+			} else {
+				// All symbols gone (e.g., PLC online change removed all subscribed vars).
+				// Clear channel reference so a future AddSymbolNotification can use a new channel.
+				conn.symbolLock.Lock()
+				conn.notificationChannel = nil
+				conn.symbolLock.Unlock()
 			}
 			if err != nil {
 				conn.logger.Warn("reconnect notification re-subscribe failed, retrying", "error", err, "attempt", attempts)
@@ -701,7 +705,6 @@ func (conn *Connection) Reconnect() error {
 
 		conn.disconnected.Store(false)
 		conn.reconnectGeneration.Add(1)
-		conn.lastReconnectTime = time.Now()
 		conn.strictReconnectFailures = 0 // reset on success
 		conn.logger.Info("reconnect successful", "attempts", attempts)
 
@@ -732,7 +735,7 @@ func (conn *Connection) ensureRoute(attempt int) error {
 		if err := conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword); err != nil {
 			return fmt.Errorf("route registration failed: %w", err)
 		}
-		conn.routeRegisteredAt = time.Now()
+
 		conn.routeProbeFailures = 0
 		return nil
 	}
@@ -755,7 +758,7 @@ func (conn *Connection) ensureRoute(attempt int) error {
 	if err := conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword); err != nil {
 		return fmt.Errorf("route registration failed after probe: %w", err)
 	}
-	conn.routeRegisteredAt = time.Now()
+
 	return nil
 }
 
@@ -870,7 +873,6 @@ func (conn *Connection) resetForRetry() {
 	conn.activeRequests = map[uint32]chan []byte{}
 	conn.activeRequestLock.Unlock()
 	// Allow route re-registration on next attempt (PLC may have rebooted)
-	conn.routeRegisteredAt = time.Time{}
 }
 
 // loadSymbols loads symbol table and datatypes from the PLC, and saves the symbol version.

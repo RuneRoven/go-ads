@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"time"
 )
 
 func (conn *Connection) send(data []byte) (response []byte, err error) {
@@ -292,11 +291,13 @@ func (conn *Connection) handleReceive(ctx context.Context, data []byte) {
 					"command", header.Command)
 			}
 		} else {
-			// After reconnect, stale responses from previous connection may arrive
-			// for invokeIDs that no longer exist. Downgrade to Debug within 10s of
-			// reconnect to reduce log noise.
-			if time.Since(conn.lastReconnectTime) < 10*time.Second {
-				conn.logger.Debug("received stale packet after reconnect (expected)",
+			// Unknown invokeID. Two expected cases:
+			// 1. During/after reconnect: activeRequests cleared, old PLC responses arrive
+			// 2. During close: requests cleaned up, final responses drain
+			// Both are harmless — downgrade to Debug. In normal operation, this
+			// indicates a protocol-level issue worth investigating.
+			if conn.reconnecting.Load() || conn.closed.Load() {
+				conn.logger.Debug("received stale packet (expected during reconnect/close)",
 					"invokeId", header.InvokeID)
 			} else {
 				conn.logger.Error("received packet with unknown invokeID",

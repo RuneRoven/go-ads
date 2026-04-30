@@ -9,7 +9,10 @@ A pure Go library for communicating with Beckhoff TwinCAT PLCs using the ADS (Au
 - Batch read multiple symbols in a single round-trip (SumRead)
 - Subscribe to symbol change notifications (single and batch)
 - Automatic symbol table and datatype discovery
-- Auto-reconnect with notification re-subscribe
+- Auto-reconnect with configurable backoff and notification re-subscribe
+- Smart AMS route registration (probe-first, credential fallback)
+- Stale handle detection across reconnects (generation counter)
+- Disconnect/reconnect event callbacks
 - Symbol version change detection and refresh
 
 ## Install
@@ -33,7 +36,9 @@ import (
 
 func main() {
 	ctx := context.Background()
-	conn, _ := ads.NewConnection(ctx, "192.168.1.100", 48898, "5.1.2.3.1.1", 851, "auto", 10500, 5*time.Second)
+	conn, _ := ads.NewConnection(ctx, "192.168.1.100", 48898, "5.1.2.3.1.1", 851, "auto", 10500, 5*time.Second,
+		ads.WithRoute("my-route", "Administrator", "1"),
+	)
 	conn.Connect(false)
 	defer conn.Close()
 
@@ -61,6 +66,73 @@ go run . -ip 192.168.1.100 -netid 5.1.2.3.1.1 -list
 ```
 
 See `examples/simple/main.go` for all available flags.
+
+## Connection options
+
+All options are passed to `NewConnection` and have sensible defaults:
+
+```go
+conn, _ := ads.NewConnection(ctx, ip, 48898, netid, 851, "auto", 10500, 5*time.Second,
+    // Route registration — probe first, register with credentials only if needed
+    ads.WithRoute("my-route", "Administrator", "1"),
+
+    // Custom logger (default: slog.Default())
+    ads.WithLogger(myLogger),
+
+    // Reconnect backoff strategy (default: 1s×3, 5s×3, 15s×4, then 30s cap)
+    ads.WithBackoff(ads.BackoffConfig{
+        InitialInterval: 1 * time.Second,
+        InitialAttempts: 3,
+        MidInterval:     5 * time.Second,
+        MidAttempts:     3,
+        SlowInterval:    15 * time.Second,
+        SlowAttempts:    4,
+        MaxInterval:     30 * time.Second,
+    }),
+
+    // Disable auto-reconnect (caller must call conn.Reconnect() manually)
+    ads.WithAutoReconnect(false),
+
+    // Event callbacks (run in goroutine, must not block)
+    ads.WithOnDisconnect(func() { log.Println("disconnected") }),
+    ads.WithOnReconnect(func() { log.Println("reconnected") }),
+
+    // Fail reconnect if previously-resolved symbols are missing (e.g., after PLC online change)
+    // maxAttempts=3 means retry 3 times before closing the connection
+    ads.WithStrictReconnect(3),
+
+    // Always register route with credentials (skip probe, for non-persistent route environments)
+    ads.WithForceRouteRegistration(),
+
+    // Override callback IP for Docker/VPN/NAT (default: derived from AMS NetID)
+    ads.WithHostIP("192.168.1.50"),
+)
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithRoute(name, user, pass)` | No route | Register AMS route via UDP. Probes first, registers only if needed |
+| `WithBackoff(cfg)` | 1s×3, 5s×3, 15s×4, 30s cap | Stepped reconnect backoff with configurable tiers |
+| `WithAutoReconnect(bool)` | `true` | Auto-reconnect on TCP errors. When `false`, sets disconnected flag only — caller must call `Reconnect()` |
+| `WithOnDisconnect(fn)` | None | Callback on disconnect detection |
+| `WithOnReconnect(fn)` | None | Callback after successful reconnect |
+| `WithStrictReconnect(n)` | Graceful skip (missing symbols warned + removed) | Fail if on-demand symbols missing after reconnect. `n` = max retry attempts before closing |
+| `WithForceRouteRegistration()` | Probe first | Always register route with credentials (skip probe). Requires `WithRoute` |
+| `WithHostIP(ip)` | Derived from AMS NetID | IP the PLC uses to reach this client (Docker/VPN/NAT). Requires `WithRoute` |
+| `WithLogger(logger)` | `slog.Default()` | Custom structured logger |
+
+### Combining options
+
+All options are composable — no mutual exclusions. Some require others to have effect:
+
+| Option | Requires | Notes |
+|--------|----------|-------|
+| `WithForceRouteRegistration()` | `WithRoute()` | No-op without route credentials |
+| `WithHostIP()` | `WithRoute()` | Only affects route registration packet |
+| `WithBackoff()` | — | Used in both auto and manual `Reconnect()` |
+| `WithStrictReconnect()` | — | Only affects on-demand symbols (resolved via `GetSymbol` before reconnect) |
+| `WithOnDisconnect()` / `WithOnReconnect()` | — | Fire regardless of auto/manual reconnect mode |
+| `WithAutoReconnect(false)` | — | Backoff still applies when caller invokes `Reconnect()` manually |
 
 ## Notifications and backpressure
 

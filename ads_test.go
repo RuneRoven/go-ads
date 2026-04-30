@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -2368,6 +2370,94 @@ func TestDeviceNotification_UnknownHandle(t *testing.T) {
 	err := conn.DeviceNotification(conn.ctx, packet)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// logRecord captures a single log entry for test assertions.
+type logRecord struct {
+	Level   slog.Level
+	Message string
+}
+
+// testLogHandler is a minimal slog.Handler that captures log records for testing.
+type testLogHandler struct {
+	records []logRecord
+	mu      sync.Mutex
+}
+
+func (h *testLogHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+func (h *testLogHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	h.records = append(h.records, logRecord{Level: r.Level, Message: r.Message})
+	h.mu.Unlock()
+	return nil
+}
+func (h *testLogHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *testLogHandler) WithGroup(_ string) slog.Handler      { return h }
+
+func (h *testLogHandler) findByMessage(msg string) *logRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if strings.Contains(r.Message, msg) {
+			return &r
+		}
+	}
+	return nil
+}
+
+func TestDeviceNotification_UnknownHandleDuringClose(t *testing.T) {
+	handler := &testLogHandler{}
+	conn := newTestConnection()
+	conn.logger = slog.New(handler)
+	conn.closedCh = make(chan struct{})
+	defer conn.shutdown()
+
+	// Mark connection as closed
+	conn.closed.Store(true)
+	close(conn.closedCh)
+
+	data := make([]byte, 2)
+	binary.LittleEndian.PutUint16(data, 42)
+	packet := buildNotificationPacket(99, 0, data)
+
+	err := conn.DeviceNotification(conn.ctx, packet)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// During Close(), stale notifications should be Debug, not Warn
+	rec := handler.findByMessage("received notification for deleted handle")
+	if rec == nil {
+		t.Fatal("expected debug log for stale notification during close")
+	}
+	if rec.Level != slog.LevelDebug {
+		t.Errorf("expected Debug level during close, got %v", rec.Level)
+	}
+}
+
+func TestDeviceNotification_UnknownHandleNormalCondition(t *testing.T) {
+	handler := &testLogHandler{}
+	conn := newTestConnection()
+	conn.logger = slog.New(handler)
+	defer conn.shutdown()
+
+	// No close, no recent reconnect — should be Warn
+	data := make([]byte, 2)
+	binary.LittleEndian.PutUint16(data, 42)
+	packet := buildNotificationPacket(99, 0, data)
+
+	err := conn.DeviceNotification(conn.ctx, packet)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	rec := handler.findByMessage("received notification for unknown handle")
+	if rec == nil {
+		t.Fatal("expected warn log for unknown handle in normal conditions")
+	}
+	if rec.Level != slog.LevelWarn {
+		t.Errorf("expected Warn level in normal conditions, got %v", rec.Level)
 	}
 }
 

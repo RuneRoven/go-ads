@@ -192,14 +192,57 @@ Read via `GroupSymbolVersion` (0xF008). Returns a uint8 that changes on every PL
 
 ## Reconnection
 
-Triggered automatically on TCP read errors (including keepalive failures).
+Triggered automatically on TCP read/write errors (including keepalive failures). Controlled by `WithAutoReconnect(true)` (default).
 
 TCP keepalive: idle=3s, interval=2s, count=5 → detection within ~13 seconds.
 
-### Reconnect sequence:
+### Backoff Strategy
+
+Reconnect uses a stepped backoff with configurable tiers (via `WithBackoff`). Resets to initial interval on each successful reconnect.
+
+**Default tiers (used when `WithBackoff` not provided):**
+
+| Attempt | Delay | Rationale |
+|---------|-------|-----------|
+| 1–3 | 1s | Fast retry for network blips |
+| 4–6 | 5s | Medium backoff |
+| 7–10 | 15s | Slow tier for extended outages |
+| 11+ | 30s | Cap to avoid overwhelming PLC |
+
+Custom example:
+```go
+ads.WithBackoff(ads.BackoffConfig{
+    InitialInterval: 500 * time.Millisecond,
+    InitialAttempts: 5,
+    MidInterval:     3 * time.Second,
+    MidAttempts:     5,
+    SlowInterval:    10 * time.Second,
+    SlowAttempts:    5,
+    MaxInterval:     60 * time.Second,
+})
+```
+
+### Auto-Reconnect vs Manual
+
+| Mode | Behavior |
+|------|----------|
+| `WithAutoReconnect(true)` (default) | `triggerReconnect()` launches reconnect goroutine automatically |
+| `WithAutoReconnect(false)` | `triggerReconnect()` sets `disconnected=true` only. Caller must call `conn.Reconnect()` manually. `sendRequest` returns `ErrDisconnected` immediately |
+
+### Event Callbacks
+
+```go
+ads.WithOnDisconnect(func() { /* runs in goroutine, must not block */ })
+ads.WithOnReconnect(func() { /* runs in goroutine, must not block */ })
+```
+
+- `OnDisconnect`: fired in `triggerReconnect()` after setting `disconnected=true`. Not fired if `Close()` was called.
+- `OnReconnect`: fired at end of successful `Reconnect()` after generation counter increment. Not fired if `Close()` was called during reconnect.
+
+### Reconnect Sequence
 
 1. Close old TCP connection
-2. Stop listen and transmitWorker goroutines
+2. Stop listen and transmitWorker goroutines (`waitGroup.Wait()`)
 3. Reset all capability flags:
    ```
    sumReadCmd = 0
@@ -207,12 +250,53 @@ TCP keepalive: idle=3s, interval=2s, count=5 → detection within ~13 seconds.
    sumNotifChecked = false
    chunkedDownloadChecked = false
    ```
-4. Retry TCP dial (configurable interval, default 5s)
-5. Re-load symbols based on discovery mode:
+4. Retry TCP dial with stepped backoff (see above)
+5. Re-register AMS route if configured (see [Smart Route Registration](#smart-route-registration))
+6. Re-load symbols based on discovery mode:
    - Full discovery → re-download full symbol table
-   - On-demand only → re-resolve only previously accessed symbols
+   - On-demand only → re-resolve only previously accessed symbols (graceful skip on missing)
    - No symbols → read symbol version only
-6. Re-subscribe all previously registered notifications
+7. Filter notification configs — remove entries for symbols no longer available
+8. Re-subscribe all remaining notifications
+9. Increment `reconnectGeneration` counter (see [Stale Handle Detection](#stale-handle-detection))
+10. Fire `OnReconnect` callback
+
+### Smart Route Registration
+
+Both `Connect()` and `Reconnect()` use a probe-first approach for route registration:
+
+1. TCP connect + start goroutines
+2. **Probe:** send `GetSymbolVersion()` (lightweight ADS command)
+3. Probe OK → route exists, skip credential registration
+4. Probe fail → register route with credentials via UDP, TCP reconnect after
+5. After 3 consecutive probe failures → skip probe, always register (fallback)
+
+`WithForceRouteRegistration()` bypasses probing entirely — always registers with credentials.
+
+### Stale Handle Detection
+
+A `reconnectGeneration` counter (atomic uint64) increments on each successful reconnect. Symbol handles acquired before a reconnect may be invalid (PLC assigns new handles after program reload).
+
+`ReadFromSymbol`, `ReadMultipleSymbols`, `WriteToSymbol`, and `WriteMultipleSymbols` capture the generation before performing I/O. If an error occurs and the generation has changed (reconnect happened mid-operation), the operation is automatically retried once with fresh handles.
+
+```
+gen = reconnectGeneration.Load()
+handle = GetSymbol(name)     // may return stale handle
+data = Read(handle)          // fails if handle is stale
+if err != nil && reconnectGeneration.Load() != gen:
+    retry once with fresh handle
+```
+
+No infinite recursion: the retry captures a new generation value, and only retries again if *another* reconnect happened during the retry.
+
+### Strict Reconnect Mode
+
+By default, missing on-demand symbols after reconnect are skipped with a warning (e.g., after PLC online change removes a variable). `WithStrictReconnect(maxAttempts)` changes this:
+
+- Missing symbol → reconnect considered failed
+- `maxAttempts = 0` → fail immediately on first missing symbol
+- `maxAttempts = N` → retry up to N times, then close the connection
+- Failure counter resets on successful reconnect (all symbols resolved)
 
 ---
 
@@ -222,11 +306,27 @@ TCP keepalive: idle=3s, interval=2s, count=5 → detection within ~13 seconds.
 
 | Method | Description |
 |--------|-------------|
-| `NewConnection(ctx, ip, port, netid, amsPort, localNetID, localPort, timeout)` | Configure connection (no connect) |
-| `Connect(local bool)` | TCP dial + start goroutines |
+| `NewConnection(ctx, ip, port, netid, amsPort, localNetID, localPort, timeout, opts...)` | Configure connection with options |
+| `Connect(local bool)` | TCP dial + start goroutines + probe/register route |
 | `Close()` | Delete notifs, release handles, close TCP |
-| `Reconnect()` | Re-establish after failure |
+| `Reconnect()` | Re-establish after failure (called automatically or manually) |
 | `IsDisconnected()` | Check connection state |
+
+### Connection Options
+
+All options are composable — no mutual exclusions. If omitted, defaults apply.
+
+| Option | Default (if omitted) | Description |
+|--------|----------------------|-------------|
+| `WithRoute(name, user, pass)` | No route registration | Register AMS route via UDP (probe-first, fallback to credentials) |
+| `WithBackoff(cfg BackoffConfig)` | `DefaultBackoffConfig()`: 1s×3, 5s×3, 15s×4, 30s cap | Stepped reconnect backoff tiers. Used in both auto and manual `Reconnect()` |
+| `WithAutoReconnect(bool)` | `true` — reconnects automatically on TCP errors | When `false`, `triggerReconnect()` only sets `disconnected=true`. `sendRequest` returns `ErrDisconnected`. Caller must call `Reconnect()` manually |
+| `WithOnDisconnect(func())` | None | Callback fired when disconnect detected (goroutine, must not block). Fires regardless of auto/manual mode. Not fired after `Close()` |
+| `WithOnReconnect(func())` | None | Callback fired after successful reconnect (goroutine, must not block). Fires regardless of auto/manual mode. Not fired after `Close()` |
+| `WithStrictReconnect(maxAttempts)` | Graceful: missing on-demand symbols warned + removed | Fail reconnect if previously-resolved symbols are missing. `0` = fail immediately. `N > 0` = retry N times then close connection. Only affects on-demand symbols (resolved via `GetSymbol` before reconnect) |
+| `WithForceRouteRegistration()` | Probe first (try ADS command, register only on failure) | Always register route with credentials. **Requires `WithRoute`** — no-op without it |
+| `WithHostIP(ip)` | Derived from AMS NetID (first 4 bytes) | IP the PLC uses to reach this client (Docker/VPN/NAT). **Requires `WithRoute`** — only affects route registration |
+| `WithLogger(logger)` | `slog.Default()` | Custom `*slog.Logger` for structured logging |
 
 ### Symbol Discovery
 
@@ -282,30 +382,37 @@ TCP keepalive: idle=3s, interval=2s, count=5 → detection within ~13 seconds.
 ## Connection Lifecycle
 
 ```text
-1. NewConnection(...)          — configure target, source, timeouts
+1. NewConnection(..., opts...)    — configure target, source, timeouts, options
        │
-2. [AddRemoteRoute(...)]       — optional: register route via UDP
+2. Connect(false)                 — TCP dial → probe route → register if needed
+       │                            → start listen + transmitWorker goroutines
        │
-3. Connect(false)              — TCP dial, start goroutines
+3. [LoadSymbols()]                — optional: full discovery
+   [LoadSymbolsSlow(cfg)]         — optional: chunked discovery
+   [LoadSymbolList(cfg)]          — optional: symbol names only
+   [LoadDataTypes(cfg)]           — optional: struct expansion
        │
-4. [LoadSymbols()]             — optional: full discovery
-   [LoadSymbolsSlow(cfg)]      — optional: chunked discovery
-   [LoadSymbolList(cfg)]       — optional: symbol names only
-   [LoadDataTypes(cfg)]        — optional: struct expansion
-       │
-5. ReadFromSymbol(...)         — on-demand symbol resolution if needed
-   WriteToSymbol(...)
+4. ReadFromSymbol(...)            — on-demand symbol resolution if needed
+   WriteToSymbol(...)               (stale handle auto-retry on reconnect)
    AddSymbolNotifications(...)
-   BrowseSymbols(path)         — requires step 4
+   BrowseSymbols(path)            — requires step 3
        │
-   ┌───┴──── (TCP error) ──────┐
-   │  Reconnect()              │
-   │  - reset capability flags │
-   │  - re-resolve symbols     │
-   │  - re-subscribe notifs    │
-   └───────────────────────────┘
+   ┌───┴──── (TCP error) ─────────────────────┐
+   │  OnDisconnect callback fired              │
+   │  if autoReconnect=true:                   │
+   │    Reconnect() with stepped backoff       │
+   │    - reset capability flags               │
+   │    - probe/register route                 │
+   │    - re-resolve symbols (graceful skip)   │
+   │    - filter + re-subscribe notifications  │
+   │    - increment reconnectGeneration        │
+   │    - OnReconnect callback fired           │
+   │  if autoReconnect=false:                  │
+   │    disconnected=true, caller must call    │
+   │    conn.Reconnect() manually              │
+   └───────────────────────────────────────────┘
        │
-6. Close()                     — cleanup + shutdown
+5. Close()                        — cleanup + shutdown
 ```
 
 ---

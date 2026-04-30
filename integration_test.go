@@ -3138,6 +3138,9 @@ func TestIntegrationReadProcessInputSize(t *testing.T) {
 
 	size, err := conn.ReadProcessInputSize()
 	if err != nil {
+		if strings.Contains(err.Error(), "service not supported") {
+			t.Skip("PLC has no physical I/O configured (process image unavailable)")
+		}
 		t.Fatalf("ReadProcessInputSize failed: %v", err)
 	}
 	if size == 0 {
@@ -3152,6 +3155,9 @@ func TestIntegrationReadProcessInput(t *testing.T) {
 	// Read first 4 bytes of input image
 	data, err := conn.ReadProcessInput(0, 4)
 	if err != nil {
+		if strings.Contains(err.Error(), "service not supported") {
+			t.Skip("PLC has no physical I/O configured (process image unavailable)")
+		}
 		t.Fatalf("ReadProcessInput failed: %v", err)
 	}
 	if len(data) != 4 {
@@ -3166,6 +3172,9 @@ func TestIntegrationReadProcessOutput(t *testing.T) {
 	// Read first 4 bytes of output image
 	data, err := conn.ReadProcessOutput(0, 4)
 	if err != nil {
+		if strings.Contains(err.Error(), "service not supported") {
+			t.Skip("PLC has no physical I/O configured (process image unavailable)")
+		}
 		t.Fatalf("ReadProcessOutput failed: %v", err)
 	}
 	if len(data) != 4 {
