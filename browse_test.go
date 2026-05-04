@@ -3,11 +3,9 @@
 package ads
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -84,45 +82,11 @@ func TestBrowseAllSymbols(t *testing.T) {
 	t.Logf("Wrote %s (%d symbols)", filename, len(symbols))
 }
 
-// browseSetupConnection is a minimal copy of setupConnection for browse_test.go
-// to avoid coupling with integration_test.go helpers.
 func browseSetupConnection(t *testing.T) *Connection {
 	t.Helper()
-
-	ip := getEnvOrDefault("ADS_PLC_IP", "192.168.0.1")
-	targetAMS := getEnvOrDefault("ADS_TARGET_AMS", "5.0.0.1.1.1")
-	targetPortStr := getEnvOrDefault("ADS_TARGET_PORT", "851")
-	targetPort, err := strconv.Atoi(targetPortStr)
-	if err != nil {
-		t.Fatalf("invalid ADS_TARGET_PORT %q: %v", targetPortStr, err)
-	}
-	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
-
-	// Build connection options — WithRoute registers route BEFORE any ADS commands
-	var opts []ConnectionOption
-	hostIP := os.Getenv("ADS_HOST_IP")
-	if hostIP != "" {
-		opts = append(opts, WithHostIP(hostIP))
-	}
-	routeUser := os.Getenv("ADS_ROUTE_USER")
-	routePass := os.Getenv("ADS_ROUTE_PASS")
-	if routeUser != "" && routePass != "" {
-		opts = append(opts, WithRoute("go-ads-browse", routeUser, routePass))
-	}
-
-	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second, opts...)
-	if err != nil {
-		t.Fatalf("NewConnection failed: %v", err)
-	}
-
-	err = conn.Connect(false)
-	if err != nil {
-		t.Fatalf("Connect failed: %v", err)
-	}
-
-	t.Cleanup(func() {
-		conn.Close()
+	return setupConnectionWithDefaults(t, connDefaults{
+		ip:        "192.168.0.1",
+		targetAMS: "5.0.0.1.1.1",
+		routeName: "go-ads-browse",
 	})
-
-	return conn
 }

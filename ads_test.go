@@ -353,79 +353,50 @@ func TestParseUploadSymbolInfoSymbols_Empty(t *testing.T) {
 	}
 }
 
-// --- Symbol.parse (readWriter) ---
+// ============================================================
+// Symbol.parse — basic types
+// ============================================================
 
-func TestSymbolParseBOOL(t *testing.T) {
-	sym := &Symbol{DataType: "BOOL", Length: 1}
-	val, err := sym.parse([]byte{1}, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestSymbolParseBasicTypes(t *testing.T) {
+	tests := []struct {
+		name     string
+		dataType string
+		length   uint32
+		data     []byte
+		want     string
+	}{
+		// BOOL
+		{"BOOL/true", "BOOL", 1, []byte{1}, "true"},
+		{"BOOL/false", "BOOL", 1, []byte{0}, "false"},
+		// Integer types
+		{"INT/-42", "INT", 2, le16(-42), "-42"},
+		{"UINT/1234", "UINT", 2, leu16(1234), "1234"},
+		{"SINT/-100", "SINT", 1, []byte{156}, "-100"}, // 156 = uint8(int8(-100))
+		{"BYTE/255", "BYTE", 1, []byte{255}, "255"},
+		{"DINT/-12345", "DINT", 4, le32(-12345), "-12345"},
+		{"LINT/-9999999999", "LINT", 8, le64(-9999999999), "-9999999999"},
+		{"ULINT/max", "ULINT", 8, leu64(18446744073709551615), "18446744073709551615"},
+		// Float
+		{"REAL/10", "REAL", 4, leF32(10.0), "10"},
+		// String
+		{"STRING/Hello", "STRING", 20, append([]byte("Hello\x00"), make([]byte, 14)...), "Hello"},
 	}
-	if val != "true" {
-		t.Errorf("got %q, want %q", val, "true")
-	}
-
-	sym2 := &Symbol{DataType: "BOOL", Length: 1}
-	val, err = sym2.parse([]byte{0}, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "false" {
-		t.Errorf("got %q, want %q", val, "false")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sym := &Symbol{DataType: tt.dataType, Length: tt.length}
+			got, err := sym.parse(tt.data, 0, nil)
+			requireNoError(t, err)
+			assertEqual(t, got, tt.want)
+		})
 	}
 }
 
-func TestSymbolParseINT16(t *testing.T) {
-	sym := &Symbol{DataType: "INT", Length: 2}
-	data := make([]byte, 2)
-	data[0] = byte(0xD6) // -42 as little-endian int16 = 0xFFD6
-	data[1] = byte(0xFF)
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "-42" {
-		t.Errorf("got %q, want %q", val, "-42")
-	}
-}
-
-func TestSymbolParseUINT(t *testing.T) {
-	sym := &Symbol{DataType: "UINT", Length: 2}
-	data := make([]byte, 2)
-	binary.LittleEndian.PutUint16(data, 1234)
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "1234" {
-		t.Errorf("got %q, want %q", val, "1234")
-	}
-}
-
-func TestSymbolParseREAL(t *testing.T) {
-	sym := &Symbol{DataType: "REAL", Length: 4}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, 0x41200000) // 10.0 as float32
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "10" {
-		t.Errorf("got %q, want %q", val, "10")
-	}
-}
-
-func TestSymbolParseSTRING(t *testing.T) {
-	sym := &Symbol{DataType: "STRING", Length: 20}
-	data := make([]byte, 20)
-	copy(data, "Hello\x00")
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "Hello" {
-		t.Errorf("got %q, want %q", val, "Hello")
-	}
+func TestSymbolParseLREAL(t *testing.T) {
+	sym := &Symbol{DataType: "LREAL", Length: 8}
+	val, err := sym.parse(leF64(3.141592653589793), 0, nil)
+	requireNoError(t, err)
+	f, _ := strconv.ParseFloat(val, 64)
+	assertFloatApprox(t, f, 3.141592653589793, toleranceFloat64)
 }
 
 func TestSymbolParseUnknownType(t *testing.T) {
@@ -438,7 +409,9 @@ func TestSymbolParseUnknownType(t *testing.T) {
 	}
 }
 
-// --- writeToNode round-trip tests ---
+// ============================================================
+// writeToNode round-trip tests
+// ============================================================
 
 // testWriteRoundTrip writes a value via writeToNode then reads it back via parse and compares.
 func testWriteRoundTrip(t *testing.T, dataType string, length uint32, value string) {
@@ -459,111 +432,84 @@ func testWriteRoundTrip(t *testing.T, dataType string, length uint32, value stri
 	}
 }
 
-func TestWriteToNodeRoundTrip_BOOL(t *testing.T) {
-	testWriteRoundTrip(t, "BOOL", 1, "true")
-	testWriteRoundTrip(t, "BOOL", 1, "false")
-}
-
-func TestWriteToNodeRoundTrip_BYTE(t *testing.T) {
-	testWriteRoundTrip(t, "BYTE", 1, "0")
-	testWriteRoundTrip(t, "BYTE", 1, "255")
-	testWriteRoundTrip(t, "USINT", 1, "42")
-}
-
-func TestWriteToNodeRoundTrip_SINT(t *testing.T) {
-	testWriteRoundTrip(t, "SINT", 1, "-128")
-	testWriteRoundTrip(t, "SINT", 1, "127")
-}
-
-func TestWriteToNodeRoundTrip_UINT(t *testing.T) {
-	testWriteRoundTrip(t, "UINT", 2, "0")
-	testWriteRoundTrip(t, "UINT", 2, "65535")
-	testWriteRoundTrip(t, "WORD", 2, "1234")
-	testWriteRoundTrip(t, "UINT16", 2, "5678")
-}
-
-func TestWriteToNodeRoundTrip_INT(t *testing.T) {
-	testWriteRoundTrip(t, "INT", 2, "-32768")
-	testWriteRoundTrip(t, "INT", 2, "32767")
-	testWriteRoundTrip(t, "INT16", 2, "-42")
-}
-
-func TestWriteToNodeRoundTrip_UDINT(t *testing.T) {
-	testWriteRoundTrip(t, "UDINT", 4, "0")
-	testWriteRoundTrip(t, "UDINT", 4, "4294967295")
-	testWriteRoundTrip(t, "DWORD", 4, "12345678")
-}
-
-func TestWriteToNodeRoundTrip_DINT(t *testing.T) {
-	testWriteRoundTrip(t, "DINT", 4, "-2147483648")
-	testWriteRoundTrip(t, "DINT", 4, "2147483647")
-}
-
-func TestWriteToNodeRoundTrip_REAL(t *testing.T) {
-	sym := &Symbol{DataType: "REAL", Length: 4}
-	data, err := sym.writeToNode("3.14", 0, nil)
-	if err != nil {
-		t.Fatalf("writeToNode error: %v", err)
+func TestWriteToNodeRoundTrip(t *testing.T) {
+	tests := []struct {
+		name     string
+		dataType string
+		length   uint32
+		value    string
+	}{
+		// BOOL
+		{"BOOL/true", "BOOL", 1, "true"},
+		{"BOOL/false", "BOOL", 1, "false"},
+		// 8-bit
+		{"BYTE/0", "BYTE", 1, "0"},
+		{"BYTE/255", "BYTE", 1, "255"},
+		{"USINT/42", "USINT", 1, "42"},
+		{"SINT/min", "SINT", 1, "-128"},
+		{"SINT/max", "SINT", 1, "127"},
+		// 16-bit
+		{"UINT/0", "UINT", 2, "0"},
+		{"UINT/max", "UINT", 2, "65535"},
+		{"WORD/1234", "WORD", 2, "1234"},
+		{"UINT16/5678", "UINT16", 2, "5678"},
+		{"INT/min", "INT", 2, "-32768"},
+		{"INT/max", "INT", 2, "32767"},
+		{"INT16/-42", "INT16", 2, "-42"},
+		// 32-bit
+		{"UDINT/0", "UDINT", 4, "0"},
+		{"UDINT/max", "UDINT", 4, "4294967295"},
+		{"DWORD/12345678", "DWORD", 4, "12345678"},
+		{"DINT/min", "DINT", 4, "-2147483648"},
+		{"DINT/max", "DINT", 4, "2147483647"},
+		// 64-bit
+		{"LINT/0", "LINT", 8, "0"},
+		{"LINT/min", "LINT", 8, "-9223372036854775808"},
+		{"LINT/max", "LINT", 8, "9223372036854775807"},
+		{"ULINT/0", "ULINT", 8, "0"},
+		{"ULINT/max", "ULINT", 8, "18446744073709551615"},
+		{"LWORD/42", "LWORD", 8, "42"},
+		// STRING
+		{"STRING/Hello", "STRING", 20, "Hello"},
+		// TIME
+		{"TIME/12:34:56", "TIME", 4, "12:34:56"},
+		{"TIME/midnight", "TIME", 4, "00:00:00"},
+		{"TIME/with_ms", "TIME", 4, "12:34:56.789"},
+		// TOD
+		{"TOD/15:30", "TOD", 4, "15:30"},
+		{"TOD/midnight", "TOD", 4, "00:00"},
+		// DATE
+		{"DATE/2024-01-15", "DATE", 4, "2024-01-15"},
+		{"DATE/2000-06-15", "DATE", 4, "2000-06-15"},
+		// DT
+		{"DT/2024-01-15", "DT", 4, "2024-01-15 12:30:00"},
+		{"DT/epoch", "DT", 4, "1970-01-01 00:00:00"},
 	}
-	// Verify bytes encode float32(3.14)
-	bits := binary.LittleEndian.Uint32(data)
-	f := math.Float32frombits(bits)
-	if math.Abs(float64(f)-3.14) > 0.001 {
-		t.Errorf("REAL: got %v, want ~3.14", f)
-	}
-}
-
-func TestWriteToNodeRoundTrip_LREAL(t *testing.T) {
-	sym := &Symbol{DataType: "LREAL", Length: 8}
-	data, err := sym.writeToNode("3.141592653589793", 0, nil)
-	if err != nil {
-		t.Fatalf("writeToNode error: %v", err)
-	}
-	bits := binary.LittleEndian.Uint64(data)
-	f := math.Float64frombits(bits)
-	if math.Abs(f-3.141592653589793) > 1e-10 {
-		t.Errorf("LREAL: got %v, want 3.141592653589793", f)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testWriteRoundTrip(t, tt.dataType, tt.length, tt.value)
+		})
 	}
 }
 
-func TestWriteToNodeRoundTrip_STRING(t *testing.T) {
-	testWriteRoundTrip(t, "STRING", 20, "Hello")
-}
+func TestWriteToNodeRoundTripFloat(t *testing.T) {
+	t.Run("REAL/3.14", func(t *testing.T) {
+		sym := &Symbol{DataType: "REAL", Length: 4}
+		data, err := sym.writeToNode("3.14", 0, nil)
+		requireNoError(t, err)
+		bits := binary.LittleEndian.Uint32(data)
+		f := math.Float32frombits(bits)
+		assertFloatApprox(t, float64(f), 3.14, toleranceFloat32)
+	})
 
-func TestWriteToNodeRoundTrip_TIME(t *testing.T) {
-	testWriteRoundTrip(t, "TIME", 4, "12:34:56")
-	testWriteRoundTrip(t, "TIME", 4, "00:00:00")
-}
-
-func TestWriteToNodeRoundTrip_TIME_WithMs(t *testing.T) {
-	testWriteRoundTrip(t, "TIME", 4, "12:34:56.789")
-}
-
-func TestWriteToNodeRoundTrip_TOD(t *testing.T) {
-	testWriteRoundTrip(t, "TOD", 4, "15:30")
-	testWriteRoundTrip(t, "TOD", 4, "00:00")
-}
-
-func TestWriteToNodeRoundTrip_DATE(t *testing.T) {
-	testWriteRoundTrip(t, "DATE", 4, "2024-01-15")
-	testWriteRoundTrip(t, "DATE", 4, "2000-06-15")
-}
-
-func TestWriteToNodeRoundTrip_DT(t *testing.T) {
-	testWriteRoundTrip(t, "DT", 4, "2024-01-15 12:30:00")
-	testWriteRoundTrip(t, "DT", 4, "1970-01-01 00:00:00")
-}
-
-func TestWriteToNodeRoundTrip_LINT(t *testing.T) {
-	testWriteRoundTrip(t, "LINT", 8, "0")
-	testWriteRoundTrip(t, "LINT", 8, "-9223372036854775808")
-	testWriteRoundTrip(t, "LINT", 8, "9223372036854775807")
-}
-
-func TestWriteToNodeRoundTrip_ULINT(t *testing.T) {
-	testWriteRoundTrip(t, "ULINT", 8, "0")
-	testWriteRoundTrip(t, "ULINT", 8, "18446744073709551615")
-	testWriteRoundTrip(t, "LWORD", 8, "42")
+	t.Run("LREAL/pi", func(t *testing.T) {
+		sym := &Symbol{DataType: "LREAL", Length: 8}
+		data, err := sym.writeToNode("3.141592653589793", 0, nil)
+		requireNoError(t, err)
+		bits := binary.LittleEndian.Uint64(data)
+		f := math.Float64frombits(bits)
+		assertFloatApprox(t, f, 3.141592653589793, toleranceFloat64)
+	})
 }
 
 func TestWriteToNodeStruct(t *testing.T) {
@@ -730,83 +676,8 @@ func TestSymbolParseAliasResolution(t *testing.T) {
 	}
 }
 
-func TestSymbolParseDINT(t *testing.T) {
-	sym := &Symbol{DataType: "DINT", Length: 4}
-	data := make([]byte, 4)
-	v := int32(-12345)
-	binary.LittleEndian.PutUint32(data, uint32(v))
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "-12345" {
-		t.Errorf("got %q, want %q", val, "-12345")
-	}
-}
-
-func TestSymbolParseLINT(t *testing.T) {
-	sym := &Symbol{DataType: "LINT", Length: 8}
-	data := make([]byte, 8)
-	v := int64(-9999999999)
-	binary.LittleEndian.PutUint64(data, uint64(v))
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "-9999999999" {
-		t.Errorf("got %q, want %q", val, "-9999999999")
-	}
-}
-
-func TestSymbolParseULINT(t *testing.T) {
-	sym := &Symbol{DataType: "ULINT", Length: 8}
-	data := make([]byte, 8)
-	binary.LittleEndian.PutUint64(data, 18446744073709551615)
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "18446744073709551615" {
-		t.Errorf("got %q, want %q", val, "18446744073709551615")
-	}
-}
-
-func TestSymbolParseLREAL(t *testing.T) {
-	sym := &Symbol{DataType: "LREAL", Length: 8}
-	data := make([]byte, 8)
-	binary.LittleEndian.PutUint64(data, math.Float64bits(3.141592653589793))
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	f, _ := strconv.ParseFloat(val, 64)
-	if math.Abs(f-3.141592653589793) > 1e-10 {
-		t.Errorf("got %q, want ~3.141592653589793", val)
-	}
-}
-
-func TestSymbolParseBYTE(t *testing.T) {
-	sym := &Symbol{DataType: "BYTE", Length: 1}
-	val, err := sym.parse([]byte{255}, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "255" {
-		t.Errorf("got %q, want %q", val, "255")
-	}
-}
-
-func TestSymbolParseSINT(t *testing.T) {
-	sym := &Symbol{DataType: "SINT", Length: 1}
-	v := int8(-100)
-	val, err := sym.parse([]byte{byte(v)}, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "-100" {
-		t.Errorf("got %q, want %q", val, "-100")
-	}
-}
+// NOTE: per-type parse tests (DINT, LINT, ULINT, LREAL, BYTE, SINT) are consolidated
+// into TestSymbolParseBasicTypes and TestSymbolParseLREAL above.
 
 // --- writeToNode error paths ---
 
@@ -1590,328 +1461,158 @@ func TestSymbolParseSTRING_SpecialChars(t *testing.T) {
 	}
 }
 
-// ==========================================================================
-// REAL/LREAL special values (NaN, Inf, -Inf, -0)
-// ==========================================================================
+// ============================================================
+// REAL/LREAL special values (NaN, Inf, -Inf, -0, subnormal)
+// ============================================================
 
-func TestSymbolParseREAL_NaN(t *testing.T) {
-	sym := &Symbol{DataType: "REAL", Length: 4}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, math.Float32bits(float32(math.NaN())))
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestSymbolParseFloatSpecial(t *testing.T) {
+	tests := []struct {
+		name     string
+		dataType string
+		length   uint32
+		data     []byte
+		want     string // exact match; empty means custom check
+		check    func(t *testing.T, val string)
+	}{
+		{"REAL/NaN", "REAL", 4, leF32(float32(math.NaN())), "NaN", nil},
+		{"REAL/+Inf", "REAL", 4, leF32(float32(math.Inf(1))), "+Inf", nil},
+		{"REAL/-Inf", "REAL", 4, leF32(float32(math.Inf(-1))), "-Inf", nil},
+		{"REAL/-0", "REAL", 4, leF32(float32(math.Copysign(0, -1))), "", func(t *testing.T, val string) {
+			if val != "0" && val != "-0" {
+				t.Errorf("got %q, want %q or %q", val, "0", "-0")
+			}
+		}},
+		{"LREAL/NaN", "LREAL", 8, leF64(math.NaN()), "NaN", nil},
+		{"LREAL/+Inf", "LREAL", 8, leF64(math.Inf(1)), "+Inf", nil},
+		{"LREAL/-Inf", "LREAL", 8, leF64(math.Inf(-1)), "-Inf", nil},
+		{"LREAL/subnormal", "LREAL", 8, leu64(1), "", func(t *testing.T, val string) {
+			f, err := strconv.ParseFloat(val, 64)
+			requireNoError(t, err)
+			if f != math.Float64frombits(1) {
+				t.Errorf("got %v, want %v", f, math.Float64frombits(1))
+			}
+		}},
 	}
-	if val != "NaN" {
-		t.Errorf("got %q, want %q", val, "NaN")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sym := &Symbol{DataType: tt.dataType, Length: tt.length}
+			val, err := sym.parse(tt.data, 0, nil)
+			requireNoError(t, err)
+			if tt.check != nil {
+				tt.check(t, val)
+			} else {
+				assertEqual(t, val, tt.want)
+			}
+		})
 	}
 }
 
-func TestSymbolParseREAL_PosInf(t *testing.T) {
-	sym := &Symbol{DataType: "REAL", Length: 4}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, math.Float32bits(float32(math.Inf(1))))
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestWriteToNodeFloatSpecial(t *testing.T) {
+	t.Run("REAL/NaN", func(t *testing.T) {
+		sym := &Symbol{DataType: "REAL", Length: 4}
+		data, err := sym.writeToNode("NaN", 0, nil)
+		requireNoError(t, err)
+		f := math.Float32frombits(binary.LittleEndian.Uint32(data))
+		if !math.IsNaN(float64(f)) {
+			t.Errorf("expected NaN, got %v", f)
+		}
+	})
+
+	t.Run("REAL/+Inf", func(t *testing.T) {
+		sym := &Symbol{DataType: "REAL", Length: 4}
+		data, err := sym.writeToNode("+Inf", 0, nil)
+		requireNoError(t, err)
+		f := math.Float32frombits(binary.LittleEndian.Uint32(data))
+		if !math.IsInf(float64(f), 1) {
+			t.Errorf("expected +Inf, got %v", f)
+		}
+	})
+
+	t.Run("LREAL/NaN", func(t *testing.T) {
+		sym := &Symbol{DataType: "LREAL", Length: 8}
+		data, err := sym.writeToNode("NaN", 0, nil)
+		requireNoError(t, err)
+		f := math.Float64frombits(binary.LittleEndian.Uint64(data))
+		if !math.IsNaN(f) {
+			t.Errorf("expected NaN, got %v", f)
+		}
+	})
+}
+
+// ============================================================
+// DATE/TIME boundary values and aliases
+// ============================================================
+
+func TestSymbolParseTemporalTypes(t *testing.T) {
+	tests := []struct {
+		name     string
+		dataType string
+		length   uint32
+		data     []byte
+		want     string
+	}{
+		// TIME
+		{"TIME/midnight", "TIME", 4, leu32(0), "00:00:00"},
+		{"TIME/max_ms", "TIME", 4, leu32(23*3600000 + 59*60000 + 59*1000 + 999), "23:59:59.999"},
+		{"TIME/1h_exact", "TIME", 4, leu32(3600000), "01:00:00"},
+		// TOD
+		{"TOD/midnight", "TOD", 4, leu32(0), "00:00"},
+		{"TOD/end_of_day", "TOD", 4, leu32(23*3600000 + 59*60000), "23:59"},
+		// DATE
+		{"DATE/epoch", "DATE", 4, leu32(0), "1970-01-01"},
+		{"DATE/leap_year", "DATE", 4, leu32(1709164800), "2024-02-29"},
+		{"DATE/max_uint32", "DATE", 4, leu32(math.MaxUint32), "2106-02-07"},
+		// DT
+		{"DT/Y2K38", "DT", 4, leu32(2147483647), "2038-01-19 03:14:07"},
 	}
-	if val != "+Inf" {
-		t.Errorf("got %q, want %q", val, "+Inf")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sym := &Symbol{DataType: tt.dataType, Length: tt.length}
+			got, err := sym.parse(tt.data, 0, nil)
+			requireNoError(t, err)
+			assertEqual(t, got, tt.want)
+		})
 	}
 }
 
-func TestSymbolParseREAL_NegInf(t *testing.T) {
-	sym := &Symbol{DataType: "REAL", Length: 4}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, math.Float32bits(float32(math.Inf(-1))))
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestWriteToNodeTemporalRoundTrip(t *testing.T) {
+	tests := []struct {
+		name     string
+		dataType string
+		length   uint32
+		value    string
+	}{
+		{"DT/epoch", "DT", 4, "1970-01-01 00:00:00"},
+		{"DATE/leap_year", "DATE", 4, "2024-02-29"},
+		{"TIME/with_ms", "TIME", 4, "01:02:03.456"},
 	}
-	if val != "-Inf" {
-		t.Errorf("got %q, want %q", val, "-Inf")
-	}
-}
-
-func TestSymbolParseREAL_NegZero(t *testing.T) {
-	sym := &Symbol{DataType: "REAL", Length: 4}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, math.Float32bits(float32(math.Copysign(0, -1))))
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// FormatFloat for -0 → "0" (float32 precision)
-	if val != "0" && val != "-0" {
-		t.Errorf("got %q, want %q or %q", val, "0", "-0")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testWriteRoundTrip(t, tt.dataType, tt.length, tt.value)
+		})
 	}
 }
 
-func TestSymbolParseLREAL_NaN(t *testing.T) {
-	sym := &Symbol{DataType: "LREAL", Length: 8}
-	data := make([]byte, 8)
-	binary.LittleEndian.PutUint64(data, math.Float64bits(math.NaN()))
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestWriteToNodeTemporalAliases(t *testing.T) {
+	tests := []struct {
+		name     string
+		dataType string
+		length   uint32
+		value    string
+	}{
+		{"TIME_OF_DAY/14:30", "TIME_OF_DAY", 4, "14:30"},
+		{"DATE_AND_TIME/full", "DATE_AND_TIME", 4, "2024-06-15 23:59:59"},
 	}
-	if val != "NaN" {
-		t.Errorf("got %q, want %q", val, "NaN")
-	}
-}
-
-func TestSymbolParseLREAL_PosInf(t *testing.T) {
-	sym := &Symbol{DataType: "LREAL", Length: 8}
-	data := make([]byte, 8)
-	binary.LittleEndian.PutUint64(data, math.Float64bits(math.Inf(1)))
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "+Inf" {
-		t.Errorf("got %q, want %q", val, "+Inf")
-	}
-}
-
-func TestSymbolParseLREAL_NegInf(t *testing.T) {
-	sym := &Symbol{DataType: "LREAL", Length: 8}
-	data := make([]byte, 8)
-	binary.LittleEndian.PutUint64(data, math.Float64bits(math.Inf(-1)))
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "-Inf" {
-		t.Errorf("got %q, want %q", val, "-Inf")
-	}
-}
-
-func TestSymbolParseLREAL_SmallSubnormal(t *testing.T) {
-	sym := &Symbol{DataType: "LREAL", Length: 8}
-	data := make([]byte, 8)
-	// Smallest positive subnormal float64
-	binary.LittleEndian.PutUint64(data, 1) // 5e-324
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	f, parseErr := strconv.ParseFloat(val, 64)
-	if parseErr != nil {
-		t.Fatalf("cannot parse result %q: %v", val, parseErr)
-	}
-	if f != math.Float64frombits(1) {
-		t.Errorf("got %v, want %v", f, math.Float64frombits(1))
-	}
-}
-
-func TestWriteToNodeREAL_NaN(t *testing.T) {
-	sym := &Symbol{DataType: "REAL", Length: 4}
-	data, err := sym.writeToNode("NaN", 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	bits := binary.LittleEndian.Uint32(data)
-	f := math.Float32frombits(bits)
-	if !math.IsNaN(float64(f)) {
-		t.Errorf("expected NaN, got %v", f)
-	}
-}
-
-func TestWriteToNodeREAL_Inf(t *testing.T) {
-	sym := &Symbol{DataType: "REAL", Length: 4}
-	data, err := sym.writeToNode("+Inf", 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	bits := binary.LittleEndian.Uint32(data)
-	f := math.Float32frombits(bits)
-	if !math.IsInf(float64(f), 1) {
-		t.Errorf("expected +Inf, got %v", f)
-	}
-}
-
-func TestWriteToNodeLREAL_NaN(t *testing.T) {
-	sym := &Symbol{DataType: "LREAL", Length: 8}
-	data, err := sym.writeToNode("NaN", 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	bits := binary.LittleEndian.Uint64(data)
-	f := math.Float64frombits(bits)
-	if !math.IsNaN(f) {
-		t.Errorf("expected NaN, got %v", f)
-	}
-}
-
-// ==========================================================================
-// DATE/TIME boundary values
-// ==========================================================================
-
-func TestSymbolParseTIME_Midnight(t *testing.T) {
-	sym := &Symbol{DataType: "TIME", Length: 4}
-	data := make([]byte, 4) // 0 ms = midnight
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "00:00:00" {
-		t.Errorf("got %q, want %q", val, "00:00:00")
-	}
-}
-
-func TestSymbolParseTIME_MaxMs(t *testing.T) {
-	// 23:59:59.999
-	sym := &Symbol{DataType: "TIME", Length: 4}
-	data := make([]byte, 4)
-	ms := uint32(23*3600000 + 59*60000 + 59*1000 + 999)
-	binary.LittleEndian.PutUint32(data, ms)
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "23:59:59.999" {
-		t.Errorf("got %q, want %q", val, "23:59:59.999")
-	}
-}
-
-func TestSymbolParseTIME_SubMillisecondPrecision(t *testing.T) {
-	// TIME with exact seconds (no ms) — should not show decimal
-	sym := &Symbol{DataType: "TIME", Length: 4}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, 3600000) // 1 hour exactly
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "01:00:00" {
-		t.Errorf("got %q, want %q", val, "01:00:00")
-	}
-}
-
-func TestSymbolParseTOD_Midnight(t *testing.T) {
-	sym := &Symbol{DataType: "TOD", Length: 4}
-	data := make([]byte, 4)
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "00:00" {
-		t.Errorf("got %q, want %q", val, "00:00")
-	}
-}
-
-func TestSymbolParseTOD_EndOfDay(t *testing.T) {
-	sym := &Symbol{DataType: "TOD", Length: 4}
-	data := make([]byte, 4)
-	ms := uint32(23*3600000 + 59*60000) // 23:59
-	binary.LittleEndian.PutUint32(data, ms)
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "23:59" {
-		t.Errorf("got %q, want %q", val, "23:59")
-	}
-}
-
-func TestSymbolParseDATE_Epoch(t *testing.T) {
-	sym := &Symbol{DataType: "DATE", Length: 4}
-	data := make([]byte, 4) // 0 seconds = 1970-01-01
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "1970-01-01" {
-		t.Errorf("got %q, want %q", val, "1970-01-01")
-	}
-}
-
-func TestSymbolParseDATE_LeapYear(t *testing.T) {
-	sym := &Symbol{DataType: "DATE", Length: 4}
-	data := make([]byte, 4)
-	// 2024-02-29 in unix seconds
-	ts := uint32(1709164800) // 2024-02-29 00:00:00 UTC
-	binary.LittleEndian.PutUint32(data, ts)
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "2024-02-29" {
-		t.Errorf("got %q, want %q", val, "2024-02-29")
-	}
-}
-
-func TestSymbolParseDATE_MaxUint32(t *testing.T) {
-	// uint32 max = 4294967295 seconds = 2106-02-07
-	sym := &Symbol{DataType: "DATE", Length: 4}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, math.MaxUint32)
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "2106-02-07" {
-		t.Errorf("got %q, want %q", val, "2106-02-07")
-	}
-}
-
-func TestSymbolParseDT_Epoch(t *testing.T) {
-	testWriteRoundTrip(t, "DT", 4, "1970-01-01 00:00:00")
-}
-
-func TestSymbolParseDT_Y2K38(t *testing.T) {
-	// 2038-01-19 03:14:07 — last second of signed 32-bit unix time
-	sym := &Symbol{DataType: "DT", Length: 4}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, 2147483647) // max int32
-	val, err := sym.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val != "2038-01-19 03:14:07" {
-		t.Errorf("got %q, want %q", val, "2038-01-19 03:14:07")
-	}
-}
-
-func TestWriteToNodeDATE_RoundTrip_LeapYear(t *testing.T) {
-	testWriteRoundTrip(t, "DATE", 4, "2024-02-29")
-}
-
-func TestWriteToNodeTIME_RoundTrip_WithMs(t *testing.T) {
-	testWriteRoundTrip(t, "TIME", 4, "01:02:03.456")
-}
-
-func TestWriteToNodeTOD_RoundTrip_Aliases(t *testing.T) {
-	// TIME_OF_DAY is alias for TOD
-	sym := &Symbol{DataType: "TIME_OF_DAY", Length: 4}
-	data, err := sym.writeToNode("14:30", 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	sym2 := &Symbol{DataType: "TIME_OF_DAY", Length: 4}
-	val, err := sym2.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("parse error: %v", err)
-	}
-	if val != "14:30" {
-		t.Errorf("got %q, want %q", val, "14:30")
-	}
-}
-
-func TestWriteToNodeDT_RoundTrip_Alias(t *testing.T) {
-	// DATE_AND_TIME is alias for DT
-	sym := &Symbol{DataType: "DATE_AND_TIME", Length: 4}
-	data, err := sym.writeToNode("2024-06-15 23:59:59", 0, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	sym2 := &Symbol{DataType: "DATE_AND_TIME", Length: 4}
-	val, err := sym2.parse(data, 0, nil)
-	if err != nil {
-		t.Fatalf("parse error: %v", err)
-	}
-	if val != "2024-06-15 23:59:59" {
-		t.Errorf("got %q, want %q", val, "2024-06-15 23:59:59")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sym := &Symbol{DataType: tt.dataType, Length: tt.length}
+			data, err := sym.writeToNode(tt.value, 0, nil)
+			requireNoError(t, err)
+			sym2 := &Symbol{DataType: tt.dataType, Length: tt.length}
+			val, err := sym2.parse(data, 0, nil)
+			requireNoError(t, err)
+			assertEqual(t, val, tt.value)
+		})
 	}
 }
 

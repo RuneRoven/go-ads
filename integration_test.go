@@ -3,7 +3,6 @@
 package ads
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"math"
@@ -88,43 +87,11 @@ func pickParseableSymbols(symbols map[string]*Symbol, n int) []string {
 
 func setupConnection(t *testing.T) *Connection {
 	t.Helper()
-
-	ip := getEnvOrDefault("ADS_PLC_IP", "192.168.3.224")
-	targetAMS := getEnvOrDefault("ADS_TARGET_AMS", "5.154.236.19.1.1")
-	targetPortStr := getEnvOrDefault("ADS_TARGET_PORT", "851")
-	targetPort, err := strconv.Atoi(targetPortStr)
-	if err != nil {
-		t.Fatalf("invalid ADS_TARGET_PORT %q: %v", targetPortStr, err)
-	}
-	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
-
-	// Build connection options — WithRoute registers route BEFORE any ADS commands
-	var opts []ConnectionOption
-	hostIP := os.Getenv("ADS_HOST_IP")
-	if hostIP != "" {
-		opts = append(opts, WithHostIP(hostIP))
-	}
-	routeUser := os.Getenv("ADS_ROUTE_USER")
-	routePass := os.Getenv("ADS_ROUTE_PASS")
-	if routeUser != "" && routePass != "" {
-		opts = append(opts, WithRoute("go-ads-test", routeUser, routePass))
-	}
-
-	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second, opts...)
-	if err != nil {
-		t.Fatalf("NewConnection failed: %v", err)
-	}
-
-	err = conn.Connect(false)
-	if err != nil {
-		t.Fatalf("Connect failed: %v", err)
-	}
-
-	t.Cleanup(func() {
-		conn.Close()
+	return setupConnectionWithDefaults(t, connDefaults{
+		ip:        "192.168.3.224",
+		targetAMS: "5.154.236.19.1.1",
+		routeName: "go-ads-test",
 	})
-
-	return conn
 }
 
 func TestIntegrationConnect(t *testing.T) {
@@ -1888,86 +1855,6 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 // SumWrite raw debug diagnostic
 // ============================================================
 
-// TestIntegrationSumWriteRawDebug compares raw SumWrite vs WriteMultipleSymbols
-// byte-for-byte to diagnose why raw SumWrite silently fails on some PLCs.
-// This test logs diagnostics — it does not assert on the raw SumWrite result
-// since the root cause is under investigation.
-func TestIntegrationSumWriteRawDebug(t *testing.T) {
-	symbolName := os.Getenv("ADS_WRITE_INT")
-	if symbolName == "" {
-		t.Skip("ADS_WRITE_INT not set")
-	}
-
-	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
-		t.Fatalf("LoadSymbols failed: %v", err)
-	}
-
-	sym, err := conn.GetSymbol(symbolName)
-	if err != nil {
-		t.Fatalf("GetSymbol(%s) failed: %v", symbolName, err)
-	}
-
-	// Log addressing info
-	group, offset := symbolSumAddress(sym)
-	t.Logf("symbol=%s type=%s length=%d handle=%d group=0x%X offset=0x%X",
-		symbolName, sym.DataType, sym.Length, sym.Handle, group, offset)
-
-	// Compare writeToNode output: nil vs real datatypes
-	conn.symbolLock.Lock()
-	datatypes := conn.datatypes
-	conn.symbolLock.Unlock()
-
-	dataNil, errNil := sym.writeToNode("42", 0, nil)
-	dataReal, errReal := sym.writeToNode("42", 0, datatypes)
-	t.Logf("writeToNode(nil):  data=%X err=%v", dataNil, errNil)
-	t.Logf("writeToNode(real): data=%X err=%v", dataReal, errReal)
-	t.Logf("data match: %v", bytes.Equal(dataNil, dataReal))
-
-	// Reset to known value first
-	if err := conn.WriteToSymbol(symbolName, "0"); err != nil {
-		t.Fatalf("WriteToSymbol reset failed: %v", err)
-	}
-
-	// Raw SumWrite with real datatypes data
-	results, err := conn.SumWrite([]SumWriteRequest{{Group: group, Offset: offset, Data: dataReal}})
-	if err != nil {
-		t.Logf("raw SumWrite error: %v", err)
-	} else {
-		t.Logf("raw SumWrite result: 0x%X", uint32(results[0].Error))
-	}
-	readBack, _ := conn.ReadFromSymbol(symbolName)
-	rawWorked := readBack == "42"
-	t.Logf("raw SumWrite readback: %s (expected 42, worked=%v)", readBack, rawWorked)
-
-	// Reset and try WriteMultipleSymbols for comparison
-	if err := conn.WriteToSymbol(symbolName, "0"); err != nil {
-		t.Fatalf("WriteToSymbol reset failed: %v", err)
-	}
-	codes, err := conn.WriteMultipleSymbols(map[string]string{symbolName: "42"})
-	if err != nil {
-		t.Logf("WriteMultipleSymbols error: %v", err)
-	} else {
-		t.Logf("WriteMultipleSymbols result: 0x%X", uint32(codes[symbolName]))
-	}
-	readBack2, _ := conn.ReadFromSymbol(symbolName)
-	apiWorked := readBack2 == "42"
-	t.Logf("WriteMultipleSymbols readback: %s (expected 42, worked=%v)", readBack2, apiWorked)
-
-	// Summary
-	if rawWorked && apiWorked {
-		t.Log("BOTH paths work — no discrepancy on this PLC")
-	} else if !rawWorked && apiWorked {
-		t.Log("DISCREPANCY: raw SumWrite fails but WriteMultipleSymbols works")
-	} else if rawWorked && !apiWorked {
-		t.Log("UNEXPECTED: raw SumWrite works but WriteMultipleSymbols fails")
-	} else {
-		t.Log("BOTH paths fail — SumWrite broken on this PLC")
-	}
-
-	// Restore
-	_ = conn.WriteToSymbol(symbolName, "0")
-}
 
 // ============================================================
 // SumRead/SumWrite functional verification
@@ -2907,75 +2794,6 @@ func TestIntegrationReadAllParseableTypes(t *testing.T) {
 	}
 }
 
-// TestIntegrationWriteReadRoundTrip writes known values to writable symbols
-// and reads them back to verify end-to-end correctness for multiple types.
-func TestIntegrationWriteReadRoundTrip(t *testing.T) {
-	// Requires writable symbols configured via env vars
-	writeBool := os.Getenv("ADS_WRITE_BOOL")
-	writeInt := os.Getenv("ADS_WRITE_INT")
-	if writeBool == "" && writeInt == "" {
-		t.Skip("ADS_WRITE_BOOL and ADS_WRITE_INT not set — skipping write round-trip")
-	}
-
-	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
-		t.Fatalf("LoadSymbols failed: %v", err)
-	}
-
-	type writeTest struct {
-		name     string
-		symbol   string
-		write    string
-		restore  string
-		validate func(string) bool
-	}
-
-	var tests []writeTest
-	if writeBool != "" {
-		tests = append(tests, writeTest{
-			name: "BOOL", symbol: writeBool,
-			write: "true", restore: "false",
-			validate: func(v string) bool { return v == "true" },
-		})
-	}
-	if writeInt != "" {
-		tests = append(tests, writeTest{
-			name: "INT", symbol: writeInt,
-			write: "12345", restore: "0",
-			validate: func(v string) bool { return v == "12345" },
-		})
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Save original
-			original, err := conn.ReadFromSymbol(tt.symbol)
-			if err != nil {
-				t.Fatalf("initial read failed: %v", err)
-			}
-			t.Logf("original value: %q", original)
-
-			// Write test value
-			if err := conn.WriteToSymbol(tt.symbol, tt.write); err != nil {
-				t.Fatalf("write failed: %v", err)
-			}
-
-			// Read back
-			readBack, err := conn.ReadFromSymbol(tt.symbol)
-			if err != nil {
-				t.Fatalf("read-back failed: %v", err)
-			}
-			if !tt.validate(readBack) {
-				t.Errorf("read-back = %q, expected %q", readBack, tt.write)
-			}
-
-			// Restore
-			if err := conn.WriteToSymbol(tt.symbol, original); err != nil {
-				t.Logf("warning: failed to restore original value: %v", err)
-			}
-		})
-	}
-}
 
 // TestIntegrationRapidSubscribeUnsubscribe subscribes and unsubscribes quickly
 // in a loop to verify handle management under rapid lifecycle churn.
