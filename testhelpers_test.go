@@ -28,13 +28,6 @@ func assertEqual(t *testing.T, got, want string) {
 	}
 }
 
-func requireEqual(t *testing.T, got, want string) {
-	t.Helper()
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
-}
-
 func assertFloatApprox(t *testing.T, got, want, tol float64) {
 	t.Helper()
 	if want == 0 {

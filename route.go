@@ -25,6 +25,10 @@ const (
 // AddRemoteRoute registers a route on the remote PLC via the Beckhoff UDP protocol (port 48899).
 // This tells the PLC how to reach this client's AmsNetId.
 //
+// Security: credentials are transmitted in cleartext over UDP. This is a limitation of
+// Beckhoff's route registration protocol — there is no encrypted alternative.
+// Ensure this is only called on trusted networks.
+//
 // Parameters:
 //   - remoteHost: IP or hostname of the PLC
 //   - localNetId: the AMS NetID this client will use as source

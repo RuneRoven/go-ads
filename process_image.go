@@ -48,6 +48,9 @@ func (conn *Connection) ReadProcessInputBit(byteOffset uint32, bitIndex uint8) (
 	if err != nil {
 		return false, err
 	}
+	if len(data) < 1 {
+		return false, fmt.Errorf("ReadProcessInputBit: response too short (%d bytes)", len(data))
+	}
 	return data[0] != 0, nil
 }
 
@@ -69,6 +72,9 @@ func (conn *Connection) ReadProcessInputSize() (uint32, error) {
 	data, err := conn.Read(uint32(GroupIoImageRisize), 0, 4)
 	if err != nil {
 		return 0, err
+	}
+	if len(data) < 4 {
+		return 0, fmt.Errorf("ReadProcessInputSize: response too short (%d bytes)", len(data))
 	}
 	return binary.LittleEndian.Uint32(data), nil
 }

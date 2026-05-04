@@ -178,7 +178,11 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 		// Fallback: infer base type from symbol size when datatypes table is
 		// not available (on-demand mode). This handles enums and simple type
 		// aliases whose underlying type matches a standard integer size.
+		// WARNING: always infers signed integer types — unsigned enums and
+		// REAL/LREAL types will be misinterpreted.
 		if inferred := inferBaseType(symbol.Length); inferred != "" {
+			getDefaultLogger().Warn("inferring base type from size (may be wrong for unsigned/float types)",
+				"symbol", symbol.DataType, "size", symbol.Length, "inferred", inferred)
 			resolved := *symbol
 			resolved.DataType = inferred
 			val, err := resolved.parse(data, offset, nil)
@@ -461,7 +465,16 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		}
 	case "STRING":
 		newBuf := make([]byte, symbol.Length)
-		copy(newBuf, []byte(value))
+		// Reserve last byte for null terminator — PLC expects null-terminated strings.
+		maxLen := int(symbol.Length) - 1
+		if maxLen < 0 {
+			maxLen = 0
+		}
+		src := []byte(value)
+		if len(src) > maxLen {
+			src = src[:maxLen]
+		}
+		copy(newBuf, src)
 		buf.Write(newBuf)
 	case "WSTRING":
 		encoded := utf16.Encode([]rune(value))

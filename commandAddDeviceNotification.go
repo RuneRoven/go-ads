@@ -32,8 +32,8 @@ func (conn *Connection) AddDeviceNotification(
 		offset,
 		length,
 		uint32(transmissionMode),
-		uint32(maxDelay.Nanoseconds() / 100),  // 1 = 1ms (alt 100ns?)
-		uint32(cycleTime.Nanoseconds() / 100), // 1 = 1ms
+		uint32(maxDelay.Nanoseconds() / 100),  // ADS uses 100ns units (1ms = 10000)
+		uint32(cycleTime.Nanoseconds() / 100), // ADS uses 100ns units (1ms = 10000)
 		[16]byte{},
 	}
 	if err = binary.Write(request, binary.LittleEndian, content); err != nil {

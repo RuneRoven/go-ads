@@ -130,6 +130,9 @@ func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnC
 	conn.symbolLock.Lock()
 	for i, h := range handles {
 		if errors[i] == ReturnCodeNoErrors {
+			if sym := conn.activeNotifications[h]; sym != nil {
+				conn.removeNotificationConfig(sym.FullName)
+			}
 			delete(conn.activeNotifications, h)
 			conn.logger.Info("batch deleted notification handle", "handle", h)
 		}

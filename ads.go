@@ -14,6 +14,10 @@ import (
 // ListSymbols returns the full symbol table.
 // Requires LoadSymbols() or LoadSymbolsSlow() to have been called first.
 // Returns an error if full discovery has not been performed.
+//
+// The returned map is a shallow copy (safe to modify the map itself),
+// but the *Symbol values are shared with the connection's internal state.
+// Callers MUST NOT mutate Symbol fields; treat them as read-only.
 func (conn *Connection) ListSymbols() (map[string]*Symbol, error) {
 	conn.symbolLock.Lock()
 	defer conn.symbolLock.Unlock()
@@ -57,17 +61,22 @@ type SlowDiscoveryConfig struct {
 	ChunkDelay time.Duration
 }
 
-// LoadSymbolsSlow downloads the full symbol table in chunks with delays
-// between each chunk, to minimize disruption to the PLC's real-time task.
-// If the PLC does not support offset-based chunked reads, it falls back
-// to downloading each table in a single request with a delay between them.
-func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
+// applyDefaults fills in zero-valued fields with sensible defaults.
+func (cfg *SlowDiscoveryConfig) applyDefaults() {
 	if cfg.ChunkSize == 0 {
 		cfg.ChunkSize = 4096
 	}
 	if cfg.ChunkDelay == 0 {
 		cfg.ChunkDelay = 100 * time.Millisecond
 	}
+}
+
+// LoadSymbolsSlow downloads the full symbol table in chunks with delays
+// between each chunk, to minimize disruption to the PLC's real-time task.
+// If the PLC does not support offset-based chunked reads, it falls back
+// to downloading each table in a single request with a delay between them.
+func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
+	cfg.applyDefaults()
 
 	// Step 1: Read symbol version
 	version, err := conn.GetSymbolVersion()
@@ -246,7 +255,10 @@ func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 		// Release the handle we just acquired since another goroutine beat us
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, handle)
-		_ = conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes)
+		if err := conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+			conn.logger.Warn("failed to release duplicate symbol handle",
+				"symbol", symbolName, "handle", handle, "error", err)
+		}
 		return existing, nil
 	}
 	conn.symbols[symbolName] = sym
@@ -346,7 +358,9 @@ func (conn *Connection) writeToSymbolRetry(symbolName string, value string, retr
 		return fmt.Errorf("write to %q: %w", symbolName, err)
 	}
 
-	// Snapshot datatypes under lock, then serialize without holding the lock
+	// Snapshot datatypes and handle under lock, then serialize without holding the lock.
+	// writeToNode reads symbol.Length and symbol.DataType internally — these fields are
+	// set at construction and never mutated, so no lock is needed for them.
 	conn.symbolLock.Lock()
 	datatypes := conn.datatypes
 	handle := symbol.Handle
@@ -877,11 +891,26 @@ func (conn *Connection) AddSymbolNotifications(configs []NotificationConfig, ch 
 			"symbol", infos[i].config.SymbolName)
 	}
 
-	// Store notification configs and channel for reconnect
-	conn.notificationConfigs = append(conn.notificationConfigs, configs...)
+	// Store only successful notification configs for reconnect
+	for i := range handles {
+		if errors[i] == ReturnCodeNoErrors {
+			conn.notificationConfigs = append(conn.notificationConfigs, infos[i].config)
+		}
+	}
 	conn.notificationChannel = ch
 
 	return nil
+}
+
+// removeNotificationConfig removes the first config matching symbolName.
+// Must be called with symbolLock held.
+func (conn *Connection) removeNotificationConfig(symbolName string) {
+	for i, cfg := range conn.notificationConfigs {
+		if cfg.SymbolName == symbolName {
+			conn.notificationConfigs = append(conn.notificationConfigs[:i], conn.notificationConfigs[i+1:]...)
+			return
+		}
+	}
 }
 
 // SymbolBrowseEntry represents a browsable symbol or child.
@@ -899,12 +928,7 @@ type SymbolBrowseEntry struct {
 // After calling this, BrowseSymbols() can list root symbols and navigate by prefix.
 // To also expand struct/array children, call LoadDataTypes() afterwards.
 func (conn *Connection) LoadSymbolList(cfg SlowDiscoveryConfig) error {
-	if cfg.ChunkSize == 0 {
-		cfg.ChunkSize = 4096
-	}
-	if cfg.ChunkDelay == 0 {
-		cfg.ChunkDelay = 100 * time.Millisecond
-	}
+	cfg.applyDefaults()
 
 	// Read symbol version
 	version, err := conn.GetSymbolVersion()
@@ -967,12 +991,7 @@ func (conn *Connection) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 // After calling this along with LoadSymbolList(), struct/array children can be
 // browsed and expanded via BrowseSymbols().
 func (conn *Connection) LoadDataTypes(cfg SlowDiscoveryConfig) error {
-	if cfg.ChunkSize == 0 {
-		cfg.ChunkSize = 4096
-	}
-	if cfg.ChunkDelay == 0 {
-		cfg.ChunkDelay = 100 * time.Millisecond
-	}
+	cfg.applyDefaults()
 
 	// Get upload info
 	uploadInfo, err := conn.GetSymbolUploadInfo()

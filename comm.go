@@ -11,13 +11,19 @@ import (
 	"strings"
 )
 
+// send is used exclusively for the local-mode handshake during Connect/Reconnect.
+// It uses the shared systemResponse channel and is NOT safe for concurrent callers.
+// For normal ADS commands, use sendRequest/sendRequestOnce which use per-invoke channels.
 func (conn *Connection) send(data []byte) (response []byte, err error) {
 	conn.currentRequest.Inc()
 	conn.chanMu.RLock()
 	sendCh := conn.sendChannel
 	sysCh := conn.systemResponse
 	conn.chanMu.RUnlock()
-	ctx, cancel := context.WithCancel(conn.ctx)
+	conn.ctxMu.RLock()
+	currentCtx := conn.ctx
+	conn.ctxMu.RUnlock()
+	ctx, cancel := context.WithTimeout(currentCtx, conn.RequestTimeout)
 	defer cancel()
 	select {
 	case <-ctx.Done():
@@ -25,16 +31,14 @@ func (conn *Connection) send(data []byte) (response []byte, err error) {
 	case sendCh <- data:
 	}
 
-	ctx, cancel = context.WithCancel(ctx)
-	defer cancel()
 	select {
 	case <-ctx.Done():
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			err = fmt.Errorf("request aborted, deadline exceeded: %w", ctx.Err())
-			conn.logger.Error("sendRequest aborted due to timeout", "error", err)
+			conn.logger.Error("send aborted due to timeout", "error", err)
 		} else {
 			err = fmt.Errorf("request aborted, shutdown initiated: %w", ctx.Err())
-			conn.logger.Error("sendRequest aborted due to shutdown", "error", err)
+			conn.logger.Error("send aborted due to shutdown", "error", err)
 		}
 		return nil, err
 	case response = <-sysCh:
@@ -311,7 +315,10 @@ func (conn *Connection) handleReceive(ctx context.Context, data []byte) {
 func (conn *Connection) transmitWorker() {
 	defer conn.waitGroup.Done()
 	writer := bufio.NewWriter(conn.connection)
-	ctx, cancel := context.WithCancel(conn.ctx)
+	conn.ctxMu.RLock()
+	currentCtx := conn.ctx
+	conn.ctxMu.RUnlock()
+	ctx, cancel := context.WithCancel(currentCtx)
 	defer cancel()
 	for {
 		select {

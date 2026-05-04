@@ -3,6 +3,7 @@ package ads
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 )
 
 // SumReadRequest represents a single read request within a sum/batch read.
@@ -52,7 +53,11 @@ func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, err
 	}
 
 	// Response: [N × (error(4), length(4))][data]
-	readLen := uint32(n*8) + totalReadLen
+	total := uint64(n)*8 + uint64(totalReadLen)
+	if total > math.MaxUint32 {
+		return nil, fmt.Errorf("SumRead total response size %d exceeds uint32 max", total)
+	}
+	readLen := uint32(total)
 
 	if cmd != 0 {
 		// Already probed — use cached command
@@ -125,8 +130,13 @@ func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumR
 	for i := 0; i < n; i++ {
 		end := dataOffset + int(lengths[i])
 		if end > len(resp) {
-			results[i].Error = ReturnCodeDeviceInvalidSize
-			continue
+			// Data section is position-dependent: each item's offset depends on
+			// the cumulative lengths of all preceding items. Once one item is
+			// truncated, all subsequent offsets are wrong and unrecoverable.
+			for j := i; j < n; j++ {
+				results[j].Error = ReturnCodeDeviceInvalidSize
+			}
+			break
 		}
 		results[i].Data = make([]byte, lengths[i])
 		copy(results[i].Data, resp[dataOffset:end])

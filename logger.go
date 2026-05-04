@@ -46,6 +46,10 @@ func WithHostIP(ip string) ConnectionOption {
 // By default, Connect and Reconnect probe the PLC first (via GetSymbolVersion) to check
 // if the route already exists, and only register with credentials if the probe fails.
 // Use WithForceRouteRegistration to always register without probing.
+//
+// Security: Beckhoff's route registration protocol transmits credentials in cleartext
+// over UDP. This is a protocol-level limitation — there is no encrypted alternative.
+// Ensure route registration only occurs on trusted networks.
 func WithRoute(routeName, username, password string) ConnectionOption {
 	return func(c *Connection) {
 		c.routeName = routeName
@@ -86,6 +90,15 @@ func DefaultBackoffConfig() BackoffConfig {
 func WithBackoff(cfg BackoffConfig) ConnectionOption {
 	return func(c *Connection) {
 		c.backoffConfig = cfg
+	}
+}
+
+// WithMaxReconnectAttempts limits total TCP reconnection attempts before giving up.
+// Default is 0 (infinite retries). When the limit is reached, the reconnect
+// goroutine returns an error and the connection stays in disconnected state.
+func WithMaxReconnectAttempts(n int) ConnectionOption {
+	return func(c *Connection) {
+		c.maxReconnectAttempts = n
 	}
 }
 

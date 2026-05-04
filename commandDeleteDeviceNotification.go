@@ -36,6 +36,9 @@ func (conn *Connection) DeleteDeviceNotification(handle uint32) error {
 		return fmt.Errorf("ADS error in DeleteDeviceNotification: %w", adsError)
 	}
 	conn.symbolLock.Lock()
+	if sym := conn.activeNotifications[handle]; sym != nil {
+		conn.removeNotificationConfig(sym.FullName)
+	}
 	delete(conn.activeNotifications, handle)
 	if len(conn.activeNotifications) == 0 {
 		conn.notificationChannel = nil

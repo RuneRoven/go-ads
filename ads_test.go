@@ -1423,28 +1423,35 @@ func TestWriteToNodeSTRING_PadsWithZeros(t *testing.T) {
 }
 
 func TestWriteToNodeSTRING_ExactLength(t *testing.T) {
-	sym := &Symbol{DataType: "STRING", Length: 5}
+	// STRING(5) → Length=6 (5 chars + null). Writing exactly 5 chars should fit.
+	sym := &Symbol{DataType: "STRING", Length: 6}
 	data, err := sym.writeToNode("Hello", 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if string(data) != "Hello" {
-		t.Errorf("got %q, want %q", string(data), "Hello")
+	if string(data[:5]) != "Hello" {
+		t.Errorf("got %q, want %q", string(data[:5]), "Hello")
+	}
+	if data[5] != 0 {
+		t.Errorf("last byte should be null terminator, got %d", data[5])
 	}
 }
 
 func TestWriteToNodeSTRING_Overflow(t *testing.T) {
-	// String longer than buffer — should be truncated
-	sym := &Symbol{DataType: "STRING", Length: 3}
+	// STRING(3) → Length=4 (3 chars + null). "Hello" truncated to 3 chars + null.
+	sym := &Symbol{DataType: "STRING", Length: 4}
 	data, err := sym.writeToNode("Hello", 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(data) != 3 {
-		t.Fatalf("expected 3 bytes, got %d", len(data))
+	if len(data) != 4 {
+		t.Fatalf("expected 4 bytes, got %d", len(data))
 	}
-	if string(data) != "Hel" {
-		t.Errorf("got %q, want %q", string(data), "Hel")
+	if string(data[:3]) != "Hel" {
+		t.Errorf("got %q, want %q", string(data[:3]), "Hel")
+	}
+	if data[3] != 0 {
+		t.Errorf("last byte should be null terminator, got %d", data[3])
 	}
 }
 

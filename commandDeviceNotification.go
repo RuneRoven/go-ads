@@ -89,8 +89,13 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 	notification := symbol.Notification
 	fullName := symbol.FullName
 
-	timeStamp := int64(timestamp)/windowsTick - secToUnixEpoch
-	notificationTime := time.Unix(timeStamp, int64(timestamp)%(windowsTick)*100)
+	var notificationTime time.Time
+	if timestamp == 0 {
+		notificationTime = time.Now()
+	} else {
+		timeStamp := int64(timestamp)/windowsTick - secToUnixEpoch
+		notificationTime = time.Unix(timeStamp, int64(timestamp)%(windowsTick)*100)
+	}
 	// parse() mutates Symbol fields (Value, Changed, Valid, etc.) so it must
 	// run under lock. This is safe because parse is pure CPU work (no I/O).
 	value, err := symbol.parse(content, 0, datatypes)

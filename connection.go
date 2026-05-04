@@ -186,14 +186,7 @@ func (conn *Connection) Connect(local bool) error {
 	// With Idle=3s, Interval=2s, Count=5: connection declared dead after ~13s of no response.
 	// This ensures cable unplugs (>13s) are detected and trigger reconnect,
 	// while not affecting slow-changing notification data (keepalive is TCP-level, not app-level).
-	if tc, ok := tcpConn.(*net.TCPConn); ok {
-		tc.SetKeepAliveConfig(net.KeepAliveConfig{
-			Enable:   true,
-			Idle:     3 * time.Second,
-			Interval: 2 * time.Second,
-			Count:    5,
-		})
-	}
+	configureKeepAlive(tcpConn)
 	// Log TCP socket (transport-level only — ADS route validation happens on first ADS command)
 	conn.logger.Info("TCP socket established (ADS route not yet verified)",
 		"local", conn.connection.LocalAddr().String(),
@@ -306,14 +299,7 @@ func (conn *Connection) Connect(local bool) error {
 			conn.connMu.Lock()
 			conn.connection = newConn
 			conn.connMu.Unlock()
-			if tcpConn, ok := newConn.(*net.TCPConn); ok {
-				tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
-					Enable:   true,
-					Idle:     3 * time.Second,
-					Interval: 2 * time.Second,
-					Count:    5,
-				})
-			}
+			configureKeepAlive(newConn)
 			conn.waitGroup.Add(2)
 			go conn.listen()
 			go conn.transmitWorker()
@@ -379,47 +365,52 @@ func (conn *Connection) Close() {
 	close(conn.closedCh)
 	conn.logger.Info("Close called, shutting down")
 
-	// Delete all active notifications (uses sum command with automatic fallback to individual)
-	conn.symbolLock.Lock()
-	handles := make([]uint32, 0, len(conn.activeNotifications))
-	for handle := range conn.activeNotifications {
-		handles = append(handles, handle)
-	}
-	conn.symbolLock.Unlock()
-	if len(handles) > 0 {
-		errors, err := conn.SumDeleteDeviceNotification(handles)
-		if err != nil {
-			conn.logger.Warn("failed to delete notification handles during close", "error", err)
-		} else {
-			for i, h := range handles {
-				if errors[i] != ReturnCodeNoErrors {
-					conn.logger.Warn("failed to delete notification handle", "handle", h, "error", uint32(errors[i]))
-				} else {
-					conn.logger.Info("removed notification handle", "handle", h)
+	// Skip handle cleanup if already disconnected — all commands would timeout
+	if !conn.disconnected.Load() {
+		// Delete all active notifications (uses sum command with automatic fallback to individual)
+		conn.symbolLock.Lock()
+		handles := make([]uint32, 0, len(conn.activeNotifications))
+		for handle := range conn.activeNotifications {
+			handles = append(handles, handle)
+		}
+		conn.symbolLock.Unlock()
+		if len(handles) > 0 {
+			errors, err := conn.SumDeleteDeviceNotification(handles)
+			if err != nil {
+				conn.logger.Warn("failed to delete notification handles during close", "error", err)
+			} else {
+				for i, h := range handles {
+					if errors[i] != ReturnCodeNoErrors {
+						conn.logger.Warn("failed to delete notification handle", "handle", h, "error", uint32(errors[i]))
+					} else {
+						conn.logger.Info("removed notification handle", "handle", h)
+					}
 				}
 			}
 		}
-	}
-	// Collect symbol handles under lock, then release without holding the lock
-	conn.symbolLock.Lock()
-	var symHandles []uint32
-	for _, symbol := range conn.symbols {
-		if symbol.Handle != 0 {
-			symHandles = append(symHandles, symbol.Handle)
+		// Collect symbol handles under lock, then release without holding the lock
+		conn.symbolLock.Lock()
+		var symHandles []uint32
+		for _, symbol := range conn.symbols {
+			if symbol.Handle != 0 {
+				symHandles = append(symHandles, symbol.Handle)
+			}
 		}
-	}
-	conn.symbolLock.Unlock()
+		conn.symbolLock.Unlock()
 
-	// Release handles individually — ADS has no batch release command,
-	// and Close() is not performance-critical.
-	for _, h := range symHandles {
-		handleBytes := make([]byte, 4)
-		binary.LittleEndian.PutUint32(handleBytes, h)
-		if err := conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
-			conn.logger.Warn("failed to release symbol handle during close", "error", err, "handle", h)
-		} else {
-			conn.logger.Info("handle deleted", "handle", h)
+		// Release handles individually — ADS has no batch release command,
+		// and Close() is not performance-critical.
+		for _, h := range symHandles {
+			handleBytes := make([]byte, 4)
+			binary.LittleEndian.PutUint32(handleBytes, h)
+			if err := conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+				conn.logger.Warn("failed to release symbol handle during close", "error", err, "handle", h)
+			} else {
+				conn.logger.Info("handle deleted", "handle", h)
+			}
 		}
+	} else {
+		conn.logger.Info("already disconnected, skipping handle cleanup")
 	}
 	conn.ctxMu.RLock()
 	conn.shutdown()
@@ -467,8 +458,10 @@ func (conn *Connection) reconnectBackoff(attempt int) time.Duration {
 func (conn *Connection) reconnectSleep(attempt int) error {
 	delay := conn.reconnectBackoff(attempt)
 	conn.logger.Info("reconnect backoff", "attempt", attempt, "delay", delay)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	select {
-	case <-time.After(delay):
+	case <-timer.C:
 		return nil
 	case <-conn.closedCh:
 		return fmt.Errorf("connection closed during reconnect")
@@ -607,14 +600,7 @@ func (conn *Connection) Reconnect() error {
 		conn.connection = newConn
 		conn.connMu.Unlock()
 		// Enable aggressive TCP keepalive to detect dead connections quickly
-		if tcpConn, ok := newConn.(*net.TCPConn); ok {
-			tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
-				Enable:   true,
-				Idle:     3 * time.Second,
-				Interval: 2 * time.Second,
-				Count:    5,
-			})
-		}
+		configureKeepAlive(newConn)
 
 		// Clear disconnected flag so sendRequest works during symbol load
 		conn.disconnected.Store(false)
@@ -877,6 +863,19 @@ func (conn *Connection) resetForRetry() {
 	conn.activeRequests = map[uint32]chan []byte{}
 	conn.activeRequestLock.Unlock()
 	// Allow route re-registration on next attempt (PLC may have rebooted)
+}
+
+// configureKeepAlive enables aggressive TCP keepalive on a connection.
+// With Idle=3s, Interval=2s, Count=5: connection declared dead after ~13s of no response.
+func configureKeepAlive(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		tc.SetKeepAliveConfig(net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     3 * time.Second,
+			Interval: 2 * time.Second,
+			Count:    5,
+		})
+	}
 }
 
 // loadSymbols loads symbol table and datatypes from the PLC, and saves the symbol version.
