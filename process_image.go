@@ -1,6 +1,9 @@
 package ads
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 // Process Image I/O
 //
@@ -36,7 +39,11 @@ func (conn *Connection) WriteProcessOutput(byteOffset uint32, data []byte) error
 }
 
 // ReadProcessInputBit reads a single bit from the input process image.
+// bitIndex must be 0-7 (bit within a single byte).
 func (conn *Connection) ReadProcessInputBit(byteOffset uint32, bitIndex uint8) (bool, error) {
+	if bitIndex > 7 {
+		return false, fmt.Errorf("bitIndex must be 0-7, got %d", bitIndex)
+	}
 	data, err := conn.Read(uint32(GroupIoImageRwix), byteOffset*8+uint32(bitIndex), 1)
 	if err != nil {
 		return false, err
@@ -45,7 +52,11 @@ func (conn *Connection) ReadProcessInputBit(byteOffset uint32, bitIndex uint8) (
 }
 
 // WriteProcessOutputBit writes a single bit to the output process image.
+// bitIndex must be 0-7 (bit within a single byte).
 func (conn *Connection) WriteProcessOutputBit(byteOffset uint32, bitIndex uint8, value bool) error {
+	if bitIndex > 7 {
+		return fmt.Errorf("bitIndex must be 0-7, got %d", bitIndex)
+	}
 	v := byte(0)
 	if value {
 		v = 1

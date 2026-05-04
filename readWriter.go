@@ -485,16 +485,24 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 
 // ReadBit extracts a single bit from a byte slice.
 // bitIndex 0 is the least significant bit of the first byte.
+// Returns false if bitIndex is out of range.
 func ReadBit(data []byte, bitIndex int) bool {
 	byteIdx := bitIndex / 8
+	if bitIndex < 0 || byteIdx >= len(data) {
+		return false
+	}
 	bitIdx := bitIndex % 8
 	return data[byteIdx]&(1<<uint(bitIdx)) != 0
 }
 
 // WriteBit sets or clears a single bit in a byte slice.
 // bitIndex 0 is the least significant bit of the first byte.
+// Does nothing if bitIndex is out of range.
 func WriteBit(data []byte, bitIndex int, value bool) {
 	byteIdx := bitIndex / 8
+	if bitIndex < 0 || byteIdx >= len(data) {
+		return
+	}
 	bitIdx := bitIndex % 8
 	if value {
 		data[byteIdx] |= 1 << uint(bitIdx)

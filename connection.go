@@ -53,7 +53,6 @@ type Connection struct {
 	symbolVersion uint8
 
 	// Reconnection settings
-	reconnectInterval    time.Duration
 	maxReconnectAttempts int // 0 = infinite
 	backoffConfig        BackoffConfig
 	isLocal              bool
@@ -106,9 +105,9 @@ type Connection struct {
 	chanMu sync.RWMutex // protects sendChannel and systemResponse against concurrent access during reconnect
 
 	// Route registration config (set via WithRoute, used in Connect and reconnect)
-	routeName         string
-	routeUsername     string
-	routePassword     string
+	routeName     string
+	routeUsername string
+	routePassword string
 
 	logger *slog.Logger
 }
@@ -116,6 +115,10 @@ type Connection struct {
 // NewConnection creates a new ADS connection. requestTimeout is the timeout for individual ADS requests.
 // If requestTimeout is 0, a default of 5000ms is used.
 // If localPort is 0, a default of 10500 is used (arbitrary AMS source port for protocol headers).
+//
+// Note: The ctx parameter is currently unused. The connection manages its own lifecycle
+// context internally so that Close() can send cleanup commands regardless of the caller's
+// context state. Use conn.Close() to shut down the connection.
 func NewConnection(ctx context.Context, ip string, port int, netid string, amsPort int, localNetID string, localPort int, requestTimeout time.Duration, opts ...ConnectionOption) (conn *Connection, err error) {
 	if requestTimeout <= 0 {
 		requestTimeout = 5000 * time.Millisecond
@@ -124,7 +127,6 @@ func NewConnection(ctx context.Context, ip string, port int, netid string, amsPo
 		ip:                   ip,
 		port:                 port,
 		RequestTimeout:       requestTimeout,
-		reconnectInterval:    5 * time.Second,
 		maxReconnectAttempts: 0, // 0 = infinite retries
 		backoffConfig:        DefaultBackoffConfig(),
 		autoReconnect:        true,
@@ -575,7 +577,9 @@ func (conn *Connection) Reconnect() error {
 	conn.symbolLock.Unlock()
 	conn.sumReadCmd.Store(0)
 	conn.sumWriteChecked.Store(false)
+	conn.sumWriteSupported.Store(false)
 	conn.sumNotifChecked.Store(false)
+	conn.sumNotifSupported.Store(false)
 	conn.chunkedDownloadChecked.Store(false)
 
 	var lastErr error

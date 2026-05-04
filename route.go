@@ -43,7 +43,7 @@ func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetId
 		"localNetId", fmt.Sprintf("%d.%d.%d.%d.%d.%d", localNetId[0], localNetId[1], localNetId[2], localNetId[3], localNetId[4], localNetId[5]),
 		"computerName", computerName,
 		"routeName", routeName,
-		"username", username)
+		"hasAuth", username != "")
 	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", remoteHost, routePort))
 	if err != nil {
 		return fmt.Errorf("failed to resolve remote host: %w", err)

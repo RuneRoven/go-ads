@@ -105,6 +105,10 @@ func (conn *Connection) sumReadExec(group Group, count uint32, readLen uint32, w
 
 // parseSumReadResponse parses the [N × (error, length)][data] response format
 // shared by both SumReadEx (0xF083) and SumReadEx2 (0xF084).
+//
+// Note: The official Beckhoff PDF shows 0xF083 with a separate error array (like 0xF080),
+// but empirical testing on both TwinCAT 2 and TwinCAT 3 confirms 0xF083 returns the
+// interleaved format identical to 0xF084. See PROTOCOL.md for details.
 func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumReadRequest) ([]SumReadResult, error) {
 	if len(resp) < n*8 {
 		return nil, fmt.Errorf("SumRead response too short: got %d bytes, expected at least %d", len(resp), n*8)

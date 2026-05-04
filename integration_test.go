@@ -1739,14 +1739,16 @@ done:
 		t.Errorf("expected periodic notifications from downgraded cycle mode, got %d", count)
 	}
 
-	// Cleanup
+	// Cleanup: copy handles first to avoid mutating map during iteration
 	conn.symbolLock.Lock()
+	handles := make([]uint32, 0, len(conn.activeNotifications))
 	for h := range conn.activeNotifications {
-		conn.symbolLock.Unlock()
-		_ = conn.DeleteDeviceNotification(h)
-		conn.symbolLock.Lock()
+		handles = append(handles, h)
 	}
 	conn.symbolLock.Unlock()
+	for _, h := range handles {
+		_ = conn.DeleteDeviceNotification(h)
+	}
 }
 
 // ============================================================
@@ -3189,6 +3191,9 @@ func TestIntegrationReadProcessInputBit(t *testing.T) {
 	// Read bit 0 of first input byte
 	val, err := conn.ReadProcessInputBit(0, 0)
 	if err != nil {
+		if strings.Contains(err.Error(), "service not supported") {
+			t.Skip("PLC has no physical I/O configured (process image unavailable)")
+		}
 		t.Fatalf("ReadProcessInputBit failed: %v", err)
 	}
 	t.Logf("input bit 0.0 = %v", val)

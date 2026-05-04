@@ -335,6 +335,10 @@ func (conn *Connection) GetHandleByName(symbolName string) (handle uint32, err e
 }
 
 func (conn *Connection) WriteToSymbol(symbolName string, value string) error {
+	return conn.writeToSymbolRetry(symbolName, value, 1)
+}
+
+func (conn *Connection) writeToSymbolRetry(symbolName string, value string, retriesLeft int) error {
 	gen := conn.reconnectGeneration.Load()
 
 	symbol, err := conn.GetSymbol(symbolName)
@@ -356,9 +360,9 @@ func (conn *Connection) WriteToSymbol(symbolName string, value string) error {
 	// Network I/O without lock
 	err = conn.Write(uint32(GroupSymbolValueByHandle), handle, data)
 	if err != nil {
-		// If a reconnect happened during our operation, retry with fresh handles
-		if conn.reconnectGeneration.Load() != gen {
-			return conn.WriteToSymbol(symbolName, value)
+		// If a reconnect happened during our operation, retry once with fresh handles
+		if retriesLeft > 0 && conn.reconnectGeneration.Load() != gen {
+			return conn.writeToSymbolRetry(symbolName, value, retriesLeft-1)
 		}
 		return fmt.Errorf("write to %q: %w", symbolName, err)
 	}
@@ -376,6 +380,10 @@ func (conn *Connection) WriteToSymbol(symbolName string, value string) error {
 }
 
 func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
+	return conn.readFromSymbolRetry(symbolName, 1)
+}
+
+func (conn *Connection) readFromSymbolRetry(symbolName string, retriesLeft int) (string, error) {
 	gen := conn.reconnectGeneration.Load()
 
 	symbol, err := conn.GetSymbol(symbolName)
@@ -399,9 +407,9 @@ func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
 	// Network I/O without lock
 	data, err := conn.Read(uint32(GroupSymbolValueByHandle), handle, length)
 	if err != nil {
-		// If a reconnect happened during our operation, retry with fresh handles
-		if conn.reconnectGeneration.Load() != gen {
-			return conn.ReadFromSymbol(symbolName)
+		// If a reconnect happened during our operation, retry once with fresh handles
+		if retriesLeft > 0 && conn.reconnectGeneration.Load() != gen {
+			return conn.readFromSymbolRetry(symbolName, retriesLeft-1)
 		}
 		return "", fmt.Errorf("read %q: %w", symbolName, err)
 	}
@@ -650,12 +658,18 @@ func symbolSumAddress(sym *Symbol) (group, offset uint32) {
 		}
 		return sym.Group, absOffset
 	}
+	// Handle and Group both zero — shouldn't happen in normal operation.
+	// Return handle-based addressing; PLC will return an error for handle 0.
 	return uint32(GroupSymbolValueByHandle), sym.Handle
 }
 
 // ReadMultipleSymbols reads multiple symbols in a single ADS round-trip using SumRead.
 // Returns a map of symbol name to parsed string value.
 func (conn *Connection) ReadMultipleSymbols(names []string) (map[string]string, error) {
+	return conn.readMultipleSymbolsRetry(names, 1)
+}
+
+func (conn *Connection) readMultipleSymbolsRetry(names []string, retriesLeft int) (map[string]string, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
@@ -687,9 +701,9 @@ func (conn *Connection) ReadMultipleSymbols(names []string) (map[string]string, 
 
 	results, err := conn.SumRead(requests)
 	if err != nil {
-		// If a reconnect happened during our operation, retry with fresh handles
-		if conn.reconnectGeneration.Load() != gen {
-			return conn.ReadMultipleSymbols(names)
+		// If a reconnect happened during our operation, retry once with fresh handles
+		if retriesLeft > 0 && conn.reconnectGeneration.Load() != gen {
+			return conn.readMultipleSymbolsRetry(names, retriesLeft-1)
 		}
 		return nil, fmt.Errorf("batch read failed: %w", err)
 	}
@@ -724,6 +738,10 @@ func (conn *Connection) ReadMultipleSymbols(names []string) (map[string]string, 
 // Uses direct iGroup/iOffs addressing when available (after LoadSymbols),
 // falling back to handle-based addressing for on-demand symbols.
 func (conn *Connection) WriteMultipleSymbols(values map[string]string) (map[string]ReturnCode, error) {
+	return conn.writeMultipleSymbolsRetry(values, 1)
+}
+
+func (conn *Connection) writeMultipleSymbolsRetry(values map[string]string, retriesLeft int) (map[string]ReturnCode, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}
@@ -768,9 +786,9 @@ func (conn *Connection) WriteMultipleSymbols(values map[string]string) (map[stri
 
 	results, err := conn.SumWrite(requests)
 	if err != nil {
-		// If a reconnect happened during our operation, retry with fresh handles
-		if conn.reconnectGeneration.Load() != gen {
-			return conn.WriteMultipleSymbols(values)
+		// If a reconnect happened during our operation, retry once with fresh handles
+		if retriesLeft > 0 && conn.reconnectGeneration.Load() != gen {
+			return conn.writeMultipleSymbolsRetry(values, retriesLeft-1)
 		}
 		return nil, fmt.Errorf("batch write failed: %w", err)
 	}
