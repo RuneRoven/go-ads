@@ -229,8 +229,19 @@ func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 				return nil, err
 			}
 			conn.symbolLock.Lock()
-			localSymbol.Handle = handle
-			conn.symbolLock.Unlock()
+			if localSymbol.Handle != 0 {
+				// Another goroutine set the handle while we were waiting — release ours.
+				conn.symbolLock.Unlock()
+				handleBytes := make([]byte, 4)
+				binary.LittleEndian.PutUint32(handleBytes, handle)
+				if err := conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+					conn.logger.Warn("failed to release duplicate symbol handle",
+						"symbol", symbolName, "handle", handle, "error", err)
+				}
+			} else {
+				localSymbol.Handle = handle
+				conn.symbolLock.Unlock()
+			}
 		}
 		conn.logger.Log(context.Background(), LevelTrace, "symbol got", "symbol", localSymbol)
 		return localSymbol, nil

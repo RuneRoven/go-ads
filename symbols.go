@@ -390,11 +390,21 @@ var stringsList = map[string]struct{}{"STRING": {}, "TIME": {}, "TOD": {}, "TIME
 func (symbol *Symbol) parseSymbol(onlyChanged bool) (rData interface{}) {
 	if len(symbol.Children) == 0 {
 		if symbol.DataType == "BOOL" {
-			rData, _ = strconv.ParseBool(symbol.Value)
+			v, err := strconv.ParseBool(symbol.Value)
+			if err != nil {
+				getDefaultLogger().Warn("parseSymbol: invalid BOOL value, defaulting to false",
+					"symbol", symbol.Name, "value", symbol.Value, "error", err)
+			}
+			rData = v
 		} else if _, ok := stringsList[symbol.DataType]; ok {
 			rData = symbol.Value
 		} else {
-			rData, _ = strconv.ParseFloat(symbol.Value, 64)
+			v, err := strconv.ParseFloat(symbol.Value, 64)
+			if err != nil {
+				getDefaultLogger().Warn("parseSymbol: invalid numeric value, defaulting to 0",
+					"symbol", symbol.Name, "dataType", symbol.DataType, "value", symbol.Value, "error", err)
+			}
+			rData = v
 		}
 	} else {
 		localMap := make(map[string]interface{})

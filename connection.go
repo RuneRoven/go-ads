@@ -247,6 +247,7 @@ func (conn *Connection) Connect(local bool) error {
 	if local {
 		resp, err := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 		if err != nil {
+			conn.cleanupAfterFailedConnect()
 			return fmt.Errorf("local mode handshake failed: %w", err)
 		}
 		buf := bytes.NewBuffer(resp)
@@ -254,6 +255,7 @@ func (conn *Connection) Connect(local bool) error {
 		conn.logger.Log(context.Background(), LevelTrace, "got stuff", "stuff", buf.Bytes())
 		err = binary.Read(buf, binary.LittleEndian, &result)
 		if err != nil {
+			conn.cleanupAfterFailedConnect()
 			return fmt.Errorf("local mode binary read failed: %w", err)
 		}
 		conn.logger.Info("local mode handshake result", "result", result)
@@ -477,7 +479,10 @@ func (conn *Connection) triggerReconnect() {
 	if conn.closed.Load() {
 		return
 	}
-	conn.disconnected.Store(true)
+	// CAS ensures only the first goroutine to detect disconnect fires the callback
+	// and sets up reconnection. Subsequent callers (e.g. both listen() and transmitWorker()
+	// detecting the same TCP failure) skip the callback to avoid double-firing.
+	firstDetector := conn.disconnected.CompareAndSwap(false, true)
 	conn.reconnectMu.Lock()
 	if conn.reconnectDone == nil {
 		conn.reconnectDone = make(chan struct{})
@@ -486,7 +491,7 @@ func (conn *Connection) triggerReconnect() {
 
 	// Fire disconnect callback in goroutine (must not block).
 	// Callback must not call Connection methods — connection may be closing.
-	if conn.onDisconnect != nil && !conn.closed.Load() {
+	if firstDetector && conn.onDisconnect != nil && !conn.closed.Load() {
 		go conn.onDisconnect()
 	}
 
@@ -602,7 +607,12 @@ func (conn *Connection) Reconnect() error {
 		// Enable aggressive TCP keepalive to detect dead connections quickly
 		configureKeepAlive(newConn)
 
-		// Clear disconnected flag so sendRequest works during symbol load
+		// Clear disconnected flag so sendRequest works during symbol reload,
+		// route registration, and notification re-subscribe (all use sendRequest internally).
+		// Known: new external callers arriving here can also send requests before
+		// symbols/notifications are fully restored. This is acceptable because
+		// ReadFromSymbol/WriteToSymbol retry with handle re-resolution on ADS errors.
+		// Callers already waiting on reconnectDone remain blocked until Reconnect's defer.
 		conn.disconnected.Store(false)
 
 		// Re-start goroutines
@@ -837,6 +847,26 @@ func (conn *Connection) reloadSymbols() error {
 	}
 
 	return nil
+}
+
+// cleanupAfterFailedConnect tears down goroutines, closes TCP, and resets
+// channels/context so the connection can be retried via Connect().
+// Used during initial Connect() when the handshake or route registration fails
+// after goroutines have already been started.
+func (conn *Connection) cleanupAfterFailedConnect() {
+	conn.shutdown()
+	conn.connMu.Lock()
+	if conn.connection != nil {
+		conn.connection.Close()
+	}
+	conn.connMu.Unlock()
+	conn.waitGroup.Wait()
+	conn.ctx, conn.shutdown = context.WithCancel(context.Background())
+	conn.sendChannel = make(chan []byte)
+	conn.systemResponse = make(chan []byte)
+	conn.activeRequestLock.Lock()
+	conn.activeRequests = map[uint32]chan []byte{}
+	conn.activeRequestLock.Unlock()
 }
 
 // resetForRetry tears down goroutines, closes the TCP connection, and resets
