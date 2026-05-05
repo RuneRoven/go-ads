@@ -830,8 +830,9 @@ func (conn *Connection) localHandshake() error {
 
 // resubscribeNotifications restores notification subscriptions stored in
 // notificationConfigs after a successful reconnect. Filters out symbols that
-// no longer exist after symbol reload. On error, restores the saved configs
-// so they can be retried by the next reconnect attempt.
+// no longer exist after symbol reload. On error, rolls back partial PLC-side
+// successes (F-12) and restores the saved configs so they can be retried by
+// the next reconnect attempt.
 func (conn *Connection) resubscribeNotifications() error {
 	conn.symbolLock.Lock()
 	savedConfigs := conn.notificationConfigs
@@ -850,12 +851,40 @@ func (conn *Connection) resubscribeNotifications() error {
 		conn.symbolLock.Unlock()
 		return nil
 	}
-	if err := conn.AddSymbolNotifications(validConfigs, savedChannel); err != nil {
-		// Restore configs so they can be retried by the next reconnect attempt.
+	// Snapshot active handles before the re-subscribe attempt. If
+	// AddSymbolNotifications partially succeeds and then errors, we use the
+	// snapshot diff to roll back the PLC-side registrations created during
+	// this attempt (F-12). Without rollback, repeated reconnect retries
+	// accumulate orphaned PLC notifications until the next TCP disconnect.
+	conn.symbolLock.Lock()
+	preHandles := make(map[uint32]struct{}, len(conn.activeNotifications))
+	for h := range conn.activeNotifications {
+		preHandles[h] = struct{}{}
+	}
+	conn.symbolLock.Unlock()
+
+	err := conn.AddSymbolNotifications(validConfigs, savedChannel)
+	if err != nil {
+		// Identify handles created during THIS attempt and best-effort delete.
 		conn.symbolLock.Lock()
+		var newHandles []uint32
+		for h := range conn.activeNotifications {
+			if _, existed := preHandles[h]; !existed {
+				newHandles = append(newHandles, h)
+				// Drop client-side bookkeeping for the rollback handles.
+				delete(conn.activeNotifications, h)
+			}
+		}
+		// Restore configs so they can be retried by the next reconnect attempt.
 		conn.notificationConfigs = savedConfigs
 		conn.notificationChannel = savedChannel
 		conn.symbolLock.Unlock()
+		if len(newHandles) > 0 {
+			deleted := conn.bestEffortDeleteNotifications(newHandles)
+			conn.logger.Warn("resubscribe rollback: deleted partial-success handles",
+				"new_handles", len(newHandles),
+				"deleted", deleted)
+		}
 		return err
 	}
 	return nil

@@ -163,6 +163,37 @@ func (conn *Connection) sumAddNotificationFallback(requests []SumNotificationReq
 	return handles, errors, nil
 }
 
+// bestEffortDeleteNotifications attempts to delete the given handles via
+// SumDeleteDeviceNotification. Errors are logged but never returned — this is
+// for cleanup paths where the caller cannot meaningfully react to a failure
+// (e.g. PLC unreachable during a reconnect retry). Returns the count of
+// successfully deleted handles for logging. Treats ReturnCodeDeviceNotifyHandleInvalid
+// as success-equivalent (handle already gone PLC-side).
+func (conn *Connection) bestEffortDeleteNotifications(handles []uint32) int {
+	if len(handles) == 0 {
+		return 0
+	}
+	errors, err := conn.SumDeleteDeviceNotification(handles)
+	if err != nil {
+		conn.logger.Warn("bestEffortDelete: SumDeleteDeviceNotification failed",
+			"error", err,
+			"handles", len(handles))
+		return 0
+	}
+	deleted := 0
+	for _, e := range errors {
+		if e == ReturnCodeNoErrors || e == ReturnCodeDeviceNotifyHandleInvalid {
+			deleted++
+		}
+	}
+	if deleted < len(handles) {
+		conn.logger.Warn("bestEffortDelete: some handles not cleaned up",
+			"deleted", deleted,
+			"requested", len(handles))
+	}
+	return deleted
+}
+
 // sumDeleteNotificationFallback deletes notifications individually when sum commands are not supported.
 func (conn *Connection) sumDeleteNotificationFallback(handles []uint32) ([]ReturnCode, error) {
 	errors := make([]ReturnCode, len(handles))
