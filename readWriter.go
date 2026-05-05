@@ -324,17 +324,29 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 	dt := symbol.DataType
 
 	if !slices.Contains(parseableTypes, dt) {
-		if datatypes == nil {
-			return nil, fmt.Errorf("cannot write to symbol with aliased type %q without full symbol discovery; call LoadSymbols() first", symbol.DataType)
+		// Try datatype-table lookup first. If that fails or yields a non-parseable
+		// type, fall back to size-based inference (F-18) — mirrors the read path
+		// at parse() so unknown types can round-trip via writeToSymbol.
+		if datatypes != nil {
+			if dtEntry, ok := datatypes[dt]; ok {
+				if slices.Contains(parseableTypes, dtEntry.DataType) {
+					dt = dtEntry.DataType
+				}
+			}
 		}
-		dtEntry, ok := datatypes[dt]
-		if !ok {
-			return nil, fmt.Errorf("datatype %q not found in datatype table", dt)
-		}
-		if slices.Contains(parseableTypes, dtEntry.DataType) {
-			dt = dtEntry.DataType
-		} else {
-			return nil, fmt.Errorf("data type not parseable: %s", dtEntry.DataType)
+		// If still not parseable after table lookup, infer from byte size.
+		// Inference always returns a signed integer type; this may misinterpret
+		// unsigned enums or floats. The read path emits the same Warn log.
+		if !slices.Contains(parseableTypes, dt) {
+			if inferred := inferBaseType(symbol.Length); inferred != "" {
+				getDefaultLogger().Warn("inferring base type from size for write (may be wrong for unsigned/float types)",
+					"symbol", symbol.DataType,
+					"size", symbol.Length,
+					"inferred", inferred)
+				dt = inferred
+			} else {
+				return nil, fmt.Errorf("data type %q not parseable and size %d not inferable (must be 1/2/4/8 bytes); call LoadSymbols() first or use a known type", symbol.DataType, symbol.Length)
+			}
 		}
 	}
 	switch dt {

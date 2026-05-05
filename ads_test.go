@@ -601,19 +601,22 @@ func TestWriteToNodeAliasResolution(t *testing.T) {
 	}
 }
 
+// Post-F-18: write falls back to inferBaseType for unknown types when size
+// matches a known integer width (1/2/4/8). To keep error-path coverage on
+// unknown types, use a non-inferable size (3) so the fallback also rejects.
 func TestWriteToNodeAliasWithoutDatatypes(t *testing.T) {
-	sym := &Symbol{DataType: "MyCustomType", Length: 4}
+	sym := &Symbol{DataType: "MyCustomType", Length: 3}
 	_, err := sym.writeToNode("42", 0, nil)
 	if err == nil {
-		t.Error("expected error for alias without datatypes")
+		t.Error("expected error for alias without datatypes (uninferable size)")
 	}
 }
 
 func TestWriteToNodeUnknownType(t *testing.T) {
-	sym := &Symbol{DataType: "UNKNOWN_XYZ", Length: 4}
+	sym := &Symbol{DataType: "UNKNOWN_XYZ", Length: 3}
 	_, err := sym.writeToNode("42", 0, map[string]SymbolUploadDataType{})
 	if err == nil {
-		t.Error("expected error for unknown type")
+		t.Error("expected error for unknown type (uninferable size)")
 	}
 }
 

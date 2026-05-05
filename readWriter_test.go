@@ -71,6 +71,44 @@ func TestWriteToNode_WSTRING_RejectsTooShort(t *testing.T) {
 	}
 }
 
+// F-18: write path must symmetrize with read — if read can fall back to
+// inferBaseType for unknown types, write must accept the same input and
+// round-trip it. Currently write errors on unknown types even when size
+// matches a known integer width.
+func TestWriteToNode_FallsBackToInferredType(t *testing.T) {
+	// Unknown type with size=4 — read would fall back to DINT.
+	sym := &Symbol{
+		Name:     "x",
+		DataType: "MyEnum32", // unknown user type
+		Length:   4,
+	}
+	got, err := sym.writeToNode("42", 0, nil)
+	if err != nil {
+		t.Fatalf("expected inference fallback to succeed, got error: %v", err)
+	}
+	if len(got) != 4 {
+		t.Errorf("expected 4 bytes, got %d", len(got))
+	}
+	// Little-endian 42 = 2A 00 00 00
+	if got[0] != 42 || got[1] != 0 || got[2] != 0 || got[3] != 0 {
+		t.Errorf("expected [2A 00 00 00], got %v", got)
+	}
+}
+
+// F-18: write must still error for sizes that don't match a known integer
+// width (no inference possible).
+func TestWriteToNode_RejectsUnknownTypeWithUninferableSize(t *testing.T) {
+	sym := &Symbol{
+		Name:     "x",
+		DataType: "MyWeirdType",
+		Length:   3, // not 1/2/4/8
+	}
+	_, err := sym.writeToNode("42", 0, nil)
+	if err == nil {
+		t.Fatalf("expected error for size=3 unknown type, got nil")
+	}
+}
+
 // Happy path: STRING with Length=10 truncates "hello world" to fit.
 func TestWriteToNode_STRING_HappyPath(t *testing.T) {
 	sym := &Symbol{
