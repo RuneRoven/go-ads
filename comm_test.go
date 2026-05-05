@@ -1,14 +1,121 @@
 package ads
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
+
+// buildAmsTCPHeader builds the 6-byte amsTCPHeader: 1-byte Reserved + 1-byte System + 4-byte Length (LE).
+func buildAmsTCPHeader(system uint8, length uint32) []byte {
+	b := make([]byte, 6)
+	b[0] = 0
+	b[1] = system
+	binary.LittleEndian.PutUint32(b[2:], length)
+	return b
+}
+
+// TestListen_TwoSequentialPackets verifies that listen() correctly frames
+// amsTCPHeader + body across multiple sequential packets. Uses net.Pipe to
+// simulate the TCP connection.
+func TestListen_TwoSequentialPackets(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	conn := &Connection{
+		connection:     client,
+		logger:         getDefaultLogger(),
+		systemResponse: make(chan []byte, 2),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	conn.ctx = ctx
+	conn.shutdown = cancel
+	conn.waitGroup.Add(1)
+
+	var listenDone sync.WaitGroup
+	listenDone.Add(1)
+	go func() {
+		defer listenDone.Done()
+		conn.listen()
+	}()
+
+	body1 := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+	hdr1 := buildAmsTCPHeader(1, uint32(len(body1)))
+	if _, err := server.Write(append(hdr1, body1...)); err != nil {
+		t.Fatalf("write packet 1: %v", err)
+	}
+
+	body2 := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+	hdr2 := buildAmsTCPHeader(1, uint32(len(body2)))
+	if _, err := server.Write(append(hdr2, body2...)); err != nil {
+		t.Fatalf("write packet 2: %v", err)
+	}
+
+	got1 := <-conn.systemResponse
+	if !bytes.Equal(got1, body1) {
+		t.Errorf("packet 1: got %v, want %v", got1, body1)
+	}
+	got2 := <-conn.systemResponse
+	if !bytes.Equal(got2, body2) {
+		t.Errorf("packet 2: got %v, want %v", got2, body2)
+	}
+
+	cancel()
+	server.Close()
+	listenDone.Wait()
+}
+
+// TestListen_OversizePacketTriggersReconnect verifies that an over-large header.Length
+// is rejected and listen() exits without panic or infinite loop. triggerReconnect's
+// internals are not exercised — we only verify the goroutine returns.
+func TestListen_OversizePacketTriggersReconnect(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	conn := &Connection{
+		connection:     client,
+		logger:         getDefaultLogger(),
+		systemResponse: make(chan []byte, 1),
+		closedCh:       make(chan struct{}),
+		reconnectDone:  nil,
+	}
+	conn.closed.Store(true) // suppress reconnect goroutine launch
+	ctx, cancel := context.WithCancel(context.Background())
+	conn.ctx = ctx
+	conn.shutdown = cancel
+	conn.waitGroup.Add(1)
+
+	var listenDone sync.WaitGroup
+	listenDone.Add(1)
+	go func() {
+		defer listenDone.Done()
+		conn.listen()
+	}()
+
+	hdr := buildAmsTCPHeader(1, 8*1024*1024) // 8 MB exceeds 4 MB cap
+	_, _ = server.Write(hdr)
+
+	done := make(chan struct{})
+	go func() {
+		listenDone.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Errorf("listen() did not return after oversized header")
+	}
+}
 
 // Verify sendRequestOnce ctxDone branch returns context.Canceled (not ErrDisconnected),
 // so the outer sendRequest retry loop re-engages.

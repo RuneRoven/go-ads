@@ -210,66 +210,68 @@ func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (respons
 func (conn *Connection) listen() {
 	defer conn.waitGroup.Done()
 	reader := bufio.NewReader(conn.connection)
-	buff := bytes.Buffer{}
+	const maxAMSPacket = 4 * 1024 * 1024 // 4 MB sanity limit
+	var hdrBytes [6]byte
 	for {
-		tcpHeader := amsTCPHeader{}
-		data := make([]byte, 6)
 		select {
 		case <-conn.ctx.Done():
 			conn.logger.Info("exit listen")
 			return
 		default:
-			_, err := io.ReadFull(reader, data)
-			if err != nil {
-				select {
-				case <-conn.ctx.Done():
-					// Shutdown was requested, don't reconnect
-					return
-				default:
-				}
-				// EOF or connection reset often means PLC has no AMS route for our NetID
-				hint := ""
-				if isRouteHintErr(err) {
-					hint = "PLC may not have an AMS route for this NetID — check route credentials or register route via WithRoute()"
-				}
-				if hint != "" {
-					conn.logger.Error("PLC closed connection, triggering reconnect", "error", err, "hint", hint,
-						"sourceNetID", fmt.Sprintf("%d.%d.%d.%d.%d.%d", conn.source.NetID[0], conn.source.NetID[1], conn.source.NetID[2], conn.source.NetID[3], conn.source.NetID[4], conn.source.NetID[5]))
-				} else {
-					conn.logger.Error("listen read error, triggering reconnect", "error", err)
-				}
-				conn.triggerReconnect()
+		}
+		// Read the 6-byte amsTCPHeader.
+		if _, err := io.ReadFull(reader, hdrBytes[:]); err != nil {
+			select {
+			case <-conn.ctx.Done():
 				return
+			default:
 			}
+			hint := ""
+			if isRouteHintErr(err) {
+				hint = "PLC may not have an AMS route for this NetID — check route credentials or register route via WithRoute()"
+			}
+			if hint != "" {
+				conn.logger.Error("PLC closed connection, triggering reconnect", "error", err, "hint", hint,
+					"sourceNetID", fmt.Sprintf("%d.%d.%d.%d.%d.%d", conn.source.NetID[0], conn.source.NetID[1], conn.source.NetID[2], conn.source.NetID[3], conn.source.NetID[4], conn.source.NetID[5]))
+			} else {
+				conn.logger.Error("listen read error, triggering reconnect", "error", err)
+			}
+			conn.triggerReconnect()
+			return
 		}
-		buff.Write(data)
-		err := binary.Read(&buff, binary.LittleEndian, &tcpHeader)
-		if err != nil {
-			conn.logger.Error("error during header read", "error", err)
-			continue
+		// Parse header from stack-allocated bytes — no persistent buffer
+		// across iterations. amsTCPHeader is exactly 6 bytes (uint8 + uint8 + uint32);
+		// any future struct change would surface here as a binary.Read error
+		// rather than silently corrupting framing.
+		var tcpHeader amsTCPHeader
+		if err := binary.Read(bytes.NewReader(hdrBytes[:]), binary.LittleEndian, &tcpHeader); err != nil {
+			// Should never happen for a fixed 6-byte input — treat as hard
+			// protocol error and reconnect.
+			conn.logger.Error("listen header decode error, triggering reconnect", "error", err)
+			conn.triggerReconnect()
+			return
 		}
-		const maxAMSPacket = 4 * 1024 * 1024 // 4 MB sanity limit
 		if tcpHeader.Length > maxAMSPacket {
 			conn.logger.Error("AMS packet length exceeds sanity limit, triggering reconnect", "length", tcpHeader.Length)
 			conn.triggerReconnect()
 			return
 		}
-		data = make([]byte, tcpHeader.Length)
+		// Read the body.
+		data := make([]byte, tcpHeader.Length)
 		select {
 		case <-conn.ctx.Done():
 			return
 		default:
-			_, err := io.ReadFull(reader, data)
-			if err != nil {
-				select {
-				case <-conn.ctx.Done():
-					return
-				default:
-				}
-				conn.logger.Error("listen body read error, triggering reconnect", "error", err)
-				conn.triggerReconnect()
+		}
+		if _, err := io.ReadFull(reader, data); err != nil {
+			select {
+			case <-conn.ctx.Done():
 				return
+			default:
 			}
+			conn.logger.Error("listen body read error, triggering reconnect", "error", err)
+			conn.triggerReconnect()
+			return
 		}
 		if tcpHeader.System > 0 {
 			select {
