@@ -128,8 +128,11 @@ func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumR
 
 	dataOffset := n * 8
 	for i := 0; i < n; i++ {
-		end := dataOffset + int(lengths[i])
-		if end > len(resp) {
+		// Compare in uint32 space first to avoid int wrap on 32-bit Go (F-09).
+		// On 32-bit, int(uint32(0xFFFFFFFE)) = -2, so dataOffset + that wraps
+		// below len(resp) and the guard misfires; allocations after that panic.
+		remaining := uint32(len(resp) - dataOffset)
+		if lengths[i] > remaining {
 			// Data section is position-dependent: each item's offset depends on
 			// the cumulative lengths of all preceding items. Once one item is
 			// truncated, all subsequent offsets are wrong and unrecoverable.
@@ -138,6 +141,7 @@ func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumR
 			}
 			break
 		}
+		end := dataOffset + int(lengths[i])
 		results[i].Data = make([]byte, lengths[i])
 		copy(results[i].Data, resp[dataOffset:end])
 		dataOffset = end
