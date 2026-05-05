@@ -400,7 +400,16 @@ func (conn *Connection) Close() {
 
 		// Release handles individually — ADS has no batch release command,
 		// and Close() is not performance-critical.
-		for _, h := range symHandles {
+		// F-26: re-check disconnected each iteration so a mid-loop PLC failure
+		// (listen detects EOF → triggerReconnect → disconnected=true) doesn't
+		// force every remaining Write to time out. Bail out early.
+		for i, h := range symHandles {
+			if conn.disconnected.Load() {
+				conn.logger.Info("close: disconnected during handle release, stopping cleanup",
+					"released", i,
+					"remaining", len(symHandles)-i)
+				break
+			}
 			handleBytes := make([]byte, 4)
 			binary.LittleEndian.PutUint32(handleBytes, h)
 			if err := conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
