@@ -919,6 +919,20 @@ func configureKeepAlive(c net.Conn) {
 	}
 }
 
+// zeroOldSymbolHandles iterates the given map and sets Handle=0 on each
+// *Symbol value. Used by loadSymbols before replacing conn.symbols so that
+// callers holding pointers to the OLD map's *Symbol values fail fast on
+// next use (Handle=0 triggers on-demand re-resolution via GetSymbol) rather
+// than racing against a PLC that may have reused the old handle for a
+// different symbol after reconnect (F-20). Nil-safe.
+func zeroOldSymbolHandles(m map[string]*Symbol) {
+	for _, s := range m {
+		if s != nil {
+			s.Handle = 0
+		}
+	}
+}
+
 // loadSymbols loads symbol table and datatypes from the PLC, and saves the symbol version.
 func (conn *Connection) loadSymbols() error {
 	// Read and store symbol version
@@ -952,6 +966,12 @@ func (conn *Connection) loadSymbols() error {
 		return fmt.Errorf("failed to parse symbols: %w", err)
 	}
 	conn.symbolLock.Lock()
+	// F-20: invalidate Handle on every old *Symbol before swap so external
+	// callers holding old pointers (e.g. infos[i].symbol in
+	// readMultipleSymbolsRetry) fail fast on next use and re-resolve via
+	// GetSymbol instead of using a stale handle that the PLC may have
+	// reassigned to a different symbol after reconnect.
+	zeroOldSymbolHandles(conn.symbols)
 	conn.datatypes = datatypes
 	conn.symbols = symbols
 	conn.symbolLock.Unlock()
