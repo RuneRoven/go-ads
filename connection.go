@@ -986,19 +986,19 @@ func (conn *Connection) loadSymbols() error {
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
-	datatypesResponse, err := conn.GetUploadSymbolInfoDataTypes(res.DataTypeLength)
+	datatypesResponse, err := conn.getUploadSymbolInfoDataTypes(res.DataTypeLength)
 	if err != nil {
 		return fmt.Errorf("failed to upload datatypes: %w", err)
 	}
-	datatypes, err := ParseUploadSymbolInfoDataTypes(datatypesResponse)
+	datatypes, err := parseUploadSymbolInfoDataTypes(datatypesResponse)
 	if err != nil {
 		return fmt.Errorf("failed to parse datatypes: %w", err)
 	}
-	symbolsResponse, err := conn.GetUploadSymbolInfoSymbols(res.SymbolLength)
+	symbolsResponse, err := conn.getUploadSymbolInfoSymbols(res.SymbolLength)
 	if err != nil {
 		return fmt.Errorf("failed to upload symbols: %w", err)
 	}
-	symbols, err := ParseUploadSymbolInfoSymbols(symbolsResponse, datatypes)
+	symbols, err := parseUploadSymbolInfoSymbols(symbolsResponse, datatypes)
 	if err != nil {
 		return fmt.Errorf("failed to parse symbols: %w", err)
 	}

@@ -101,7 +101,7 @@ type Symbol struct {
 	Children map[string]*Symbol
 }
 
-func ParseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUploadDataType) (symbols map[string]*Symbol, err error) {
+func parseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUploadDataType) (symbols map[string]*Symbol, err error) {
 	symbols = map[string]*Symbol{}
 	buff := bytes.NewBuffer(data)
 
@@ -236,7 +236,7 @@ func isEnumDataType(dt *SymbolUploadDataType) bool {
 		slices.Contains(parseableTypes, dt.DataType)
 }
 
-func ParseUploadSymbolInfoDataTypes(data []byte) (datatypes map[string]SymbolUploadDataType, err error) {
+func parseUploadSymbolInfoDataTypes(data []byte) (datatypes map[string]SymbolUploadDataType, err error) {
 	buff := bytes.NewBuffer(data)
 	datatypes = make(map[string]SymbolUploadDataType)
 	for buff.Len() > 0 {

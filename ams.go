@@ -25,12 +25,8 @@ type amsHeader struct {
 	InvokeID  uint32
 }
 
-// StringToNetID converts a dotted notation NetID string (e.g. "192.168.1.1.1.1") to a 6-byte array.
+// stringToNetID converts a dotted notation NetID string (e.g. "192.168.1.1.1.1") to a 6-byte array.
 // Returns an error if the string is malformed (wrong number of parts or non-numeric values).
-func StringToNetID(source string) ([6]byte, error) {
-	return stringToNetID(source)
-}
-
 func stringToNetID(source string) (result [6]byte, err error) {
 	parts := strings.Split(source, ".")
 	if len(parts) != 6 {

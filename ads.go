@@ -107,12 +107,12 @@ func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download datatypes in one request
 		conn.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
-		datatypesData, err = conn.GetUploadSymbolInfoDataTypes(uploadInfo.DataTypeLength)
+		datatypesData, err = conn.getUploadSymbolInfoDataTypes(uploadInfo.DataTypeLength)
 		if err != nil {
 			return fmt.Errorf("failed to download datatypes: %w", err)
 		}
 	}
-	datatypes, err := ParseUploadSymbolInfoDataTypes(datatypesData)
+	datatypes, err := parseUploadSymbolInfoDataTypes(datatypesData)
 	if err != nil {
 		return fmt.Errorf("failed to parse datatypes: %w", err)
 	}
@@ -129,12 +129,12 @@ func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download symbols in one request
 		conn.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
-		symbolsData, err = conn.GetUploadSymbolInfoSymbols(uploadInfo.SymbolLength)
+		symbolsData, err = conn.getUploadSymbolInfoSymbols(uploadInfo.SymbolLength)
 		if err != nil {
 			return fmt.Errorf("failed to download symbols: %w", err)
 		}
 	}
-	symbols, err := ParseUploadSymbolInfoSymbols(symbolsData, datatypes)
+	symbols, err := parseUploadSymbolInfoSymbols(symbolsData, datatypes)
 	if err != nil {
 		return fmt.Errorf("failed to parse symbols: %w", err)
 	}
@@ -496,15 +496,15 @@ func (conn *Connection) GetSymbolUploadInfo() (uploadInfo SymbolUploadInfo, err 
 	return
 }
 
-func (conn *Connection) GetUploadSymbolInfoSymbols(length uint32) (data []byte, err error) {
+func (conn *Connection) getUploadSymbolInfoSymbols(length uint32) (data []byte, err error) {
 	res, err := conn.Read(uint32(GroupSymbolUpload), 0, length)
 	if err != nil {
-		return nil, fmt.Errorf("GetUploadSymbolInfoSymbols failed: %w", err)
+		return nil, fmt.Errorf("getUploadSymbolInfoSymbols failed: %w", err)
 	}
 	return res, nil
 }
 
-func (conn *Connection) GetUploadSymbolInfoDataTypes(length uint32) (data []byte, err error) {
+func (conn *Connection) getUploadSymbolInfoDataTypes(length uint32) (data []byte, err error) {
 	data, err = conn.Read(
 		uint32(GroupSymbolDataTypeUpload),
 		0x0,
@@ -997,14 +997,14 @@ func (conn *Connection) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download symbols in one request
 		conn.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
-		symbolsData, err = conn.GetUploadSymbolInfoSymbols(uploadInfo.SymbolLength)
+		symbolsData, err = conn.getUploadSymbolInfoSymbols(uploadInfo.SymbolLength)
 		if err != nil {
 			return fmt.Errorf("failed to download symbols: %w", err)
 		}
 	}
 
 	// Parse without datatypes — no child expansion
-	symbols, err := ParseUploadSymbolInfoSymbols(symbolsData, nil)
+	symbols, err := parseUploadSymbolInfoSymbols(symbolsData, nil)
 	if err != nil {
 		return fmt.Errorf("failed to parse symbols: %w", err)
 	}
@@ -1050,13 +1050,13 @@ func (conn *Connection) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download datatypes in one request
 		conn.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
-		datatypesData, err = conn.GetUploadSymbolInfoDataTypes(uploadInfo.DataTypeLength)
+		datatypesData, err = conn.getUploadSymbolInfoDataTypes(uploadInfo.DataTypeLength)
 		if err != nil {
 			return fmt.Errorf("failed to download datatypes: %w", err)
 		}
 	}
 
-	datatypes, err := ParseUploadSymbolInfoDataTypes(datatypesData)
+	datatypes, err := parseUploadSymbolInfoDataTypes(datatypesData)
 	if err != nil {
 		return fmt.Errorf("failed to parse datatypes: %w", err)
 	}

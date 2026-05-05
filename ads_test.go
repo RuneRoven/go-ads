@@ -15,7 +15,7 @@ import (
 	"unicode/utf16"
 )
 
-// --- stringToNetID / StringToNetID ---
+// --- stringToNetID / stringToNetID ---
 
 func TestStringToNetID(t *testing.T) {
 	tests := []struct {
@@ -31,12 +31,12 @@ func TestStringToNetID(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			result, err := StringToNetID(tt.input)
+			result, err := stringToNetID(tt.input)
 			if err != nil {
-				t.Fatalf("StringToNetID(%q) unexpected error: %v", tt.input, err)
+				t.Fatalf("stringToNetID(%q) unexpected error: %v", tt.input, err)
 			}
 			if result != tt.expected {
-				t.Errorf("StringToNetID(%q) = %v, want %v", tt.input, result, tt.expected)
+				t.Errorf("stringToNetID(%q) = %v, want %v", tt.input, result, tt.expected)
 			}
 		})
 	}
@@ -55,9 +55,9 @@ func TestStringToNetIDErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.desc, func(t *testing.T) {
-			_, err := StringToNetID(tt.input)
+			_, err := stringToNetID(tt.input)
 			if err == nil {
-				t.Errorf("StringToNetID(%q) expected error for %s, got nil", tt.input, tt.desc)
+				t.Errorf("stringToNetID(%q) expected error for %s, got nil", tt.input, tt.desc)
 			}
 		})
 	}
@@ -329,10 +329,10 @@ func TestAppendNull(t *testing.T) {
 	}
 }
 
-// --- ParseUploadSymbolInfoDataTypes ---
+// --- parseUploadSymbolInfoDataTypes ---
 
 func TestParseUploadSymbolInfoDataTypes_Empty(t *testing.T) {
-	datatypes, err := ParseUploadSymbolInfoDataTypes([]byte{})
+	datatypes, err := parseUploadSymbolInfoDataTypes([]byte{})
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -341,10 +341,10 @@ func TestParseUploadSymbolInfoDataTypes_Empty(t *testing.T) {
 	}
 }
 
-// --- ParseUploadSymbolInfoSymbols ---
+// --- parseUploadSymbolInfoSymbols ---
 
 func TestParseUploadSymbolInfoSymbols_Empty(t *testing.T) {
-	symbols, err := ParseUploadSymbolInfoSymbols([]byte{}, nil)
+	symbols, err := parseUploadSymbolInfoSymbols([]byte{}, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -1159,7 +1159,7 @@ func TestGetJSONOnlyChanged(t *testing.T) {
 	}
 }
 
-// --- ParseUploadSymbolInfoSymbols with real data ---
+// --- parseUploadSymbolInfoSymbols with real data ---
 
 func TestParseUploadSymbolInfoSymbols_SingleSymbol(t *testing.T) {
 	// Build a minimal symbol entry: header + name + null + type + null + comment + null
@@ -1203,7 +1203,7 @@ func TestParseUploadSymbolInfoSymbols_SingleSymbol(t *testing.T) {
 	buf = append(buf, comment...)
 	buf = append(buf, 0) // null terminator
 
-	symbols, err := ParseUploadSymbolInfoSymbols(buf, nil)
+	symbols, err := parseUploadSymbolInfoSymbols(buf, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1230,7 +1230,7 @@ func TestParseUploadSymbolInfoSymbols_SingleSymbol(t *testing.T) {
 
 func TestParseUploadSymbolInfoSymbols_TruncatedEntry(t *testing.T) {
 	// Only 10 bytes — not enough for a symbolEntry header
-	_, err := ParseUploadSymbolInfoSymbols([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, nil)
+	_, err := parseUploadSymbolInfoSymbols([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, nil)
 	if err == nil {
 		t.Error("expected error for truncated data")
 	}
