@@ -25,9 +25,10 @@ func (conn *Connection) ListSymbols() (map[string]*Symbol, error) {
 		return nil, fmt.Errorf("full symbol discovery has not been run; call LoadSymbols() or LoadSymbolsSlow() first")
 	}
 	// Return a shallow copy to prevent callers from mutating the internal map
+	// Return PLC-cased keys (from Symbol.FullName) for user-facing map
 	copy := make(map[string]*Symbol, len(conn.symbols))
-	for k, v := range conn.symbols {
-		copy[k] = v
+	for _, v := range conn.symbols {
+		copy[v.FullName] = v
 	}
 	return copy, nil
 }
@@ -216,7 +217,7 @@ func (conn *Connection) downloadInChunks(group uint32, totalLength uint32, chunk
 
 func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 	conn.symbolLock.Lock()
-	localSymbol, ok := conn.symbols[symbolName]
+	localSymbol, ok := conn.symbols[symbolKey(symbolName)]
 	needHandle := ok && localSymbol.Handle == 0
 	conn.symbolLock.Unlock()
 
@@ -261,7 +262,7 @@ func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 
 	conn.symbolLock.Lock()
 	// Check if another goroutine resolved this symbol while we were waiting
-	if existing, ok := conn.symbols[symbolName]; ok {
+	if existing, ok := conn.symbols[symbolKey(symbolName)]; ok {
 		conn.symbolLock.Unlock()
 		// Release the handle we just acquired since another goroutine beat us
 		handleBytes := make([]byte, 4)
@@ -272,8 +273,8 @@ func (conn *Connection) GetSymbol(symbolName string) (*Symbol, error) {
 		}
 		return existing, nil
 	}
-	conn.symbols[symbolName] = sym
-	conn.onDemandSymbols[symbolName] = true
+	conn.symbols[symbolKey(symbolName)] = sym
+	conn.onDemandSymbols[symbolKey(symbolName)] = true
 	conn.symbolLock.Unlock()
 
 	conn.logger.Info("symbol resolved on-demand",
@@ -330,7 +331,7 @@ func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) 
 
 	flags := SymbolFlag(entry.Flags)
 	sym := &Symbol{
-		FullName:          symbolName,
+		FullName:          string(name), // PLC-returned casing (authoritative)
 		Name:              string(name),
 		DataType:          dataType,
 		Comment:           string(comment),
@@ -917,7 +918,7 @@ func (conn *Connection) AddSymbolNotifications(configs []NotificationConfig, ch 
 // Must be called with symbolLock held.
 func (conn *Connection) removeNotificationConfig(symbolName string) {
 	for i, cfg := range conn.notificationConfigs {
-		if cfg.SymbolName == symbolName {
+		if strings.EqualFold(cfg.SymbolName, symbolName) {
 			conn.notificationConfigs = append(conn.notificationConfigs[:i], conn.notificationConfigs[i+1:]...)
 			return
 		}
@@ -1127,7 +1128,7 @@ func (conn *Connection) browseRoot() []SymbolBrowseEntry {
 		if !roots[root] {
 			roots[root] = true
 			// Check if the root itself is a symbol
-			if rootSym, ok := conn.symbols[root]; ok {
+			if rootSym, ok := conn.symbols[symbolKey(root)]; ok {
 				entries = append(entries, SymbolBrowseEntry{
 					Name:        rootSym.Name,
 					FullName:    rootSym.FullName,
@@ -1157,7 +1158,7 @@ func (conn *Connection) browseRoot() []SymbolBrowseEntry {
 // Must be called with symbolLock held.
 func (conn *Connection) browseChildren(path string) []SymbolBrowseEntry {
 	// First: check if the exact symbol exists and has Children
-	if sym, ok := conn.symbols[path]; ok && len(sym.Children) > 0 {
+	if sym, ok := conn.symbols[symbolKey(path)]; ok && len(sym.Children) > 0 {
 		entries := make([]SymbolBrowseEntry, 0, len(sym.Children))
 		for _, child := range sym.Children {
 			entries = append(entries, SymbolBrowseEntry{
@@ -1176,7 +1177,7 @@ func (conn *Connection) browseChildren(path string) []SymbolBrowseEntry {
 	}
 
 	// Fallback: scan for symbols with the prefix "path."
-	prefix := path + "."
+	prefix := symbolKey(path) + "."
 	seen := make(map[string]bool)
 	var entries []SymbolBrowseEntry
 
@@ -1201,7 +1202,7 @@ func (conn *Connection) browseChildren(path string) []SymbolBrowseEntry {
 		}
 		seen[childFullName] = true
 
-		if childSym, ok := conn.symbols[childFullName]; ok {
+		if childSym, ok := conn.symbols[symbolKey(childFullName)]; ok {
 			entries = append(entries, SymbolBrowseEntry{
 				Name:        childSym.Name,
 				FullName:    childSym.FullName,
@@ -1221,7 +1222,7 @@ func (conn *Connection) browseChildren(path string) []SymbolBrowseEntry {
 	}
 
 	// Also check for the exact symbol with no deeper children
-	if sym, ok := conn.symbols[path]; ok && len(entries) == 0 {
+	if sym, ok := conn.symbols[symbolKey(path)]; ok && len(entries) == 0 {
 		entries = append(entries, SymbolBrowseEntry{
 			Name:        sym.Name,
 			FullName:    sym.FullName,

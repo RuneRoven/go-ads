@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+// symbolKey normalizes a symbol name for use as an internal map key.
+// TwinCAT treats symbol names case-insensitively (IEC 61131-3).
+// TC2 returns uppercase, TC3 preserves original casing — lowercasing
+// ensures consistent lookups regardless of caller or PLC casing.
+func symbolKey(name string) string { return strings.ToLower(name) }
+
 type datatypeEntry struct {
 	EntryLength   uint32
 	Version       uint32
@@ -133,7 +139,7 @@ func ParseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUpload
 		endBuff := buff.Len()
 		symbol := addSymbol(item, datatypes)
 
-		symbols[item.Name] = symbol
+		symbols[symbolKey(item.Name)] = symbol
 		addChildren(symbol, symbols)
 
 		skip := int(item.SymbolEntry.EntryLength) - (begBuff - endBuff)
@@ -146,8 +152,8 @@ func ParseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUpload
 
 func addChildren(symbol *Symbol, symbols map[string]*Symbol) {
 	for _, child := range symbol.Children {
-		if _, ok := symbols[child.FullName]; !ok {
-			symbols[child.FullName] = child
+		if _, ok := symbols[symbolKey(child.FullName)]; !ok {
+			symbols[symbolKey(child.FullName)] = child
 			addChildren(child, symbols)
 		}
 	}

@@ -1207,9 +1207,12 @@ func TestParseUploadSymbolInfoSymbols_SingleSymbol(t *testing.T) {
 	if len(symbols) != 1 {
 		t.Fatalf("expected 1 symbol, got %d", len(symbols))
 	}
-	sym, ok := symbols["MAIN.test"]
+	sym, ok := symbols["main.test"] // internal keys are lowercased
 	if !ok {
-		t.Fatal("expected symbol 'MAIN.test'")
+		t.Fatal("expected symbol 'main.test'")
+	}
+	if sym.FullName != "MAIN.test" {
+		t.Errorf("FullName = %q, want %q (PLC original casing)", sym.FullName, "MAIN.test")
 	}
 	if sym.DataType != "INT" {
 		t.Errorf("DataType = %q, want %q", sym.DataType, "INT")

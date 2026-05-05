@@ -770,9 +770,9 @@ func (conn *Connection) filterValidNotificationConfigs(configs []NotificationCon
 
 	valid := make([]NotificationConfig, 0, len(configs))
 	for _, cfg := range configs {
-		if _, exists := conn.symbols[cfg.SymbolName]; exists {
+		if _, exists := conn.symbols[symbolKey(cfg.SymbolName)]; exists {
 			valid = append(valid, cfg)
-		} else if _, onDemand := conn.onDemandSymbols[cfg.SymbolName]; onDemand {
+		} else if _, onDemand := conn.onDemandSymbols[symbolKey(cfg.SymbolName)]; onDemand {
 			valid = append(valid, cfg)
 		} else {
 			conn.logger.Warn("notification symbol gone after reconnect, dropping subscription",
