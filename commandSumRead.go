@@ -136,6 +136,11 @@ func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumR
 			// Data section is position-dependent: each item's offset depends on
 			// the cumulative lengths of all preceding items. Once one item is
 			// truncated, all subsequent offsets are wrong and unrecoverable.
+			conn.logger.Error("SumRead truncated — likely protocol corruption",
+				"items_lost", n-i,
+				"declared_length", lengths[i],
+				"bytes_remaining", remaining,
+				"item_index", i)
 			for j := i; j < n; j++ {
 				results[j].Error = ReturnCodeDeviceInvalidSize
 			}
