@@ -102,6 +102,22 @@ func WithMaxReconnectAttempts(n int) ConnectionOption {
 	}
 }
 
+// WithRequestTimeout overrides the per-request timeout for ADS commands and
+// initial-dial timeout. Defaults to the value passed as requestTimeout in
+// NewConnection (or 5s if that was zero). Useful for slow PLCs or networks
+// where a single command may legitimately take longer than the default.
+//
+// Note: this option is also used as the net.DialTimeout for initial Connect
+// and reconnect dial. A single value covers both ADS request and TCP dial
+// semantics — split if you need different deadlines.
+func WithRequestTimeout(d time.Duration) ConnectionOption {
+	return func(c *Connection) {
+		if d > 0 {
+			c.requestTimeout = d
+		}
+	}
+}
+
 // WithForceRouteRegistration disables route probing and always registers the route
 // with credentials on every Connect and Reconnect. Use this in environments where
 // routes are not persistent or must be refreshed on each connection.

@@ -46,7 +46,7 @@ func (conn *Connection) send(data []byte) (response []byte, err error) {
 	conn.ctxMu.RLock()
 	currentCtx := conn.ctx
 	conn.ctxMu.RUnlock()
-	ctx, cancel := context.WithTimeout(currentCtx, conn.RequestTimeout)
+	ctx, cancel := context.WithTimeout(currentCtx, conn.requestTimeout)
 	defer cancel()
 	select {
 	case <-ctx.Done():
@@ -168,7 +168,7 @@ func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (respons
 	conn.chanMu.RLock()
 	sendCh := conn.sendChannel
 	conn.chanMu.RUnlock()
-	ctx, cancel := context.WithTimeout(currentCtx, conn.RequestTimeout)
+	ctx, cancel := context.WithTimeout(currentCtx, conn.requestTimeout)
 	defer cancel()
 	select {
 	case <-ctx.Done():

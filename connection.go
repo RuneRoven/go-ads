@@ -69,7 +69,7 @@ type Connection struct {
 
 	systemResponse chan []byte
 
-	RequestTimeout time.Duration
+	requestTimeout time.Duration
 
 	// Stored notification configs for re-subscribe after reconnect
 	notificationConfigs []NotificationConfig
@@ -150,7 +150,7 @@ func NewConnection(ctx context.Context, ip string, port int, netid string, amsPo
 	conn = &Connection{
 		ip:                   ip,
 		port:                 port,
-		RequestTimeout:       requestTimeout,
+		requestTimeout:       requestTimeout,
 		maxReconnectAttempts: 0, // 0 = infinite retries
 		backoffConfig:        DefaultBackoffConfig(),
 		autoReconnect:        true,
@@ -198,7 +198,7 @@ func (conn *Connection) Connect(local bool) error {
 		conn.target.NetID = [6]byte{127, 0, 0, 1, 1, 1}
 		conn.ip = "127.0.0.1"
 	}
-	tcpConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.RequestTimeout)
+	tcpConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.requestTimeout)
 	if err != nil {
 		conn.logger.Error("Error connecting", "error", err)
 		return err
@@ -824,7 +824,7 @@ func (conn *Connection) tearDownAndReset(resetFeatureFlags bool) {
 // Re-checks closed before waitGroup.Add(2) to prevent the F-02 sync.WaitGroup
 // misuse race.
 func (conn *Connection) dialAndStart() error {
-	newConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.RequestTimeout)
+	newConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.requestTimeout)
 	if err != nil {
 		return err
 	}
