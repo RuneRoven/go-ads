@@ -175,9 +175,21 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 				}
 			}
 		}
-		// Fallback: infer base type from symbol size when datatypes table is
-		// not available (on-demand mode). This handles enums and simple type
-		// aliases whose underlying type matches a standard integer size.
+		// Use ADST_ numeric type code from protocol (authoritative).
+		// The PLC sends the correct base type (e.g., ADSTReal32=4 for a REAL-based alias).
+		if resolved := adsTypeToString(symbol.BaseType); resolved != "" {
+			copy := *symbol
+			copy.DataType = resolved
+			val, err := copy.parse(data, offset, nil)
+			if err != nil {
+				return "", err
+			}
+			symbol.updateValue(val)
+			return symbol.Value, nil
+		}
+		// Last resort: infer base type from symbol size when ADST_ code is
+		// unavailable (BaseType=0). Handles enums and simple type aliases
+		// whose underlying type matches a standard integer size.
 		// WARNING: always infers signed integer types — unsigned enums and
 		// REAL/LREAL types will be misinterpreted.
 		if inferred := inferBaseType(symbol.Length); inferred != "" {

@@ -567,6 +567,63 @@ func (rc ReturnCode) Error() string {
 	return rc.String()
 }
 
+// ADST_ data type IDs from the ADS protocol (ADSDATATYPEID enum).
+// The PLC sends these numeric codes in symbolEntry.DataType to identify
+// the base type of a variable. Works on both TwinCAT 2 and TwinCAT 3.
+// Source: Beckhoff TC2_Utilities ADSDATATYPEID
+const (
+	ADSTVoid    uint32 = 0
+	ADSTInt16   uint32 = 2  // INT
+	ADSTInt32   uint32 = 3  // DINT
+	ADSTReal32  uint32 = 4  // REAL
+	ADSTReal64  uint32 = 5  // LREAL
+	ADSTInt8    uint32 = 16 // SINT
+	ADSTUint8   uint32 = 17 // USINT/BYTE
+	ADSTUint16  uint32 = 18 // UINT/WORD
+	ADSTUint32  uint32 = 19 // UDINT/DWORD
+	ADSTInt64   uint32 = 20 // LINT
+	ADSTUint64  uint32 = 21 // ULINT/LWORD
+	ADSTString  uint32 = 30 // STRING
+	ADSTWString uint32 = 31 // WSTRING
+	ADSTBool    uint32 = 33 // BOOL
+)
+
+// adsTypeToString maps an ADST_ numeric type code to the corresponding
+// IEC 61131-3 type name used in the parse switch statement.
+// Returns "" for unknown or composite types.
+func adsTypeToString(code uint32) string {
+	switch code {
+	case ADSTBool:
+		return "BOOL"
+	case ADSTInt8:
+		return "SINT"
+	case ADSTUint8:
+		return "USINT"
+	case ADSTInt16:
+		return "INT"
+	case ADSTUint16:
+		return "UINT"
+	case ADSTInt32:
+		return "DINT"
+	case ADSTUint32:
+		return "UDINT"
+	case ADSTReal32:
+		return "REAL"
+	case ADSTReal64:
+		return "LREAL"
+	case ADSTInt64:
+		return "LINT"
+	case ADSTUint64:
+		return "ULINT"
+	case ADSTString:
+		return "STRING"
+	case ADSTWString:
+		return "WSTRING"
+	default:
+		return ""
+	}
+}
+
 // isSumCommandUnsupportedError returns true if the error indicates the PLC does
 // not support sum/batch commands (as opposed to a transient network error).
 func isSumCommandUnsupportedError(err error) bool {

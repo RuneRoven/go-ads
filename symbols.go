@@ -86,6 +86,7 @@ type Symbol struct {
 	Group             uint32
 	Offset            uint32
 	Length            uint32
+	BaseType          uint32     // ADST_ numeric type code from protocol (e.g., ADSTReal32=4 for REAL)
 	Flags             SymbolFlag
 	ContextMask       uint8 // PLC task context (bits 8-11 of Flags); 0 = no task binding
 	Changed           bool
@@ -169,6 +170,7 @@ func addSymbol(symbol symbolUploadSymbol, datatypes map[string]SymbolUploadDataT
 		DataType:          symbol.DataType,
 		Comment:           symbol.Comment,
 		Length:            symbol.SymbolEntry.Size,
+		BaseType:          symbol.SymbolEntry.DataType,
 		Group:             symbol.SymbolEntry.IGroup,
 		Offset:            symbol.SymbolEntry.IOffs,
 		Flags:             flags,
@@ -390,7 +392,7 @@ func (symbol *Symbol) GetJSON(onlyChanged bool) string {
 	return string(jsonData)
 }
 
-var stringsList = map[string]struct{}{"STRING": {}, "TIME": {}, "TOD": {}, "TIME_OF_DAY": {}, "DATE": {}, "DT": {}, "DATE_AND_TIME": {}}
+var stringsList = map[string]struct{}{"STRING": {}, "WSTRING": {}, "TIME": {}, "TOD": {}, "TIME_OF_DAY": {}, "DATE": {}, "DT": {}, "DATE_AND_TIME": {}}
 
 // parseSymbol returns JSON interface for symbol
 func (symbol *Symbol) parseSymbol(onlyChanged bool) (rData interface{}) {

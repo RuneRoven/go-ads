@@ -25,7 +25,7 @@ func (conn *Connection) SumAddDeviceNotification(requests []SumNotificationReque
 	}
 
 	// Skip sum command if we already know it's not supported
-	if conn.sumNotifChecked.Load() && !conn.sumNotifSupported.Load() {
+	if conn.sumNotifState.Load() == 2 {
 		return conn.sumAddNotificationFallback(requests)
 	}
 
@@ -49,19 +49,15 @@ func (conn *Connection) SumAddDeviceNotification(requests []SumNotificationReque
 
 	resp, err := conn.WriteRead(uint32(GroupSumupAddDeviceNotification), uint32(n), readLen, writeData)
 	if err != nil {
-		if !conn.sumNotifChecked.Load() && isSumCommandUnsupportedError(err) {
+		if isSumCommandUnsupportedError(err) {
+			conn.sumNotifState.CompareAndSwap(0, 2) // atomic: only first prober sets
 			conn.logger.Warn("SumAddDeviceNotification not supported, using individual calls", "error", err)
-			conn.sumNotifSupported.Store(false)
-			conn.sumNotifChecked.Store(true)
 			return conn.sumAddNotificationFallback(requests)
 		}
 		return nil, nil, fmt.Errorf("SumAddDeviceNotification failed: %w", err)
 	}
 
-	if !conn.sumNotifChecked.Load() {
-		conn.sumNotifSupported.Store(true)
-		conn.sumNotifChecked.Store(true)
-	}
+	conn.sumNotifState.CompareAndSwap(0, 1) // atomic: only first prober sets
 
 	if len(resp) < n*8 {
 		return nil, nil, fmt.Errorf("SumAddDeviceNotification response too short: got %d bytes, expected %d", len(resp), n*8)
@@ -86,7 +82,7 @@ func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnC
 	}
 
 	// Skip sum command if we already know it's not supported
-	if conn.sumNotifChecked.Load() && !conn.sumNotifSupported.Load() {
+	if conn.sumNotifState.Load() == 2 {
 		return conn.sumDeleteNotificationFallback(handles)
 	}
 
@@ -103,19 +99,15 @@ func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnC
 
 	resp, err := conn.WriteRead(uint32(GroupSumupDeleteDeviceNotification), uint32(n), readLen, writeData)
 	if err != nil {
-		if !conn.sumNotifChecked.Load() && isSumCommandUnsupportedError(err) {
+		if isSumCommandUnsupportedError(err) {
+			conn.sumNotifState.CompareAndSwap(0, 2) // atomic: only first prober sets
 			conn.logger.Warn("SumDeleteDeviceNotification not supported, using individual calls", "error", err)
-			conn.sumNotifSupported.Store(false)
-			conn.sumNotifChecked.Store(true)
 			return conn.sumDeleteNotificationFallback(handles)
 		}
 		return nil, fmt.Errorf("SumDeleteDeviceNotification failed: %w", err)
 	}
 
-	if !conn.sumNotifChecked.Load() {
-		conn.sumNotifSupported.Store(true)
-		conn.sumNotifChecked.Store(true)
-	}
+	conn.sumNotifState.CompareAndSwap(0, 1) // atomic: only first prober sets
 
 	if len(resp) < n*4 {
 		return nil, fmt.Errorf("SumDeleteDeviceNotification response too short: got %d bytes, expected %d", len(resp), n*4)

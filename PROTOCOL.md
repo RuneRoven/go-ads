@@ -337,6 +337,29 @@ After the strings, additional data may follow based on which flags are set:
 
 TwinCAT 2 does not include extended data after the strings.
 
+### ADST_ Data Type IDs
+
+The `DataType` field (offset 16) in the symbol entry header contains a numeric type code from the ADSDATATYPEID enum. This identifies the base type of the variable and is authoritative — even for type aliases (e.g., a `MyFloat` alias of `REAL` will have DataType=4). These codes are defined in TC2_Utilities and work on both TwinCAT 2 and TwinCAT 3.
+
+| Code | Constant    | IEC 61131-3 Type    |
+|------|-------------|---------------------|
+| 0    | ADST_VOID   | (composite/struct)  |
+| 2    | ADST_INT16  | INT                 |
+| 3    | ADST_INT32  | DINT                |
+| 4    | ADST_REAL32 | REAL                |
+| 5    | ADST_REAL64 | LREAL               |
+| 16   | ADST_INT8   | SINT                |
+| 17   | ADST_UINT8  | USINT / BYTE        |
+| 18   | ADST_UINT16 | UINT / WORD         |
+| 19   | ADST_UINT32 | UDINT / DWORD       |
+| 20   | ADST_INT64  | LINT                |
+| 21   | ADST_UINT64 | ULINT / LWORD       |
+| 30   | ADST_STRING | STRING              |
+| 31   | ADST_WSTRING| WSTRING             |
+| 33   | ADST_BOOL   | BOOL                |
+
+Code 0 (ADST_VOID) indicates a composite type (struct, function block, array) — the variable has children and should not be parsed as a scalar. For type aliases and enums, the PLC sends the underlying base type code, not 0.
+
 ### Symbol Flags
 
 The Flags field (offset 20) in the symbol entry is a bitfield:

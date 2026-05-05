@@ -26,7 +26,7 @@ func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, 
 	}
 
 	// Skip SumWrite if we already know it's not supported.
-	if conn.sumWriteChecked.Load() && !conn.sumWriteSupported.Load() {
+	if conn.sumWriteState.Load() == 2 {
 		return conn.sumWriteFallback(requests)
 	}
 
@@ -55,10 +55,9 @@ func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, 
 
 	resp, err := conn.WriteRead(uint32(GroupSumupWrite), uint32(n), readLen, writeData)
 	if err != nil {
-		if !conn.sumWriteChecked.Load() && isSumCommandUnsupportedError(err) {
+		if isSumCommandUnsupportedError(err) {
+			conn.sumWriteState.CompareAndSwap(0, 2) // atomic: only first prober sets
 			conn.logger.Warn("SumWrite not supported by PLC, using individual writes", "error", err)
-			conn.sumWriteSupported.Store(false)
-			conn.sumWriteChecked.Store(true)
 			return conn.sumWriteFallback(requests)
 		}
 		// Don't fall back for transient errors — writes are not idempotent
@@ -66,10 +65,7 @@ func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, 
 		return nil, fmt.Errorf("SumWrite failed: %w", err)
 	}
 
-	if !conn.sumWriteChecked.Load() {
-		conn.sumWriteSupported.Store(true)
-		conn.sumWriteChecked.Store(true)
-	}
+	conn.sumWriteState.CompareAndSwap(0, 1) // atomic: only first prober sets
 
 	if len(resp) < n*4 {
 		return nil, fmt.Errorf("SumWrite response too short: got %d bytes, expected %d", len(resp), n*4)

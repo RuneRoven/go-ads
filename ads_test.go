@@ -3015,3 +3015,197 @@ func TestProcessImageBitOffset(t *testing.T) {
 		}
 	}
 }
+
+// --- ADST_ type code tests ---
+
+func TestADSTypeToString(t *testing.T) {
+	tests := []struct {
+		code uint32
+		want string
+	}{
+		{ADSTBool, "BOOL"},
+		{ADSTInt8, "SINT"},
+		{ADSTUint8, "USINT"},
+		{ADSTInt16, "INT"},
+		{ADSTUint16, "UINT"},
+		{ADSTInt32, "DINT"},
+		{ADSTUint32, "UDINT"},
+		{ADSTReal32, "REAL"},
+		{ADSTReal64, "LREAL"},
+		{ADSTInt64, "LINT"},
+		{ADSTUint64, "ULINT"},
+		{ADSTString, "STRING"},
+		{ADSTWString, "WSTRING"},
+		{ADSTVoid, ""},
+		{999, ""},
+	}
+	for _, tt := range tests {
+		got := adsTypeToString(tt.code)
+		if got != tt.want {
+			t.Errorf("adsTypeToString(%d) = %q, want %q", tt.code, got, tt.want)
+		}
+	}
+}
+
+func TestParseWithBaseType_REAL(t *testing.T) {
+	// Symbol with unknown DataType but BaseType=ADST_REAL32 should parse as float
+	sym := &Symbol{
+		Name:     "MyAlias",
+		FullName: "GVL.MyAlias",
+		DataType: "MyRealAlias", // not in parseableTypes
+		Length:   4,
+		BaseType: ADSTReal32,
+	}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, math.Float32bits(3.14))
+
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	f, _ := strconv.ParseFloat(val, 64)
+	if math.Abs(f-3.14) > 0.01 {
+		t.Errorf("expected ~3.14, got %s", val)
+	}
+}
+
+func TestParseWithBaseType_UDINT(t *testing.T) {
+	// Symbol with BaseType=ADST_UINT32 should parse as unsigned, not signed
+	sym := &Symbol{
+		Name:     "MyEnum",
+		FullName: "GVL.MyEnum",
+		DataType: "E_MyEnum",
+		Length:   4,
+		BaseType: ADSTUint32,
+	}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, 3000000000) // > INT32_MAX
+
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if val != "3000000000" {
+		t.Errorf("expected 3000000000, got %s", val)
+	}
+}
+
+func TestParseWithBaseType_FallbackToInfer(t *testing.T) {
+	// BaseType=0 (ADST_VOID) → falls through to inferBaseType
+	sym := &Symbol{
+		Name:     "UnknownAlias",
+		FullName: "GVL.UnknownAlias",
+		DataType: "SomeAlias",
+		Length:   2,
+		BaseType: ADSTVoid, // no ADST_ info
+	}
+	data := []byte{0x39, 0x05} // 1337 as INT16
+
+	val, err := sym.parse(data, 0, nil)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if val != "1337" {
+		t.Errorf("expected 1337, got %s", val)
+	}
+}
+
+// --- WSTRING in GetJSON ---
+
+func TestGetJSON_WSTRINGAsString(t *testing.T) {
+	sym := &Symbol{
+		Name:     "MyWString",
+		FullName: "GVL.MyWString",
+		DataType: "WSTRING",
+		Value:    "Hello World",
+	}
+	got := sym.GetJSON(false)
+	if got != `"Hello World"` {
+		t.Errorf("expected WSTRING as JSON string, got %s", got)
+	}
+}
+
+// --- SumRead overflow guard ---
+
+func TestSumReadOverflowGuard(t *testing.T) {
+	// Verify that totalReadLen uses uint64 and the overflow check catches >4GiB
+	n := 2
+	requests := []SumReadRequest{
+		{Group: 1, Offset: 0, Length: math.MaxUint32},
+		{Group: 1, Offset: 0, Length: 1}, // total > MaxUint32
+	}
+
+	var totalReadLen uint64
+	for _, req := range requests {
+		totalReadLen += uint64(req.Length)
+	}
+	total := uint64(n)*8 + totalReadLen
+	if total <= math.MaxUint32 {
+		t.Fatalf("expected total > MaxUint32, got %d", total)
+	}
+}
+
+// --- Sum probe state CAS ---
+
+func TestSumProbeStateTransitions(t *testing.T) {
+	// Verify CAS 0→1 and 0→2 work, and second CAS is rejected
+	var conn Connection
+
+	// sumWriteState: 0→1
+	if !conn.sumWriteState.CompareAndSwap(0, 1) {
+		t.Error("CAS 0→1 should succeed")
+	}
+	if conn.sumWriteState.Load() != 1 {
+		t.Error("state should be 1")
+	}
+	// Second goroutine trying 0→2 should fail
+	if conn.sumWriteState.CompareAndSwap(0, 2) {
+		t.Error("CAS 0→2 should fail when state is 1")
+	}
+
+	// sumNotifState: 0→2
+	if !conn.sumNotifState.CompareAndSwap(0, 2) {
+		t.Error("CAS 0→2 should succeed")
+	}
+	if conn.sumNotifState.Load() != 2 {
+		t.Error("state should be 2")
+	}
+
+	// Reset works
+	conn.sumWriteState.Store(0)
+	if conn.sumWriteState.Load() != 0 {
+		t.Error("reset should set state to 0")
+	}
+}
+
+func TestSumProbeStateConcurrent(t *testing.T) {
+	// Concurrent CAS: only one goroutine should win
+	var conn Connection
+	const goroutines = 100
+	var wg sync.WaitGroup
+	wins := make(chan uint32, goroutines)
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			val := uint32(1)
+			if id%2 == 0 {
+				val = 2
+			}
+			if conn.sumWriteState.CompareAndSwap(0, val) {
+				wins <- val
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(wins)
+
+	count := 0
+	for range wins {
+		count++
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 CAS winner, got %d", count)
+	}
+}

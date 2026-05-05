@@ -325,7 +325,9 @@ func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) 
 	}
 
 	dataType := string(dt)
-	if len(dataType) >= 6 && dataType[:6] == "STRING" {
+	if len(dataType) >= 7 && dataType[:7] == "WSTRING" {
+		dataType = "WSTRING"
+	} else if len(dataType) >= 6 && dataType[:6] == "STRING" {
 		dataType = "STRING"
 	}
 
@@ -338,6 +340,7 @@ func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) 
 		Group:             entry.IGroup,
 		Offset:            entry.IOffs,
 		Length:            entry.Size,
+		BaseType:          entry.DataType,
 		Flags:             flags,
 		ContextMask:       flags.ContextMask(),
 		LastUpdateTime:    time.Now(),

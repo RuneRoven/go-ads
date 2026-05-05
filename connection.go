@@ -81,16 +81,14 @@ type Connection struct {
 	datatypesLoaded    bool            // true after LoadDataTypes() — struct children expandable
 	onDemandSymbols    map[string]bool // tracks symbol names resolved on-demand (for reconnect)
 
-	// Feature support flags (detected at runtime)
+	// Feature support flags (detected at runtime via CAS)
 	// sumReadCmd: 0 = unchecked (try Ex2 first),
 	// uint32(GroupSumupReadEx2) = use 0xF084,
 	// uint32(GroupSumupReadEx) = use 0xF083,
 	// 1 = no sum read support (individual reads)
-	sumReadCmd               atomic.Uint32
-	sumWriteSupported        atomic.Bool
-	sumWriteChecked          atomic.Bool
-	sumNotifSupported        atomic.Bool
-	sumNotifChecked          atomic.Bool
+	sumReadCmd    atomic.Uint32
+	sumWriteState atomic.Uint32 // 0=unchecked, 1=supported, 2=unsupported
+	sumNotifState atomic.Uint32 // 0=unchecked, 1=supported, 2=unsupported
 	chunkedDownloadSupported atomic.Bool
 	chunkedDownloadChecked   atomic.Bool
 
@@ -574,10 +572,8 @@ func (conn *Connection) Reconnect() error {
 	conn.activeNotifications = make(map[uint32]*Symbol)
 	conn.symbolLock.Unlock()
 	conn.sumReadCmd.Store(0)
-	conn.sumWriteChecked.Store(false)
-	conn.sumWriteSupported.Store(false)
-	conn.sumNotifChecked.Store(false)
-	conn.sumNotifSupported.Store(false)
+	conn.sumWriteState.Store(0)
+	conn.sumNotifState.Store(0)
 	conn.chunkedDownloadChecked.Store(false)
 
 	var lastErr error

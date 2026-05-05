@@ -44,16 +44,16 @@ func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, err
 
 	// Build write data: N × 12 bytes (group + offset + length per request)
 	writeData := make([]byte, n*12)
-	var totalReadLen uint32
+	var totalReadLen uint64
 	for i, req := range requests {
 		binary.LittleEndian.PutUint32(writeData[i*12:], req.Group)
 		binary.LittleEndian.PutUint32(writeData[i*12+4:], req.Offset)
 		binary.LittleEndian.PutUint32(writeData[i*12+8:], req.Length)
-		totalReadLen += req.Length
+		totalReadLen += uint64(req.Length)
 	}
 
 	// Response: [N × (error(4), length(4))][data]
-	total := uint64(n)*8 + uint64(totalReadLen)
+	total := uint64(n)*8 + totalReadLen
 	if total > math.MaxUint32 {
 		return nil, fmt.Errorf("SumRead total response size %d exceeds uint32 max", total)
 	}
