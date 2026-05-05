@@ -50,5 +50,11 @@ func (conn *Connection) Read(group uint32, offset uint32, length uint32) (data [
 		err = fmt.Errorf("ADS error in Read: %w", response.Error)
 		return
 	}
-	return respBuff.Bytes(), nil
+	// F-19: validate that the body has the bytes the response header declared.
+	// Returning the raw remaining buffer would silently pass through truncated
+	// or padded payloads. Trust the declared Length; reject undersized.
+	if uint64(respBuff.Len()) < uint64(response.Length) {
+		return nil, fmt.Errorf("Read: declared length %d, body has %d bytes", response.Length, respBuff.Len())
+	}
+	return respBuff.Next(int(response.Length)), nil
 }
