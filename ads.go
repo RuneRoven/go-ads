@@ -655,6 +655,11 @@ func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, c
 		TransmissionMode: transMode,
 	})
 	conn.notificationChannel = updateReceiver
+	// F-22: record subscribe time so handleNotification suppresses the
+	// "unknown handle" Warn for any notifications arriving in the small
+	// race window between PLC firing the first sample and the map insert
+	// completing here.
+	conn.lastSubscribeNs.Store(time.Now().UnixNano())
 
 	return handle, nil
 }
@@ -927,6 +932,11 @@ func (conn *Connection) AddSymbolNotifications(configs []NotificationConfig, ch 
 		}
 	}
 	conn.notificationChannel = ch
+	// F-22: record subscribe time so handleNotification suppresses the
+	// "unknown handle" Warn for any notifications arriving in the small
+	// race window between PLC firing the first sample and the map insert
+	// completing here. Stamp once per batch — covers all successful entries.
+	conn.lastSubscribeNs.Store(time.Now().UnixNano())
 
 	return nil
 }

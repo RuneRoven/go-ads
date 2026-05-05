@@ -78,9 +78,17 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 		// Stale notifications are expected during:
 		// - Close(): handles deleted from activeNotifications while listen() still drains
 		// - Reconnect: activeNotifications cleared (connection.go:575) before new subscriptions
-		if conn.closed.Load() || conn.reconnecting.Load() {
+		// - F-22: first-sample race — PLC fires the first notification before our
+		//   activeNotifications map insert completes (sub-millisecond window for
+		//   fast PLCs and zero-MaxDelay subscriptions). Suppress within ~100ms of
+		//   the most recent successful subscribe.
+		const subscribeRaceWindowNs = int64(100 * time.Millisecond)
+		switch {
+		case conn.closed.Load() || conn.reconnecting.Load():
 			conn.logger.Debug("received notification for deleted handle (expected during close/reconnect)", "handle", handle)
-		} else {
+		case time.Now().UnixNano()-conn.lastSubscribeNs.Load() < subscribeRaceWindowNs:
+			conn.logger.Debug("received notification for unknown handle (likely first-sample race)", "handle", handle)
+		default:
 			conn.logger.Warn("received notification for unknown handle", "handle", handle)
 		}
 		return nil

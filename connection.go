@@ -48,6 +48,14 @@ type Connection struct {
 	activeNotifications map[uint32]*Symbol
 	symbolLock          sync.Mutex
 
+	// lastSubscribeNs records the time.Now().UnixNano() of the most recent
+	// successful AddSymbolNotification(s). Used by handleNotification to
+	// suppress the "unknown handle" Warn when a notification packet arrives
+	// at the goroutine before the activeNotifications[handle] map insert
+	// completes (F-22). Window is small (sub-millisecond) but real for
+	// fast PLCs and zero-MaxDelay subscriptions.
+	lastSubscribeNs atomic.Int64
+
 	datatypes map[string]SymbolUploadDataType
 	ctx       context.Context
 	shutdown  context.CancelFunc
