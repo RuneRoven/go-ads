@@ -243,7 +243,10 @@ func TestIntegrationReadStructWithEnum(t *testing.T) {
 
 	// Every child must have a parsed value after reading the struct
 	for childName, child := range sym.Children {
-		if child.Value == "" {
+		// F-31: empty Value is valid for empty STRING/WSTRING leaves and for
+		// non-leaf nodes (their value is computed from children via GetJSON,
+		// which may produce an empty/{} string).
+		if len(child.Children) == 0 && child.Value == "" && child.DataType != "STRING" && child.DataType != "WSTRING" {
 			t.Errorf("child %q has empty Value after struct read", childName)
 		}
 	}
