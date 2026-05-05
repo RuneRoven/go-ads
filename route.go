@@ -1,6 +1,7 @@
 package ads
 
 import (
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -59,8 +60,18 @@ func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetId
 	}
 	defer func() { _ = conn.Close() }()
 
+	// F-24: generate random invokeId via crypto/rand for response-echo
+	// validation in parseRouteResponse. Defends against UDP spoofing on the
+	// local network — an attacker would need to predict the random per-call
+	// value to inject a fake "success" response.
+	var invokeIdBuf [4]byte
+	if _, err := cryptorand.Read(invokeIdBuf[:]); err != nil {
+		return fmt.Errorf("generate invokeId: %w", err)
+	}
+	invokeId := binary.LittleEndian.Uint32(invokeIdBuf[:])
+
 	// Build the route request packet
-	packet := buildRoutePacket(localNetId, routeName, computerName, username, password)
+	packet := buildRoutePacket(localNetId, routeName, computerName, username, password, invokeId)
 
 	_, err = conn.Write(packet)
 	if err != nil {
@@ -77,11 +88,14 @@ func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetId
 		return fmt.Errorf("failed to read route response: %w", err)
 	}
 
-	return parseRouteResponse(logger, respBuf[:n])
+	return parseRouteResponse(logger, respBuf[:n], invokeId)
 }
 
 // buildRoutePacket constructs a UDP route registration packet.
-func buildRoutePacket(localNetId [6]byte, routeName string, computerName string, username string, password string) []byte {
+// invokeId is set by the caller (per ADS InvokeID semantics) to identify the
+// command and validate the response echo. Use a random uint32 from crypto/rand
+// to defend against UDP spoofing on the local network (F-24).
+func buildRoutePacket(localNetId [6]byte, routeName string, computerName string, username string, password string, invokeId uint32) []byte {
 	// Build tags
 	tags := [][]byte{
 		buildTag(tagNetID, localNetId[:]),
@@ -99,7 +113,7 @@ func buildRoutePacket(localNetId [6]byte, routeName string, computerName string,
 	// Header: cookie(4) + invokeId(4) + serviceId(4) + AmsAddr(8) + tagCount(4)
 	header := make([]byte, 24)
 	binary.LittleEndian.PutUint32(header[0:], routeCookie)
-	binary.LittleEndian.PutUint32(header[4:], 0) // invokeId
+	binary.LittleEndian.PutUint32(header[4:], invokeId) // F-24: caller-provided random invokeId for echo validation
 	binary.LittleEndian.PutUint32(header[8:], routeServiceAdd)
 	// AmsAddr: NetID(6) + Port(2) — port is 0 per Beckhoff spec
 	copy(header[12:18], localNetId[:])
@@ -125,7 +139,11 @@ func appendNull(data []byte) []byte {
 
 // parseRouteResponse validates the route registration response.
 // Response format: cookie(4) + invokeId(4) + serviceId(4) + AmsAddr(8) + tagCount(4) + tags...
-func parseRouteResponse(logger *slog.Logger, data []byte) error {
+//
+// expectedInvokeId is the value the caller provided in the request; the PLC
+// echoes it per ADS InvokeID semantics and we reject mismatches as possible
+// UDP-spoofing attempts (F-24).
+func parseRouteResponse(logger *slog.Logger, data []byte, expectedInvokeId uint32) error {
 	logger.Debug("route response raw bytes", hexAttr("response", data), "length", len(data))
 
 	if len(data) < 24 {
@@ -135,6 +153,14 @@ func parseRouteResponse(logger *slog.Logger, data []byte) error {
 	cookie := binary.LittleEndian.Uint32(data[0:])
 	if cookie != routeCookie {
 		return fmt.Errorf("unexpected route response cookie: 0x%08X", cookie)
+	}
+
+	// F-24: validate invokeId echo. Defends against UDP spoofing on the local
+	// network — an attacker would need to predict the random per-call invokeId
+	// to inject a fake "success" response.
+	gotInvokeId := binary.LittleEndian.Uint32(data[4:])
+	if gotInvokeId != expectedInvokeId {
+		return fmt.Errorf("route response invokeId mismatch: got 0x%08X, expected 0x%08X (possible spoof or PLC misbehavior)", gotInvokeId, expectedInvokeId)
 	}
 
 	serviceId := binary.LittleEndian.Uint32(data[8:])

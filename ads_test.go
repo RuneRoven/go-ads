@@ -67,7 +67,7 @@ func TestStringToNetIDErrors(t *testing.T) {
 
 func TestBuildRoutePacket(t *testing.T) {
 	netID := [6]byte{192, 168, 1, 100, 1, 1}
-	packet := buildRoutePacket(netID, "TestRoute", "192.168.1.100", "Admin", "secret")
+	packet := buildRoutePacket(netID, "TestRoute", "192.168.1.100", "Admin", "secret", 0)
 
 	// Verify header
 	if len(packet) < 24 {
@@ -143,7 +143,7 @@ func TestParseRouteResponse_Success(t *testing.T) {
 	binary.LittleEndian.PutUint16(resp[26:], 4)
 	binary.LittleEndian.PutUint32(resp[28:], 0) // success
 
-	err := parseRouteResponse(getDefaultLogger(), resp)
+	err := parseRouteResponse(getDefaultLogger(), resp, 0)
 	if err != nil {
 		t.Errorf("expected success, got error: %v", err)
 	}
@@ -158,14 +158,14 @@ func TestParseRouteResponse_ErrorCode(t *testing.T) {
 	binary.LittleEndian.PutUint16(resp[26:], 4)
 	binary.LittleEndian.PutUint32(resp[28:], 7) // error code 7
 
-	err := parseRouteResponse(getDefaultLogger(), resp)
+	err := parseRouteResponse(getDefaultLogger(), resp, 0)
 	if err == nil {
 		t.Error("expected error for non-zero error code")
 	}
 }
 
 func TestParseRouteResponse_TooShort(t *testing.T) {
-	err := parseRouteResponse(getDefaultLogger(), []byte{1, 2, 3})
+	err := parseRouteResponse(getDefaultLogger(), []byte{1, 2, 3}, 0)
 	if err == nil {
 		t.Error("expected error for short response")
 	}
@@ -176,7 +176,7 @@ func TestParseRouteResponse_WrongCookie(t *testing.T) {
 	binary.LittleEndian.PutUint32(resp[0:], 0xDEADBEEF) // wrong cookie
 	binary.LittleEndian.PutUint32(resp[8:], 0x80000000|routeServiceAdd)
 
-	err := parseRouteResponse(getDefaultLogger(), resp)
+	err := parseRouteResponse(getDefaultLogger(), resp, 0)
 	if err == nil {
 		t.Error("expected error for wrong cookie")
 	}
@@ -187,7 +187,7 @@ func TestParseRouteResponse_WrongServiceID(t *testing.T) {
 	binary.LittleEndian.PutUint32(resp[0:], routeCookie)
 	binary.LittleEndian.PutUint32(resp[8:], 0x12345678) // wrong serviceId
 
-	err := parseRouteResponse(getDefaultLogger(), resp)
+	err := parseRouteResponse(getDefaultLogger(), resp, 0)
 	if err == nil {
 		t.Error("expected error for wrong serviceId")
 	}
