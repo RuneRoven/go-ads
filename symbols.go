@@ -346,6 +346,12 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 	return
 }
 
+// maxArrayElementsPerLevel caps PLC-declared array Elements per dimension to
+// prevent malformed/buggy datatype responses from triggering huge map
+// allocations (F-15). Real PLC arrays rarely exceed a few thousand elements;
+// 1M is a safety ceiling well above any legitimate use.
+const maxArrayElementsPerLevel = 1_000_000
+
 func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (children map[string]*SymbolUploadDataType) {
 	children = map[string]*SymbolUploadDataType{}
 
@@ -355,6 +361,24 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (chil
 
 	level := levels[0]
 	if level.Elements == 0 {
+		return
+	}
+	// F-15: defend against malformed/buggy PLC datatype responses.
+	// (1) Cap Elements at a sanity limit to prevent DoS via huge map allocation.
+	// (2) Reject when LBound + Elements overflows uint32 — loop counter would
+	//     wrap and either skip the body or iterate ~4 billion times.
+	if level.Elements > maxArrayElementsPerLevel {
+		getDefaultLogger().Error("makeArrayChildren: array Elements exceeds sanity cap, refusing to allocate",
+			"declared_elements", level.Elements,
+			"cap", maxArrayElementsPerLevel,
+			"datatype", dt)
+		return
+	}
+	if uint64(level.LBound)+uint64(level.Elements) > uint64(^uint32(0)) {
+		getDefaultLogger().Error("makeArrayChildren: LBound + Elements overflows uint32, refusing",
+			"lbound", level.LBound,
+			"elements", level.Elements,
+			"datatype", dt)
 		return
 	}
 	// subChildren is shared across all array elements at this level.
