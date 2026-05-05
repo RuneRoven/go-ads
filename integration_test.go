@@ -1539,8 +1539,7 @@ func TestIntegrationSumWriteFallbackForced(t *testing.T) {
 	}
 
 	// Force fallback
-	conn.sumWriteChecked.Store(true)
-	conn.sumWriteSupported.Store(false)
+	conn.sumWriteState.Store(2) // 2 = checked + unsupported (forces fallback)
 
 	// Save originals
 	originals := make(map[string]string)
@@ -1597,8 +1596,7 @@ func TestIntegrationSumNotifFallbackForced(t *testing.T) {
 	}
 
 	// Force fallback
-	conn.sumNotifChecked.Store(true)
-	conn.sumNotifSupported.Store(false)
+	conn.sumNotifState.Store(2) // 2 = checked + unsupported (forces fallback)
 
 	ch := make(chan *Update, 50)
 	var configs []NotificationConfig
@@ -1670,8 +1668,7 @@ func TestIntegrationSumNotifFallbackDowngrade(t *testing.T) {
 	t.Logf("symbol %q: ContextMask=%d flags=0x%04X (fallback test)", symbolName, sym.ContextMask, uint32(sym.Flags))
 
 	// Force notification fallback — v2 modes should be downgraded to v1
-	conn.sumNotifChecked.Store(true)
-	conn.sumNotifSupported.Store(false)
+	conn.sumNotifState.Store(2) // 2 = checked + unsupported (forces fallback)
 
 	ch := make(chan *Update, 20)
 	configs := []NotificationConfig{{
