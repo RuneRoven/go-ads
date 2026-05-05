@@ -78,3 +78,38 @@ func TestParseSumReadResponse_TruncationLogsError(t *testing.T) {
 		t.Errorf("expected truncation log, got: %s", logOut)
 	}
 }
+
+// F-11: PLC oversizing one item's response shifts later items' offsets.
+// Defense: reject when lengths[i] > requests[i].Length even if total bytes
+// fit in the response.
+func TestParseSumReadResponse_PerItemOversize(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	conn := &Connection{logger: logger}
+
+	// Two items each requested as 4 bytes, but item 0 declares 8 bytes returned.
+	// Total response size accommodates 8+4=12 data bytes so the gross truncation
+	// guard (F-09) does NOT fire; only the per-item check (F-11) catches it.
+	resp := craftSumReadResponse(
+		[]ReturnCode{ReturnCodeNoErrors, ReturnCodeNoErrors},
+		[]uint32{8, 4},
+		[]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+	)
+	requests := []SumReadRequest{{Length: 4}, {Length: 4}}
+
+	results, err := conn.parseSumReadResponse(resp, 2, requests)
+	if err != nil {
+		t.Fatalf("unexpected outer error: %v", err)
+	}
+	if results[0].Error != ReturnCodeDeviceInvalidSize {
+		t.Errorf("results[0].Error = %v, want ReturnCodeDeviceInvalidSize", results[0].Error)
+	}
+	if results[1].Error != ReturnCodeDeviceInvalidSize {
+		t.Errorf("results[1].Error = %v, want ReturnCodeDeviceInvalidSize", results[1].Error)
+	}
+
+	logOut := logBuf.String()
+	if !strings.Contains(logOut, "per-item oversize") {
+		t.Errorf("expected per-item oversize log, got: %s", logOut)
+	}
+}

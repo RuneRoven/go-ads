@@ -128,6 +128,19 @@ func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumR
 
 	dataOffset := n * 8
 	for i := 0; i < n; i++ {
+		// F-11: reject per-item oversize. PLC declaring a bigger length than
+		// requested would shift all subsequent items' offsets even if total
+		// bytes fit in the response. Reject and break (cascade marks remaining).
+		if lengths[i] > requests[i].Length {
+			conn.logger.Error("SumRead per-item oversize — protocol drift or wire corruption",
+				"item_index", i,
+				"declared_length", lengths[i],
+				"requested_length", requests[i].Length)
+			for j := i; j < n; j++ {
+				results[j].Error = ReturnCodeDeviceInvalidSize
+			}
+			break
+		}
 		// Compare in uint32 space first to avoid int wrap on 32-bit Go (F-09).
 		// On 32-bit, int(uint32(0xFFFFFFFE)) = -2, so dataOffset + that wraps
 		// below len(resp) and the guard misfires; allocations after that panic.
