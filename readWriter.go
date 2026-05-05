@@ -14,6 +14,14 @@ import (
 
 func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]SymbolUploadDataType) (string, error) {
 	start := offset
+	// F-16: reject oversized symbol.Length before arithmetic. uint32 → int
+	// conversion wraps on 32-bit Go; an attacker-controlled or buggy symbol
+	// entry with Length = 0xFFFFFFFF produces a negative int that bypasses
+	// the bounds guard and panics on slice. Compare in uint64 space to dodge
+	// the wrap entirely.
+	if uint64(symbol.Length) > uint64(len(data)) {
+		return "", fmt.Errorf("parse %s: symbol.Length %d exceeds data buffer size %d", symbol.DataType, symbol.Length, len(data))
+	}
 	stop := start + int(symbol.Length)
 	if start+int(symbol.Length) > len(data) {
 		stop = len(data)
