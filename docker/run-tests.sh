@@ -41,8 +41,11 @@ fi
 # shellcheck disable=SC1090
 set -a && source "$ENV_FILE" && set +a
 
-# Detect host IP for Docker bridge
-HOST_IP=$(ifconfig 2>/dev/null | grep "inet " | grep -v 127.0.0.1 | head -1 | awk '{print $2}' || true)
+# Honor explicit ADS_HOST_IP override before autodetection (F-32).
+HOST_IP="${ADS_HOST_IP:-}"
+if [[ -z "$HOST_IP" ]]; then
+    HOST_IP=$(ifconfig 2>/dev/null | grep "inet " | grep -v 127.0.0.1 | head -1 | awk '{print $2}' || true)
+fi
 if [[ -z "$HOST_IP" ]]; then
     HOST_IP=$(ip -4 addr show scope global 2>/dev/null | grep -oE 'inet [0-9.]+' | head -1 | awk '{print $2}' || true)
 fi
