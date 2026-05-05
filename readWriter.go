@@ -484,12 +484,15 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 			return nil, fmt.Errorf("binary.Write DT failed: %w", err)
 		}
 	case "STRING":
+		// F-17: refuse to write to a STRING declared with Length=0. The PLC
+		// expects at least 1 byte for the null terminator; a 0-byte payload
+		// is silently truncating and indistinguishable from caller error.
+		if symbol.Length < 1 {
+			return nil, fmt.Errorf("STRING write requires symbol.Length >= 1, got %d", symbol.Length)
+		}
 		newBuf := make([]byte, symbol.Length)
 		// Reserve last byte for null terminator — PLC expects null-terminated strings.
 		maxLen := int(symbol.Length) - 1
-		if maxLen < 0 {
-			maxLen = 0
-		}
 		src := []byte(value)
 		if len(src) > maxLen {
 			src = src[:maxLen]
@@ -497,12 +500,13 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		copy(newBuf, src)
 		buf.Write(newBuf)
 	case "WSTRING":
+		// F-17: WSTRING needs at least 2 bytes for the UTF-16 null terminator.
+		if symbol.Length < 2 {
+			return nil, fmt.Errorf("WSTRING write requires symbol.Length >= 2, got %d", symbol.Length)
+		}
 		encoded := utf16.Encode([]rune(value))
 		newBuf := make([]byte, symbol.Length)
 		maxChars := (int(symbol.Length) - 2) / 2 // reserve 2 bytes for null terminator
-		if maxChars < 0 {
-			maxChars = 0
-		}
 		if len(encoded) > maxChars {
 			encoded = encoded[:maxChars]
 		}
