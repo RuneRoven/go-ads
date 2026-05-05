@@ -74,12 +74,13 @@ echo -e "${DIM}Build complete${RESET}"
 echo ""
 
 # Run tests, capture raw output
+RUN_EXIT=0
 RAW_OUTPUT=$(docker run --rm \
     --env-file "$ENV_FILE" \
     -e "ADS_HOST_IP=$HOST_IP" \
     go-ads-test \
     -test.v -test.timeout 120s \
-    -test.run "$TEST_PATTERN" 2>&1) || true
+    -test.run "$TEST_PATTERN" 2>&1) || RUN_EXIT=$?
 
 # ── Format terminal output ──
 format_terminal() {
@@ -287,7 +288,7 @@ echo ""
     echo "$RAW_OUTPUT"
 } >&2
 
-if [[ "$FAILED" -gt 0 ]]; then
+if [[ "$RUN_EXIT" -ne 0 || "$FAILED" -gt 0 ]]; then
     exit 1
 fi
 exit 0
