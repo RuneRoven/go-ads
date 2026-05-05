@@ -274,35 +274,10 @@ func (conn *Connection) Connect(local bool) error {
 		if registered {
 			// TCP reconnect — PLC may reset connections from previously-unknown NetIDs.
 			// Shut down goroutines, close TCP, redial, restart.
-			conn.ctxMu.RLock()
-			conn.shutdown()
-			conn.ctxMu.RUnlock()
-			conn.connMu.Lock()
-			conn.connection.Close()
-			conn.connMu.Unlock()
-			conn.waitGroup.Wait()
-			conn.ctxMu.Lock()
-			conn.ctx, conn.shutdown = context.WithCancel(context.Background())
-			conn.ctxMu.Unlock()
-			conn.chanMu.Lock()
-			conn.sendChannel = make(chan []byte)
-			conn.systemResponse = make(chan []byte)
-			conn.chanMu.Unlock()
-			conn.activeRequestLock.Lock()
-			conn.activeRequests = map[uint32]chan []byte{}
-			conn.activeRequestLock.Unlock()
-
-			newConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.RequestTimeout)
-			if err != nil {
+			conn.tearDownAndReset(false)
+			if err := conn.dialAndStart(); err != nil {
 				return fmt.Errorf("TCP reconnect after route registration failed: %w", err)
 			}
-			conn.connMu.Lock()
-			conn.connection = newConn
-			conn.connMu.Unlock()
-			configureKeepAlive(newConn)
-			conn.waitGroup.Add(2)
-			go conn.listen()
-			go conn.transmitWorker()
 			conn.logger.Info("TCP reconnected after route registration")
 		}
 
@@ -546,39 +521,12 @@ func (conn *Connection) Reconnect() error {
 	conn.logger.Info("attempting reconnect")
 	conn.disconnected.Store(true)
 
-	// Close existing TCP connection if still open
-	conn.connMu.Lock()
-	if conn.connection != nil {
-		conn.connection.Close()
-	}
-	conn.connMu.Unlock()
-
-	// Cancel old goroutines and wait
-	conn.ctxMu.RLock()
-	conn.shutdown()
-	conn.ctxMu.RUnlock()
-	conn.waitGroup.Wait()
-
-	// Reset context
-	conn.ctxMu.Lock()
-	conn.ctx, conn.shutdown = context.WithCancel(context.Background())
-	conn.ctxMu.Unlock()
-
-	// Reset channels, feature flags, and active notifications (old handles are invalid)
-	conn.chanMu.Lock()
-	conn.sendChannel = make(chan []byte)
-	conn.systemResponse = make(chan []byte)
-	conn.chanMu.Unlock()
-	conn.activeRequestLock.Lock()
-	conn.activeRequests = map[uint32]chan []byte{}
-	conn.activeRequestLock.Unlock()
+	// Clear active notifications (old handles invalid after reconnect).
 	conn.symbolLock.Lock()
 	conn.activeNotifications = make(map[uint32]*Symbol)
 	conn.symbolLock.Unlock()
-	conn.sumReadCmd.Store(0)
-	conn.sumWriteState.Store(0)
-	conn.sumNotifState.Store(0)
-	conn.chunkedDownloadChecked.Store(false)
+
+	conn.tearDownAndReset(true)
 
 	var lastErr error
 	attempts := 0
@@ -591,47 +539,20 @@ func (conn *Connection) Reconnect() error {
 			return fmt.Errorf("reconnect failed after %d attempts: %w", conn.maxReconnectAttempts, lastErr)
 		}
 
-		var err error
-		newConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.RequestTimeout)
-		if err != nil {
+		// Dial TCP, configure keepalive, clear disconnected flag, start goroutines.
+		// dialAndStart re-checks closed.Load() before waitGroup.Add(2) (F-02).
+		if err := conn.dialAndStart(); err != nil {
 			lastErr = err
-			conn.logger.Warn("reconnect dial failed, retrying", "error", err, "ip", conn.ip, "port", conn.port, "attempt", attempts)
+			conn.logger.Warn("reconnect dial/start failed, retrying", "error", err, "ip", conn.ip, "port", conn.port, "attempt", attempts)
 			if err := conn.reconnectSleep(attempts); err != nil {
 				return err
 			}
 			continue
 		}
-		conn.connMu.Lock()
-		conn.connection = newConn
-		conn.connMu.Unlock()
-		// Enable aggressive TCP keepalive to detect dead connections quickly
-		configureKeepAlive(newConn)
-
-		// Clear disconnected flag so sendRequest works during symbol reload,
-		// route registration, and notification re-subscribe (all use sendRequest internally).
-		// Known: new external callers arriving here can also send requests before
-		// symbols/notifications are fully restored. This is acceptable because
-		// ReadFromSymbol/WriteToSymbol retry with handle re-resolution on ADS errors.
-		// Callers already waiting on reconnectDone remain blocked until Reconnect's defer.
-		conn.disconnected.Store(false)
-
-		// Re-check closed BEFORE waitGroup.Add(2). Without this, a Close()
-		// that already completed waitGroup.Wait() (counter=0) racing with
-		// our Add(2) here would trigger "sync: WaitGroup misuse" (F-02).
-		// Close() now waits on reconnectDone before its own Wait, but we
-		// also gate Add() on closed for defense-in-depth.
-		if conn.closed.Load() {
-			return fmt.Errorf("connection closed during reconnect")
-		}
-		// Re-start goroutines
-		conn.waitGroup.Add(2)
-		go conn.listen()
-		go conn.transmitWorker()
 
 		// Re-perform local-mode handshake if needed
 		if conn.isLocal {
-			resp, err := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
-			if err != nil {
+			if err := conn.localHandshake(); err != nil {
 				lastErr = err
 				conn.logger.Warn("reconnect local handshake failed, retrying", "error", err, "attempt", attempts)
 				conn.resetForRetry()
@@ -640,19 +561,6 @@ func (conn *Connection) Reconnect() error {
 				}
 				continue
 			}
-			buf := bytes.NewBuffer(resp)
-			result := AmsAddress{}
-			if err = binary.Read(buf, binary.LittleEndian, &result); err != nil {
-				conn.logger.Warn("reconnect local handshake parse failed, retrying", "error", err, "attempt", attempts)
-				conn.resetForRetry()
-				if err := conn.reconnectSleep(attempts); err != nil {
-					return err
-				}
-				continue
-			}
-			conn.connMu.Lock()
-			conn.source = result
-			conn.connMu.Unlock()
 		}
 
 		// Smart route registration: probe first, register only if needed.
@@ -678,37 +586,14 @@ func (conn *Connection) Reconnect() error {
 		}
 
 		// Re-subscribe notifications using stored configs.
-		// Filter out symbols that no longer exist after reload to prevent failures.
-		conn.symbolLock.Lock()
-		savedConfigs := conn.notificationConfigs
-		savedChannel := conn.notificationChannel
-		conn.notificationConfigs = nil // Clear before re-adding to prevent duplicates
-		conn.symbolLock.Unlock()
-		if len(savedConfigs) > 0 && savedChannel != nil {
-			// Filter to only symbols that still exist
-			validConfigs := conn.filterValidNotificationConfigs(savedConfigs)
-			if len(validConfigs) > 0 {
-				err = conn.AddSymbolNotifications(validConfigs, savedChannel)
-			} else {
-				// All symbols gone (e.g., PLC online change removed all subscribed vars).
-				// Clear channel reference so a future AddSymbolNotification can use a new channel.
-				conn.symbolLock.Lock()
-				conn.notificationChannel = nil
-				conn.symbolLock.Unlock()
+		if err := conn.resubscribeNotifications(); err != nil {
+			lastErr = err
+			conn.logger.Warn("reconnect notification re-subscribe failed, retrying", "error", err, "attempt", attempts)
+			conn.resetForRetry()
+			if err := conn.reconnectSleep(attempts); err != nil {
+				return err
 			}
-			if err != nil {
-				conn.logger.Warn("reconnect notification re-subscribe failed, retrying", "error", err, "attempt", attempts)
-				// Restore ALL configs (including filtered) so they can be retried
-				conn.symbolLock.Lock()
-				conn.notificationConfigs = savedConfigs
-				conn.notificationChannel = savedChannel
-				conn.symbolLock.Unlock()
-				conn.resetForRetry()
-				if err := conn.reconnectSleep(attempts); err != nil {
-					return err
-				}
-				continue
-			}
+			continue
 		}
 
 		conn.disconnected.Store(false)
@@ -857,38 +742,18 @@ func (conn *Connection) reloadSymbols() error {
 	return nil
 }
 
-// cleanupAfterFailedConnect tears down goroutines, closes TCP, and resets
-// channels/context so the connection can be retried via Connect().
-// Used during initial Connect() when the handshake or route registration fails
-// after goroutines have already been started.
-func (conn *Connection) cleanupAfterFailedConnect() {
-	conn.shutdown()
-	conn.connMu.Lock()
-	if conn.connection != nil {
-		conn.connection.Close()
-	}
-	conn.connMu.Unlock()
-	conn.waitGroup.Wait()
-	// Reassign ctx/shutdown/channels under their guards for symmetry with
-	// resetForRetry. Currently this function is only called from initial
-	// Connect() failure paths where no external caller holds the connection,
-	// but the locks are cheap insurance against future callers.
-	conn.ctxMu.Lock()
-	conn.ctx, conn.shutdown = context.WithCancel(context.Background())
-	conn.ctxMu.Unlock()
-	conn.chanMu.Lock()
-	conn.sendChannel = make(chan []byte)
-	conn.systemResponse = make(chan []byte)
-	conn.chanMu.Unlock()
-	conn.activeRequestLock.Lock()
-	conn.activeRequests = map[uint32]chan []byte{}
-	conn.activeRequestLock.Unlock()
-}
-
-// resetForRetry tears down goroutines, closes the TCP connection, and resets
-// channels/state so the next retry iteration starts clean.
-func (conn *Connection) resetForRetry() {
-	conn.disconnected.Store(true)
+// tearDownAndReset cancels the active goroutines, closes the TCP connection,
+// and resets ctx/channels/activeRequests so the connection can be re-dialed.
+// Optionally resets feature-detection flags (sumReadCmd / sumWriteState /
+// sumNotifState / chunkedDownloadChecked) — needed during Reconnect when the
+// PLC may have changed; not needed during initial Connect cleanup.
+//
+// Consolidates four previously-duplicated reset paths:
+//   - Connect()'s post-route-registration TCP teardown
+//   - Reconnect()'s pre-retry-loop reset
+//   - cleanupAfterFailedConnect()
+//   - resetForRetry()
+func (conn *Connection) tearDownAndReset(resetFeatureFlags bool) {
 	conn.ctxMu.RLock()
 	conn.shutdown()
 	conn.ctxMu.RUnlock()
@@ -908,6 +773,107 @@ func (conn *Connection) resetForRetry() {
 	conn.activeRequestLock.Lock()
 	conn.activeRequests = map[uint32]chan []byte{}
 	conn.activeRequestLock.Unlock()
+	if resetFeatureFlags {
+		conn.sumReadCmd.Store(0)
+		conn.sumWriteState.Store(0)
+		conn.sumNotifState.Store(0)
+		conn.chunkedDownloadChecked.Store(false)
+	}
+}
+
+// dialAndStart performs net.DialTimeout, configures keepalive, clears the
+// disconnected flag, and starts the listen/transmit goroutines. Used by both
+// Connect()'s post-route-registration redial path and Reconnect()'s retry loop.
+// Re-checks closed before waitGroup.Add(2) to prevent the F-02 sync.WaitGroup
+// misuse race.
+func (conn *Connection) dialAndStart() error {
+	newConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.RequestTimeout)
+	if err != nil {
+		return err
+	}
+	conn.connMu.Lock()
+	conn.connection = newConn
+	conn.connMu.Unlock()
+	configureKeepAlive(newConn)
+	conn.disconnected.Store(false)
+	if conn.closed.Load() {
+		// Connection was Closed mid-dial. Don't Add to waitGroup.
+		conn.connMu.Lock()
+		newConn.Close()
+		conn.connection = nil
+		conn.connMu.Unlock()
+		return fmt.Errorf("connection closed during dial")
+	}
+	conn.waitGroup.Add(2)
+	go conn.listen()
+	go conn.transmitWorker()
+	return nil
+}
+
+// localHandshake performs the local-mode AmsAddress probe used after dial when
+// isLocal is true. Updates conn.source on success.
+func (conn *Connection) localHandshake() error {
+	resp, err := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
+	if err != nil {
+		return fmt.Errorf("local handshake send: %w", err)
+	}
+	buf := bytes.NewBuffer(resp)
+	result := AmsAddress{}
+	if err := binary.Read(buf, binary.LittleEndian, &result); err != nil {
+		return fmt.Errorf("local handshake parse: %w", err)
+	}
+	conn.connMu.Lock()
+	conn.source = result
+	conn.connMu.Unlock()
+	return nil
+}
+
+// resubscribeNotifications restores notification subscriptions stored in
+// notificationConfigs after a successful reconnect. Filters out symbols that
+// no longer exist after symbol reload. On error, restores the saved configs
+// so they can be retried by the next reconnect attempt.
+func (conn *Connection) resubscribeNotifications() error {
+	conn.symbolLock.Lock()
+	savedConfigs := conn.notificationConfigs
+	savedChannel := conn.notificationChannel
+	conn.notificationConfigs = nil // Clear before re-adding to prevent duplicates
+	conn.symbolLock.Unlock()
+	if len(savedConfigs) == 0 || savedChannel == nil {
+		return nil
+	}
+	validConfigs := conn.filterValidNotificationConfigs(savedConfigs)
+	if len(validConfigs) == 0 {
+		// All symbols gone (e.g., PLC online change removed all subscribed vars).
+		// Clear channel reference so a future AddSymbolNotification can use a new channel.
+		conn.symbolLock.Lock()
+		conn.notificationChannel = nil
+		conn.symbolLock.Unlock()
+		return nil
+	}
+	if err := conn.AddSymbolNotifications(validConfigs, savedChannel); err != nil {
+		// Restore configs so they can be retried by the next reconnect attempt.
+		conn.symbolLock.Lock()
+		conn.notificationConfigs = savedConfigs
+		conn.notificationChannel = savedChannel
+		conn.symbolLock.Unlock()
+		return err
+	}
+	return nil
+}
+
+// cleanupAfterFailedConnect tears down goroutines, closes TCP, and resets
+// channels/context so the connection can be retried via Connect().
+// Used during initial Connect() when the handshake or route registration fails
+// after goroutines have already been started.
+func (conn *Connection) cleanupAfterFailedConnect() {
+	conn.tearDownAndReset(false)
+}
+
+// resetForRetry tears down goroutines, closes the TCP connection, and resets
+// channels/state so the next retry iteration starts clean.
+func (conn *Connection) resetForRetry() {
+	conn.disconnected.Store(true)
+	conn.tearDownAndReset(false)
 	// Allow route re-registration on next attempt (PLC may have rebooted)
 }
 
