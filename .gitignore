@@ -8,3 +8,5 @@ coverage.html
 *.pdf
 *.var
 logs/
+improvements.md
+docs/
