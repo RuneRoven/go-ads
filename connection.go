@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -447,8 +448,10 @@ func (conn *Connection) Close() {
 	conn.logger.Info("Close DONE")
 }
 
-// ErrDisconnected is returned when attempting to send on a closed connection.
-var ErrDisconnected = fmt.Errorf("connection is disconnected")
+// ErrDisconnected indicates the underlying TCP connection is not available —
+// either Close() has been called or a reconnect has failed. Callers should use
+// errors.Is(err, ErrDisconnected) to detect this case.
+var ErrDisconnected = errors.New("connection is disconnected")
 
 // reconnectBackoff returns the delay for the given reconnect attempt number (1-indexed)
 // based on the configured BackoffConfig tiers.
