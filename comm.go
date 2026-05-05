@@ -8,8 +8,31 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
+	"net"
+	"syscall"
 )
+
+// isRouteHintErr returns true if err indicates a likely missing-AMS-route condition
+// (PLC closed the TCP connection because no route exists for our NetID).
+// Detects wrapped io.EOF and ECONNRESET via the standard errors.Is/As mechanism.
+func isRouteHintErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		if errors.Is(netErr.Err, syscall.ECONNRESET) {
+			return true
+		}
+	}
+	if errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	return false
+}
 
 // send is used exclusively for the local-mode handshake during Connect/Reconnect.
 // It uses the shared systemResponse channel and is NOT safe for concurrent callers.
@@ -204,7 +227,7 @@ func (conn *Connection) listen() {
 				}
 				// EOF or connection reset often means PLC has no AMS route for our NetID
 				hint := ""
-				if err.Error() == "EOF" || strings.Contains(err.Error(), "connection reset") {
+				if isRouteHintErr(err) {
 					hint = "PLC may not have an AMS route for this NetID — check route credentials or register route via WithRoute()"
 				}
 				if hint != "" {
