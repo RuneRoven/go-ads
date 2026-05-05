@@ -16,6 +16,23 @@ import (
 	"go.uber.org/atomic"
 )
 
+// secret is an internal wrapper around password/credential strings that
+// implements String() and slog.LogValuer to return "[REDACTED]" instead
+// of the raw value. Defends against accidental leaks via fmt.Sprintf("%+v",
+// conn) or slog.Any("conn", conn) (F-25).
+//
+// Kept unexported. The Connection's public API for credentials remains
+// plain string — conversion happens at the boundary.
+type secret string
+
+func (s secret) String() string {
+	return "[REDACTED]"
+}
+
+func (s secret) LogValue() slog.Value {
+	return slog.StringValue("[REDACTED]")
+}
+
 type Connection struct {
 	ip   string
 	port int
@@ -105,7 +122,7 @@ type Connection struct {
 	// Route registration config (set via WithRoute, used in Connect and reconnect)
 	routeName     string
 	routeUsername string
-	routePassword string
+	routePassword secret
 
 	logger *slog.Logger
 }
@@ -306,7 +323,7 @@ func (conn *Connection) ensureRouteOnConnect() (registered bool, err error) {
 	// Force mode → always register
 	if conn.forceRouteRegistration {
 		conn.logger.Info("registering route (force mode)")
-		err = conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword)
+		err = conn.AddRoute(conn.routeName, conn.routeUsername, string(conn.routePassword))
 		return err == nil, err
 	}
 
@@ -325,7 +342,7 @@ func (conn *Connection) ensureRouteOnConnect() (registered bool, err error) {
 	// Probe failed → register with credentials
 	conn.routeProbeFailures++
 	conn.logger.Info("route probe failed, registering route", "error", probeErr)
-	err = conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword)
+	err = conn.AddRoute(conn.routeName, conn.routeUsername, string(conn.routePassword))
 	if err != nil {
 		return false, err
 	}
@@ -625,7 +642,7 @@ func (conn *Connection) ensureRoute(attempt int) error {
 	// Force mode or too many probe failures → always register
 	if conn.forceRouteRegistration || conn.routeProbeFailures >= 3 {
 		conn.logger.Info("registering route (forced/fallback)", "probeFailures", conn.routeProbeFailures)
-		if err := conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword); err != nil {
+		if err := conn.AddRoute(conn.routeName, conn.routeUsername, string(conn.routePassword)); err != nil {
 			return fmt.Errorf("route registration failed: %w", err)
 		}
 
@@ -648,7 +665,7 @@ func (conn *Connection) ensureRoute(attempt int) error {
 	// Probe failed → register with credentials
 	conn.routeProbeFailures++
 	conn.logger.Info("route probe failed, registering route", "error", probeErr, "probeFailures", conn.routeProbeFailures)
-	if err := conn.AddRoute(conn.routeName, conn.routeUsername, conn.routePassword); err != nil {
+	if err := conn.AddRoute(conn.routeName, conn.routeUsername, string(conn.routePassword)); err != nil {
 		return fmt.Errorf("route registration failed after probe: %w", err)
 	}
 

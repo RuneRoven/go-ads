@@ -54,7 +54,7 @@ func WithRoute(routeName, username, password string) ConnectionOption {
 	return func(c *Connection) {
 		c.routeName = routeName
 		c.routeUsername = username
-		c.routePassword = password
+		c.routePassword = secret(password)
 	}
 }
 
