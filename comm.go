@@ -172,6 +172,16 @@ func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (respons
 	}
 }
 
+// listen reads inbound AMS packets and dispatches notifications to handleNotification.
+//
+// Lifecycle invariant: conn.connection, conn.ctx, conn.systemResponse are read
+// without locks inside this loop. This is safe because Reconnect() guarantees
+// the field-swap ordering: shutdown() cancels conn.ctx → waitGroup.Wait() blocks
+// until the existing listen/transmit goroutines exit → fields are reassigned
+// under their respective locks → waitGroup.Add(2) and `go listen()` start fresh
+// goroutines. The `go` statement establishes happens-before, so a new listen()
+// always sees the post-swap field values. No goroutine is alive concurrent with
+// the field swap.
 func (conn *Connection) listen() {
 	defer conn.waitGroup.Done()
 	reader := bufio.NewReader(conn.connection)
