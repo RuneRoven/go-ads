@@ -857,9 +857,17 @@ func (conn *Connection) cleanupAfterFailedConnect() {
 	}
 	conn.connMu.Unlock()
 	conn.waitGroup.Wait()
+	// Reassign ctx/shutdown/channels under their guards for symmetry with
+	// resetForRetry. Currently this function is only called from initial
+	// Connect() failure paths where no external caller holds the connection,
+	// but the locks are cheap insurance against future callers.
+	conn.ctxMu.Lock()
 	conn.ctx, conn.shutdown = context.WithCancel(context.Background())
+	conn.ctxMu.Unlock()
+	conn.chanMu.Lock()
 	conn.sendChannel = make(chan []byte)
 	conn.systemResponse = make(chan []byte)
+	conn.chanMu.Unlock()
 	conn.activeRequestLock.Lock()
 	conn.activeRequests = map[uint32]chan []byte{}
 	conn.activeRequestLock.Unlock()
