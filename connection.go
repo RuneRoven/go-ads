@@ -112,9 +112,9 @@ type Connection struct {
 	// uint32(GroupSumupReadEx2) = use 0xF084,
 	// uint32(GroupSumupReadEx) = use 0xF083,
 	// 1 = no sum read support (individual reads)
-	sumReadCmd    atomic.Uint32
-	sumWriteState atomic.Uint32 // 0=unchecked, 1=supported, 2=unsupported
-	sumNotifState atomic.Uint32 // 0=unchecked, 1=supported, 2=unsupported
+	sumReadCmd               atomic.Uint32
+	sumWriteState            atomic.Uint32 // 0=unchecked, 1=supported, 2=unsupported
+	sumNotifState            atomic.Uint32 // 0=unchecked, 1=supported, 2=unsupported
 	chunkedDownloadSupported atomic.Bool
 	chunkedDownloadChecked   atomic.Bool
 

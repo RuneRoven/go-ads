@@ -86,7 +86,7 @@ type Symbol struct {
 	Group             uint32
 	Offset            uint32
 	Length            uint32
-	BaseType          uint32     // ADST_ numeric type code from protocol (e.g., ADSTReal32=4 for REAL)
+	BaseType          uint32 // ADST_ numeric type code from protocol (e.g., ADSTReal32=4 for REAL)
 	Flags             SymbolFlag
 	ContextMask       uint8 // PLC task context (bits 8-11 of Flags); 0 = no task binding
 	Changed           bool
