@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,30 @@ import (
 	"syscall"
 	"testing"
 )
+
+// Verify sendRequestOnce ctxDone branch returns context.Canceled (not ErrDisconnected),
+// so the outer sendRequest retry loop re-engages.
+//
+// Simulates the disconnected-wait state by setting up a Connection with
+// disconnected=true and a non-nil reconnectDone channel, then cancelling the ctx.
+func TestSendRequestOnce_CtxDoneReturnsCanceled(t *testing.T) {
+	conn := &Connection{
+		logger:        getDefaultLogger(),
+		reconnectDone: make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	conn.ctx = ctx
+	conn.shutdown = cancel
+	conn.disconnected.Store(true)
+
+	cancel()
+
+	_, err := conn.sendRequestOnce(CommandIDRead, []byte{})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v (errors.Is(context.Canceled)=%v)",
+			err, errors.Is(err, context.Canceled))
+	}
+}
 
 func TestIsRouteHintErr_EOF(t *testing.T) {
 	cases := []struct {

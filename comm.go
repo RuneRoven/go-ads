@@ -133,7 +133,9 @@ func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (respons
 					return nil, ErrDisconnected
 				}
 			case <-ctxDone:
-				return nil, ErrDisconnected
+				// Reconnect cancelled our ctx mid-wait. Return context.Canceled
+				// so the outer sendRequest retry loop re-engages.
+				return nil, context.Canceled
 			}
 		} else {
 			return nil, ErrDisconnected
