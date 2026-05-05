@@ -121,12 +121,16 @@ func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnC
 	// Clean up internal notification tracking
 	conn.symbolLock.Lock()
 	for i, h := range handles {
-		if errors[i] == ReturnCodeNoErrors {
+		// F-23: ReturnCodeDeviceNotifyHandleInvalid means the PLC already
+		// considers the handle gone — equivalent-to-success for cleanup.
+		// Without this, the client-side activeNotifications entry leaks
+		// (no PLC counterpart, but config retried on next reconnect).
+		if errors[i] == ReturnCodeNoErrors || errors[i] == ReturnCodeDeviceNotifyHandleInvalid {
 			if sym := conn.activeNotifications[h]; sym != nil {
 				conn.removeNotificationConfig(sym.FullName)
 			}
 			delete(conn.activeNotifications, h)
-			conn.logger.Info("batch deleted notification handle", "handle", h)
+			conn.logger.Info("batch deleted notification handle", "handle", h, "errorCode", uint32(errors[i]))
 		}
 	}
 	if len(conn.activeNotifications) == 0 {
