@@ -112,18 +112,37 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 		Value:     value,
 		TimeStamp: notificationTime,
 	}
+	conn.deliverNotification(ctx, notification, updateStruct, handle, fullName)
+	return nil
+}
+
+// deliverNotification performs a non-blocking send on the caller-owned channel.
+// Guards against the caller closing the channel: a select with default does NOT
+// prevent panics on send-to-closed-channel — Go runtime always panics in that case.
+// Recovers and logs an Error instead of crashing the listen goroutine.
+//
+// Caller must NOT close the update channel while subscriptions exist on this
+// connection; see AddSymbolNotification(s) godoc for the ownership rule.
+func (conn *Connection) deliverNotification(ctx context.Context, ch chan<- *Update, update *Update, handle uint32, fullName string) {
+	defer func() {
+		if r := recover(); r != nil {
+			conn.logger.Error("notification send panicked — caller closed the update channel?",
+				"handle", handle,
+				"symbol", fullName,
+				"panic", r)
+		}
+	}()
 	// Non-blocking send: deliver notification instantly or drop if channel full.
 	// Caller controls backpressure by sizing the channel buffer appropriately
 	// (e.g. make(chan *Update, 1024) for burst absorption).
 	// This prevents goroutine accumulation and never blocks the receive pipeline.
 	select {
 	case <-ctx.Done():
-	case notification <- updateStruct:
+	case ch <- update:
 		conn.logger.Debug("Successfully delivered notification", "handle", handle)
 	default:
 		conn.logger.Warn("notification dropped (channel full, receiver too slow)",
 			"handle", handle,
 			"symbol", fullName)
 	}
-	return nil
 }

@@ -595,6 +595,13 @@ func (conn *Connection) RefreshSymbols() error {
 // Note: all notifications must share the same updateReceiver channel.
 // On reconnect, the stored channel is used to re-subscribe all notifications.
 // For multiple notifications, prefer AddSymbolNotifications.
+//
+// Channel ownership: the caller MUST NOT close updateReceiver while any
+// notification is active on this connection. The library guards against
+// accidental close with a recover (see deliverNotification), but a closed
+// channel will silently drop notifications and emit Error logs. To stop
+// receiving notifications, call DeleteDeviceNotification or Close() — these
+// remove the PLC-side registration before the channel is no longer used.
 func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay int, cycleTime int, transMode TransMode, updateReceiver chan *Update) (uint32, error) {
 	conn.symbolLock.Lock()
 	if conn.notificationChannel != nil && conn.notificationChannel != updateReceiver {
@@ -838,6 +845,13 @@ func (conn *Connection) writeMultipleSymbolsRetry(values map[string]string, retr
 }
 
 // AddSymbolNotifications adds multiple symbol notifications in a single ADS round-trip using SumAddDeviceNotification.
+//
+// Channel ownership: the caller MUST NOT close ch while any notification is
+// active on this connection. The library guards against accidental close with
+// a recover (see deliverNotification), but a closed channel will silently drop
+// notifications and emit Error logs. To stop receiving notifications, call
+// DeleteDeviceNotification or Close() — these remove the PLC-side registration
+// before the channel is no longer used.
 func (conn *Connection) AddSymbolNotifications(configs []NotificationConfig, ch chan *Update) error {
 	if len(configs) == 0 {
 		return nil
