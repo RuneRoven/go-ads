@@ -421,16 +421,20 @@ func (conn *Connection) Close() {
 		conn.connection.Close()
 	}
 	conn.connMu.Unlock()
-	conn.logger.Info("Waiting for workers to close")
-	conn.waitGroup.Wait()
-	// Wait for any in-progress reconnect to stop.
-	// The closedCh signal makes Reconnect exit its retry loop promptly.
+	// Wait for any in-progress reconnect to stop BEFORE waiting on the
+	// goroutine waitGroup. Reconnect's retry loop may call waitGroup.Add(2)
+	// after we Close — calling Wait first would race with that Add and
+	// trigger "sync: WaitGroup misuse" (F-02). closedCh signals Reconnect
+	// to exit its retry loop promptly; reconnectDone is closed when Reconnect
+	// returns.
 	conn.reconnectMu.Lock()
 	ch := conn.reconnectDone
 	conn.reconnectMu.Unlock()
 	if ch != nil {
 		<-ch
 	}
+	conn.logger.Info("Waiting for workers to close")
+	conn.waitGroup.Wait()
 	conn.logger.Info("Close DONE")
 }
 
@@ -611,6 +615,14 @@ func (conn *Connection) Reconnect() error {
 		// Callers already waiting on reconnectDone remain blocked until Reconnect's defer.
 		conn.disconnected.Store(false)
 
+		// Re-check closed BEFORE waitGroup.Add(2). Without this, a Close()
+		// that already completed waitGroup.Wait() (counter=0) racing with
+		// our Add(2) here would trigger "sync: WaitGroup misuse" (F-02).
+		// Close() now waits on reconnectDone before its own Wait, but we
+		// also gate Add() on closed for defense-in-depth.
+		if conn.closed.Load() {
+			return fmt.Errorf("connection closed during reconnect")
+		}
 		// Re-start goroutines
 		conn.waitGroup.Add(2)
 		go conn.listen()
