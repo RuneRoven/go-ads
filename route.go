@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net"
 	"time"
+
+	"go.uber.org/atomic"
 )
 
 // UDP route registration constants
@@ -32,20 +34,20 @@ const (
 //
 // Parameters:
 //   - remoteHost: IP or hostname of the PLC
-//   - localNetId: the AMS NetID this client will use as source
+//   - localNetID: the AMS NetID this client will use as source
 //   - routeName: name for the route entry on the PLC
 //   - computerName: the IP/hostname the PLC should use to connect back to this client
 //   - username: PLC admin username (typically "Administrator")
 //   - password: PLC admin password
-func AddRemoteRoute(remoteHost string, localNetId [6]byte, routeName string, computerName string, username string, password string) error {
-	return AddRemoteRouteWithLogger(getDefaultLogger(), remoteHost, localNetId, routeName, computerName, username, password)
+func AddRemoteRoute(remoteHost string, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
+	return AddRemoteRouteWithLogger(getDefaultLogger(), remoteHost, localNetID, routeName, computerName, username, password)
 }
 
 // AddRemoteRouteWithLogger is like AddRemoteRoute but accepts an explicit logger.
-func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetId [6]byte, routeName string, computerName string, username string, password string) error {
+func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
 	logger.Info("registering route",
 		"remoteHost", remoteHost,
-		"localNetId", fmt.Sprintf("%d.%d.%d.%d.%d.%d", localNetId[0], localNetId[1], localNetId[2], localNetId[3], localNetId[4], localNetId[5]),
+		"localNetID", fmt.Sprintf("%d.%d.%d.%d.%d.%d", localNetID[0], localNetID[1], localNetID[2], localNetID[3], localNetID[4], localNetID[5]),
 		"computerName", computerName,
 		"routeName", routeName,
 		"hasAuth", username != "")
@@ -60,18 +62,18 @@ func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetId
 	}
 	defer func() { _ = conn.Close() }()
 
-	// F-24: generate random invokeId via crypto/rand for response-echo
+	// generate random invokeID via crypto/rand for response-echo
 	// validation in parseRouteResponse. Defends against UDP spoofing on the
 	// local network — an attacker would need to predict the random per-call
 	// value to inject a fake "success" response.
-	var invokeIdBuf [4]byte
-	if _, err := cryptorand.Read(invokeIdBuf[:]); err != nil {
-		return fmt.Errorf("generate invokeId: %w", err)
+	var invokeIDBuf [4]byte
+	if _, err := cryptorand.Read(invokeIDBuf[:]); err != nil {
+		return fmt.Errorf("generate invokeID: %w", err)
 	}
-	invokeId := binary.LittleEndian.Uint32(invokeIdBuf[:])
+	invokeID := binary.LittleEndian.Uint32(invokeIDBuf[:])
 
 	// Build the route request packet
-	packet := buildRoutePacket(localNetId, routeName, computerName, username, password, invokeId)
+	packet := buildRoutePacket(localNetID, routeName, computerName, username, password, invokeID)
 
 	_, err = conn.Write(packet)
 	if err != nil {
@@ -88,17 +90,17 @@ func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetId
 		return fmt.Errorf("failed to read route response: %w", err)
 	}
 
-	return parseRouteResponse(logger, respBuf[:n], invokeId)
+	return parseRouteResponse(logger, respBuf[:n], invokeID)
 }
 
 // buildRoutePacket constructs a UDP route registration packet.
-// invokeId is set by the caller (per ADS InvokeID semantics) to identify the
+// invokeID is set by the caller (per ADS InvokeID semantics) to identify the
 // command and validate the response echo. Use a random uint32 from crypto/rand
-// to defend against UDP spoofing on the local network (F-24).
-func buildRoutePacket(localNetId [6]byte, routeName string, computerName string, username string, password string, invokeId uint32) []byte {
+// to defend against UDP spoofing on the local network.
+func buildRoutePacket(localNetID [6]byte, routeName string, computerName string, username string, password string, invokeID uint32) []byte {
 	// Build tags
 	tags := [][]byte{
-		buildTag(tagNetID, localNetId[:]),
+		buildTag(tagNetID, localNetID[:]),
 		buildTag(tagPassword, appendNull([]byte(password))),
 		buildTag(tagComputerName, appendNull([]byte(computerName))),
 		buildTag(tagRouteName, appendNull([]byte(routeName))),
@@ -110,13 +112,13 @@ func buildRoutePacket(localNetId [6]byte, routeName string, computerName string,
 		tagsData = append(tagsData, tag...)
 	}
 
-	// Header: cookie(4) + invokeId(4) + serviceId(4) + AmsAddr(8) + tagCount(4)
+	// Header: cookie(4) + invokeID(4) + serviceId(4) + AmsAddr(8) + tagCount(4)
 	header := make([]byte, 24)
 	binary.LittleEndian.PutUint32(header[0:], routeCookie)
-	binary.LittleEndian.PutUint32(header[4:], invokeId) // F-24: caller-provided random invokeId for echo validation
+	binary.LittleEndian.PutUint32(header[4:], invokeID) // caller-provided random invokeID for echo validation
 	binary.LittleEndian.PutUint32(header[8:], routeServiceAdd)
 	// AmsAddr: NetID(6) + Port(2) — port is 0 per Beckhoff spec
-	copy(header[12:18], localNetId[:])
+	copy(header[12:18], localNetID[:])
 	binary.LittleEndian.PutUint16(header[18:], 0)
 	binary.LittleEndian.PutUint32(header[20:], uint32(len(tags)))
 
@@ -138,12 +140,12 @@ func appendNull(data []byte) []byte {
 }
 
 // parseRouteResponse validates the route registration response.
-// Response format: cookie(4) + invokeId(4) + serviceId(4) + AmsAddr(8) + tagCount(4) + tags...
+// Response format: cookie(4) + invokeID(4) + serviceId(4) + AmsAddr(8) + tagCount(4) + tags...
 //
-// expectedInvokeId is the value the caller provided in the request; the PLC
+// expectedInvokeID is the value the caller provided in the request; the PLC
 // echoes it per ADS InvokeID semantics and we reject mismatches as possible
-// UDP-spoofing attempts (F-24).
-func parseRouteResponse(logger *slog.Logger, data []byte, expectedInvokeId uint32) error {
+// UDP-spoofing attempts.
+func parseRouteResponse(logger *slog.Logger, data []byte, expectedInvokeID uint32) error {
 	logger.Debug("route response raw bytes", hexAttr("response", data), "length", len(data))
 
 	if len(data) < 24 {
@@ -155,12 +157,12 @@ func parseRouteResponse(logger *slog.Logger, data []byte, expectedInvokeId uint3
 		return fmt.Errorf("unexpected route response cookie: 0x%08X", cookie)
 	}
 
-	// F-24: validate invokeId echo. Defends against UDP spoofing on the local
-	// network — an attacker would need to predict the random per-call invokeId
+	// validate invokeID echo. Defends against UDP spoofing on the local
+	// network — an attacker would need to predict the random per-call invokeID
 	// to inject a fake "success" response.
-	gotInvokeId := binary.LittleEndian.Uint32(data[4:])
-	if gotInvokeId != expectedInvokeId {
-		return fmt.Errorf("route response invokeId mismatch: got 0x%08X, expected 0x%08X (possible spoof or PLC misbehavior)", gotInvokeId, expectedInvokeId)
+	gotInvokeID := binary.LittleEndian.Uint32(data[4:])
+	if gotInvokeID != expectedInvokeID {
+		return fmt.Errorf("route response invokeID mismatch: got 0x%08X, expected 0x%08X (possible spoof or PLC misbehavior)", gotInvokeID, expectedInvokeID)
 	}
 
 	serviceId := binary.LittleEndian.Uint32(data[8:])
@@ -197,4 +199,21 @@ func parseRouteResponse(logger *slog.Logger, data []byte, expectedInvokeId uint3
 
 	logger.Info("route registration response received (no error tag found, assuming success)")
 	return nil
+}
+
+// routeManager holds the credentials and policy state used for AMS route
+// registration. The caller's WithRoute(name, user, password) option populates
+// these fields; Connect/Reconnect read them when probing the PLC's route
+// table and registering if needed.
+//
+// name/username/password/forceRouteRegistration are write-once at construction
+// (via WithRoute). routeProbeFailures is read+written from both Connect (caller
+// goroutine) and Reconnect (lifecycle goroutine) - atomic.Int32 makes that
+// race-free without imposing a lock on the hot reconnect path.
+type routeManager struct {
+	name                   string
+	username               string
+	password               secret
+	forceRouteRegistration bool
+	routeProbeFailures     atomic.Int32
 }

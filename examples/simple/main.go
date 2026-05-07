@@ -107,6 +107,10 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// NOTE: connMu only guards Connect/Close transitions in the cleanup
+	// goroutine; the REPL loop reads conn without locking because Readline
+	// blocks the main thread between commands. Acceptable for an example;
+	// production code should use atomic.Pointer or full mutex-guarded access.
 	var conn *ads.Connection
 	var connMu sync.Mutex
 	updateCh := make(chan *ads.Update, 100)
@@ -210,7 +214,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				continue
 			}
-			fmt.Printf("ADS State: %d  Device State: %d\n", state.AdsState, state.DeviceState)
+			fmt.Printf("ADS State: %d  Device State: %d\n", state.ADSState, state.DeviceState)
 
 		case "discover":
 			if conn == nil {
@@ -430,7 +434,7 @@ func main() {
 					maxDelay = v
 				}
 			}
-			handle, err := conn.AddSymbolNotification(symbolName, maxDelay, cycleTime, ads.TransModeServerOnChange, updateCh)
+			handle, err := conn.AddSymbolNotification(symbolName, time.Duration(maxDelay)*time.Millisecond, time.Duration(cycleTime)*time.Millisecond, ads.TransModeServerOnChange, updateCh)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				continue
@@ -783,7 +787,7 @@ func doConnect(ctx context.Context, cfg *Config) (*ads.Connection, error) {
 		}
 	}
 
-	conn, err := ads.NewConnection(ctx, cfg.IP, cfg.Port, cfg.NetID, cfg.AMSPort, localNetID, cfg.LocalPort, 5*time.Second)
+	conn, err := ads.NewConnection(cfg.IP, cfg.Port, cfg.NetID, cfg.AMSPort, localNetID, cfg.LocalPort, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -809,7 +813,7 @@ func doConnect(ctx context.Context, cfg *Config) (*ads.Connection, error) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not read state: %v\n", err)
 	} else {
-		fmt.Printf("ADS State: %d  Device State: %d\n", state.AdsState, state.DeviceState)
+		fmt.Printf("ADS State: %d  Device State: %d\n", state.ADSState, state.DeviceState)
 	}
 
 	return conn, nil

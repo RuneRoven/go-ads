@@ -48,7 +48,7 @@ func TestWriteToNode_STRING_RejectsZeroLength(t *testing.T) {
 		DataType: "STRING",
 		Length:   0,
 	}
-	_, err := sym.writeToNode("hello", 0, nil)
+	_, err := sym.writeToNode("hello", nil)
 	if err == nil {
 		t.Fatalf("expected error for STRING with Length=0, got nil")
 	}
@@ -64,7 +64,7 @@ func TestWriteToNode_WSTRING_RejectsTooShort(t *testing.T) {
 			DataType: "WSTRING",
 			Length:   length,
 		}
-		_, err := sym.writeToNode("hi", 0, nil)
+		_, err := sym.writeToNode("hi", nil)
 		if err == nil {
 			t.Errorf("expected error for WSTRING with Length=%d, got nil", length)
 		}
@@ -82,7 +82,7 @@ func TestWriteToNode_FallsBackToInferredType(t *testing.T) {
 		DataType: "MyEnum32", // unknown user type
 		Length:   4,
 	}
-	got, err := sym.writeToNode("42", 0, nil)
+	got, err := sym.writeToNode("42", nil)
 	if err != nil {
 		t.Fatalf("expected inference fallback to succeed, got error: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestWriteToNode_RejectsUnknownTypeWithUninferableSize(t *testing.T) {
 		DataType: "MyWeirdType",
 		Length:   3, // not 1/2/4/8
 	}
-	_, err := sym.writeToNode("42", 0, nil)
+	_, err := sym.writeToNode("42", nil)
 	if err == nil {
 		t.Fatalf("expected error for size=3 unknown type, got nil")
 	}
@@ -116,7 +116,7 @@ func TestWriteToNode_STRING_HappyPath(t *testing.T) {
 		DataType: "STRING",
 		Length:   10,
 	}
-	got, err := sym.writeToNode("hello world", 0, nil)
+	got, err := sym.writeToNode("hello world", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

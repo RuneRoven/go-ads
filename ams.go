@@ -16,8 +16,8 @@ type amsTCPHeader struct {
 }
 
 type amsHeader struct {
-	Target    AmsAddress
-	Source    AmsAddress
+	Target    AMSAddress
+	Source    AMSAddress
 	Command   CommandID
 	State     uint16
 	Length    uint32
@@ -45,9 +45,9 @@ func stringToNetID(source string) (result [6]byte, err error) {
 func (conn *Connection) encode(command CommandID, data []byte, invokeID uint32) ([]byte, error) {
 	// Snapshot source under lock to avoid race with Reconnect writing conn.source.
 	// target is write-once (set in NewConnection), so no lock needed.
-	conn.connMu.Lock()
+	conn.tx.connMu.Lock()
 	source := conn.source
-	conn.connMu.Unlock()
+	conn.tx.connMu.Unlock()
 	conn.logger.Log(context.Background(), LevelTrace, "Starting encoding of AMS header",
 		"command", command,
 		"target", conn.target,

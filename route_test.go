@@ -8,25 +8,25 @@ import (
 	"testing"
 )
 
-// F-24: parseRouteResponse must reject a response whose invokeId does not
+// F-24: parseRouteResponse must reject a response whose invokeID does not
 // match the expected value. This is the spoof defense.
 func TestParseRouteResponse_RejectsInvokeIdMismatch(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	resp := make([]byte, 24)
 	binary.LittleEndian.PutUint32(resp[0:], routeCookie)
-	binary.LittleEndian.PutUint32(resp[4:], 0xCAFEBABE)                 // response invokeId
+	binary.LittleEndian.PutUint32(resp[4:], 0xCAFEBABE)                 // response invokeID
 	binary.LittleEndian.PutUint32(resp[8:], 0x80000000|routeServiceAdd) // valid serviceId
 
-	err := parseRouteResponse(logger, resp, 0xDEADBEEF) // expecting different invokeId
+	err := parseRouteResponse(logger, resp, 0xDEADBEEF) // expecting different invokeID
 	if err == nil {
-		t.Fatalf("expected invokeId mismatch error, got nil")
+		t.Fatalf("expected invokeID mismatch error, got nil")
 	}
-	if !strings.Contains(err.Error(), "invokeId") {
-		t.Errorf("expected error to mention invokeId, got: %v", err)
+	if !strings.Contains(err.Error(), "invokeID") {
+		t.Errorf("expected error to mention invokeID, got: %v", err)
 	}
 }
 
-// F-24: parseRouteResponse must accept a response whose invokeId matches.
+// F-24: parseRouteResponse must accept a response whose invokeID matches.
 func TestParseRouteResponse_AcceptsMatchingInvokeId(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	resp := make([]byte, 24)
@@ -37,11 +37,11 @@ func TestParseRouteResponse_AcceptsMatchingInvokeId(t *testing.T) {
 
 	err := parseRouteResponse(logger, resp, 0x12345678)
 	if err != nil {
-		t.Errorf("expected nil error for matching invokeId, got: %v", err)
+		t.Errorf("expected nil error for matching invokeID, got: %v", err)
 	}
 }
 
-// F-24: buildRoutePacket must encode the provided invokeId at offset 4.
+// F-24: buildRoutePacket must encode the provided invokeID at offset 4.
 func TestBuildRoutePacket_EncodesInvokeId(t *testing.T) {
 	netId := [6]byte{1, 2, 3, 4, 5, 6}
 	pkt := buildRoutePacket(netId, "route", "host", "admin", "pwd", 0xABCDEF12)
@@ -50,6 +50,6 @@ func TestBuildRoutePacket_EncodesInvokeId(t *testing.T) {
 	}
 	got := binary.LittleEndian.Uint32(pkt[4:])
 	if got != 0xABCDEF12 {
-		t.Errorf("invokeId in packet = 0x%08X, want 0xABCDEF12", got)
+		t.Errorf("invokeID in packet = 0x%08X, want 0xABCDEF12", got)
 	}
 }

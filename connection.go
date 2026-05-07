@@ -11,16 +11,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
-
-	"go.uber.org/atomic"
 )
 
 // secret is an internal wrapper around password/credential strings that
 // implements String() and slog.LogValuer to return "[REDACTED]" instead
 // of the raw value. Defends against accidental leaks via fmt.Sprintf("%+v",
-// conn) or slog.Any("conn", conn) (F-25).
+// conn) or slog.Any("conn", conn).
 //
 // Kept unexported. The Connection's public API for credentials remains
 // plain string — conversion happens at the boundary.
@@ -38,100 +35,36 @@ type Connection struct {
 	ip   string
 	port int
 
-	connection  net.Conn
-	connMu      sync.Mutex // protects connection field against concurrent Close/Reconnect
-	target      AmsAddress
-	source      AmsAddress
-	callbackIP  string // IP PLC uses to reach us (for Docker/VPN; set via WithHostIP)
-	sendChannel chan []byte
+	// TCP socket + request multiplexing + listen/transmit channels.
+	tx *transport
 
-	symbols             map[string]*Symbol
-	activeNotifications map[uint32]*Symbol
-	symbolLock          sync.Mutex
+	target     AMSAddress
+	source     AMSAddress
+	callbackIP string // IP PLC uses to reach us (for Docker/VPN; set via WithHostIP)
 
-	// lastSubscribeNs records the time.Now().UnixNano() of the most recent
-	// successful AddSymbolNotification(s). Used by handleNotification to
-	// suppress the "unknown handle" Warn when a notification packet arrives
-	// at the goroutine before the activeNotifications[handle] map insert
-	// completes (F-22). Window is small (sub-millisecond) but real for
-	// fast PLCs and zero-MaxDelay subscriptions.
-	lastSubscribeNs atomic.Int64
+	// Symbol cache + data-type table + discovery-mode flags.
+	cache *symbolCache
 
-	datatypes map[string]SymbolUploadDataType
-	ctx       context.Context
-	shutdown  context.CancelFunc
-	waitGroup sync.WaitGroup // tracks only infrastructure goroutines (listen, transmitWorker)
+	// Notification state (activeNotifications, notificationConfigs,
+	// notificationChannel, lastSubscribeNs).
+	notifs *notificationManager
 
-	// List of active requests that waits a response, invokeid is key and value is a channel to the request rutine
-	currentRequest    atomic.Uint32
-	activeRequestLock sync.Mutex
-	activeRequests    map[uint32]chan []byte
-
-	systemResponse chan []byte
+	// Lifecycle FSM (ctx, shutdown, waitGroup, reconnect/closed flags + channels,
+	// generation counter, retry policy).
+	lifecycle *reconnector
 
 	requestTimeout time.Duration
-
-	// Stored notification configs for re-subscribe after reconnect
-	notificationConfigs []NotificationConfig
-	notificationChannel chan *Update
-
-	// Symbol version tracking
-	symbolVersion uint8
-
-	// Reconnection settings
-	maxReconnectAttempts int // 0 = infinite
-	backoffConfig        BackoffConfig
-	isLocal              bool
-	disconnected         atomic.Bool
-	autoReconnect        bool // default true; when false, triggerReconnect does not launch goroutine
-
-	// Strict reconnect: fail if on-demand symbols are missing after reconnect
-	strictReconnect            bool
-	strictReconnectMaxAttempts int
-	strictReconnectFailures    int // tracks consecutive symbol-missing reconnect failures
-
-	// Reconnect generation counter for stale handle detection
-	reconnectGeneration atomic.Uint64
+	isLocal        bool
 
 	// Event callbacks (run in goroutine, must not block)
 	onDisconnect func()
 	onReconnect  func()
 
-	// Route probing
-	forceRouteRegistration bool
-	routeProbeFailures     int
+	// Feature support state. See capabilities type for state transitions.
+	capabilities capabilities
 
-	// Symbol discovery mode tracking
-	symbolsFullyLoaded bool            // true after LoadSymbols() or LoadSymbolsSlow() completes
-	symbolListLoaded   bool            // true after LoadSymbolList() — symbol names available for browsing
-	datatypesLoaded    bool            // true after LoadDataTypes() — struct children expandable
-	onDemandSymbols    map[string]bool // tracks symbol names resolved on-demand (for reconnect)
-
-	// Feature support flags (detected at runtime via CAS)
-	// sumReadCmd: 0 = unchecked (try Ex2 first),
-	// uint32(GroupSumupReadEx2) = use 0xF084,
-	// uint32(GroupSumupReadEx) = use 0xF083,
-	// 1 = no sum read support (individual reads)
-	sumReadCmd               atomic.Uint32
-	sumWriteState            atomic.Uint32 // 0=unchecked, 1=supported, 2=unsupported
-	sumNotifState            atomic.Uint32 // 0=unchecked, 1=supported, 2=unsupported
-	chunkedDownloadSupported atomic.Bool
-	chunkedDownloadChecked   atomic.Bool
-
-	reconnecting  atomic.Bool // prevents concurrent reconnect attempts
-	reconnectDone chan struct{}
-	reconnectMu   sync.Mutex // protects reconnectDone
-
-	closed   atomic.Bool
-	closedCh chan struct{} // closed by Close(), never written to
-
-	ctxMu  sync.RWMutex // protects conn.ctx and conn.shutdown against concurrent access
-	chanMu sync.RWMutex // protects sendChannel and systemResponse against concurrent access during reconnect
-
-	// Route registration config (set via WithRoute, used in Connect and reconnect)
-	routeName     string
-	routeUsername string
-	routePassword secret
+	// Route registration config (populated by WithRoute / WithForceRouteRegistration).
+	route *routeManager
 
 	logger *slog.Logger
 }
@@ -140,22 +73,37 @@ type Connection struct {
 // If requestTimeout is 0, a default of 5000ms is used.
 // If localPort is 0, a default of 10500 is used (arbitrary AMS source port for protocol headers).
 //
-// Note: The ctx parameter is currently unused. The connection manages its own lifecycle
-// context internally so that Close() can send cleanup commands regardless of the caller's
-// context state. Use conn.Close() to shut down the connection.
-func NewConnection(ctx context.Context, ip string, port int, netid string, amsPort int, localNetID string, localPort int, requestTimeout time.Duration, opts ...ConnectionOption) (conn *Connection, err error) {
+// The connection manages its own lifecycle context internally so that Close()
+// can send cleanup commands regardless of any caller context state.
+// Use conn.Close() to shut down the connection.
+func NewConnection(ip string, port int, netid string, amsPort int, localNetID string, localPort int, requestTimeout time.Duration, opts ...ConnectionOption) (conn *Connection, err error) {
 	if requestTimeout <= 0 {
 		requestTimeout = 5000 * time.Millisecond
 	}
 	conn = &Connection{
-		ip:                   ip,
-		port:                 port,
-		requestTimeout:       requestTimeout,
-		maxReconnectAttempts: 0, // 0 = infinite retries
-		backoffConfig:        DefaultBackoffConfig(),
-		autoReconnect:        true,
-		logger:               slog.Default(),
+		ip:             ip,
+		port:           port,
+		requestTimeout: requestTimeout,
+		route:          &routeManager{},
+		notifs:         &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
+		cache: &symbolCache{
+			symbols:         map[string]*Symbol{},
+			onDemandSymbols: map[string]bool{},
+		},
+		tx: &transport{
+			sendChannel:    make(chan []byte),
+			systemResponse: make(chan []byte),
+			activeRequests: map[uint32]chan []byte{},
+		},
+		lifecycle: &reconnector{
+			autoReconnect:        true,
+			maxReconnectAttempts: 0, // 0 = infinite retries
+			backoffConfig:        DefaultBackoffConfig(),
+			closedCh:             make(chan struct{}),
+		},
+		logger: slog.Default(),
 	}
+	conn.lifecycle.ctx, conn.lifecycle.shutdown = context.WithCancel(context.Background()) //nolint:gosec // cancel stored in lifecycle.shutdown, called from Close
 	for _, opt := range opts {
 		opt(conn)
 	}
@@ -177,16 +125,7 @@ func NewConnection(ctx context.Context, ip string, port int, netid string, amsPo
 		localPort = 10500
 	}
 	conn.source.Port = uint16(localPort)
-	conn.systemResponse = make(chan []byte)
-	conn.activeRequests = map[uint32]chan []byte{}
-	conn.activeNotifications = make(map[uint32]*Symbol)
-	conn.sendChannel = make(chan []byte)
-	conn.symbols = map[string]*Symbol{}
-	conn.onDemandSymbols = map[string]bool{}
-	conn.closedCh = make(chan struct{})
-	// Use an independent context so that Close() can still send cleanup commands
-	// even after the parent context is canceled (e.g. on SIGTERM)
-	conn.ctx, conn.shutdown = context.WithCancel(context.Background())
+	// closedCh and ctx/shutdown initialized in struct literal above (lifecycle field).
 	return
 }
 
@@ -203,9 +142,9 @@ func (conn *Connection) Connect(local bool) error {
 		conn.logger.Error("Error connecting", "error", err)
 		return err
 	}
-	conn.connMu.Lock()
-	conn.connection = tcpConn
-	conn.connMu.Unlock()
+	conn.tx.connMu.Lock()
+	conn.tx.connection = tcpConn
+	conn.tx.connMu.Unlock()
 	// Enable aggressive TCP keepalive to detect dead connections quickly.
 	// With Idle=3s, Interval=2s, Count=5: connection declared dead after ~13s of no response.
 	// This ensures cable unplugs (>13s) are detected and trigger reconnect,
@@ -213,14 +152,14 @@ func (conn *Connection) Connect(local bool) error {
 	configureKeepAlive(tcpConn)
 	// Log TCP socket (transport-level only — ADS route validation happens on first ADS command)
 	conn.logger.Info("TCP socket established (ADS route not yet verified)",
-		"local", conn.connection.LocalAddr().String(),
-		"remote", conn.connection.RemoteAddr().String())
+		"local", conn.tx.connection.LocalAddr().String(),
+		"remote", conn.tx.connection.RemoteAddr().String())
 
 	// Auto-derive source AMS NetID from local IP if source NetID is all zeros
 	if conn.source.NetID == [6]byte{} {
-		localAddr, ok := conn.connection.LocalAddr().(*net.TCPAddr)
+		localAddr, ok := conn.tx.connection.LocalAddr().(*net.TCPAddr)
 		if !ok {
-			return fmt.Errorf("unexpected local address type: %T", conn.connection.LocalAddr())
+			return fmt.Errorf("unexpected local address type: %T", conn.tx.connection.LocalAddr())
 		}
 		ip := localAddr.IP.To4()
 		if ip != nil {
@@ -265,34 +204,34 @@ func (conn *Connection) Connect(local bool) error {
 		"target", fmt.Sprintf("%d.%d.%d.%d.%d.%d:%d", conn.target.NetID[0], conn.target.NetID[1], conn.target.NetID[2], conn.target.NetID[3], conn.target.NetID[4], conn.target.NetID[5], conn.target.Port))
 
 	conn.logger.Log(context.Background(), LevelTrace, "connected")
-	conn.waitGroup.Add(2)
+	conn.lifecycle.waitGroup.Add(2)
 	go conn.listen()
 	go conn.transmitWorker()
 	if local {
 		resp, err := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 		if err != nil {
-			conn.cleanupAfterFailedConnect()
+			conn.tearDownAndReset(false)
 			return fmt.Errorf("local mode handshake failed: %w", err)
 		}
 		buf := bytes.NewBuffer(resp)
-		result := AmsAddress{}
+		result := AMSAddress{}
 		conn.logger.Log(context.Background(), LevelTrace, "got stuff", "stuff", buf.Bytes())
 		err = binary.Read(buf, binary.LittleEndian, &result)
 		if err != nil {
-			conn.cleanupAfterFailedConnect()
+			conn.tearDownAndReset(false)
 			return fmt.Errorf("local mode binary read failed: %w", err)
 		}
 		conn.logger.Info("local mode handshake result", "result", result)
-		conn.connMu.Lock()
+		conn.tx.connMu.Lock()
 		conn.source = result
-		conn.connMu.Unlock()
+		conn.tx.connMu.Unlock()
 	}
 
 	// Smart route registration: probe PLC first, register only if route missing.
 	// Route registration is UDP-based but needs goroutines running for the probe
 	// (which sends an ADS command over TCP). If route is registered, TCP reconnect
 	// is needed because PLC may close connections from previously-unknown NetIDs.
-	if conn.routeName != "" {
+	if conn.route.name != "" {
 		registered, err := conn.ensureRouteOnConnect()
 		if err != nil {
 			conn.logger.Warn("route registration failed during connect", "error", err)
@@ -314,9 +253,9 @@ func (conn *Connection) Connect(local bool) error {
 	if err != nil {
 		conn.logger.Debug("could not read symbol version during connect", "error", err)
 	} else {
-		conn.symbolLock.Lock()
-		conn.symbolVersion = version
-		conn.symbolLock.Unlock()
+		conn.cache.lock.Lock()
+		conn.cache.symbolVersion = version
+		conn.cache.lock.Unlock()
 	}
 	return nil
 }
@@ -325,14 +264,14 @@ func (conn *Connection) Connect(local bool) error {
 // Returns (registered bool, err error) where registered=true means a route was added
 // and the caller should TCP-reconnect.
 func (conn *Connection) ensureRouteOnConnect() (registered bool, err error) {
-	if conn.closed.Load() {
+	if conn.lifecycle.closed.Load() {
 		return false, fmt.Errorf("connection closed")
 	}
 
 	// Force mode → always register
-	if conn.forceRouteRegistration {
+	if conn.route.forceRouteRegistration {
 		conn.logger.Info("registering route (force mode)")
-		err = conn.AddRoute(conn.routeName, conn.routeUsername, string(conn.routePassword))
+		err = conn.AddRoute(conn.route.name, conn.route.username, string(conn.route.password))
 		return err == nil, err
 	}
 
@@ -340,18 +279,18 @@ func (conn *Connection) ensureRouteOnConnect() (registered bool, err error) {
 	_, probeErr := conn.GetSymbolVersion()
 	if probeErr == nil {
 		conn.logger.Info("route already exists on PLC, skipping registration")
-		conn.routeProbeFailures = 0
+		conn.route.routeProbeFailures.Store(0)
 		return false, nil
 	}
 
-	if conn.closed.Load() {
+	if conn.lifecycle.closed.Load() {
 		return false, fmt.Errorf("connection closed during route probe")
 	}
 
 	// Probe failed → register with credentials
-	conn.routeProbeFailures++
+	conn.route.routeProbeFailures.Inc()
 	conn.logger.Info("route probe failed, registering route", "error", probeErr)
-	err = conn.AddRoute(conn.routeName, conn.routeUsername, string(conn.routePassword))
+	err = conn.AddRoute(conn.route.name, conn.route.username, string(conn.route.password))
 	if err != nil {
 		return false, err
 	}
@@ -360,29 +299,29 @@ func (conn *Connection) ensureRouteOnConnect() (registered bool, err error) {
 
 // Close closes connection and waits for completion
 func (conn *Connection) Close() {
-	if !conn.closed.CompareAndSwap(false, true) {
+	if !conn.lifecycle.closed.CompareAndSwap(false, true) {
 		return // already closed
 	}
-	close(conn.closedCh)
+	close(conn.lifecycle.closedCh)
 	conn.logger.Info("Close called, shutting down")
 
 	// Skip handle cleanup if already disconnected — all commands would timeout
-	if !conn.disconnected.Load() {
+	if !conn.lifecycle.disconnected.Load() {
 		// Delete all active notifications (uses sum command with automatic fallback to individual)
-		conn.symbolLock.Lock()
-		handles := make([]uint32, 0, len(conn.activeNotifications))
-		for handle := range conn.activeNotifications {
+		conn.notifs.lock.Lock()
+		handles := make([]uint32, 0, len(conn.notifs.activeNotifications))
+		for handle := range conn.notifs.activeNotifications {
 			handles = append(handles, handle)
 		}
-		conn.symbolLock.Unlock()
+		conn.notifs.lock.Unlock()
 		if len(handles) > 0 {
-			errors, err := conn.SumDeleteDeviceNotification(handles)
+			codes, err := conn.SumDeleteDeviceNotification(handles)
 			if err != nil {
 				conn.logger.Warn("failed to delete notification handles during close", "error", err)
 			} else {
 				for i, h := range handles {
-					if errors[i] != ReturnCodeNoErrors {
-						conn.logger.Warn("failed to delete notification handle", "handle", h, "error", uint32(errors[i]))
+					if codes[i] != ReturnCodeNoErrors {
+						conn.logger.Warn("failed to delete notification handle", "handle", h, "error", uint32(codes[i]))
 					} else {
 						conn.logger.Info("removed notification handle", "handle", h)
 					}
@@ -390,22 +329,22 @@ func (conn *Connection) Close() {
 			}
 		}
 		// Collect symbol handles under lock, then release without holding the lock
-		conn.symbolLock.Lock()
+		conn.cache.lock.Lock()
 		var symHandles []uint32
-		for _, symbol := range conn.symbols {
+		for _, symbol := range conn.cache.symbols {
 			if symbol.Handle != 0 {
 				symHandles = append(symHandles, symbol.Handle)
 			}
 		}
-		conn.symbolLock.Unlock()
+		conn.cache.lock.Unlock()
 
 		// Release handles individually — ADS has no batch release command,
 		// and Close() is not performance-critical.
-		// F-26: re-check disconnected each iteration so a mid-loop PLC failure
+		// re-check disconnected each iteration so a mid-loop PLC failure
 		// (listen detects EOF → triggerReconnect → disconnected=true) doesn't
 		// force every remaining Write to time out. Bail out early.
 		for i, h := range symHandles {
-			if conn.disconnected.Load() {
+			if conn.lifecycle.disconnected.Load() {
 				conn.logger.Info("close: disconnected during handle release, stopping cleanup",
 					"released", i,
 					"remaining", len(symHandles)-i)
@@ -422,29 +361,29 @@ func (conn *Connection) Close() {
 	} else {
 		conn.logger.Info("already disconnected, skipping handle cleanup")
 	}
-	conn.ctxMu.RLock()
-	conn.shutdown()
-	conn.ctxMu.RUnlock()
+	conn.lifecycle.ctxMu.RLock()
+	conn.lifecycle.shutdown()
+	conn.lifecycle.ctxMu.RUnlock()
 	// Close the TCP connection to unblock listen() which may be stuck in ReadFull
-	conn.connMu.Lock()
-	if conn.connection != nil {
-		conn.connection.Close()
+	conn.tx.connMu.Lock()
+	if conn.tx.connection != nil {
+		conn.tx.connection.Close()
 	}
-	conn.connMu.Unlock()
+	conn.tx.connMu.Unlock()
 	// Wait for any in-progress reconnect to stop BEFORE waiting on the
 	// goroutine waitGroup. Reconnect's retry loop may call waitGroup.Add(2)
 	// after we Close — calling Wait first would race with that Add and
-	// trigger "sync: WaitGroup misuse" (F-02). closedCh signals Reconnect
+	// trigger "sync: WaitGroup misuse". closedCh signals Reconnect
 	// to exit its retry loop promptly; reconnectDone is closed when Reconnect
 	// returns.
-	conn.reconnectMu.Lock()
-	ch := conn.reconnectDone
-	conn.reconnectMu.Unlock()
+	conn.lifecycle.reconnectMu.Lock()
+	ch := conn.lifecycle.reconnectDone
+	conn.lifecycle.reconnectMu.Unlock()
 	if ch != nil {
 		<-ch
 	}
 	conn.logger.Info("Waiting for workers to close")
-	conn.waitGroup.Wait()
+	conn.lifecycle.waitGroup.Wait()
 	conn.logger.Info("Close DONE")
 }
 
@@ -456,7 +395,7 @@ var ErrDisconnected = errors.New("connection is disconnected")
 // reconnectBackoff returns the delay for the given reconnect attempt number (1-indexed)
 // based on the configured BackoffConfig tiers.
 func (conn *Connection) reconnectBackoff(attempt int) time.Duration {
-	cfg := conn.backoffConfig
+	cfg := conn.lifecycle.backoffConfig
 	switch {
 	case attempt <= cfg.InitialAttempts:
 		return cfg.InitialInterval
@@ -479,7 +418,7 @@ func (conn *Connection) reconnectSleep(attempt int) error {
 	select {
 	case <-timer.C:
 		return nil
-	case <-conn.closedCh:
+	case <-conn.lifecycle.closedCh:
 		return fmt.Errorf("connection closed during reconnect")
 	}
 }
@@ -490,36 +429,36 @@ func (conn *Connection) reconnectSleep(attempt int) error {
 // the race window where callers could see a "healthy" connection between the trigger
 // and Reconnect() being scheduled.
 func (conn *Connection) triggerReconnect() {
-	if conn.closed.Load() {
+	if conn.lifecycle.closed.Load() {
 		return
 	}
 	// CAS ensures only the first goroutine to detect disconnect fires the callback
 	// and sets up reconnection. Subsequent callers (e.g. both listen() and transmitWorker()
 	// detecting the same TCP failure) skip the callback to avoid double-firing.
-	firstDetector := conn.disconnected.CompareAndSwap(false, true)
-	conn.reconnectMu.Lock()
-	if conn.reconnectDone == nil {
-		conn.reconnectDone = make(chan struct{})
+	firstDetector := conn.lifecycle.disconnected.CompareAndSwap(false, true)
+	conn.lifecycle.reconnectMu.Lock()
+	if conn.lifecycle.reconnectDone == nil {
+		conn.lifecycle.reconnectDone = make(chan struct{})
 	}
-	conn.reconnectMu.Unlock()
+	conn.lifecycle.reconnectMu.Unlock()
 
 	// Fire disconnect callback in goroutine (must not block).
 	// Callback must not call Connection methods — connection may be closing.
-	if firstDetector && conn.onDisconnect != nil && !conn.closed.Load() {
+	if firstDetector && conn.onDisconnect != nil && !conn.lifecycle.closed.Load() {
 		go conn.onDisconnect()
 	}
 
-	if conn.autoReconnect {
+	if conn.lifecycle.autoReconnect {
 		go conn.Reconnect()
 	} else {
 		// No auto-reconnect: close reconnectDone immediately so sendRequest
 		// waiters unblock with ErrDisconnected instead of hanging forever.
-		conn.reconnectMu.Lock()
-		if conn.reconnectDone != nil {
-			close(conn.reconnectDone)
-			conn.reconnectDone = nil
+		conn.lifecycle.reconnectMu.Lock()
+		if conn.lifecycle.reconnectDone != nil {
+			close(conn.lifecycle.reconnectDone)
+			conn.lifecycle.reconnectDone = nil
 		}
-		conn.reconnectMu.Unlock()
+		conn.lifecycle.reconnectMu.Unlock()
 	}
 }
 
@@ -528,56 +467,56 @@ func (conn *Connection) triggerReconnect() {
 // Uses configurable backoff (see WithBackoff) with fast initial retries and
 // progressive slowdown. Backoff resets on each successful reconnect.
 func (conn *Connection) Reconnect() error {
-	if conn.closed.Load() {
+	if conn.lifecycle.closed.Load() {
 		return fmt.Errorf("connection closed")
 	}
 	// Prevent concurrent reconnect attempts
-	if !conn.reconnecting.CompareAndSwap(false, true) {
+	if !conn.lifecycle.reconnecting.CompareAndSwap(false, true) {
 		conn.logger.Info("reconnect already in progress, skipping")
 		return nil
 	}
 
 	// Create a channel that waiters (sendRequest) can block on.
 	// triggerReconnect() may have already created it — only create if nil.
-	conn.reconnectMu.Lock()
-	if conn.reconnectDone == nil {
-		conn.reconnectDone = make(chan struct{})
+	conn.lifecycle.reconnectMu.Lock()
+	if conn.lifecycle.reconnectDone == nil {
+		conn.lifecycle.reconnectDone = make(chan struct{})
 	}
-	conn.reconnectMu.Unlock()
+	conn.lifecycle.reconnectMu.Unlock()
 
 	defer func() {
-		conn.reconnecting.Store(false)
-		conn.reconnectMu.Lock()
-		if conn.reconnectDone != nil {
-			close(conn.reconnectDone)
-			conn.reconnectDone = nil
+		conn.lifecycle.reconnecting.Store(false)
+		conn.lifecycle.reconnectMu.Lock()
+		if conn.lifecycle.reconnectDone != nil {
+			close(conn.lifecycle.reconnectDone)
+			conn.lifecycle.reconnectDone = nil
 		}
-		conn.reconnectMu.Unlock()
+		conn.lifecycle.reconnectMu.Unlock()
 	}()
 
 	conn.logger.Info("attempting reconnect")
-	conn.disconnected.Store(true)
+	conn.lifecycle.disconnected.Store(true)
 
 	// Clear active notifications (old handles invalid after reconnect).
-	conn.symbolLock.Lock()
-	conn.activeNotifications = make(map[uint32]*Symbol)
-	conn.symbolLock.Unlock()
+	conn.notifs.lock.Lock()
+	conn.notifs.activeNotifications = make(map[uint32]*Symbol)
+	conn.notifs.lock.Unlock()
 
 	conn.tearDownAndReset(true)
 
 	var lastErr error
 	attempts := 0
 	for {
-		if conn.closed.Load() {
+		if conn.lifecycle.closed.Load() {
 			return fmt.Errorf("connection closed during reconnect")
 		}
 		attempts++
-		if conn.maxReconnectAttempts > 0 && attempts > conn.maxReconnectAttempts {
-			return fmt.Errorf("reconnect failed after %d attempts: %w", conn.maxReconnectAttempts, lastErr)
+		if conn.lifecycle.maxReconnectAttempts > 0 && attempts > conn.lifecycle.maxReconnectAttempts {
+			return fmt.Errorf("reconnect failed after %d attempts: %w", conn.lifecycle.maxReconnectAttempts, lastErr)
 		}
 
 		// Dial TCP, configure keepalive, clear disconnected flag, start goroutines.
-		// dialAndStart re-checks closed.Load() before waitGroup.Add(2) (F-02).
+		// dialAndStart re-checks closed.Load() before waitGroup.Add(2).
 		if err := conn.dialAndStart(); err != nil {
 			lastErr = err
 			conn.logger.Warn("reconnect dial/start failed, retrying", "error", err, "ip", conn.ip, "port", conn.port, "attempt", attempts)
@@ -601,7 +540,7 @@ func (conn *Connection) Reconnect() error {
 		}
 
 		// Smart route registration: probe first, register only if needed.
-		if err := conn.ensureRoute(attempts); err != nil {
+		if err := conn.ensureRoute(); err != nil {
 			lastErr = err
 			conn.logger.Warn("route registration failed during reconnect, retrying", "error", err, "attempt", attempts)
 			conn.resetForRetry()
@@ -633,14 +572,14 @@ func (conn *Connection) Reconnect() error {
 			continue
 		}
 
-		conn.disconnected.Store(false)
-		conn.reconnectGeneration.Add(1)
-		conn.strictReconnectFailures = 0 // reset on success
+		conn.lifecycle.disconnected.Store(false)
+		conn.lifecycle.reconnectGeneration.Add(1)
+		conn.lifecycle.strictReconnectFailures = 0 // reset on success
 		conn.logger.Info("reconnect successful", "attempts", attempts)
 
 		// Fire reconnect callback in goroutine (must not block).
 		// Callback must not call Connection methods — connection may be closing.
-		if conn.onReconnect != nil && !conn.closed.Load() {
+		if conn.onReconnect != nil && !conn.lifecycle.closed.Load() {
 			go conn.onReconnect()
 		}
 		return nil
@@ -651,22 +590,23 @@ func (conn *Connection) Reconnect() error {
 // On force mode or after repeated probe failures, skips the probe.
 // Returns a non-nil error only if registration was attempted and failed critically
 // (requiring a TCP reset / retry).
-func (conn *Connection) ensureRoute(attempt int) error {
-	if conn.routeName == "" {
+func (conn *Connection) ensureRoute() error {
+	if conn.route.name == "" {
 		return nil
 	}
-	if conn.closed.Load() {
+	if conn.lifecycle.closed.Load() {
 		return fmt.Errorf("connection closed")
 	}
 
 	// Force mode or too many probe failures → always register
-	if conn.forceRouteRegistration || conn.routeProbeFailures >= 3 {
-		conn.logger.Info("registering route (forced/fallback)", "probeFailures", conn.routeProbeFailures)
-		if err := conn.AddRoute(conn.routeName, conn.routeUsername, string(conn.routePassword)); err != nil {
+	probeFailures := conn.route.routeProbeFailures.Load()
+	if conn.route.forceRouteRegistration || probeFailures >= 3 {
+		conn.logger.Info("registering route (forced/fallback)", "probeFailures", probeFailures)
+		if err := conn.AddRoute(conn.route.name, conn.route.username, string(conn.route.password)); err != nil {
 			return fmt.Errorf("route registration failed: %w", err)
 		}
 
-		conn.routeProbeFailures = 0
+		conn.route.routeProbeFailures.Store(0)
 		return nil
 	}
 
@@ -674,18 +614,18 @@ func (conn *Connection) ensureRoute(attempt int) error {
 	_, probeErr := conn.GetSymbolVersion()
 	if probeErr == nil {
 		conn.logger.Debug("route still valid, skipping re-registration")
-		conn.routeProbeFailures = 0
+		conn.route.routeProbeFailures.Store(0)
 		return nil
 	}
 
-	if conn.closed.Load() {
+	if conn.lifecycle.closed.Load() {
 		return fmt.Errorf("connection closed during route probe")
 	}
 
 	// Probe failed → register with credentials
-	conn.routeProbeFailures++
-	conn.logger.Info("route probe failed, registering route", "error", probeErr, "probeFailures", conn.routeProbeFailures)
-	if err := conn.AddRoute(conn.routeName, conn.routeUsername, string(conn.routePassword)); err != nil {
+	failuresAfter := conn.route.routeProbeFailures.Inc()
+	conn.logger.Info("route probe failed, registering route", "error", probeErr, "probeFailures", failuresAfter)
+	if err := conn.AddRoute(conn.route.name, conn.route.username, string(conn.route.password)); err != nil {
 		return fmt.Errorf("route registration failed after probe: %w", err)
 	}
 
@@ -695,14 +635,14 @@ func (conn *Connection) ensureRoute(attempt int) error {
 // filterValidNotificationConfigs returns only configs whose symbols still exist
 // in the current symbol table. Logs a warning for dropped subscriptions.
 func (conn *Connection) filterValidNotificationConfigs(configs []NotificationConfig) []NotificationConfig {
-	conn.symbolLock.Lock()
-	defer conn.symbolLock.Unlock()
+	conn.cache.lock.Lock()
+	defer conn.cache.lock.Unlock()
 
 	valid := make([]NotificationConfig, 0, len(configs))
 	for _, cfg := range configs {
-		if _, exists := conn.symbols[symbolKey(cfg.SymbolName)]; exists {
+		if _, exists := conn.cache.symbols[symbolKey(cfg.SymbolName)]; exists {
 			valid = append(valid, cfg)
-		} else if _, onDemand := conn.onDemandSymbols[symbolKey(cfg.SymbolName)]; onDemand {
+		} else if _, onDemand := conn.cache.onDemandSymbols[symbolKey(cfg.SymbolName)]; onDemand {
 			valid = append(valid, cfg)
 		} else {
 			conn.logger.Warn("notification symbol gone after reconnect, dropping subscription",
@@ -715,12 +655,12 @@ func (conn *Connection) filterValidNotificationConfigs(configs []NotificationCon
 // reloadSymbols re-establishes the symbol table after a reconnect, matching
 // the discovery mode that was used before the connection dropped.
 func (conn *Connection) reloadSymbols() error {
-	conn.symbolLock.Lock()
-	fullyLoaded := conn.symbolsFullyLoaded
-	listLoaded := conn.symbolListLoaded
-	dtLoaded := conn.datatypesLoaded
-	hasOnDemand := len(conn.onDemandSymbols) > 0
-	conn.symbolLock.Unlock()
+	conn.cache.lock.Lock()
+	fullyLoaded := conn.cache.symbolsFullyLoaded
+	listLoaded := conn.cache.symbolListLoaded
+	dtLoaded := conn.cache.datatypesLoaded
+	hasOnDemand := len(conn.cache.onDemandSymbols) > 0
+	conn.cache.lock.Unlock()
 
 	switch {
 	case fullyLoaded:
@@ -744,20 +684,21 @@ func (conn *Connection) reloadSymbols() error {
 		// On-demand mode: re-resolve only the symbols that were previously loaded.
 		// By default, missing symbols are skipped gracefully (PLC may have done
 		// an online change). With WithStrictReconnect, missing symbols cause failure.
-		conn.symbolLock.Lock()
-		oldSymbols := conn.onDemandSymbols
-		conn.symbols = make(map[string]*Symbol)
-		conn.onDemandSymbols = make(map[string]bool)
-		conn.symbolLock.Unlock()
+		conn.cache.lock.Lock()
+		oldSymbols := conn.cache.onDemandSymbols
+		conn.cache.symbols = make(map[string]*Symbol)
+		conn.cache.onDemandSymbols = make(map[string]bool)
+		conn.cache.generation.Inc()
+		conn.cache.lock.Unlock()
 
 		for name := range oldSymbols {
-			if _, err := conn.GetSymbol(name); err != nil {
-				if conn.strictReconnect {
-					conn.strictReconnectFailures++
-					if conn.strictReconnectMaxAttempts == 0 || conn.strictReconnectFailures > conn.strictReconnectMaxAttempts {
-						return fmt.Errorf("re-resolve symbol %q (strict mode, %d failures): %w", name, conn.strictReconnectFailures, err)
+			if _, err := conn.getSymbol(name); err != nil {
+				if conn.lifecycle.strictReconnect {
+					conn.lifecycle.strictReconnectFailures++
+					if conn.lifecycle.strictReconnectMaxAttempts == 0 || conn.lifecycle.strictReconnectFailures > conn.lifecycle.strictReconnectMaxAttempts {
+						return fmt.Errorf("re-resolve symbol %q (strict mode, %d failures): %w", name, conn.lifecycle.strictReconnectFailures, err)
 					}
-					return fmt.Errorf("re-resolve symbol %q (strict mode, attempt %d/%d): %w", name, conn.strictReconnectFailures, conn.strictReconnectMaxAttempts, err)
+					return fmt.Errorf("re-resolve symbol %q (strict mode, attempt %d/%d): %w", name, conn.lifecycle.strictReconnectFailures, conn.lifecycle.strictReconnectMaxAttempts, err)
 				}
 				conn.logger.Warn("on-demand symbol unavailable after reconnect, skipping",
 					"symbol", name, "error", err)
@@ -770,9 +711,9 @@ func (conn *Connection) reloadSymbols() error {
 		if err != nil {
 			conn.logger.Debug("could not read symbol version during reconnect", "error", err)
 		} else {
-			conn.symbolLock.Lock()
-			conn.symbolVersion = version
-			conn.symbolLock.Unlock()
+			conn.cache.lock.Lock()
+			conn.cache.symbolVersion = version
+			conn.cache.lock.Unlock()
 		}
 	}
 
@@ -788,66 +729,62 @@ func (conn *Connection) reloadSymbols() error {
 // Consolidates four previously-duplicated reset paths:
 //   - Connect()'s post-route-registration TCP teardown
 //   - Reconnect()'s pre-retry-loop reset
-//   - cleanupAfterFailedConnect()
 //   - resetForRetry()
 func (conn *Connection) tearDownAndReset(resetFeatureFlags bool) {
-	conn.ctxMu.RLock()
-	conn.shutdown()
-	conn.ctxMu.RUnlock()
-	conn.connMu.Lock()
-	if conn.connection != nil {
-		conn.connection.Close()
+	conn.lifecycle.ctxMu.RLock()
+	conn.lifecycle.shutdown()
+	conn.lifecycle.ctxMu.RUnlock()
+	conn.tx.connMu.Lock()
+	if conn.tx.connection != nil {
+		conn.tx.connection.Close()
 	}
-	conn.connMu.Unlock()
-	conn.waitGroup.Wait()
-	conn.ctxMu.Lock()
-	conn.ctx, conn.shutdown = context.WithCancel(context.Background())
-	conn.ctxMu.Unlock()
-	conn.chanMu.Lock()
-	conn.sendChannel = make(chan []byte)
-	conn.systemResponse = make(chan []byte)
-	conn.chanMu.Unlock()
-	conn.activeRequestLock.Lock()
-	conn.activeRequests = map[uint32]chan []byte{}
-	conn.activeRequestLock.Unlock()
+	conn.tx.connMu.Unlock()
+	conn.lifecycle.waitGroup.Wait()
+	conn.lifecycle.ctxMu.Lock()
+	conn.lifecycle.ctx, conn.lifecycle.shutdown = context.WithCancel(context.Background()) //nolint:gosec // cancel stored in lifecycle.shutdown, called from Close
+	conn.lifecycle.ctxMu.Unlock()
+	conn.tx.chanMu.Lock()
+	conn.tx.sendChannel = make(chan []byte)
+	conn.tx.systemResponse = make(chan []byte)
+	conn.tx.chanMu.Unlock()
+	conn.tx.activeRequestLock.Lock()
+	conn.tx.activeRequests = map[uint32]chan []byte{}
+	conn.tx.activeRequestLock.Unlock()
 	if resetFeatureFlags {
-		conn.sumReadCmd.Store(0)
-		conn.sumWriteState.Store(0)
-		conn.sumNotifState.Store(0)
-		conn.chunkedDownloadChecked.Store(false)
+		conn.capabilities.reset()
 	}
 }
 
 // dialAndStart performs net.DialTimeout, configures keepalive, clears the
 // disconnected flag, and starts the listen/transmit goroutines. Used by both
 // Connect()'s post-route-registration redial path and Reconnect()'s retry loop.
-// Re-checks closed before waitGroup.Add(2) to prevent the F-02 sync.WaitGroup
+// Re-checks closed before waitGroup.Add(2) to prevent the sync.WaitGroup
 // misuse race.
 func (conn *Connection) dialAndStart() error {
 	newConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.requestTimeout)
 	if err != nil {
 		return err
 	}
-	conn.connMu.Lock()
-	conn.connection = newConn
-	conn.connMu.Unlock()
+	conn.tx.connMu.Lock()
+	conn.tx.connection = newConn
+	conn.tx.connMu.Unlock()
 	configureKeepAlive(newConn)
-	conn.disconnected.Store(false)
-	if conn.closed.Load() {
+	conn.lifecycle.disconnected.Store(false)
+	if conn.lifecycle.closed.Load() {
 		// Connection was Closed mid-dial. Don't Add to waitGroup.
-		conn.connMu.Lock()
+		conn.tx.connMu.Lock()
 		newConn.Close()
-		conn.connection = nil
-		conn.connMu.Unlock()
+		conn.tx.connection = nil
+		conn.tx.connMu.Unlock()
 		return fmt.Errorf("connection closed during dial")
 	}
-	conn.waitGroup.Add(2)
+	conn.lifecycle.waitGroup.Add(2)
 	go conn.listen()
 	go conn.transmitWorker()
 	return nil
 }
 
-// localHandshake performs the local-mode AmsAddress probe used after dial when
+// localHandshake performs the local-mode AMSAddress probe used after dial when
 // isLocal is true. Updates conn.source on success.
 func (conn *Connection) localHandshake() error {
 	resp, err := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
@@ -855,27 +792,27 @@ func (conn *Connection) localHandshake() error {
 		return fmt.Errorf("local handshake send: %w", err)
 	}
 	buf := bytes.NewBuffer(resp)
-	result := AmsAddress{}
+	result := AMSAddress{}
 	if err := binary.Read(buf, binary.LittleEndian, &result); err != nil {
 		return fmt.Errorf("local handshake parse: %w", err)
 	}
-	conn.connMu.Lock()
+	conn.tx.connMu.Lock()
 	conn.source = result
-	conn.connMu.Unlock()
+	conn.tx.connMu.Unlock()
 	return nil
 }
 
 // resubscribeNotifications restores notification subscriptions stored in
 // notificationConfigs after a successful reconnect. Filters out symbols that
 // no longer exist after symbol reload. On error, rolls back partial PLC-side
-// successes (F-12) and restores the saved configs so they can be retried by
+// successes and restores the saved configs so they can be retried by
 // the next reconnect attempt.
 func (conn *Connection) resubscribeNotifications() error {
-	conn.symbolLock.Lock()
-	savedConfigs := conn.notificationConfigs
-	savedChannel := conn.notificationChannel
-	conn.notificationConfigs = nil // Clear before re-adding to prevent duplicates
-	conn.symbolLock.Unlock()
+	conn.notifs.lock.Lock()
+	savedConfigs := conn.notifs.notificationConfigs
+	savedChannel := conn.notifs.notificationChannel
+	conn.notifs.notificationConfigs = nil // Clear before re-adding to prevent duplicates
+	conn.notifs.lock.Unlock()
 	if len(savedConfigs) == 0 || savedChannel == nil {
 		return nil
 	}
@@ -883,39 +820,58 @@ func (conn *Connection) resubscribeNotifications() error {
 	if len(validConfigs) == 0 {
 		// All symbols gone (e.g., PLC online change removed all subscribed vars).
 		// Clear channel reference so a future AddSymbolNotification can use a new channel.
-		conn.symbolLock.Lock()
-		conn.notificationChannel = nil
-		conn.symbolLock.Unlock()
+		conn.notifs.lock.Lock()
+		conn.notifs.notificationChannel = nil
+		conn.notifs.lock.Unlock()
 		return nil
 	}
 	// Snapshot active handles before the re-subscribe attempt. If
 	// AddSymbolNotifications partially succeeds and then errors, we use the
 	// snapshot diff to roll back the PLC-side registrations created during
-	// this attempt (F-12). Without rollback, repeated reconnect retries
+	// this attempt. Without rollback, repeated reconnect retries
 	// accumulate orphaned PLC notifications until the next TCP disconnect.
-	conn.symbolLock.Lock()
-	preHandles := make(map[uint32]struct{}, len(conn.activeNotifications))
-	for h := range conn.activeNotifications {
+	conn.notifs.lock.Lock()
+	preHandles := make(map[uint32]struct{}, len(conn.notifs.activeNotifications))
+	for h := range conn.notifs.activeNotifications {
 		preHandles[h] = struct{}{}
 	}
-	conn.symbolLock.Unlock()
+	conn.notifs.lock.Unlock()
 
-	err := conn.AddSymbolNotifications(validConfigs, savedChannel)
+	subResults, err := conn.AddSymbolNotifications(validConfigs, savedChannel)
+
+	// Collect Skipped+Handle entries: AddSymbolNotifications surfaces handles
+	// for items where the PLC accepted but the library refused to commit
+	// (concurrent-subscribe TOCTOU loss, cache-stranded post-roundtrip).
+	// Those handles are NOT in activeNotifications - they would leak unless
+	// we explicitly release them.
+	var orphanHandles []uint32
+	for _, r := range subResults {
+		if r.Skipped != nil && r.Handle != 0 {
+			orphanHandles = append(orphanHandles, r.Handle)
+		}
+	}
+	if len(orphanHandles) > 0 {
+		deleted := conn.bestEffortDeleteNotifications(orphanHandles)
+		conn.logger.Warn("resubscribe: released PLC handles for Skipped+Handle entries",
+			"orphan_handles", len(orphanHandles),
+			"deleted", deleted)
+	}
+
 	if err != nil {
 		// Identify handles created during THIS attempt and best-effort delete.
-		conn.symbolLock.Lock()
+		conn.notifs.lock.Lock()
 		var newHandles []uint32
-		for h := range conn.activeNotifications {
+		for h := range conn.notifs.activeNotifications {
 			if _, existed := preHandles[h]; !existed {
 				newHandles = append(newHandles, h)
 				// Drop client-side bookkeeping for the rollback handles.
-				delete(conn.activeNotifications, h)
+				delete(conn.notifs.activeNotifications, h)
 			}
 		}
 		// Restore configs so they can be retried by the next reconnect attempt.
-		conn.notificationConfigs = savedConfigs
-		conn.notificationChannel = savedChannel
-		conn.symbolLock.Unlock()
+		conn.notifs.notificationConfigs = savedConfigs
+		conn.notifs.notificationChannel = savedChannel
+		conn.notifs.lock.Unlock()
 		if len(newHandles) > 0 {
 			deleted := conn.bestEffortDeleteNotifications(newHandles)
 			conn.logger.Warn("resubscribe rollback: deleted partial-success handles",
@@ -927,18 +883,10 @@ func (conn *Connection) resubscribeNotifications() error {
 	return nil
 }
 
-// cleanupAfterFailedConnect tears down goroutines, closes TCP, and resets
-// channels/context so the connection can be retried via Connect().
-// Used during initial Connect() when the handshake or route registration fails
-// after goroutines have already been started.
-func (conn *Connection) cleanupAfterFailedConnect() {
-	conn.tearDownAndReset(false)
-}
-
 // resetForRetry tears down goroutines, closes the TCP connection, and resets
 // channels/state so the next retry iteration starts clean.
 func (conn *Connection) resetForRetry() {
-	conn.disconnected.Store(true)
+	conn.lifecycle.disconnected.Store(true)
 	conn.tearDownAndReset(false)
 	// Allow route re-registration on next attempt (PLC may have rebooted)
 }
@@ -956,16 +904,20 @@ func configureKeepAlive(c net.Conn) {
 	}
 }
 
-// zeroOldSymbolHandles iterates the given map and sets Handle=0 on each
-// *Symbol value. Used by loadSymbols before replacing conn.symbols so that
-// callers holding pointers to the OLD map's *Symbol values fail fast on
-// next use (Handle=0 triggers on-demand re-resolution via GetSymbol) rather
-// than racing against a PLC that may have reused the old handle for a
-// different symbol after reconnect (F-20). Nil-safe.
+// zeroOldSymbolHandles invalidates each *Symbol in the given map. Sets
+// Handle=0 so callers holding pointers to OLD-map values force on-demand
+// re-resolution via GetSymbol (defends against the PLC reusing the old
+// handle for a different symbol after reconnect), and clears cached
+// Value/Valid/ValueParsed/LastUpdateTime so a Read within MinUpdateInterval
+// of reconnect does not return stale pre-disconnect data. Nil-safe.
 func zeroOldSymbolHandles(m map[string]*Symbol) {
 	for _, s := range m {
 		if s != nil {
 			s.Handle = 0
+			s.Value = ""
+			s.Valid = false
+			s.ValueParsed = false
+			s.LastUpdateTime = time.Time{}
 		}
 	}
 }
@@ -977,9 +929,9 @@ func (conn *Connection) loadSymbols() error {
 	if err != nil {
 		conn.logger.Warn("failed to read symbol version, continuing with symbol load", "error", err)
 	} else {
-		conn.symbolLock.Lock()
-		conn.symbolVersion = version
-		conn.symbolLock.Unlock()
+		conn.cache.lock.Lock()
+		conn.cache.symbolVersion = version
+		conn.cache.lock.Unlock()
 	}
 
 	res, err := conn.GetSymbolUploadInfo()
@@ -1002,16 +954,17 @@ func (conn *Connection) loadSymbols() error {
 	if err != nil {
 		return fmt.Errorf("failed to parse symbols: %w", err)
 	}
-	conn.symbolLock.Lock()
-	// F-20: invalidate Handle on every old *Symbol before swap so external
+	conn.cache.lock.Lock()
+	// invalidate Handle on every old *Symbol before swap so external
 	// callers holding old pointers (e.g. infos[i].symbol in
 	// readMultipleSymbolsRetry) fail fast on next use and re-resolve via
 	// GetSymbol instead of using a stale handle that the PLC may have
 	// reassigned to a different symbol after reconnect.
-	zeroOldSymbolHandles(conn.symbols)
-	conn.datatypes = datatypes
-	conn.symbols = symbols
-	conn.symbolLock.Unlock()
+	zeroOldSymbolHandles(conn.cache.symbols)
+	conn.cache.datatypes = datatypes
+	conn.cache.symbols = symbols
+	conn.cache.generation.Inc()
+	conn.cache.lock.Unlock()
 	return nil
 }
 
@@ -1030,7 +983,7 @@ func (conn *Connection) AddRoute(routeName, username, password string) error {
 
 // IsDisconnected returns whether the connection is currently in a disconnected state.
 func (conn *Connection) IsDisconnected() bool {
-	return conn.disconnected.Load()
+	return conn.lifecycle.disconnected.Load()
 }
 
 // isRunningInContainer returns true if the process is running inside a

@@ -3,7 +3,6 @@
 package ads
 
 import (
-	"context"
 	"os"
 	"strconv"
 	"testing"
@@ -41,7 +40,7 @@ func setupConnectionWithDefaults(t *testing.T, d connDefaults) *Connection {
 		opts = append(opts, WithRoute(d.routeName, routeUser, routePass))
 	}
 
-	conn, err := NewConnection(context.Background(), ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second, opts...)
+	conn, err := NewConnection(ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second, opts...)
 	if err != nil {
 		t.Fatalf("NewConnection failed: %v", err)
 	}

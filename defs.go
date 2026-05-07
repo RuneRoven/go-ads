@@ -6,7 +6,7 @@ import (
 )
 
 // AMSAddress netid and port of device
-type AmsAddress struct {
+type AMSAddress struct {
 	NetID [6]byte
 	Port  uint16
 }
@@ -127,27 +127,27 @@ func (f SymbolFlag) Has(flag SymbolFlag) bool {
 	return f&flag == flag
 }
 
-type AdsState uint16
+type ADSState uint16
 
 const (
-	AdsStateInvalid      AdsState = 0
-	AdsStateIdle         AdsState = 1
-	AdsStateReset        AdsState = 2
-	AdsStateInit         AdsState = 3
-	AdsStateStart        AdsState = 4
-	AdsStateRun          AdsState = 5
-	AdsStateStop         AdsState = 6
-	AdsStateSaveCfg      AdsState = 7
-	AdsStateLoadCfg      AdsState = 8
-	AdsStatePowerFailure AdsState = 9
-	AdsStatePowerGood    AdsState = 10
-	AdsStateError        AdsState = 11
-	AdsStateShutdown     AdsState = 12
-	AdsStateSuspend      AdsState = 13
-	AdsStateResume       AdsState = 14
-	AdsStateConfig       AdsState = 15 // System Is In Config Mode
-	AdsStateReconfig     AdsState = 16 // System Should Restart In Config Mode
-	AdsStateMaxStates    AdsState = 255
+	ADSStateInvalid      ADSState = 0
+	ADSStateIdle         ADSState = 1
+	ADSStateReset        ADSState = 2
+	ADSStateInit         ADSState = 3
+	ADSStateStart        ADSState = 4
+	ADSStateRun          ADSState = 5
+	ADSStateStop         ADSState = 6
+	ADSStateSaveCfg      ADSState = 7
+	ADSStateLoadCfg      ADSState = 8
+	ADSStatePowerFailure ADSState = 9
+	ADSStatePowerGood    ADSState = 10
+	ADSStateError        ADSState = 11
+	ADSStateShutdown     ADSState = 12
+	ADSStateSuspend      ADSState = 13
+	ADSStateResume       ADSState = 14
+	ADSStateConfig       ADSState = 15 // System Is In Config Mode
+	ADSStateReconfig     ADSState = 16 // System Should Restart In Config Mode
+	ADSStateMaxStates    ADSState = 255
 )
 
 // Port default twincat ports
@@ -234,7 +234,7 @@ const (
 type Offset uint32
 
 const (
-	OffsetDeviceDataAdsState    Offset = 0x0000 // ads state of device
+	OffsetDeviceDataADSState    Offset = 0x0000 // ads state of device
 	OffsetDeviceDataDeviceState Offset = 0x0002 // device state
 )
 
@@ -365,7 +365,7 @@ const (
 	ReturnCodeClientW32Error            ReturnCode = (0x46 + ReturnCodeErrorOffset)
 	ReturnCodeClientTimeoutInvalid      ReturnCode = (0x47 + ReturnCodeErrorOffset)
 	ReturnCodeClientPortNotOpen         ReturnCode = (0x48 + ReturnCodeErrorOffset)
-	ReturnCodeClientNoAmsAddress        ReturnCode = (0x49 + ReturnCodeErrorOffset)
+	ReturnCodeClientNoAMSAddress        ReturnCode = (0x49 + ReturnCodeErrorOffset)
 	ReturnCodeClientSyncInternal        ReturnCode = (0x50 + ReturnCodeErrorOffset)
 	ReturnCodeClientAddHash             ReturnCode = (0x51 + ReturnCodeErrorOffset)
 	ReturnCodeClientRemoveHash          ReturnCode = (0x52 + ReturnCodeErrorOffset)
@@ -520,7 +520,7 @@ var returnCodeDescriptions = map[ReturnCode]string{
 	ReturnCodeClientW32Error:            "error in Win32 subsystem",
 	ReturnCodeClientTimeoutInvalid:      "invalid client timeout value",
 	ReturnCodeClientPortNotOpen:         "ADS port not opened",
-	ReturnCodeClientNoAmsAddress:        "no AMS address",
+	ReturnCodeClientNoAMSAddress:        "no AMS address",
 	ReturnCodeClientSyncInternal:        "internal error in ADS sync",
 	ReturnCodeClientAddHash:             "hash table overflow",
 	ReturnCodeClientRemoveHash:          "key not found in hash table",

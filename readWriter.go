@@ -14,7 +14,7 @@ import (
 
 func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]SymbolUploadDataType) (string, error) {
 	start := offset
-	// F-16: reject oversized symbol.Length before arithmetic. uint32 → int
+	// reject oversized symbol.Length before arithmetic. uint32 → int
 	// conversion wraps on 32-bit Go; an attacker-controlled or buggy symbol
 	// entry with Length = 0xFFFFFFFF produces a negative int that bypasses
 	// the bounds guard and panics on slice. Compare in uint64 space to dodge
@@ -231,11 +231,24 @@ func (symbol *Symbol) updateValue(newValue string) {
 	}
 }
 
+// parentChangedMaxDepth caps walk up the Parent chain. Real PLC struct
+// nesting is at most a few dozen levels; the cap defends against pathological
+// or malformed data that could form a cycle and stack-overflow the runtime.
+const parentChangedMaxDepth = 256
+
 func (symbol *Symbol) parentChanged() {
-	if symbol.Parent != nil {
-		symbol.Parent.parentChanged()
+	s, depth := symbol, 0
+	for ; s != nil && depth < parentChangedMaxDepth; s, depth = s.Parent, depth+1 {
+		s.Changed = true
 	}
-	symbol.Changed = true
+	if depth >= parentChangedMaxDepth && s != nil {
+		// Likely cycle in Symbol.Parent chain or pathological depth.
+		// Cap-hit indicates corruption — surface for debugging instead of
+		// silently truncating Changed propagation.
+		getDefaultLogger().Warn("parentChanged hit depth cap; possible Parent cycle or malformed Symbol tree",
+			"symbol", symbol.FullName,
+			"max_depth", parentChangedMaxDepth)
+	}
 }
 
 var parseableTypes = []string{
@@ -284,7 +297,7 @@ func inferBaseType(size uint32) string {
 	}
 }
 
-func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string]SymbolUploadDataType) (data []byte, err error) {
+func (symbol *Symbol) writeToNode(value string, datatypes map[string]SymbolUploadDataType) (data []byte, err error) {
 	if len(symbol.Children) > 0 {
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(value), &fields); err != nil {
@@ -307,7 +320,7 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 			} else {
 				childValue = string(raw)
 			}
-			childBytes, err := child.writeToNode(childValue, 0, datatypes)
+			childBytes, err := child.writeToNode(childValue, datatypes)
 			if err != nil {
 				return nil, fmt.Errorf("field %q: %w", name, err)
 			}
@@ -325,7 +338,7 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 
 	if !slices.Contains(parseableTypes, dt) {
 		// Try datatype-table lookup first. If that fails or yields a non-parseable
-		// type, fall back to size-based inference (F-18) — mirrors the read path
+		// type, fall back to size-based inference — mirrors the read path
 		// at parse() so unknown types can round-trip via writeToSymbol.
 		if datatypes != nil {
 			if dtEntry, ok := datatypes[dt]; ok {
@@ -496,7 +509,7 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 			return nil, fmt.Errorf("binary.Write DT failed: %w", err)
 		}
 	case "STRING":
-		// F-17: refuse to write to a STRING declared with Length=0. The PLC
+		// refuse to write to a STRING declared with Length=0. The PLC
 		// expects at least 1 byte for the null terminator; a 0-byte payload
 		// is silently truncating and indistinguishable from caller error.
 		if symbol.Length < 1 {
@@ -512,7 +525,7 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		copy(newBuf, src)
 		buf.Write(newBuf)
 	case "WSTRING":
-		// F-17: WSTRING needs at least 2 bytes for the UTF-16 null terminator.
+		// WSTRING needs at least 2 bytes for the UTnull terminator.
 		if symbol.Length < 2 {
 			return nil, fmt.Errorf("WSTRING write requires symbol.Length >= 2, got %d", symbol.Length)
 		}
@@ -521,6 +534,15 @@ func (symbol *Symbol) writeToNode(value string, offset int, datatypes map[string
 		maxChars := (int(symbol.Length) - 2) / 2 // reserve 2 bytes for null terminator
 		if len(encoded) > maxChars {
 			encoded = encoded[:maxChars]
+			// If truncation lands inside a UTF-16 surrogate pair (high
+			// surrogate at the end with no following low surrogate), drop
+			// the high surrogate to avoid emitting an invalid sequence.
+			if len(encoded) > 0 {
+				last := encoded[len(encoded)-1]
+				if last >= 0xD800 && last <= 0xDBFF {
+					encoded = encoded[:len(encoded)-1]
+				}
+			}
 		}
 		for i, r := range encoded {
 			binary.LittleEndian.PutUint16(newBuf[i*2:], r)

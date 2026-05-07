@@ -38,14 +38,14 @@ func isRouteHintErr(err error) bool {
 // It uses the shared systemResponse channel and is NOT safe for concurrent callers.
 // For normal ADS commands, use sendRequest/sendRequestOnce which use per-invoke channels.
 func (conn *Connection) send(data []byte) (response []byte, err error) {
-	conn.currentRequest.Inc()
-	conn.chanMu.RLock()
-	sendCh := conn.sendChannel
-	sysCh := conn.systemResponse
-	conn.chanMu.RUnlock()
-	conn.ctxMu.RLock()
-	currentCtx := conn.ctx
-	conn.ctxMu.RUnlock()
+	conn.tx.currentRequest.Inc()
+	conn.tx.chanMu.RLock()
+	sendCh := conn.tx.sendChannel
+	sysCh := conn.tx.systemResponse
+	conn.tx.chanMu.RUnlock()
+	conn.lifecycle.ctxMu.RLock()
+	currentCtx := conn.lifecycle.ctx
+	conn.lifecycle.ctxMu.RUnlock()
 	ctx, cancel := context.WithTimeout(currentCtx, conn.requestTimeout)
 	defer cancel()
 	select {
@@ -85,17 +85,17 @@ func (conn *Connection) sendRequest(command CommandID, data []byte) (response []
 			return nil, err
 		}
 		// Don't retry if the connection is permanently closed.
-		if conn.closed.Load() {
+		if conn.lifecycle.closed.Load() {
 			return nil, err
 		}
 		// Only retry if a reconnect is actually in progress.
-		if !conn.reconnecting.Load() {
+		if !conn.lifecycle.reconnecting.Load() {
 			return nil, err
 		}
 		// Wait for reconnect to finish before retrying.
-		conn.reconnectMu.Lock()
-		ch := conn.reconnectDone
-		conn.reconnectMu.Unlock()
+		conn.lifecycle.reconnectMu.Lock()
+		ch := conn.lifecycle.reconnectDone
+		conn.lifecycle.reconnectMu.Unlock()
 		if ch == nil {
 			return nil, err
 		}
@@ -105,10 +105,10 @@ func (conn *Connection) sendRequest(command CommandID, data []byte) (response []
 		select {
 		case <-ch:
 			// Reconnect finished — loop will retry if connection is healthy.
-			if conn.disconnected.Load() {
+			if conn.lifecycle.disconnected.Load() {
 				return nil, ErrDisconnected
 			}
-		case <-conn.closedCh:
+		case <-conn.lifecycle.closedCh:
 			return nil, fmt.Errorf("connection closed while waiting for reconnect: %w", err)
 		}
 	}
@@ -116,20 +116,20 @@ func (conn *Connection) sendRequest(command CommandID, data []byte) (response []
 }
 
 func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (response []byte, err error) {
-	if conn.disconnected.Load() {
+	if conn.lifecycle.disconnected.Load() {
 		// If a reconnect is in progress, wait for it to finish before giving up
-		conn.reconnectMu.Lock()
-		ch := conn.reconnectDone
-		conn.reconnectMu.Unlock()
+		conn.lifecycle.reconnectMu.Lock()
+		ch := conn.lifecycle.reconnectDone
+		conn.lifecycle.reconnectMu.Unlock()
 		if ch != nil {
 			conn.logger.Debug("sendRequest waiting for reconnect to complete")
-			conn.ctxMu.RLock()
-			ctxDone := conn.ctx.Done()
-			conn.ctxMu.RUnlock()
+			conn.lifecycle.ctxMu.RLock()
+			ctxDone := conn.lifecycle.ctx.Done()
+			conn.lifecycle.ctxMu.RUnlock()
 			select {
 			case <-ch:
 				// Reconnect finished — check if we're still disconnected
-				if conn.disconnected.Load() {
+				if conn.lifecycle.disconnected.Load() {
 					return nil, ErrDisconnected
 				}
 			case <-ctxDone:
@@ -141,16 +141,16 @@ func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (respons
 			return nil, ErrDisconnected
 		}
 	}
-	conn.activeRequestLock.Lock()
+	conn.tx.activeRequestLock.Lock()
 	// First, request a new invoke id
-	id := conn.currentRequest.Inc()
+	id := conn.tx.currentRequest.Inc()
 	// Create a channel for the response
-	conn.activeRequests[id] = make(chan []byte, 1)
-	conn.activeRequestLock.Unlock()
+	conn.tx.activeRequests[id] = make(chan []byte, 1)
+	conn.tx.activeRequestLock.Unlock()
 	defer func() {
-		conn.activeRequestLock.Lock()
-		delete(conn.activeRequests, id)
-		conn.activeRequestLock.Unlock()
+		conn.tx.activeRequestLock.Lock()
+		delete(conn.tx.activeRequests, id)
+		conn.tx.activeRequestLock.Unlock()
 	}()
 	conn.logger.Log(context.Background(), LevelTrace, "encoding packet",
 		"command", command,
@@ -162,12 +162,12 @@ func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (respons
 		conn.logger.Error("Error during sendrequest encode", "error", err)
 		return nil, err
 	}
-	conn.ctxMu.RLock()
-	currentCtx := conn.ctx
-	conn.ctxMu.RUnlock()
-	conn.chanMu.RLock()
-	sendCh := conn.sendChannel
-	conn.chanMu.RUnlock()
+	conn.lifecycle.ctxMu.RLock()
+	currentCtx := conn.lifecycle.ctx
+	conn.lifecycle.ctxMu.RUnlock()
+	conn.tx.chanMu.RLock()
+	sendCh := conn.tx.sendChannel
+	conn.tx.chanMu.RUnlock()
 	ctx, cancel := context.WithTimeout(currentCtx, conn.requestTimeout)
 	defer cancel()
 	select {
@@ -181,9 +181,9 @@ func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (respons
 	case sendCh <- pack:
 	}
 	// Capture channel reference under lock to avoid concurrent map read
-	conn.activeRequestLock.Lock()
-	responseCh := conn.activeRequests[id]
-	conn.activeRequestLock.Unlock()
+	conn.tx.activeRequestLock.Lock()
+	responseCh := conn.tx.activeRequests[id]
+	conn.tx.activeRequestLock.Unlock()
 	select {
 	case <-ctx.Done():
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -199,22 +199,22 @@ func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (respons
 
 // listen reads inbound AMS packets and dispatches notifications to handleNotification.
 //
-// Lifecycle invariant: conn.connection, conn.ctx, conn.systemResponse are read
+// Lifecycle invariant: conn.tx.connection, conn.lifecycle.ctx, conn.tx.systemResponse are read
 // without locks inside this loop. This is safe because Reconnect() guarantees
-// the field-swap ordering: shutdown() cancels conn.ctx → waitGroup.Wait() blocks
+// the field-swap ordering: shutdown() cancels conn.lifecycle.ctx → waitGroup.Wait() blocks
 // until the existing listen/transmit goroutines exit → fields are reassigned
 // under their respective locks → waitGroup.Add(2) and `go listen()` start fresh
 // goroutines. The `go` statement establishes happens-before, so a new listen()
 // always sees the post-swap field values. No goroutine is alive concurrent with
 // the field swap.
 func (conn *Connection) listen() {
-	defer conn.waitGroup.Done()
-	reader := bufio.NewReader(conn.connection)
+	defer conn.lifecycle.waitGroup.Done()
+	reader := bufio.NewReader(conn.tx.connection)
 	const maxAMSPacket = 4 * 1024 * 1024 // 4 MB sanity limit
 	var hdrBytes [6]byte
 	for {
 		select {
-		case <-conn.ctx.Done():
+		case <-conn.lifecycle.ctx.Done():
 			conn.logger.Info("exit listen")
 			return
 		default:
@@ -222,7 +222,7 @@ func (conn *Connection) listen() {
 		// Read the 6-byte amsTCPHeader.
 		if _, err := io.ReadFull(reader, hdrBytes[:]); err != nil {
 			select {
-			case <-conn.ctx.Done():
+			case <-conn.lifecycle.ctx.Done():
 				return
 			default:
 			}
@@ -259,13 +259,13 @@ func (conn *Connection) listen() {
 		// Read the body.
 		data := make([]byte, tcpHeader.Length)
 		select {
-		case <-conn.ctx.Done():
+		case <-conn.lifecycle.ctx.Done():
 			return
 		default:
 		}
 		if _, err := io.ReadFull(reader, data); err != nil {
 			select {
-			case <-conn.ctx.Done():
+			case <-conn.lifecycle.ctx.Done():
 				return
 			default:
 			}
@@ -275,12 +275,12 @@ func (conn *Connection) listen() {
 		}
 		if tcpHeader.System > 0 {
 			select {
-			case conn.systemResponse <- data:
-			case <-conn.ctx.Done():
+			case conn.tx.systemResponse <- data:
+			case <-conn.lifecycle.ctx.Done():
 				return
 			}
 		} else {
-			go conn.handleReceive(conn.ctx, data)
+			go conn.handleReceive(conn.lifecycle.ctx, data)
 		}
 	}
 }
@@ -316,9 +316,9 @@ func (conn *Connection) handleReceive(ctx context.Context, data []byte) {
 		conn.logger.Log(context.Background(), LevelTrace, "default receive")
 		// Look up response channel under lock, then release before channel send
 		// to avoid deadlock if sendRequest's cleanup defer also acquires the lock.
-		conn.activeRequestLock.Lock()
-		response, ok := conn.activeRequests[header.InvokeID]
-		conn.activeRequestLock.Unlock()
+		conn.tx.activeRequestLock.Lock()
+		response, ok := conn.tx.activeRequests[header.InvokeID]
+		conn.tx.activeRequestLock.Unlock()
 		if ok {
 			select {
 			case <-ctx.Done():
@@ -337,24 +337,24 @@ func (conn *Connection) handleReceive(ctx context.Context, data []byte) {
 			// 2. During close: requests cleaned up, final responses drain
 			// Both are harmless — downgrade to Debug. In normal operation, this
 			// indicates a protocol-level issue worth investigating.
-			if conn.reconnecting.Load() || conn.closed.Load() {
+			if conn.lifecycle.reconnecting.Load() || conn.lifecycle.closed.Load() {
 				conn.logger.Debug("received stale packet (expected during reconnect/close)",
-					"invokeId", header.InvokeID)
+					"invokeID", header.InvokeID)
 			} else {
 				conn.logger.Error("received packet with unknown invokeID",
 					"data", buff.Bytes(),
-					"invokeId", header.InvokeID)
+					"invokeID", header.InvokeID)
 			}
 		}
 	}
 }
 
 func (conn *Connection) transmitWorker() {
-	defer conn.waitGroup.Done()
-	writer := bufio.NewWriter(conn.connection)
-	conn.ctxMu.RLock()
-	currentCtx := conn.ctx
-	conn.ctxMu.RUnlock()
+	defer conn.lifecycle.waitGroup.Done()
+	writer := bufio.NewWriter(conn.tx.connection)
+	conn.lifecycle.ctxMu.RLock()
+	currentCtx := conn.lifecycle.ctx
+	conn.lifecycle.ctxMu.RUnlock()
 	ctx, cancel := context.WithCancel(currentCtx)
 	defer cancel()
 	for {
@@ -362,7 +362,7 @@ func (conn *Connection) transmitWorker() {
 		case <-ctx.Done():
 			conn.logger.Debug("Exit transmitWorker")
 			return
-		case data := <-conn.sendChannel:
+		case data := <-conn.tx.sendChannel:
 			conn.logger.Log(context.Background(), LevelTrace, fmt.Sprintf("Sending %d bytes", len(data)))
 			_, err := writer.Write(data)
 			if err != nil {

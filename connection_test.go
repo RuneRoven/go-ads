@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-// F-20: loadSymbols replaces conn.symbols map with fresh entries (Handle=0).
+// F-20: loadSymbols replaces conn.cache.symbols map with fresh entries (Handle=0).
 // Callers may hold *Symbol pointers from the OLD map (e.g. infos[i].symbol
 // in readMultipleSymbolsRetry). After the swap, those old pointers retain
 // stale Handle values. Defensive fix: zero Handle on every old *Symbol

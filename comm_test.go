@@ -32,14 +32,14 @@ func TestListen_TwoSequentialPackets(t *testing.T) {
 	defer client.Close()
 
 	conn := &Connection{
-		connection:     client,
-		logger:         getDefaultLogger(),
-		systemResponse: make(chan []byte, 2),
+		tx:        &transport{connection: client, systemResponse: make(chan []byte, 2)},
+		logger:    getDefaultLogger(),
+		lifecycle: &reconnector{},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	conn.ctx = ctx
-	conn.shutdown = cancel
-	conn.waitGroup.Add(1)
+	conn.lifecycle.ctx = ctx
+	conn.lifecycle.shutdown = cancel
+	conn.lifecycle.waitGroup.Add(1)
 
 	var listenDone sync.WaitGroup
 	listenDone.Add(1)
@@ -60,11 +60,11 @@ func TestListen_TwoSequentialPackets(t *testing.T) {
 		t.Fatalf("write packet 2: %v", err)
 	}
 
-	got1 := <-conn.systemResponse
+	got1 := <-conn.tx.systemResponse
 	if !bytes.Equal(got1, body1) {
 		t.Errorf("packet 1: got %v, want %v", got1, body1)
 	}
-	got2 := <-conn.systemResponse
+	got2 := <-conn.tx.systemResponse
 	if !bytes.Equal(got2, body2) {
 		t.Errorf("packet 2: got %v, want %v", got2, body2)
 	}
@@ -83,17 +83,15 @@ func TestListen_OversizePacketTriggersReconnect(t *testing.T) {
 	defer client.Close()
 
 	conn := &Connection{
-		connection:     client,
-		logger:         getDefaultLogger(),
-		systemResponse: make(chan []byte, 1),
-		closedCh:       make(chan struct{}),
-		reconnectDone:  nil,
+		tx:        &transport{connection: client, systemResponse: make(chan []byte, 1)},
+		logger:    getDefaultLogger(),
+		lifecycle: &reconnector{closedCh: make(chan struct{})},
 	}
-	conn.closed.Store(true) // suppress reconnect goroutine launch
+	conn.lifecycle.closed.Store(true) // suppress reconnect goroutine launch
 	ctx, cancel := context.WithCancel(context.Background())
-	conn.ctx = ctx
-	conn.shutdown = cancel
-	conn.waitGroup.Add(1)
+	conn.lifecycle.ctx = ctx
+	conn.lifecycle.shutdown = cancel
+	conn.lifecycle.waitGroup.Add(1)
 
 	var listenDone sync.WaitGroup
 	listenDone.Add(1)
@@ -124,13 +122,13 @@ func TestListen_OversizePacketTriggersReconnect(t *testing.T) {
 // disconnected=true and a non-nil reconnectDone channel, then cancelling the ctx.
 func TestSendRequestOnce_CtxDoneReturnsCanceled(t *testing.T) {
 	conn := &Connection{
-		logger:        getDefaultLogger(),
-		reconnectDone: make(chan struct{}),
+		logger:    getDefaultLogger(),
+		lifecycle: &reconnector{reconnectDone: make(chan struct{})},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	conn.ctx = ctx
-	conn.shutdown = cancel
-	conn.disconnected.Store(true)
+	conn.lifecycle.ctx = ctx
+	conn.lifecycle.shutdown = cancel
+	conn.lifecycle.disconnected.Store(true)
 
 	cancel()
 

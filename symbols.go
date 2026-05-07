@@ -17,6 +17,23 @@ import (
 // ensures consistent lookups regardless of caller or PLC casing.
 func symbolKey(name string) string { return strings.ToLower(name) }
 
+// normalizeStringDataType strips trailing array/length suffixes from STRING
+// and WSTRING type names. The PLC reports types like "STRING(80)" or
+// "WSTRING(255)"; the library treats all string variants of the same kind
+// uniformly, so we collapse to the bare "STRING" or "WSTRING" prefix.
+//
+// Returns the input unchanged if it is neither a STRING nor a WSTRING.
+func normalizeStringDataType(dt string) string {
+	switch {
+	case len(dt) >= 7 && dt[:7] == "WSTRING":
+		return "WSTRING"
+	case len(dt) >= 6 && dt[:6] == "STRING":
+		return "STRING"
+	default:
+		return dt
+	}
+}
+
 type datatypeEntry struct {
 	EntryLength   uint32
 	Version       uint32
@@ -75,6 +92,34 @@ type SymbolUploadInfo struct {
 	ExtraLength    uint32
 }
 
+// Symbol is the internal cache record for a PLC symbol. External callers
+// should use SymbolView (returned by GetSymbol/ListSymbols) - direct access
+// to *Symbol is reserved for in-package code paths that need to mutate
+// state under the appropriate lock.
+//
+// Field guards:
+//
+//   - Immutable after construction (safe to read without a lock):
+//     FullName, Name, DataType, Comment, Group, Offset, Length, BaseType,
+//     Flags, ContextMask, MinUpdateInterval, Parent, Children.
+//
+//   - Guarded by Connection.cache.lock (mutated by parse/Read/Write/loadSymbols):
+//     Value, Valid, ValueParsed, Changed, LastUpdateTime.
+//
+//   - Handle: write-once during getSymbol resolve under cache.lock, then
+//     stable until loadSymbols zeroes the old map (also under cache.lock).
+//     Concurrent reads after resolve are safe lock-free — observed value is
+//     either the resolved handle or 0 (post-reload), and a 0 handle naturally
+//     fails the next PLC operation (ReturnCodeDeviceNotifyHandleInvalid),
+//     prompting re-resolve via GetSymbol.
+//
+//   - Guarded by Connection.notifs.lock (mutated by AddSymbolNotification(s)
+//     and DeleteDeviceNotification):
+//     Notification.
+//
+// The Children map and Parent pointer form a tree, set up during discovery
+// and never mutated after - callers may walk freely without a lock as long
+// as no concurrent reload (LoadSymbols/LoadSymbolsSlow) is in progress.
 type Symbol struct {
 	FullName          string
 	LastUpdateTime    time.Time
@@ -99,6 +144,154 @@ type Symbol struct {
 
 	Parent   *Symbol
 	Children map[string]*Symbol
+}
+
+// SymbolView is a read-only snapshot of a symbol's metadata and current
+// cached value, captured atomically under cache.lock at view creation.
+// All fields - including Value and Valid - reflect the cache state at the
+// instant GetSymbol/ListSymbols returned. The view does NOT track later
+// updates; for fresh data, call GetSymbol again or subscribe via
+// AddSymbolNotification.
+//
+// Trade-offs of the snapshot model:
+//   - Read-only ergonomics: every field access is a cheap struct read, no
+//     locks, no allocation, no deadlock risk.
+//   - Internally consistent: Valid and Value were captured together, so
+//     callers cannot observe a "Valid=true, Value=empty" tear.
+//   - Stale after concurrent loadSymbols / online-change: if the cache is
+//     swapped after the view is built, the view shows the prior state.
+//
+// IsValid() returns false for the zero-value SymbolView. Children() and
+// ChildrenWalk() collect snapshots under cache.lock and release before
+// invoking the caller's iterator - safe to call any Connection method
+// from within a walk.
+type SymbolView struct {
+	Name        string
+	FullName    string
+	DataType    string
+	Comment     string
+	Handle      uint32
+	Group       uint32
+	Offset      uint32
+	Length      uint32
+	BaseType    uint32 // ADST_ numeric type code from protocol
+	Flags       SymbolFlag
+	ContextMask uint8 // PLC task context (bits 8-11 of Flags); 0 = no task binding
+	Valid       bool  // true if Value has been parsed at least once at snapshot time
+	IsRoot      bool  // true if this symbol has no parent (top-level program/global var)
+	Value       string
+
+	conn *Connection
+}
+
+// IsValid reports whether the view is backed by a live connection. Zero-value
+// SymbolView returns false; views obtained from GetSymbol/ListSymbols return
+// true (until the connection is closed).
+func (v SymbolView) IsValid() bool { return v.conn != nil && v.FullName != "" }
+
+// Children returns SymbolViews for struct/array members captured at view
+// creation time. Returns nil for scalars and for symbols whose subtree has
+// not been populated by full discovery. The map is freshly allocated per
+// call; callers can mutate it without affecting library state.
+//
+// Each child is a freshly-snapshotted SymbolView (lookups walk the cache
+// under cache.lock once per call, then release). Caller code in a walk loop
+// is free to call any Connection method - no lock held.
+func (v SymbolView) Children() map[string]SymbolView {
+	if v.conn == nil {
+		return nil
+	}
+	v.conn.cache.lock.Lock()
+	s := v.conn.cache.symbols[symbolKey(v.FullName)]
+	if s == nil || len(s.Children) == 0 {
+		v.conn.cache.lock.Unlock()
+		return nil
+	}
+	out := make(map[string]SymbolView, len(s.Children))
+	for k, c := range s.Children {
+		if c == nil {
+			continue
+		}
+		out[k] = c.view(v.conn)
+	}
+	v.conn.cache.lock.Unlock()
+	return out
+}
+
+// ChildrenWalk visits every symbol in the subtree rooted at this view in
+// depth-first order. Snapshots the entire subtree under cache.lock once,
+// releases the lock, then invokes fn for each entry. fn is free to call
+// any Connection method (Value field reads are lock-free, GetSymbol etc.
+// take their own locks - no deadlock risk).
+//
+// Walk terminates early if fn returns false.
+func (v SymbolView) ChildrenWalk(fn func(SymbolView) bool) {
+	if v.conn == nil || fn == nil {
+		return
+	}
+	v.conn.cache.lock.Lock()
+	root := v.conn.cache.symbols[symbolKey(v.FullName)]
+	if root == nil {
+		v.conn.cache.lock.Unlock()
+		return
+	}
+	// Phase 1: collect snapshots under lock.
+	var snapshots []SymbolView
+	collectSubtree(root, v.conn, &snapshots)
+	v.conn.cache.lock.Unlock()
+	// Phase 2: invoke fn outside lock.
+	for _, view := range snapshots {
+		if !fn(view) {
+			return
+		}
+	}
+}
+
+// collectSubtreeMaxDepth caps recursion depth as defense against malformed
+// data forming a Children cycle. Real PLC struct nesting is at most a few
+// dozen levels; matches parentChangedMaxDepth in readWriter.go.
+const collectSubtreeMaxDepth = 256
+
+func collectSubtree(s *Symbol, conn *Connection, out *[]SymbolView) {
+	collectSubtreeDepth(s, conn, out, 0)
+}
+
+func collectSubtreeDepth(s *Symbol, conn *Connection, out *[]SymbolView, depth int) {
+	if depth >= collectSubtreeMaxDepth {
+		getDefaultLogger().Warn("collectSubtree hit depth cap; possible Children cycle or malformed Symbol tree",
+			"symbol", s.FullName,
+			"max_depth", collectSubtreeMaxDepth)
+		return
+	}
+	for _, c := range s.Children {
+		if c == nil {
+			continue
+		}
+		*out = append(*out, c.view(conn))
+		collectSubtreeDepth(c, conn, out, depth+1)
+	}
+}
+
+// view builds a SymbolView for s. Caller must hold cache.lock so the
+// snapshot of metadata + value is internally consistent. O(1).
+func (s *Symbol) view(conn *Connection) SymbolView {
+	return SymbolView{
+		Name:        s.Name,
+		FullName:    s.FullName,
+		DataType:    s.DataType,
+		Comment:     s.Comment,
+		Handle:      s.Handle,
+		Group:       s.Group,
+		Offset:      s.Offset,
+		Length:      s.Length,
+		BaseType:    s.BaseType,
+		Flags:       s.Flags,
+		ContextMask: s.ContextMask,
+		Valid:       s.Valid,
+		IsRoot:      s.Parent == nil,
+		Value:       s.Value,
+		conn:        conn,
+	}
 }
 
 func parseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUploadDataType) (symbols map[string]*Symbol, err error) {
@@ -130,11 +323,7 @@ func parseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUpload
 		item := symbolUploadSymbol{}
 		item.Name = string(name)
 		item.DataType = string(dt)
-		if len(item.DataType) >= 7 && item.DataType[:7] == "WSTRING" {
-			item.DataType = "WSTRING"
-		} else if len(item.DataType) >= 6 && item.DataType[:6] == "STRING" {
-			item.DataType = "STRING"
-		}
+		item.DataType = normalizeStringDataType(item.DataType)
 		item.Comment = string(comment)
 		item.SymbolEntry = result
 		endBuff := buff.Len()
@@ -179,13 +368,13 @@ func addSymbol(symbol symbolUploadSymbol, datatypes map[string]SymbolUploadDataT
 
 	dt, ok := datatypes[symbol.DataType]
 	if ok {
-		sym.Children = dt.addOffset(sym, datatypes, sym.Group, sym.Offset)
+		sym.Children = dt.addOffset(sym, datatypes, sym.Group)
 	}
 
 	return sym
 }
 
-func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string]SymbolUploadDataType, group uint32, offset uint32) (children map[string]*Symbol) {
+func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string]SymbolUploadDataType, group uint32) (children map[string]*Symbol) {
 	children = map[string]*Symbol{}
 
 	for key, segment := range data.Children {
@@ -217,7 +406,7 @@ func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string
 		// Enums have children (enum constants) but should be parsed as
 		// their base type (e.g. INT), not expanded as struct fields.
 		if dt, ok := datatypes[segment.DataType]; ok && !isEnumDataType(&dt) {
-			child.Children = dt.addOffset(&child, datatypes, child.Group, child.Offset)
+			child.Children = dt.addOffset(&child, datatypes, child.Group)
 		}
 
 		children[key] = &child
@@ -295,11 +484,7 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 
 	header.DatatypeEntry = result
 
-	if len(header.DataType) >= 7 && header.DataType[:7] == "WSTRING" {
-		header.DataType = "WSTRING"
-	} else if len(header.DataType) >= 6 && header.DataType[:6] == "STRING" {
-		header.DataType = "STRING"
-	}
+	header.DataType = normalizeStringDataType(header.DataType)
 
 	childLen := int(result.EntryLength) - (totalSize - data.Len())
 	if childLen <= 0 {
@@ -348,7 +533,7 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 
 // maxArrayElementsPerLevel caps PLC-declared array Elements per dimension to
 // prevent malformed/buggy datatype responses from triggering huge map
-// allocations (F-15). Real PLC arrays rarely exceed a few thousand elements;
+// allocations. Real PLC arrays rarely exceed a few thousand elements;
 // 1M is a safety ceiling well above any legitimate use.
 const maxArrayElementsPerLevel = 1_000_000
 
@@ -363,7 +548,7 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (chil
 	if level.Elements == 0 {
 		return
 	}
-	// F-15: defend against malformed/buggy PLC datatype responses.
+	// defend against malformed/buggy PLC datatype responses.
 	// (1) Cap Elements at a sanity limit to prevent DoS via huge map allocation.
 	// (2) Reject when LBound + Elements overflows uint32 — loop counter would
 	//     wrap and either skip the body or iterate ~4 billion times.

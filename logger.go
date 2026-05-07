@@ -52,9 +52,9 @@ func WithHostIP(ip string) ConnectionOption {
 // Ensure route registration only occurs on trusted networks.
 func WithRoute(routeName, username, password string) ConnectionOption {
 	return func(c *Connection) {
-		c.routeName = routeName
-		c.routeUsername = username
-		c.routePassword = secret(password)
+		c.route.name = routeName
+		c.route.username = username
+		c.route.password = secret(password)
 	}
 }
 
@@ -89,7 +89,7 @@ func DefaultBackoffConfig() BackoffConfig {
 // If not provided, DefaultBackoffConfig() is used.
 func WithBackoff(cfg BackoffConfig) ConnectionOption {
 	return func(c *Connection) {
-		c.backoffConfig = cfg
+		c.lifecycle.backoffConfig = cfg
 	}
 }
 
@@ -98,7 +98,7 @@ func WithBackoff(cfg BackoffConfig) ConnectionOption {
 // goroutine returns an error and the connection stays in disconnected state.
 func WithMaxReconnectAttempts(n int) ConnectionOption {
 	return func(c *Connection) {
-		c.maxReconnectAttempts = n
+		c.lifecycle.maxReconnectAttempts = n
 	}
 }
 
@@ -123,7 +123,7 @@ func WithRequestTimeout(d time.Duration) ConnectionOption {
 // routes are not persistent or must be refreshed on each connection.
 func WithForceRouteRegistration() ConnectionOption {
 	return func(c *Connection) {
-		c.forceRouteRegistration = true
+		c.route.forceRouteRegistration = true
 	}
 }
 
@@ -135,8 +135,8 @@ func WithForceRouteRegistration() ConnectionOption {
 //   - N > 0 = retry up to N times, then return error (connection closes)
 func WithStrictReconnect(maxAttempts int) ConnectionOption {
 	return func(c *Connection) {
-		c.strictReconnect = true
-		c.strictReconnectMaxAttempts = maxAttempts
+		c.lifecycle.strictReconnect = true
+		c.lifecycle.strictReconnectMaxAttempts = maxAttempts
 	}
 }
 
@@ -147,7 +147,7 @@ func WithStrictReconnect(maxAttempts int) ConnectionOption {
 // The caller must call Reconnect() manually to re-establish the connection.
 func WithAutoReconnect(enabled bool) ConnectionOption {
 	return func(c *Connection) {
-		c.autoReconnect = enabled
+		c.lifecycle.autoReconnect = enabled
 	}
 }
 

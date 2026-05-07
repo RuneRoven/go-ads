@@ -131,10 +131,10 @@ func TestBuildRoutePacket(t *testing.T) {
 
 func TestParseRouteResponse_Success(t *testing.T) {
 	// Build a successful route response:
-	// cookie(4) + invokeId(4) + serviceId(4) + AmsAddr(8) + tagCount(4) + error tag
+	// cookie(4) + invokeID(4) + serviceId(4) + AmsAddr(8) + tagCount(4) + error tag
 	resp := make([]byte, 24+8) // header + one tag with 4-byte data
 	binary.LittleEndian.PutUint32(resp[0:], routeCookie)
-	binary.LittleEndian.PutUint32(resp[4:], 0) // invokeId
+	binary.LittleEndian.PutUint32(resp[4:], 0) // invokeID
 	binary.LittleEndian.PutUint32(resp[8:], 0x80000000|routeServiceAdd)
 	// AmsAddr (8 bytes) at offset 12 - zero is fine
 	binary.LittleEndian.PutUint32(resp[20:], 1) // tagCount = 1
@@ -417,7 +417,7 @@ func TestSymbolParseUnknownType(t *testing.T) {
 func testWriteRoundTrip(t *testing.T, dataType string, length uint32, value string) {
 	t.Helper()
 	sym := &Symbol{DataType: dataType, Length: length}
-	data, err := sym.writeToNode(value, 0, nil)
+	data, err := sym.writeToNode(value, nil)
 	if err != nil {
 		t.Fatalf("writeToNode(%q, %q) error: %v", dataType, value, err)
 	}
@@ -495,7 +495,7 @@ func TestWriteToNodeRoundTrip(t *testing.T) {
 func TestWriteToNodeRoundTripFloat(t *testing.T) {
 	t.Run("REAL/3.14", func(t *testing.T) {
 		sym := &Symbol{DataType: "REAL", Length: 4}
-		data, err := sym.writeToNode("3.14", 0, nil)
+		data, err := sym.writeToNode("3.14", nil)
 		requireNoError(t, err)
 		bits := binary.LittleEndian.Uint32(data)
 		f := math.Float32frombits(bits)
@@ -504,7 +504,7 @@ func TestWriteToNodeRoundTripFloat(t *testing.T) {
 
 	t.Run("LREAL/pi", func(t *testing.T) {
 		sym := &Symbol{DataType: "LREAL", Length: 8}
-		data, err := sym.writeToNode("3.141592653589793", 0, nil)
+		data, err := sym.writeToNode("3.141592653589793", nil)
 		requireNoError(t, err)
 		bits := binary.LittleEndian.Uint64(data)
 		f := math.Float64frombits(bits)
@@ -538,7 +538,7 @@ func TestWriteToNodeStruct(t *testing.T) {
 		},
 	}
 
-	data, err := parent.writeToNode(`{"field1":"42","field2":"100"}`, 0, nil)
+	data, err := parent.writeToNode(`{"field1":"42","field2":"100"}`, nil)
 	if err != nil {
 		t.Fatalf("struct writeToNode error: %v", err)
 	}
@@ -574,7 +574,7 @@ func TestWriteToNodeStructPartialFields(t *testing.T) {
 	}
 
 	// Only write "x", "y" should remain zero
-	data, err := parent.writeToNode(`{"x":"7"}`, 0, nil)
+	data, err := parent.writeToNode(`{"x":"7"}`, nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -591,7 +591,7 @@ func TestWriteToNodeAliasResolution(t *testing.T) {
 		"MyInt": {DataType: "INT"},
 	}
 	sym := &Symbol{DataType: "MyInt", Length: 2}
-	data, err := sym.writeToNode("123", 0, datatypes)
+	data, err := sym.writeToNode("123", datatypes)
 	if err != nil {
 		t.Fatalf("alias writeToNode error: %v", err)
 	}
@@ -606,7 +606,7 @@ func TestWriteToNodeAliasResolution(t *testing.T) {
 // unknown types, use a non-inferable size (3) so the fallback also rejects.
 func TestWriteToNodeAliasWithoutDatatypes(t *testing.T) {
 	sym := &Symbol{DataType: "MyCustomType", Length: 3}
-	_, err := sym.writeToNode("42", 0, nil)
+	_, err := sym.writeToNode("42", nil)
 	if err == nil {
 		t.Error("expected error for alias without datatypes (uninferable size)")
 	}
@@ -614,7 +614,7 @@ func TestWriteToNodeAliasWithoutDatatypes(t *testing.T) {
 
 func TestWriteToNodeUnknownType(t *testing.T) {
 	sym := &Symbol{DataType: "UNKNOWN_XYZ", Length: 3}
-	_, err := sym.writeToNode("42", 0, map[string]SymbolUploadDataType{})
+	_, err := sym.writeToNode("42", map[string]SymbolUploadDataType{})
 	if err == nil {
 		t.Error("expected error for unknown type (uninferable size)")
 	}
@@ -709,7 +709,7 @@ func TestWriteToNodeInvalidValues(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			sym := &Symbol{DataType: tt.dataType, Length: tt.length}
-			_, err := sym.writeToNode(tt.value, 0, nil)
+			_, err := sym.writeToNode(tt.value, nil)
 			if err == nil {
 				t.Errorf("expected error for %s with value %q", tt.dataType, tt.value)
 			}
@@ -724,7 +724,7 @@ func TestWriteToNodeStructInvalidJSON(t *testing.T) {
 			"x": {Name: "x", FullName: "s.x", DataType: "BYTE", Length: 1, Offset: 0},
 		},
 	}
-	_, err := parent.writeToNode("not json", 0, nil)
+	_, err := parent.writeToNode("not json", nil)
 	if err == nil {
 		t.Error("expected error for invalid JSON in struct write")
 	}
@@ -739,7 +739,7 @@ func TestAddOffsetEmptySegmentName(t *testing.T) {
 			"": {Name: "", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2}},
 		},
 	}
-	children := dt.addOffset(parent, nil, 0, 0)
+	children := dt.addOffset(parent, nil, 0)
 	// Empty segment name should be skipped (F-06 fix)
 	if len(children) != 0 {
 		t.Errorf("expected 0 children for empty segment name, got %d", len(children))
@@ -753,7 +753,7 @@ func TestAddOffsetFullNameWithDot(t *testing.T) {
 			"speed": {Name: "speed", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2, Offs: 0}},
 		},
 	}
-	children := dt.addOffset(parent, nil, 0, 0)
+	children := dt.addOffset(parent, nil, 0)
 	child, ok := children["speed"]
 	if !ok {
 		t.Fatal("expected child 'speed'")
@@ -772,7 +772,7 @@ func TestAddOffsetArrayFullName(t *testing.T) {
 			"[1]": {Name: "[1]", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2, Offs: 2}},
 		},
 	}
-	children := dt.addOffset(parent, nil, 0, 0)
+	children := dt.addOffset(parent, nil, 0)
 	child0, ok := children["[0]"]
 	if !ok {
 		t.Fatal("expected child '[0]'")
@@ -821,7 +821,7 @@ func TestParseEnumNestedInStruct(t *testing.T) {
 			DataType: "ST_Motor", Length: 8, Group: 0x4040,
 		}
 		dt := datatypes["ST_Motor"]
-		motorSym.Children = dt.addOffset(motorSym, datatypes, motorSym.Group, motorSym.Offset)
+		motorSym.Children = dt.addOffset(motorSym, datatypes, motorSym.Group)
 
 		// Wire data: state=2 (Running, DINT), speed=1500 (INT)
 		data := make([]byte, 8)
@@ -886,7 +886,7 @@ func TestParseEnumNestedInStruct(t *testing.T) {
 			DataType: "ST_Motor", Length: 8, Group: 0x4040,
 		}
 		dt := datatypes["ST_Motor"]
-		motorSym.Children = dt.addOffset(motorSym, datatypes, motorSym.Group, motorSym.Offset)
+		motorSym.Children = dt.addOffset(motorSym, datatypes, motorSym.Group)
 
 		data := make([]byte, 8)
 		binary.LittleEndian.PutUint32(data[0:4], 4) // ERROR=4
@@ -1002,7 +1002,7 @@ func TestArrayTypedefNotMistakenForEnum(t *testing.T) {
 		Offset:   0,
 	}
 	dt := datatypes["ST_WithArray"]
-	parent.Children = dt.addOffset(parent, datatypes, parent.Group, parent.Offset)
+	parent.Children = dt.addOffset(parent, datatypes, parent.Group)
 
 	// "values" child must have array element children expanded
 	valuesChild, ok := parent.Children["values"]
@@ -1410,7 +1410,7 @@ func TestSymbolParseSTRING_TrailingGarbage(t *testing.T) {
 
 func TestWriteToNodeSTRING_PadsWithZeros(t *testing.T) {
 	sym := &Symbol{DataType: "STRING", Length: 10}
-	data, err := sym.writeToNode("Hi", 0, nil)
+	data, err := sym.writeToNode("Hi", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1431,7 +1431,7 @@ func TestWriteToNodeSTRING_PadsWithZeros(t *testing.T) {
 func TestWriteToNodeSTRING_ExactLength(t *testing.T) {
 	// STRING(5) → Length=6 (5 chars + null). Writing exactly 5 chars should fit.
 	sym := &Symbol{DataType: "STRING", Length: 6}
-	data, err := sym.writeToNode("Hello", 0, nil)
+	data, err := sym.writeToNode("Hello", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1446,7 +1446,7 @@ func TestWriteToNodeSTRING_ExactLength(t *testing.T) {
 func TestWriteToNodeSTRING_Overflow(t *testing.T) {
 	// STRING(3) → Length=4 (3 chars + null). "Hello" truncated to 3 chars + null.
 	sym := &Symbol{DataType: "STRING", Length: 4}
-	data, err := sym.writeToNode("Hello", 0, nil)
+	data, err := sym.writeToNode("Hello", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1523,7 +1523,7 @@ func TestSymbolParseFloatSpecial(t *testing.T) {
 func TestWriteToNodeFloatSpecial(t *testing.T) {
 	t.Run("REAL/NaN", func(t *testing.T) {
 		sym := &Symbol{DataType: "REAL", Length: 4}
-		data, err := sym.writeToNode("NaN", 0, nil)
+		data, err := sym.writeToNode("NaN", nil)
 		requireNoError(t, err)
 		f := math.Float32frombits(binary.LittleEndian.Uint32(data))
 		if !math.IsNaN(float64(f)) {
@@ -1533,7 +1533,7 @@ func TestWriteToNodeFloatSpecial(t *testing.T) {
 
 	t.Run("REAL/+Inf", func(t *testing.T) {
 		sym := &Symbol{DataType: "REAL", Length: 4}
-		data, err := sym.writeToNode("+Inf", 0, nil)
+		data, err := sym.writeToNode("+Inf", nil)
 		requireNoError(t, err)
 		f := math.Float32frombits(binary.LittleEndian.Uint32(data))
 		if !math.IsInf(float64(f), 1) {
@@ -1543,7 +1543,7 @@ func TestWriteToNodeFloatSpecial(t *testing.T) {
 
 	t.Run("LREAL/NaN", func(t *testing.T) {
 		sym := &Symbol{DataType: "LREAL", Length: 8}
-		data, err := sym.writeToNode("NaN", 0, nil)
+		data, err := sym.writeToNode("NaN", nil)
 		requireNoError(t, err)
 		f := math.Float64frombits(binary.LittleEndian.Uint64(data))
 		if !math.IsNaN(f) {
@@ -1619,7 +1619,7 @@ func TestWriteToNodeTemporalAliases(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			sym := &Symbol{DataType: tt.dataType, Length: tt.length}
-			data, err := sym.writeToNode(tt.value, 0, nil)
+			data, err := sym.writeToNode(tt.value, nil)
 			requireNoError(t, err)
 			sym2 := &Symbol{DataType: tt.dataType, Length: tt.length}
 			val, err := sym2.parse(data, 0, nil)
@@ -1899,7 +1899,7 @@ func TestWriteToNodeNestedStruct(t *testing.T) {
 		Children: map[string]*Symbol{"inner": inner, "flag": outerField},
 	}
 
-	data, err := parent.writeToNode(`{"inner":{"val":"99"},"flag":"true"}`, 0, nil)
+	data, err := parent.writeToNode(`{"inner":{"val":"99"},"flag":"true"}`, nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -2016,17 +2016,17 @@ func buildNotificationPacketMultiSample(stamps []struct {
 func newTestConnection() *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := &Connection{
-		ctx:                 ctx,
-		shutdown:            cancel,
-		activeNotifications: make(map[uint32]*Symbol),
-		logger:              getDefaultLogger(),
+		lifecycle: &reconnector{ctx: ctx, shutdown: cancel},
+		notifs:    &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
+		cache:     &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
+		logger:    getDefaultLogger(),
 	}
 	return conn
 }
 
 func TestDeviceNotification_SingleSample(t *testing.T) {
 	conn := newTestConnection()
-	defer conn.shutdown()
+	defer conn.lifecycle.shutdown()
 
 	// Register a notification for handle 42
 	ch := make(chan *Update, 10)
@@ -2036,7 +2036,8 @@ func TestDeviceNotification_SingleSample(t *testing.T) {
 		Length:       2,
 		Notification: ch,
 	}
-	conn.activeNotifications[42] = sym
+	conn.notifs.activeNotifications[42] = sym
+	conn.cache.symbols[symbolKey(sym.FullName)] = sym
 
 	// Build INT value = 1234
 	data := make([]byte, 2)
@@ -2048,7 +2049,7 @@ func TestDeviceNotification_SingleSample(t *testing.T) {
 	filetime := uint64((unixTS + secToUnixEpoch) * windowsTick)
 
 	packet := buildNotificationPacket(42, filetime, data)
-	err := conn.DeviceNotification(conn.ctx, packet)
+	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("DeviceNotification error: %v", err)
 	}
@@ -2073,7 +2074,7 @@ func TestDeviceNotification_SingleSample(t *testing.T) {
 
 func TestDeviceNotification_UnknownHandle(t *testing.T) {
 	conn := newTestConnection()
-	defer conn.shutdown()
+	defer conn.lifecycle.shutdown()
 
 	// No notifications registered — handle 99 is unknown
 	data := make([]byte, 2)
@@ -2081,7 +2082,7 @@ func TestDeviceNotification_UnknownHandle(t *testing.T) {
 	packet := buildNotificationPacket(99, 0, data)
 
 	// Should not error, just log warning
-	err := conn.DeviceNotification(conn.ctx, packet)
+	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2124,18 +2125,18 @@ func TestDeviceNotification_UnknownHandleDuringClose(t *testing.T) {
 	handler := &testLogHandler{}
 	conn := newTestConnection()
 	conn.logger = slog.New(handler)
-	conn.closedCh = make(chan struct{})
-	defer conn.shutdown()
+	conn.lifecycle.closedCh = make(chan struct{})
+	defer conn.lifecycle.shutdown()
 
 	// Mark connection as closed
-	conn.closed.Store(true)
-	close(conn.closedCh)
+	conn.lifecycle.closed.Store(true)
+	close(conn.lifecycle.closedCh)
 
 	data := make([]byte, 2)
 	binary.LittleEndian.PutUint16(data, 42)
 	packet := buildNotificationPacket(99, 0, data)
 
-	err := conn.DeviceNotification(conn.ctx, packet)
+	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2154,14 +2155,14 @@ func TestDeviceNotification_UnknownHandleNormalCondition(t *testing.T) {
 	handler := &testLogHandler{}
 	conn := newTestConnection()
 	conn.logger = slog.New(handler)
-	defer conn.shutdown()
+	defer conn.lifecycle.shutdown()
 
 	// No close, no recent reconnect — should be Warn
 	data := make([]byte, 2)
 	binary.LittleEndian.PutUint16(data, 42)
 	packet := buildNotificationPacket(99, 0, data)
 
-	err := conn.DeviceNotification(conn.ctx, packet)
+	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2177,13 +2178,15 @@ func TestDeviceNotification_UnknownHandleNormalCondition(t *testing.T) {
 
 func TestDeviceNotification_MultipleStampsAndSamples(t *testing.T) {
 	conn := newTestConnection()
-	defer conn.shutdown()
+	defer conn.lifecycle.shutdown()
 
 	ch := make(chan *Update, 10)
 	sym1 := &Symbol{FullName: "var1", DataType: "BYTE", Length: 1, Notification: ch}
 	sym2 := &Symbol{FullName: "var2", DataType: "BYTE", Length: 1, Notification: ch}
-	conn.activeNotifications[1] = sym1
-	conn.activeNotifications[2] = sym2
+	conn.notifs.activeNotifications[1] = sym1
+	conn.notifs.activeNotifications[2] = sym2
+	conn.cache.symbols[symbolKey(sym1.FullName)] = sym1
+	conn.cache.symbols[symbolKey(sym2.FullName)] = sym2
 
 	stamps := []struct {
 		timestamp uint64
@@ -2214,7 +2217,7 @@ func TestDeviceNotification_MultipleStampsAndSamples(t *testing.T) {
 	}
 
 	packet := buildNotificationPacketMultiSample(stamps)
-	err := conn.DeviceNotification(conn.ctx, packet)
+	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -2236,10 +2239,10 @@ func TestDeviceNotification_MultipleStampsAndSamples(t *testing.T) {
 
 func TestDeviceNotification_EmptyPacket(t *testing.T) {
 	conn := newTestConnection()
-	defer conn.shutdown()
+	defer conn.lifecycle.shutdown()
 
 	// Too short — should return error
-	err := conn.DeviceNotification(conn.ctx, []byte{1, 2, 3})
+	err := conn.DeviceNotification(conn.lifecycle.ctx, []byte{1, 2, 3})
 	if err == nil {
 		t.Error("expected error for truncated packet")
 	}
@@ -2247,14 +2250,14 @@ func TestDeviceNotification_EmptyPacket(t *testing.T) {
 
 func TestDeviceNotification_ZeroStamps(t *testing.T) {
 	conn := newTestConnection()
-	defer conn.shutdown()
+	defer conn.lifecycle.shutdown()
 
 	// Valid header with 0 stamps
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, uint32(8)) // length
 	binary.Write(buf, binary.LittleEndian, uint32(0)) // 0 stamps
 
-	err := conn.DeviceNotification(conn.ctx, buf.Bytes())
+	err := conn.DeviceNotification(conn.lifecycle.ctx, buf.Bytes())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2262,7 +2265,7 @@ func TestDeviceNotification_ZeroStamps(t *testing.T) {
 
 func TestDeviceNotification_SampleSizeExceedsData(t *testing.T) {
 	conn := newTestConnection()
-	defer conn.shutdown()
+	defer conn.lifecycle.shutdown()
 
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, uint32(100))      // length (fake)
@@ -2272,7 +2275,7 @@ func TestDeviceNotification_SampleSizeExceedsData(t *testing.T) {
 	binary.Write(buf, binary.LittleEndian, uint32(42))       // handle
 	binary.Write(buf, binary.LittleEndian, uint32(99999999)) // size > remaining
 
-	err := conn.DeviceNotification(conn.ctx, buf.Bytes())
+	err := conn.DeviceNotification(conn.lifecycle.ctx, buf.Bytes())
 	if err == nil {
 		t.Error("expected error for sample size exceeding data")
 	}
@@ -2280,14 +2283,15 @@ func TestDeviceNotification_SampleSizeExceedsData(t *testing.T) {
 
 func TestDeviceNotification_BoolType(t *testing.T) {
 	conn := newTestConnection()
-	defer conn.shutdown()
+	defer conn.lifecycle.shutdown()
 
 	ch := make(chan *Update, 5)
 	sym := &Symbol{FullName: "MAIN.bFlag", DataType: "BOOL", Length: 1, Notification: ch}
-	conn.activeNotifications[10] = sym
+	conn.notifs.activeNotifications[10] = sym
+	conn.cache.symbols[symbolKey(sym.FullName)] = sym
 
 	packet := buildNotificationPacket(10, 0, []byte{1})
-	err := conn.DeviceNotification(conn.ctx, packet)
+	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -2304,17 +2308,18 @@ func TestDeviceNotification_BoolType(t *testing.T) {
 
 func TestDeviceNotification_StringType(t *testing.T) {
 	conn := newTestConnection()
-	defer conn.shutdown()
+	defer conn.lifecycle.shutdown()
 
 	ch := make(chan *Update, 5)
 	sym := &Symbol{FullName: "MAIN.sName", DataType: "STRING", Length: 20, Notification: ch}
-	conn.activeNotifications[11] = sym
+	conn.notifs.activeNotifications[11] = sym
+	conn.cache.symbols[symbolKey(sym.FullName)] = sym
 
 	strData := make([]byte, 20)
 	copy(strData, "Hello\x00")
 
 	packet := buildNotificationPacket(11, 0, strData)
-	err := conn.DeviceNotification(conn.ctx, packet)
+	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -2337,13 +2342,14 @@ func TestEncodePacket(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	conn := &Connection{
-		ctx:    ctx,
-		logger: getDefaultLogger(),
-		target: AmsAddress{
+		tx:        &transport{},
+		lifecycle: &reconnector{ctx: ctx},
+		logger:    getDefaultLogger(),
+		target: AMSAddress{
 			NetID: [6]byte{5, 154, 236, 19, 1, 1},
 			Port:  851,
 		},
-		source: AmsAddress{
+		source: AMSAddress{
 			NetID: [6]byte{192, 168, 1, 100, 1, 1},
 			Port:  10500,
 		},
@@ -2420,10 +2426,11 @@ func TestEncodePacket_EmptyData(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	conn := &Connection{
-		ctx:    ctx,
-		logger: getDefaultLogger(),
-		target: AmsAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851},
-		source: AmsAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500},
+		tx:        &transport{},
+		lifecycle: &reconnector{ctx: ctx},
+		logger:    getDefaultLogger(),
+		target:    AMSAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851},
+		source:    AMSAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500},
 	}
 
 	packet, err := conn.encode(CommandIDReadDeviceInfo, nil, 0)
@@ -2446,10 +2453,11 @@ func TestEncodePacket_AllCommands(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	conn := &Connection{
-		ctx:    ctx,
-		logger: getDefaultLogger(),
-		target: AmsAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851},
-		source: AmsAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500},
+		tx:        &transport{},
+		lifecycle: &reconnector{ctx: ctx},
+		logger:    getDefaultLogger(),
+		target:    AMSAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851},
+		source:    AMSAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500},
 	}
 
 	commands := []CommandID{
@@ -2486,21 +2494,21 @@ func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	conn := &Connection{
-		ctx:            ctx,
-		logger:         getDefaultLogger(),
-		activeRequests: make(map[uint32]chan []byte),
+		lifecycle: &reconnector{ctx: ctx},
+		logger:    getDefaultLogger(),
+		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
 	}
 
 	// Register a response channel for invokeID 42
 	ch := make(chan []byte, 1)
-	conn.activeRequestLock.Lock()
-	conn.activeRequests[42] = ch
-	conn.activeRequestLock.Unlock()
+	conn.tx.activeRequestLock.Lock()
+	conn.tx.activeRequests[42] = ch
+	conn.tx.activeRequestLock.Unlock()
 
 	// Build AMS header + data
 	header := amsHeader{
-		Target:    AmsAddress{},
-		Source:    AmsAddress{},
+		Target:    AMSAddress{},
+		Source:    AMSAddress{},
 		Command:   CommandIDRead,
 		State:     5, // response
 		Length:    4,
@@ -2527,9 +2535,9 @@ func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	conn := &Connection{
-		ctx:            ctx,
-		logger:         getDefaultLogger(),
-		activeRequests: make(map[uint32]chan []byte),
+		lifecycle: &reconnector{ctx: ctx},
+		logger:    getDefaultLogger(),
+		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
 	}
 
 	// No registered channels — should not panic
@@ -2551,9 +2559,9 @@ func TestHandleReceive_TooShort(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	conn := &Connection{
-		ctx:            ctx,
-		logger:         getDefaultLogger(),
-		activeRequests: make(map[uint32]chan []byte),
+		lifecycle: &reconnector{ctx: ctx},
+		logger:    getDefaultLogger(),
+		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
 	}
 
 	// Less than 32 bytes — should return early
@@ -2731,7 +2739,7 @@ func TestParseWSTRING_SurrogatePair(t *testing.T) {
 
 func TestWriteWSTRING_ASCII(t *testing.T) {
 	sym := &Symbol{DataType: "WSTRING", Length: 20}
-	data, err := sym.writeToNode("Hello", 0, nil)
+	data, err := sym.writeToNode("Hello", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2756,7 +2764,7 @@ func TestWriteWSTRING_ASCII(t *testing.T) {
 func TestWriteWSTRING_Unicode(t *testing.T) {
 	sym := &Symbol{DataType: "WSTRING", Length: 20}
 	text := "日本語"
-	data, err := sym.writeToNode(text, 0, nil)
+	data, err := sym.writeToNode(text, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2771,7 +2779,7 @@ func TestWriteWSTRING_Unicode(t *testing.T) {
 func TestWriteWSTRING_Truncation(t *testing.T) {
 	// Length 6 = room for 2 chars + null terminator (each 2 bytes)
 	sym := &Symbol{DataType: "WSTRING", Length: 6}
-	data, err := sym.writeToNode("ABCDE", 0, nil)
+	data, err := sym.writeToNode("ABCDE", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2796,7 +2804,7 @@ func TestWriteWSTRING_RoundTrip(t *testing.T) {
 	for _, text := range texts {
 		t.Run(text, func(t *testing.T) {
 			sym := &Symbol{DataType: "WSTRING", Length: 40}
-			data, err := sym.writeToNode(text, 0, nil)
+			data, err := sym.writeToNode(text, nil)
 			if err != nil {
 				t.Fatalf("write error: %v", err)
 			}
@@ -2847,7 +2855,7 @@ func TestParseBitSymbol_False(t *testing.T) {
 
 func TestWriteBitSymbol_True(t *testing.T) {
 	sym := &Symbol{DataType: "BOOL", Length: 1, Flags: SymbolFlagBitValue}
-	data, err := sym.writeToNode("true", 0, nil)
+	data, err := sym.writeToNode("true", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2858,7 +2866,7 @@ func TestWriteBitSymbol_True(t *testing.T) {
 
 func TestWriteBitSymbol_False(t *testing.T) {
 	sym := &Symbol{DataType: "BOOL", Length: 1, Flags: SymbolFlagBitValue}
-	data, err := sym.writeToNode("false", 0, nil)
+	data, err := sym.writeToNode("false", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -3155,28 +3163,32 @@ func TestSumProbeStateTransitions(t *testing.T) {
 	var conn Connection
 
 	// sumWriteState: 0→1
-	if !conn.sumWriteState.CompareAndSwap(0, 1) {
+	if !conn.capabilities.SumWriteStateCAS(0, 1) {
 		t.Error("CAS 0→1 should succeed")
 	}
-	if conn.sumWriteState.Load() != 1 {
+	if conn.capabilities.SumWriteStateLoad() != 1 {
 		t.Error("state should be 1")
 	}
 	// Second goroutine trying 0→2 should fail
-	if conn.sumWriteState.CompareAndSwap(0, 2) {
+	if conn.capabilities.SumWriteStateCAS(0, 2) {
 		t.Error("CAS 0→2 should fail when state is 1")
 	}
 
-	// sumNotifState: 0→2
-	if !conn.sumNotifState.CompareAndSwap(0, 2) {
+	// sumAddNotifState: 0→2
+	if !conn.capabilities.SumAddNotifStateCAS(0, 2) {
 		t.Error("CAS 0→2 should succeed")
 	}
-	if conn.sumNotifState.Load() != 2 {
+	if conn.capabilities.SumAddNotifStateLoad() != 2 {
 		t.Error("state should be 2")
+	}
+	// sumDeleteNotifState independent of sumAddNotifState
+	if conn.capabilities.SumDeleteNotifStateLoad() != 0 {
+		t.Error("delete state should still be 0 (independent of add)")
 	}
 
 	// Reset works
-	conn.sumWriteState.Store(0)
-	if conn.sumWriteState.Load() != 0 {
+	conn.capabilities.SumWriteStateStore(0)
+	if conn.capabilities.SumWriteStateLoad() != 0 {
 		t.Error("reset should set state to 0")
 	}
 }
@@ -3196,7 +3208,7 @@ func TestSumProbeStateConcurrent(t *testing.T) {
 			if id%2 == 0 {
 				val = 2
 			}
-			if conn.sumWriteState.CompareAndSwap(0, val) {
+			if conn.capabilities.SumWriteStateCAS(0, val) {
 				wins <- val
 			}
 		}(i)
