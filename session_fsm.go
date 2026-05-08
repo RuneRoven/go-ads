@@ -153,3 +153,9 @@ func (conn *Session) isDisconnected() bool {
 	s := conn.lifecycle.state.load()
 	return s == SessionStateDisconnected || s == SessionStateReconnecting
 }
+
+// isReconnecting reports whether a reconnect attempt is in flight.
+// Phase 2.c replacement for legacy lifecycle.reconnecting.Load().
+func (conn *Session) isReconnecting() bool {
+	return conn.lifecycle.state.load() == SessionStateReconnecting
+}

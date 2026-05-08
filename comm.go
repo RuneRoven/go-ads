@@ -89,7 +89,7 @@ func (conn *Session) sendRequest(command CommandID, data []byte) (response []byt
 			return nil, err
 		}
 		// Only retry if a reconnect is actually in progress.
-		if !conn.lifecycle.reconnecting.Load() {
+		if !conn.isReconnecting() {
 			return nil, err
 		}
 		// Wait for reconnect to finish before retrying.
@@ -369,7 +369,7 @@ func (conn *Session) handleReceive(ctx context.Context, data []byte) {
 			// 2. During close: requests cleaned up, final responses drain
 			// Both are harmless — downgrade to Debug. In normal operation, this
 			// indicates a protocol-level issue worth investigating.
-			if conn.lifecycle.reconnecting.Load() || conn.isClosed() {
+			if conn.isReconnecting() || conn.isClosed() {
 				conn.logger.Debug("received stale packet (expected during reconnect/close)",
 					"invokeID", header.InvokeID)
 			} else {
