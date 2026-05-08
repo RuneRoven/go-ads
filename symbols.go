@@ -8,8 +8,43 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// symbolCache owns the connection-level symbol metadata: the symbol map,
+// the data-type table, the PLC's reported symbol version (for change
+// detection), and discovery-mode flags that track which load function was
+// used (LoadSymbols, LoadSymbolsSlow, LoadSymbolList, LoadDataTypes).
+//
+// Lock also covers Symbol mutation during parse() — Symbol objects live
+// in the cache.symbols map and parse() rewrites their Value/Valid
+// fields. Lock ordering: NEVER hold both cache.lock and notifications.lock at
+// the same time. Paths that need both must release one before acquiring
+// the other.
+//
+// Generation tracking lives on sessionFSM.epoch. Cache.symbols swaps
+// (loadSymbols, LoadSymbolList, LoadDataTypes, on-demand reset in
+// reloadSymbols) call Session.bumpEpoch() under this lock. Simple insert
+// (on-demand getSymbol) does NOT bump — existing pointers stay valid
+// across an insert.
+//
+// Callers that need to publish a *Symbol pointer they obtained pre-roundtrip
+// into another data structure (e.g. notifications.activeNotifications) MUST capture
+// the epoch before resolve and recheck before commit; if the value changed,
+// the pointer is stranded and must be discarded. Closes the residual race
+// window between cache.lock release and notifications.lock acquire that the
+// simple re-fetch pattern leaves open.
+type symbolCache struct {
+	lock               sync.Mutex
+	symbols            map[string]*Symbol
+	datatypes          map[string]SymbolUploadDataType
+	symbolVersion      uint8
+	onDemandSymbols    map[string]bool
+	symbolListLoaded   bool
+	symbolsFullyLoaded bool
+	datatypesLoaded    bool
+}
 
 // symbolKey normalizes a symbol name for use as an internal map key.
 // TwinCAT treats symbol names case-insensitively (IEC 61131-3).
