@@ -39,13 +39,14 @@ func TestListen_TwoSequentialPackets(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn.lifecycle.ctx = ctx
 	conn.lifecycle.shutdown = cancel
-	conn.lifecycle.waitGroup.Add(1)
+	conn.client = &Client{tx: conn.tx, logger: conn.logger, ctx: ctx}
+	conn.client.waitGroup.Add(1)
 
 	var listenDone sync.WaitGroup
 	listenDone.Add(1)
 	go func() {
 		defer listenDone.Done()
-		conn.listen()
+		conn.client.listen()
 	}()
 
 	body1 := []byte{0xAA, 0xBB, 0xCC, 0xDD}
@@ -92,13 +93,14 @@ func TestListen_OversizePacketTriggersReconnect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn.lifecycle.ctx = ctx
 	conn.lifecycle.shutdown = cancel
-	conn.lifecycle.waitGroup.Add(1)
+	conn.client = &Client{tx: conn.tx, logger: conn.logger, ctx: ctx}
+	conn.client.waitGroup.Add(1)
 
 	var listenDone sync.WaitGroup
 	listenDone.Add(1)
 	go func() {
 		defer listenDone.Done()
-		conn.listen()
+		conn.client.listen()
 	}()
 
 	hdr := buildAmsTCPHeader(1, 8*1024*1024) // 8 MB exceeds 4 MB cap

@@ -1962,6 +1962,9 @@ func buildNotificationPacketMultiSample(stamps []struct {
 }
 
 // newTestConnection creates a minimal Session for unit testing notification parsing.
+// The Session has a synthetic *Client wired with its handleNotification installed
+// so packet-level tests can drive `conn.client.deviceNotification(ctx, packet)`
+// and exercise the cache-aware handler.
 func newTestConnection() *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := &Session{
@@ -1970,7 +1973,22 @@ func newTestConnection() *Session {
 		cache:     &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:    getDefaultLogger(),
 	}
+	conn.client = &Client{
+		logger: conn.logger,
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	conn.client.SetNotificationHandler(conn.handleNotification)
 	return conn
+}
+
+// drivePacket feeds a wire-format DeviceNotification packet into the
+// Client.deviceNotification decoder, which then dispatches to
+// Session.handleNotification via the installed callback. Replaces the old
+// `conn.drivePacket(ctx, packet)` call after Phase 5.a-dial moved
+// the decoder onto Client.
+func (conn *Session) drivePacket(ctx context.Context, packet []byte) error {
+	return conn.client.deviceNotification(ctx, packet)
 }
 
 func TestDeviceNotification_SingleSample(t *testing.T) {
@@ -1998,7 +2016,7 @@ func TestDeviceNotification_SingleSample(t *testing.T) {
 	filetime := uint64((unixTS + secToUnixEpoch) * windowsTick)
 
 	packet := buildNotificationPacket(42, filetime, data)
-	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
+	err := conn.drivePacket(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("DeviceNotification error: %v", err)
 	}
@@ -2031,7 +2049,7 @@ func TestDeviceNotification_UnknownHandle(t *testing.T) {
 	packet := buildNotificationPacket(99, 0, data)
 
 	// Should not error, just log warning
-	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
+	err := conn.drivePacket(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2085,7 +2103,7 @@ func TestDeviceNotification_UnknownHandleDuringClose(t *testing.T) {
 	binary.LittleEndian.PutUint16(data, 42)
 	packet := buildNotificationPacket(99, 0, data)
 
-	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
+	err := conn.drivePacket(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2111,7 +2129,7 @@ func TestDeviceNotification_UnknownHandleNormalCondition(t *testing.T) {
 	binary.LittleEndian.PutUint16(data, 42)
 	packet := buildNotificationPacket(99, 0, data)
 
-	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
+	err := conn.drivePacket(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2166,7 +2184,7 @@ func TestDeviceNotification_MultipleStampsAndSamples(t *testing.T) {
 	}
 
 	packet := buildNotificationPacketMultiSample(stamps)
-	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
+	err := conn.drivePacket(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -2191,7 +2209,7 @@ func TestDeviceNotification_EmptyPacket(t *testing.T) {
 	defer conn.lifecycle.shutdown()
 
 	// Too short — should return error
-	err := conn.DeviceNotification(conn.lifecycle.ctx, []byte{1, 2, 3})
+	err := conn.drivePacket(conn.lifecycle.ctx, []byte{1, 2, 3})
 	if err == nil {
 		t.Error("expected error for truncated packet")
 	}
@@ -2206,7 +2224,7 @@ func TestDeviceNotification_ZeroStamps(t *testing.T) {
 	binary.Write(buf, binary.LittleEndian, uint32(8)) // length
 	binary.Write(buf, binary.LittleEndian, uint32(0)) // 0 stamps
 
-	err := conn.DeviceNotification(conn.lifecycle.ctx, buf.Bytes())
+	err := conn.drivePacket(conn.lifecycle.ctx, buf.Bytes())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2224,7 +2242,7 @@ func TestDeviceNotification_SampleSizeExceedsData(t *testing.T) {
 	binary.Write(buf, binary.LittleEndian, uint32(42))       // handle
 	binary.Write(buf, binary.LittleEndian, uint32(99999999)) // size > remaining
 
-	err := conn.DeviceNotification(conn.lifecycle.ctx, buf.Bytes())
+	err := conn.drivePacket(conn.lifecycle.ctx, buf.Bytes())
 	if err == nil {
 		t.Error("expected error for sample size exceeding data")
 	}
@@ -2240,7 +2258,7 @@ func TestDeviceNotification_BoolType(t *testing.T) {
 	conn.cache.symbols[symbolKey(sym.FullName)] = sym
 
 	packet := buildNotificationPacket(10, 0, []byte{1})
-	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
+	err := conn.drivePacket(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -2268,7 +2286,7 @@ func TestDeviceNotification_StringType(t *testing.T) {
 	copy(strData, "Hello\x00")
 
 	packet := buildNotificationPacket(11, 0, strData)
-	err := conn.DeviceNotification(conn.lifecycle.ctx, packet)
+	err := conn.drivePacket(conn.lifecycle.ctx, packet)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -2447,6 +2465,7 @@ func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 		logger:    getDefaultLogger(),
 		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
 	}
+	conn.client = &Client{tx: conn.tx, logger: conn.logger, ctx: ctx}
 
 	// Register a response channel for invokeID 42
 	ch := make(chan []byte, 1)
@@ -2468,7 +2487,7 @@ func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 	binary.Write(buf, binary.LittleEndian, &header)
 	buf.Write([]byte{0xDE, 0xAD, 0xBE, 0xEF})
 
-	conn.handleReceive(ctx, buf.Bytes())
+	conn.client.handleReceive(ctx, buf.Bytes())
 
 	select {
 	case resp := <-ch:
@@ -2488,6 +2507,7 @@ func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 		logger:    getDefaultLogger(),
 		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
 	}
+	conn.client = &Client{tx: conn.tx, logger: conn.logger, ctx: ctx}
 
 	// No registered channels — should not panic
 	header := amsHeader{
@@ -2501,7 +2521,7 @@ func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 	buf.Write([]byte{0x00, 0x00})
 
 	// Should not panic or error
-	conn.handleReceive(ctx, buf.Bytes())
+	conn.client.handleReceive(ctx, buf.Bytes())
 }
 
 func TestHandleReceive_TooShort(t *testing.T) {
@@ -2512,9 +2532,10 @@ func TestHandleReceive_TooShort(t *testing.T) {
 		logger:    getDefaultLogger(),
 		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
 	}
+	conn.client = &Client{tx: conn.tx, logger: conn.logger, ctx: ctx}
 
 	// Less than 32 bytes — should return early
-	conn.handleReceive(ctx, []byte{1, 2, 3, 4, 5})
+	conn.client.handleReceive(ctx, []byte{1, 2, 3, 4, 5})
 }
 
 // ==========================================================================

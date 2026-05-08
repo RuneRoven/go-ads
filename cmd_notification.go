@@ -129,47 +129,10 @@ type NotificationSample struct {
 	Size   uint32
 }
 
-// DeviceNotification - ADS command id: 8
-func (conn *Session) DeviceNotification(ctx context.Context, in []byte) error {
-	var stream NotificationStream
-	var header StampHeader
-	var sample NotificationSample
-	var content []byte
-
-	data := bytes.NewBuffer(in)
-
-	// Read stream header
-
-	err := binary.Read(data, binary.LittleEndian, &stream)
-	if err != nil {
-		return fmt.Errorf("unable to read notification: %w", err)
-	}
-	for i := uint32(0); i < stream.Stamps; i++ {
-		// Read stamp header
-		if err = binary.Read(data, binary.LittleEndian, &header); err != nil {
-			return fmt.Errorf("error reading stamp header: %w", err)
-		}
-
-		for j := uint32(0); j < header.Samples; j++ {
-			if err = binary.Read(data, binary.LittleEndian, &sample); err != nil {
-				return fmt.Errorf("error reading notification sample: %w", err)
-			}
-			if sample.Size > uint32(data.Len()) {
-				return fmt.Errorf("notification sample size %d exceeds remaining data %d", sample.Size, data.Len())
-			}
-			content = make([]byte, sample.Size)
-			n, err := data.Read(content)
-			if err != nil {
-				return fmt.Errorf("error reading notification content: %w", err)
-			}
-			if n != int(sample.Size) {
-				return fmt.Errorf("short read on notification content: got %d of %d bytes", n, sample.Size)
-			}
-			conn.handleNotification(ctx, sample.Handle, header.Timestamp, content)
-		}
-	}
-	return nil
-}
+// DeviceNotification (ADS cmd 8) packet decoder migrated to *Client in
+// Phase 5.a-dial — see Client.deviceNotification. Session.handleNotification
+// below is the cache-aware handler installed via Client.SetNotificationHandler
+// from Session.Connect.
 
 func (conn *Session) handleNotification(ctx context.Context, handle uint32, timestamp uint64, content []byte) {
 	// Phase 1: notifs.lock for handle lookup + symbol pointer/field snapshot.

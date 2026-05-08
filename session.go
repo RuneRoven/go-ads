@@ -221,12 +221,27 @@ func (conn *Session) Connect(local bool) error {
 		"target", fmt.Sprintf("%d.%d.%d.%d.%d.%d:%d", conn.target.NetID[0], conn.target.NetID[1], conn.target.NetID[2], conn.target.NetID[3], conn.target.NetID[4], conn.target.NetID[5], conn.target.Port))
 
 	conn.logger.Log(context.Background(), LevelTrace, "connected")
-	conn.lifecycle.waitGroup.Add(2 + recvWorkerCount)
-	go conn.listen()
-	go conn.transmitWorker()
-	for i := 0; i < recvWorkerCount; i++ {
-		go conn.recvWorker()
+	// Allocate the underlying Client and start its workers. Session and
+	// Client share the *transport pointer (no re-dial); the Client owns
+	// the listen / transmit / recvWorker goroutines from Phase 5.a-dial
+	// onward. handleNotification is installed via callback so cache-aware
+	// dispatch fires for inbound DeviceNotification packets, and
+	// triggerReconnect is installed as the on-drop hook so transport-down
+	// signals enter Session's reconnect FSM.
+	conn.client = &Client{
+		ip:             conn.ip,
+		port:           conn.port,
+		target:         conn.target,
+		source:         conn.source,
+		requestTimeout: conn.requestTimeout,
+		logger:         conn.logger,
+		tx:             conn.tx,
+		ctx:            conn.lifecycle.ctx,
+		cancel:         conn.lifecycle.shutdown,
 	}
+	conn.client.SetNotificationHandler(conn.handleNotification)
+	conn.client.SetOnDrop(conn.triggerReconnect)
+	conn.client.startWorkers()
 	if local {
 		resp, err := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 		if err != nil {
@@ -409,6 +424,9 @@ func (conn *Session) Close() {
 		<-ch
 	}
 	conn.logger.Info("Waiting for workers to close")
+	if conn.client != nil {
+		conn.client.waitGroup.Wait()
+	}
 	conn.lifecycle.waitGroup.Wait()
 	conn.logger.Info("Close DONE")
 }
@@ -773,6 +791,12 @@ func (conn *Session) tearDownAndReset(resetFeatureFlags bool) {
 		conn.tx.connection.Close()
 	}
 	conn.tx.connMu.Unlock()
+	// Wait for the previous batch of Client workers (listen, transmit,
+	// recvWorker) to exit. They share ctx with lifecycle.ctx; the cancel
+	// above plus the closed TCP socket trigger their exit.
+	if conn.client != nil {
+		conn.client.waitGroup.Wait()
+	}
 	conn.lifecycle.waitGroup.Wait()
 	conn.lifecycle.ctxMu.Lock()
 	conn.lifecycle.ctx, conn.lifecycle.shutdown = context.WithCancel(context.Background()) //nolint:gosec // cancel stored in lifecycle.shutdown, called from Close
@@ -813,12 +837,26 @@ func (conn *Session) dialAndStart() error {
 		conn.tx.connMu.Unlock()
 		return fmt.Errorf("connection closed during dial")
 	}
-	conn.lifecycle.waitGroup.Add(2 + recvWorkerCount)
-	go conn.listen()
-	go conn.transmitWorker()
-	for i := 0; i < recvWorkerCount; i++ {
-		go conn.recvWorker()
+	// Allocate a fresh Client (or rewire the existing one's transport
+	// references — fields that change after a redial: ctx, source, tx
+	// pointer is the same).
+	conn.lifecycle.ctxMu.RLock()
+	freshCtx := conn.lifecycle.ctx
+	conn.lifecycle.ctxMu.RUnlock()
+	conn.client = &Client{
+		ip:             conn.ip,
+		port:           conn.port,
+		target:         conn.target,
+		source:         conn.source,
+		requestTimeout: conn.requestTimeout,
+		logger:         conn.logger,
+		tx:             conn.tx,
+		ctx:            freshCtx,
+		cancel:         conn.lifecycle.shutdown,
 	}
+	conn.client.SetNotificationHandler(conn.handleNotification)
+	conn.client.SetOnDrop(conn.triggerReconnect)
+	conn.client.startWorkers()
 	return nil
 }
 
