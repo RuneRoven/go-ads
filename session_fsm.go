@@ -222,6 +222,32 @@ func (conn *Session) bumpEpoch() {
 	conn.lifecycle.state.epoch.Add(1)
 }
 
+// waitForReconnect blocks until any in-flight reconnect completes (or the
+// Session is closed). No-op if no reconnect is in flight.
+//
+// Used by Session-managed retry-helpers (readFromSymbolRetry etc.) before
+// they decide whether to retry. Without this, a fast-failing transport-down
+// error returns to the caller before the reconnect cycle has had a chance
+// to advance epoch — the helper's "epoch changed?" check fires false and
+// the user observes a transient failure that strict R-TX-005 says should
+// have been transparent. With waitForReconnect inserted before the epoch
+// re-check, the helper retries through the post-reconnect Client.
+func (conn *Session) waitForReconnect() {
+	if conn.isClosed() {
+		return
+	}
+	conn.lifecycle.reconnectMu.Lock()
+	ch := conn.lifecycle.reconnectDone
+	conn.lifecycle.reconnectMu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	case <-conn.lifecycle.closedCh:
+	}
+}
+
 // isTransportDown is the transport-level "no live socket" signal. Phase 5.b
 // removed all callers when send/sendRequest moved onto *Client; Phase 5.c
 // reintroduces it as the gate for Session-level clientRead/Write wrappers.

@@ -35,6 +35,7 @@ func (conn *Session) writeToSymbolRetry(symbolName string, value string, retries
 	err = conn.client.Write(uint32(GroupSymbolValueByHandle), handle, data)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
+		conn.waitForReconnect()
 		if retriesLeft > 0 && conn.epoch() != gen {
 			return conn.writeToSymbolRetry(symbolName, value, retriesLeft-1)
 		}
@@ -82,6 +83,7 @@ func (conn *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (st
 	data, err := conn.client.Read(uint32(GroupSymbolValueByHandle), handle, length)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
+		conn.waitForReconnect()
 		if retriesLeft > 0 && conn.epoch() != gen {
 			return conn.readFromSymbolRetry(symbolName, retriesLeft-1)
 		}
@@ -172,6 +174,7 @@ func (conn *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (
 	results, err := conn.client.SumRead(requests)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
+		conn.waitForReconnect()
 		if retriesLeft > 0 && conn.epoch() != gen {
 			return conn.readMultipleSymbolsRetry(names, retriesLeft-1)
 		}
@@ -267,6 +270,7 @@ func (conn *Session) writeMultipleSymbolsRetry(values map[string]string, retries
 	results, err := conn.client.SumWrite(requests)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
+		conn.waitForReconnect()
 		if retriesLeft > 0 && conn.epoch() != gen {
 			return conn.writeMultipleSymbolsRetry(values, retriesLeft-1)
 		}
