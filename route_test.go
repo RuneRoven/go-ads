@@ -53,3 +53,133 @@ func TestBuildRoutePacket_EncodesInvokeId(t *testing.T) {
 		t.Errorf("invokeID in packet = 0x%08X, want 0xABCDEF12", got)
 	}
 }
+
+// --- buildRoutePacket ---
+
+func TestBuildRoutePacket(t *testing.T) {
+	netID := [6]byte{192, 168, 1, 100, 1, 1}
+	packet := buildRoutePacket(netID, "TestRoute", "192.168.1.100", "Admin", "secret", 0)
+
+	// Verify header
+	if len(packet) < 24 {
+		t.Fatalf("packet too short: %d bytes", len(packet))
+	}
+
+	// Cookie
+	cookie := binary.LittleEndian.Uint32(packet[0:])
+	if cookie != routeCookie {
+		t.Errorf("cookie = 0x%08X, want 0x%08X", cookie, routeCookie)
+	}
+
+	// InvokeID
+	invokeID := binary.LittleEndian.Uint32(packet[4:])
+	if invokeID != 0 {
+		t.Errorf("invokeID = %d, want 0", invokeID)
+	}
+
+	// ServiceID
+	serviceID := binary.LittleEndian.Uint32(packet[8:])
+	if serviceID != routeServiceAdd {
+		t.Errorf("serviceID = %d, want %d", serviceID, routeServiceAdd)
+	}
+
+	// AmsAddr: NetID at offset 12, Port at offset 18
+	var parsedNetID [6]byte
+	copy(parsedNetID[:], packet[12:18])
+	if parsedNetID != netID {
+		t.Errorf("NetID = %v, want %v", parsedNetID, netID)
+	}
+
+	port := binary.LittleEndian.Uint16(packet[18:])
+	if port != 0 {
+		t.Errorf("port = %d, want 0", port)
+	}
+
+	// Tag count
+	tagCount := binary.LittleEndian.Uint32(packet[20:])
+	if tagCount != 5 {
+		t.Errorf("tagCount = %d, want 5", tagCount)
+	}
+
+	// Verify tags are present by scanning for tag IDs
+	tagIDs := make(map[uint16]bool)
+	offset := 24
+	for offset+4 <= len(packet) {
+		tid := binary.LittleEndian.Uint16(packet[offset:])
+		tlen := binary.LittleEndian.Uint16(packet[offset+2:])
+		tagIDs[tid] = true
+		offset += 4 + int(tlen)
+	}
+	expectedTags := []uint16{tagNetID, tagPassword, tagComputerName, tagRouteName, tagUsername}
+	for _, expected := range expectedTags {
+		if !tagIDs[expected] {
+			t.Errorf("missing tag ID %d in packet", expected)
+		}
+	}
+}
+
+// --- parseRouteResponse ---
+
+func TestParseRouteResponse_Success(t *testing.T) {
+	// Build a successful route response:
+	// cookie(4) + invokeID(4) + serviceId(4) + AmsAddr(8) + tagCount(4) + error tag
+	resp := make([]byte, 24+8) // header + one tag with 4-byte data
+	binary.LittleEndian.PutUint32(resp[0:], routeCookie)
+	binary.LittleEndian.PutUint32(resp[4:], 0) // invokeID
+	binary.LittleEndian.PutUint32(resp[8:], 0x80000000|routeServiceAdd)
+	// AmsAddr (8 bytes) at offset 12 - zero is fine
+	binary.LittleEndian.PutUint32(resp[20:], 1) // tagCount = 1
+	// Error tag: id=1, len=4, data=0 (success)
+	binary.LittleEndian.PutUint16(resp[24:], tagResponseError)
+	binary.LittleEndian.PutUint16(resp[26:], 4)
+	binary.LittleEndian.PutUint32(resp[28:], 0) // success
+
+	err := parseRouteResponse(getDefaultLogger(), resp, 0)
+	if err != nil {
+		t.Errorf("expected success, got error: %v", err)
+	}
+}
+
+func TestParseRouteResponse_ErrorCode(t *testing.T) {
+	resp := make([]byte, 32)
+	binary.LittleEndian.PutUint32(resp[0:], routeCookie)
+	binary.LittleEndian.PutUint32(resp[8:], 0x80000000|routeServiceAdd)
+	binary.LittleEndian.PutUint32(resp[20:], 1)
+	binary.LittleEndian.PutUint16(resp[24:], tagResponseError)
+	binary.LittleEndian.PutUint16(resp[26:], 4)
+	binary.LittleEndian.PutUint32(resp[28:], 7) // error code 7
+
+	err := parseRouteResponse(getDefaultLogger(), resp, 0)
+	if err == nil {
+		t.Error("expected error for non-zero error code")
+	}
+}
+
+func TestParseRouteResponse_TooShort(t *testing.T) {
+	err := parseRouteResponse(getDefaultLogger(), []byte{1, 2, 3}, 0)
+	if err == nil {
+		t.Error("expected error for short response")
+	}
+}
+
+func TestParseRouteResponse_WrongCookie(t *testing.T) {
+	resp := make([]byte, 24)
+	binary.LittleEndian.PutUint32(resp[0:], 0xDEADBEEF) // wrong cookie
+	binary.LittleEndian.PutUint32(resp[8:], 0x80000000|routeServiceAdd)
+
+	err := parseRouteResponse(getDefaultLogger(), resp, 0)
+	if err == nil {
+		t.Error("expected error for wrong cookie")
+	}
+}
+
+func TestParseRouteResponse_WrongServiceID(t *testing.T) {
+	resp := make([]byte, 24)
+	binary.LittleEndian.PutUint32(resp[0:], routeCookie)
+	binary.LittleEndian.PutUint32(resp[8:], 0x12345678) // wrong serviceId
+
+	err := parseRouteResponse(getDefaultLogger(), resp, 0)
+	if err == nil {
+		t.Error("expected error for wrong serviceId")
+	}
+}

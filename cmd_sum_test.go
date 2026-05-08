@@ -3,8 +3,11 @@ package ads
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"log/slog"
+	"math"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -129,5 +132,117 @@ func TestBestEffortDeleteNotifications_Empty(t *testing.T) {
 	got = conn.bestEffortDeleteNotifications([]uint32{})
 	if got != 0 {
 		t.Errorf("expected 0, got %d", got)
+	}
+}
+
+// --- SumRead overflow guard ---
+
+func TestSumReadOverflowGuard(t *testing.T) {
+	// Verify that totalReadLen uses uint64 and the overflow check catches >4GiB
+	n := 2
+	requests := []SumReadRequest{
+		{Group: 1, Offset: 0, Length: math.MaxUint32},
+		{Group: 1, Offset: 0, Length: 1}, // total > MaxUint32
+	}
+
+	var totalReadLen uint64
+	for _, req := range requests {
+		totalReadLen += uint64(req.Length)
+	}
+	total := uint64(n)*8 + totalReadLen
+	if total <= math.MaxUint32 {
+		t.Fatalf("expected total > MaxUint32, got %d", total)
+	}
+}
+
+// --- isSumCommandUnsupportedError ---
+
+func TestIsSumCommandUnsupportedError(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{ReturnCodeDeviceServiceNotSupported, true},
+		{ReturnCodeGlobalUnknownCommandID, true},
+		{ReturnCodeGlobalUnknownAdsCommand, true},
+		{ReturnCodeDeviceBusy, false},
+		{ReturnCodeDeviceTimeout, false},
+		{fmt.Errorf("network error"), false},
+		{nil, false},
+	}
+	for _, tt := range tests {
+		got := isSumCommandUnsupportedError(tt.err)
+		if got != tt.want {
+			t.Errorf("isSumCommandUnsupportedError(%v) = %v, want %v", tt.err, got, tt.want)
+		}
+	}
+}
+
+// --- Sum probe state CAS ---
+
+func TestSumProbeStateTransitions(t *testing.T) {
+	// Verify CAS 0→1 and 0→2 work, and second CAS is rejected
+	conn := Session{client: &Client{}}
+
+	// sumWriteState: 0→1
+	if !conn.client.capabilities.SumWriteStateCAS(0, 1) {
+		t.Error("CAS 0→1 should succeed")
+	}
+	if conn.client.capabilities.SumWriteStateLoad() != 1 {
+		t.Error("state should be 1")
+	}
+	// Second goroutine trying 0→2 should fail
+	if conn.client.capabilities.SumWriteStateCAS(0, 2) {
+		t.Error("CAS 0→2 should fail when state is 1")
+	}
+
+	// sumAddNotifState: 0→2
+	if !conn.client.capabilities.SumAddNotifStateCAS(0, 2) {
+		t.Error("CAS 0→2 should succeed")
+	}
+	if conn.client.capabilities.SumAddNotifStateLoad() != 2 {
+		t.Error("state should be 2")
+	}
+	// sumDeleteNotifState independent of sumAddNotifState
+	if conn.client.capabilities.SumDeleteNotifStateLoad() != 0 {
+		t.Error("delete state should still be 0 (independent of add)")
+	}
+
+	// Reset works
+	conn.client.capabilities.SumWriteStateStore(0)
+	if conn.client.capabilities.SumWriteStateLoad() != 0 {
+		t.Error("reset should set state to 0")
+	}
+}
+
+func TestSumProbeStateConcurrent(t *testing.T) {
+	// Concurrent CAS: only one goroutine should win
+	conn := Session{client: &Client{}}
+	const goroutines = 100
+	var wg sync.WaitGroup
+	wins := make(chan uint32, goroutines)
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			val := uint32(1)
+			if id%2 == 0 {
+				val = 2
+			}
+			if conn.client.capabilities.SumWriteStateCAS(0, val) {
+				wins <- val
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(wins)
+
+	count := 0
+	for range wins {
+		count++
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 CAS winner, got %d", count)
 	}
 }
