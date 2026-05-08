@@ -74,7 +74,7 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Step 1: Read symbol version
-	version, err := conn.GetSymbolVersion()
+	version, err := conn.client.GetSymbolVersion()
 	if err != nil {
 		conn.logger.Warn("failed to read symbol version during slow discovery", "error", err)
 	} else {
@@ -84,7 +84,7 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	}
 
 	// Step 2: Get upload info (small request)
-	uploadInfo, err := conn.GetSymbolUploadInfo()
+	uploadInfo, err := conn.client.GetSymbolUploadInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
@@ -92,7 +92,7 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Step 3: Download datatypes in chunks
-	datatypesData, err := conn.downloadInChunks(
+	datatypesData, err := conn.client.DownloadInChunks(
 		uint32(GroupSymbolDataTypeUpload),
 		uploadInfo.DataTypeLength,
 		cfg.ChunkSize,
@@ -101,7 +101,7 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download datatypes in one request
 		conn.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
-		datatypesData, err = conn.getUploadSymbolInfoDataTypes(uploadInfo.DataTypeLength)
+		datatypesData, err = conn.client.DownloadDataTypes(uploadInfo.DataTypeLength)
 		if err != nil {
 			return fmt.Errorf("failed to download datatypes: %w", err)
 		}
@@ -114,7 +114,7 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Step 4: Download symbols in chunks
-	symbolsData, err := conn.downloadInChunks(
+	symbolsData, err := conn.client.DownloadInChunks(
 		uint32(GroupSymbolUpload),
 		uploadInfo.SymbolLength,
 		cfg.ChunkSize,
@@ -123,7 +123,7 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download symbols in one request
 		conn.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
-		symbolsData, err = conn.getUploadSymbolInfoSymbols(uploadInfo.SymbolLength)
+		symbolsData, err = conn.client.DownloadSymbolList(uploadInfo.SymbolLength)
 		if err != nil {
 			return fmt.Errorf("failed to download symbols: %w", err)
 		}
@@ -153,60 +153,54 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 // the offset parameter of the ADS Read command.
 // If chunked downloads are already known to be unsupported (e.g. TwinCAT 2),
 // this returns an error immediately so the caller can use the single-request fallback.
-func (conn *Session) downloadInChunks(group uint32, totalLength uint32, chunkSize uint32, delay time.Duration) ([]byte, error) {
+// DownloadInChunks reads totalLength bytes from group:0 in chunkSize-byte
+// chunks with optional inter-chunk delay. Tracks chunked-download support
+// in capabilities so subsequent calls short-circuit when the PLC does not
+// support it. Used by the Slow / List / DataTypes loaders to fetch large
+// upload tables without overwhelming the PLC's real-time loop.
+func (c *Client) DownloadInChunks(group uint32, totalLength uint32, chunkSize uint32, delay time.Duration) ([]byte, error) {
 	if totalLength == 0 {
 		return []byte{}, nil
 	}
-
-	// Skip if already known unsupported
-	if conn.client.capabilities.ChunkedDownloadCheckedLoad() && !conn.client.capabilities.ChunkedDownloadSupportedLoad() {
+	if c.capabilities.ChunkedDownloadCheckedLoad() && !c.capabilities.ChunkedDownloadSupportedLoad() {
 		return nil, fmt.Errorf("chunked download not supported by this PLC")
 	}
-
 	const maxDownloadSize = 64 * 1024 * 1024 // 64 MB sanity limit
 	if totalLength > maxDownloadSize {
 		return nil, fmt.Errorf("download size %d exceeds sanity limit of %d bytes", totalLength, maxDownloadSize)
 	}
-
 	result := make([]byte, 0, totalLength)
 	var offset uint32
-
 	for offset < totalLength {
 		remaining := totalLength - offset
 		readLen := chunkSize
 		if remaining < readLen {
 			readLen = remaining
 		}
-
-		chunk, err := conn.client.Read(group, offset, readLen)
+		chunk, err := c.Read(group, offset, readLen)
 		if err != nil {
-			if !conn.client.capabilities.ChunkedDownloadCheckedLoad() {
-				conn.client.capabilities.ChunkedDownloadSupportedStore(false)
-				conn.client.capabilities.ChunkedDownloadCheckedStore(true)
+			if !c.capabilities.ChunkedDownloadCheckedLoad() {
+				c.capabilities.ChunkedDownloadSupportedStore(false)
+				c.capabilities.ChunkedDownloadCheckedStore(true)
 			}
 			return nil, fmt.Errorf("chunk read at offset %d failed: %w", offset, err)
 		}
 		if len(chunk) == 0 {
 			return nil, fmt.Errorf("chunk read at offset %d returned empty response", offset)
 		}
-
 		result = append(result, chunk...)
 		offset += uint32(len(chunk))
-
 		if offset < totalLength && delay > 0 {
 			time.Sleep(delay)
 		}
 	}
-
-	if !conn.client.capabilities.ChunkedDownloadCheckedLoad() {
-		conn.client.capabilities.ChunkedDownloadSupportedStore(true)
-		conn.client.capabilities.ChunkedDownloadCheckedStore(true)
+	if !c.capabilities.ChunkedDownloadCheckedLoad() {
+		c.capabilities.ChunkedDownloadSupportedStore(true)
+		c.capabilities.ChunkedDownloadCheckedStore(true)
 	}
-
 	if uint32(len(result)) != totalLength {
 		return nil, fmt.Errorf("downloaded %d bytes but expected %d", len(result), totalLength)
 	}
-
 	return result, nil
 }
 
@@ -236,7 +230,7 @@ func (conn *Session) getSymbol(symbolName string) (*Symbol, error) {
 		if needHandle {
 			// Network I/O must happen outside the lock to avoid deadlock
 			// with handleNotification which also acquires cache.lock.
-			handle, err := conn.GetHandleByName(symbolName)
+			handle, err := conn.client.GetHandleByName(symbolName)
 			if err != nil {
 				return nil, err
 			}
@@ -260,12 +254,12 @@ func (conn *Session) getSymbol(symbolName string) (*Symbol, error) {
 	}
 
 	// On-demand resolution: query the PLC for this specific symbol
-	sym, err := conn.getSymbolInfoByName(symbolName)
+	sym, err := conn.client.GetSymbolInfoByName(symbolName)
 	if err != nil {
 		return nil, fmt.Errorf("symbol %q not found and on-demand lookup failed: %w", symbolName, err)
 	}
 
-	handle, err := conn.GetHandleByName(symbolName)
+	handle, err := conn.client.GetHandleByName(symbolName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get handle for %q: %w", symbolName, err)
 	}
@@ -298,10 +292,12 @@ func (conn *Session) getSymbol(symbolName string) (*Symbol, error) {
 
 // getSymbolInfoByName queries a single symbol's metadata from the PLC
 // using GroupSymbolInfoByNameEx (0xF009).
-// Returns a populated Symbol with Group, Offset, Length, DataType, etc.
-// Does NOT populate Children (struct/array children require full discovery).
-func (conn *Session) getSymbolInfoByName(symbolName string) (*Symbol, error) {
-	resp, err := conn.client.WriteRead(
+// GetSymbolInfoByName resolves a single symbol on the PLC and returns a
+// populated Symbol with Group, Offset, Length, DataType, etc. Does NOT
+// populate Children (struct / array children require full discovery via
+// LoadSymbols / LoadSymbolList + LoadDataTypes). Wire RPC; no cache.
+func (c *Client) GetSymbolInfoByName(symbolName string) (*Symbol, error) {
+	resp, err := c.WriteRead(
 		uint32(GroupSymbolInfoByNameEx),
 		0,
 		2048,
@@ -310,35 +306,28 @@ func (conn *Session) getSymbolInfoByName(symbolName string) (*Symbol, error) {
 	if err != nil {
 		return nil, fmt.Errorf("GetSymbolInfoByName(%s) failed: %w", symbolName, err)
 	}
-
 	buff := bytes.NewBuffer(resp)
 	entry := symbolEntry{}
 	if err := binary.Read(buff, binary.LittleEndian, &entry); err != nil {
 		return nil, fmt.Errorf("failed to parse symbol entry for %s: %w", symbolName, err)
 	}
-
-	// Read null-terminated strings: name, type, comment
 	name := make([]byte, entry.NameLength)
 	if err := binary.Read(buff, binary.LittleEndian, name); err != nil {
 		return nil, fmt.Errorf("reading symbol name for %s: %w", symbolName, err)
 	}
 	buff.Next(1) // null terminator
-
 	dt := make([]byte, entry.TypeLength)
 	if err := binary.Read(buff, binary.LittleEndian, dt); err != nil {
 		return nil, fmt.Errorf("reading symbol type for %s: %w", symbolName, err)
 	}
 	buff.Next(1) // null terminator
-
 	comment := make([]byte, entry.CommentLength)
 	if err := binary.Read(buff, binary.LittleEndian, comment); err != nil {
 		return nil, fmt.Errorf("reading symbol comment for %s: %w", symbolName, err)
 	}
-
 	dataType := normalizeStringDataType(string(dt))
-
 	flags := SymbolFlag(entry.Flags)
-	sym := &Symbol{
+	return &Symbol{
 		FullName:          string(name), // PLC-returned casing (authoritative)
 		Name:              string(name),
 		DataType:          dataType,
@@ -351,79 +340,85 @@ func (conn *Session) getSymbolInfoByName(symbolName string) (*Symbol, error) {
 		ContextMask:       flags.ContextMask(),
 		LastUpdateTime:    time.Now(),
 		MinUpdateInterval: 50 * time.Millisecond,
-	}
-	return sym, nil
+	}, nil
 }
 
-func (conn *Session) GetHandleByName(symbolName string) (handle uint32, err error) {
-	resp, err := conn.client.WriteRead(uint32(GroupSymbolHandleByName), 0, 4, append([]byte(symbolName), 0))
+// GetHandleByName resolves a symbol name to its PLC-side handle. Wire RPC;
+// no cache. The handle is valid until the TCP transport drops or until
+// the caller releases it via ReleaseHandle.
+func (c *Client) GetHandleByName(symbolName string) (uint32, error) {
+	resp, err := c.WriteRead(uint32(GroupSymbolHandleByName), 0, 4, append([]byte(symbolName), 0))
 	if err != nil {
 		return 0, fmt.Errorf("getting handle for %q: %w", symbolName, err)
 	}
 	if len(resp) < 4 {
 		return 0, fmt.Errorf("getting handle for %q: response too short (%d bytes)", symbolName, len(resp))
 	}
-	handle = binary.LittleEndian.Uint32(resp)
-	return handle, nil
+	return binary.LittleEndian.Uint32(resp), nil
 }
 
-func (conn *Session) GetSymbolUploadInfo() (uploadInfo SymbolUploadInfo, err error) {
-	// Try extended info (0xF00F) first, fall back to basic info (0xF00C)
-	res, err := conn.client.Read(uint32(GroupSymbolUploadInfo2), 0, 24)
+// GetSymbolUploadInfo reads the symbol-table size header from the PLC.
+// Tries extended info (0xF00F, 24 bytes) first; falls back to basic info
+// (0xF00C, 16 bytes) for older PLCs. Used by LoadSymbols / LoadSymbolList /
+// LoadDataTypes to size the subsequent download. Wire RPC; no cache.
+func (c *Client) GetSymbolUploadInfo() (SymbolUploadInfo, error) {
+	var uploadInfo SymbolUploadInfo
+	res, err := c.Read(uint32(GroupSymbolUploadInfo2), 0, 24)
 	if err != nil {
-		conn.logger.Debug("GroupSymbolUploadInfo2 not supported, falling back to GroupSymbolUploadInfo", "error", err)
-		res, err = conn.client.Read(uint32(GroupSymbolUploadInfo), 0, 16)
+		c.logger.Debug("GroupSymbolUploadInfo2 not supported, falling back to GroupSymbolUploadInfo", "error", err)
+		res, err = c.Read(uint32(GroupSymbolUploadInfo), 0, 16)
 		if err != nil {
 			return uploadInfo, fmt.Errorf("GetSymbolUploadInfo failed: %w", err)
 		}
 	}
 	buff := bytes.NewBuffer(res)
-	if err = binary.Read(buff, binary.LittleEndian, &uploadInfo.SymbolCount); err != nil {
+	if err := binary.Read(buff, binary.LittleEndian, &uploadInfo.SymbolCount); err != nil {
 		return uploadInfo, fmt.Errorf("reading SymbolCount: %w", err)
 	}
-	if err = binary.Read(buff, binary.LittleEndian, &uploadInfo.SymbolLength); err != nil {
+	if err := binary.Read(buff, binary.LittleEndian, &uploadInfo.SymbolLength); err != nil {
 		return uploadInfo, fmt.Errorf("reading SymbolLength: %w", err)
 	}
-	if err = binary.Read(buff, binary.LittleEndian, &uploadInfo.DataTypeCount); err != nil {
+	if err := binary.Read(buff, binary.LittleEndian, &uploadInfo.DataTypeCount); err != nil {
 		return uploadInfo, fmt.Errorf("reading DataTypeCount: %w", err)
 	}
-	if err = binary.Read(buff, binary.LittleEndian, &uploadInfo.DataTypeLength); err != nil {
+	if err := binary.Read(buff, binary.LittleEndian, &uploadInfo.DataTypeLength); err != nil {
 		return uploadInfo, fmt.Errorf("reading DataTypeLength: %w", err)
 	}
 	if buff.Len() >= 8 {
-		if err = binary.Read(buff, binary.LittleEndian, &uploadInfo.ExtraCount); err != nil {
+		if err := binary.Read(buff, binary.LittleEndian, &uploadInfo.ExtraCount); err != nil {
 			return uploadInfo, fmt.Errorf("reading ExtraCount: %w", err)
 		}
-		if err = binary.Read(buff, binary.LittleEndian, &uploadInfo.ExtraLength); err != nil {
+		if err := binary.Read(buff, binary.LittleEndian, &uploadInfo.ExtraLength); err != nil {
 			return uploadInfo, fmt.Errorf("reading ExtraLength: %w", err)
 		}
 	}
-	return
+	return uploadInfo, nil
 }
 
-func (conn *Session) getUploadSymbolInfoSymbols(length uint32) (data []byte, err error) {
-	res, err := conn.client.Read(uint32(GroupSymbolUpload), 0, length)
+// DownloadSymbolList downloads the raw symbol-table bytes (group 0xF00B).
+// Caller decodes per parseUploadSymbolInfoSymbols. Wire RPC; no cache.
+func (c *Client) DownloadSymbolList(length uint32) ([]byte, error) {
+	res, err := c.Read(uint32(GroupSymbolUpload), 0, length)
 	if err != nil {
-		return nil, fmt.Errorf("getUploadSymbolInfoSymbols failed: %w", err)
+		return nil, fmt.Errorf("DownloadSymbolList failed: %w", err)
 	}
 	return res, nil
 }
 
-func (conn *Session) getUploadSymbolInfoDataTypes(length uint32) (data []byte, err error) {
-	data, err = conn.client.Read(
-		uint32(GroupSymbolDataTypeUpload),
-		0x0,
-		length)
+// DownloadDataTypes downloads the raw datatype-table bytes (group 0xF00E).
+// Caller decodes via parseUploadSymbolInfoDataTypes. Wire RPC; no cache.
+func (c *Client) DownloadDataTypes(length uint32) ([]byte, error) {
+	res, err := c.Read(uint32(GroupSymbolDataTypeUpload), 0x0, length)
 	if err != nil {
-		return nil, fmt.Errorf("error doing DT UPLOAD: %w", err)
+		return nil, fmt.Errorf("DownloadDataTypes failed: %w", err)
 	}
-	return data, nil
+	return res, nil
 }
 
-// GetSymbolVersion reads the current symbol version from the PLC.
-// The symbol version is a single byte (uint8) that increments on online-change or download.
-func (conn *Session) GetSymbolVersion() (uint8, error) {
-	data, err := conn.client.Read(uint32(GroupSymbolVersion), 0, 1)
+// GetSymbolVersion reads the current PLC symbol version (single byte).
+// Increments on online-change or download. Wire RPC; no cache.
+func (c *Client) GetSymbolVersion() (uint8, error) {
+	data, err := c.Read(uint32(GroupSymbolVersion), 0, 1)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read symbol version: %w", err)
 	}
@@ -436,7 +431,7 @@ func (conn *Session) GetSymbolVersion() (uint8, error) {
 // CheckSymbolVersion compares the current PLC symbol version against the stored version.
 // Returns true if the version has changed.
 func (conn *Session) CheckSymbolVersion() (changed bool, err error) {
-	version, err := conn.GetSymbolVersion()
+	version, err := conn.client.GetSymbolVersion()
 	if err != nil {
 		return false, err
 	}
@@ -504,7 +499,7 @@ func (conn *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Read symbol version
-	version, err := conn.GetSymbolVersion()
+	version, err := conn.client.GetSymbolVersion()
 	if err != nil {
 		conn.logger.Warn("failed to read symbol version during LoadSymbolList", "error", err)
 	} else {
@@ -514,7 +509,7 @@ func (conn *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	}
 
 	// Get upload info
-	uploadInfo, err := conn.GetSymbolUploadInfo()
+	uploadInfo, err := conn.client.GetSymbolUploadInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
@@ -522,7 +517,7 @@ func (conn *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Download symbols in chunks
-	symbolsData, err := conn.downloadInChunks(
+	symbolsData, err := conn.client.DownloadInChunks(
 		uint32(GroupSymbolUpload),
 		uploadInfo.SymbolLength,
 		cfg.ChunkSize,
@@ -531,7 +526,7 @@ func (conn *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download symbols in one request
 		conn.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
-		symbolsData, err = conn.getUploadSymbolInfoSymbols(uploadInfo.SymbolLength)
+		symbolsData, err = conn.client.DownloadSymbolList(uploadInfo.SymbolLength)
 		if err != nil {
 			return fmt.Errorf("failed to download symbols: %w", err)
 		}
@@ -568,7 +563,7 @@ func (conn *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Get upload info
-	uploadInfo, err := conn.GetSymbolUploadInfo()
+	uploadInfo, err := conn.client.GetSymbolUploadInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
@@ -576,7 +571,7 @@ func (conn *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Download datatypes in chunks
-	datatypesData, err := conn.downloadInChunks(
+	datatypesData, err := conn.client.DownloadInChunks(
 		uint32(GroupSymbolDataTypeUpload),
 		uploadInfo.DataTypeLength,
 		cfg.ChunkSize,
@@ -585,7 +580,7 @@ func (conn *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download datatypes in one request
 		conn.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
-		datatypesData, err = conn.getUploadSymbolInfoDataTypes(uploadInfo.DataTypeLength)
+		datatypesData, err = conn.client.DownloadDataTypes(uploadInfo.DataTypeLength)
 		if err != nil {
 			return fmt.Errorf("failed to download datatypes: %w", err)
 		}

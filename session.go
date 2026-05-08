@@ -281,7 +281,7 @@ func (conn *Session) Connect(local bool) error {
 	}
 
 	// Read symbol version for later change detection (best-effort, don't fail connect)
-	version, err := conn.GetSymbolVersion()
+	version, err := conn.client.GetSymbolVersion()
 	if err != nil {
 		conn.logger.Debug("could not read symbol version during connect", "error", err)
 	} else {
@@ -309,7 +309,7 @@ func (conn *Session) ensureRouteOnConnect() (registered bool, err error) {
 	}
 
 	// Probe: try a lightweight ADS command to see if route exists
-	_, probeErr := conn.GetSymbolVersion()
+	_, probeErr := conn.client.GetSymbolVersion()
 	if probeErr == nil {
 		conn.logger.Info("route already exists on PLC, skipping registration")
 		conn.route.routeProbeFailures.Store(0)
@@ -660,7 +660,7 @@ func (conn *Session) ensureRoute() error {
 	}
 
 	// Probe: try a lightweight ADS command to see if route already exists
-	_, probeErr := conn.GetSymbolVersion()
+	_, probeErr := conn.client.GetSymbolVersion()
 	if probeErr == nil {
 		conn.logger.Debug("route still valid, skipping re-registration")
 		conn.route.routeProbeFailures.Store(0)
@@ -756,7 +756,7 @@ func (conn *Session) reloadSymbols() error {
 
 	default:
 		// No symbols were loaded — read symbol version for future use
-		version, err := conn.GetSymbolVersion()
+		version, err := conn.client.GetSymbolVersion()
 		if err != nil {
 			conn.logger.Debug("could not read symbol version during reconnect", "error", err)
 		} else {
@@ -1026,7 +1026,7 @@ func zeroOldSymbolHandles(m map[string]*Symbol) {
 // loadSymbols loads symbol table and datatypes from the PLC, and saves the symbol version.
 func (conn *Session) loadSymbols() error {
 	// Read and store symbol version
-	version, err := conn.GetSymbolVersion()
+	version, err := conn.client.GetSymbolVersion()
 	if err != nil {
 		conn.logger.Warn("failed to read symbol version, continuing with symbol load", "error", err)
 	} else {
@@ -1035,11 +1035,11 @@ func (conn *Session) loadSymbols() error {
 		conn.cache.lock.Unlock()
 	}
 
-	res, err := conn.GetSymbolUploadInfo()
+	res, err := conn.client.GetSymbolUploadInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
-	datatypesResponse, err := conn.getUploadSymbolInfoDataTypes(res.DataTypeLength)
+	datatypesResponse, err := conn.client.DownloadDataTypes(res.DataTypeLength)
 	if err != nil {
 		return fmt.Errorf("failed to upload datatypes: %w", err)
 	}
@@ -1047,7 +1047,7 @@ func (conn *Session) loadSymbols() error {
 	if err != nil {
 		return fmt.Errorf("failed to parse datatypes: %w", err)
 	}
-	symbolsResponse, err := conn.getUploadSymbolInfoSymbols(res.SymbolLength)
+	symbolsResponse, err := conn.client.DownloadSymbolList(res.SymbolLength)
 	if err != nil {
 		return fmt.Errorf("failed to upload symbols: %w", err)
 	}
