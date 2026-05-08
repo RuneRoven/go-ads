@@ -136,3 +136,11 @@ func (conn *Session) transitionState(want SessionState) {
 	}
 	conn.logger.Log(context.Background(), LevelTrace, "FSM transition", "from", from, "to", want)
 }
+
+// isClosed reports whether the session has reached the terminal Closed
+// state. Phase 2.a introduces this as the FSM-driven replacement for
+// lifecycle.closed.Load() at the read sites; the boolean flag remains
+// authoritative for writes until Phase 3.
+func (conn *Session) isClosed() bool {
+	return conn.lifecycle.state.load() == SessionStateClosed
+}

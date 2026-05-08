@@ -280,7 +280,7 @@ func (conn *Session) Connect(local bool) error {
 // Returns (registered bool, err error) where registered=true means a route was added
 // and the caller should TCP-reconnect.
 func (conn *Session) ensureRouteOnConnect() (registered bool, err error) {
-	if conn.lifecycle.closed.Load() {
+	if conn.isClosed() {
 		return false, fmt.Errorf("connection closed")
 	}
 
@@ -299,7 +299,7 @@ func (conn *Session) ensureRouteOnConnect() (registered bool, err error) {
 		return false, nil
 	}
 
-	if conn.lifecycle.closed.Load() {
+	if conn.isClosed() {
 		return false, fmt.Errorf("connection closed during route probe")
 	}
 
@@ -446,7 +446,7 @@ func (conn *Session) reconnectSleep(attempt int) error {
 // the race window where callers could see a "healthy" connection between the trigger
 // and Reconnect() being scheduled.
 func (conn *Session) triggerReconnect() {
-	if conn.lifecycle.closed.Load() {
+	if conn.isClosed() {
 		return
 	}
 	// CAS ensures only the first goroutine to detect disconnect fires the callback
@@ -464,7 +464,7 @@ func (conn *Session) triggerReconnect() {
 
 	// Fire disconnect callback in goroutine (must not block).
 	// Callback must not call Session methods — connection may be closing.
-	if firstDetector && conn.onDisconnect != nil && !conn.lifecycle.closed.Load() {
+	if firstDetector && conn.onDisconnect != nil && !conn.isClosed() {
 		go conn.onDisconnect()
 	}
 
@@ -487,7 +487,7 @@ func (conn *Session) triggerReconnect() {
 // Uses configurable backoff (see WithBackoff) with fast initial retries and
 // progressive slowdown. Backoff resets on each successful reconnect.
 func (conn *Session) Reconnect() error {
-	if conn.lifecycle.closed.Load() {
+	if conn.isClosed() {
 		return fmt.Errorf("connection closed")
 	}
 	// Prevent concurrent reconnect attempts
@@ -528,7 +528,7 @@ func (conn *Session) Reconnect() error {
 	var lastErr error
 	attempts := 0
 	for {
-		if conn.lifecycle.closed.Load() {
+		if conn.isClosed() {
 			return fmt.Errorf("connection closed during reconnect")
 		}
 		attempts++
@@ -601,7 +601,7 @@ func (conn *Session) Reconnect() error {
 
 		// Fire reconnect callback in goroutine (must not block).
 		// Callback must not call Session methods — connection may be closing.
-		if conn.onReconnect != nil && !conn.lifecycle.closed.Load() {
+		if conn.onReconnect != nil && !conn.isClosed() {
 			go conn.onReconnect()
 		}
 		return nil
@@ -616,7 +616,7 @@ func (conn *Session) ensureRoute() error {
 	if conn.route.name == "" {
 		return nil
 	}
-	if conn.lifecycle.closed.Load() {
+	if conn.isClosed() {
 		return fmt.Errorf("connection closed")
 	}
 
@@ -640,7 +640,7 @@ func (conn *Session) ensureRoute() error {
 		return nil
 	}
 
-	if conn.lifecycle.closed.Load() {
+	if conn.isClosed() {
 		return fmt.Errorf("connection closed during route probe")
 	}
 
@@ -793,7 +793,7 @@ func (conn *Session) dialAndStart() error {
 	conn.tx.connMu.Unlock()
 	configureKeepAlive(newConn)
 	conn.lifecycle.disconnected.Store(false)
-	if conn.lifecycle.closed.Load() {
+	if conn.isClosed() {
 		// Session was Closed mid-dial. Don't Add to waitGroup.
 		conn.tx.connMu.Lock()
 		newConn.Close()

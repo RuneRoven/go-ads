@@ -88,6 +88,7 @@ func TestListen_OversizePacketTriggersReconnect(t *testing.T) {
 		lifecycle: &reconnector{closedCh: make(chan struct{})},
 	}
 	conn.lifecycle.closed.Store(true) // suppress reconnect goroutine launch
+	conn.lifecycle.state.transitionTo(SessionStateClosed)
 	ctx, cancel := context.WithCancel(context.Background())
 	conn.lifecycle.ctx = ctx
 	conn.lifecycle.shutdown = cancel

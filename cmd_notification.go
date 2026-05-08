@@ -186,7 +186,7 @@ func (conn *Session) handleNotification(ctx context.Context, handle uint32, time
 		//   the most recent successful subscribe.
 		const subscribeRaceWindowNs = int64(100 * time.Millisecond)
 		switch {
-		case conn.lifecycle.closed.Load() || conn.lifecycle.reconnecting.Load():
+		case conn.isClosed() || conn.lifecycle.reconnecting.Load():
 			conn.logger.Debug("received notification for deleted handle (expected during close/reconnect)", "handle", handle)
 		case time.Now().UnixNano()-conn.notifs.lastSubscribeNs.Load() < subscribeRaceWindowNs:
 			conn.logger.Debug("received notification for unknown handle (likely first-sample race)", "handle", handle)
