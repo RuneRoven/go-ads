@@ -118,36 +118,10 @@ func TestListen_OversizePacketTriggersReconnect(t *testing.T) {
 	}
 }
 
-// Verify sendRequestOnce ctxDone branch returns context.Canceled (not ErrDisconnected),
-// so the outer sendRequest retry loop re-engages.
-//
-// Simulates the disconnected-wait state by setting up a Session with
-// disconnected=true and a non-nil reconnectDone channel, then cancelling the ctx.
-func TestSendRequestOnce_CtxDoneReturnsCanceled(t *testing.T) {
-	conn := &Session{
-		logger:    getDefaultLogger(),
-		lifecycle: &reconnector{reconnectDone: make(chan struct{})},
-		tx:        &transport{},
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	conn.lifecycle.ctx = ctx
-	conn.lifecycle.shutdown = cancel
-	conn.client = &Client{tx: conn.tx, logger: conn.logger, ctx: ctx}
-	conn.lifecycle.disconnected.Store(true)
-	// Walk the FSM into Disconnected so isDisconnected() reflects the synthetic
-	// state. Constructed -> Disconnected is not a legal direct transition.
-	conn.lifecycle.state.transitionTo(SessionStateConnecting)
-	conn.lifecycle.state.transitionTo(SessionStateConnected)
-	conn.lifecycle.state.transitionTo(SessionStateDisconnected)
-
-	cancel()
-
-	_, err := conn.sendRequestOnce(CommandIDRead, []byte{})
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled, got %v (errors.Is(context.Canceled)=%v)",
-			err, errors.Is(err, context.Canceled))
-	}
-}
+// TestSendRequestOnce_CtxDoneReturnsCanceled was removed in Phase 5.b.2/3:
+// Session.sendRequestOnce no longer exists. The wait-for-reconnect logic
+// it covered moves to Session-side clientRead / clientWrite wrappers in
+// Phase 5.c; an equivalent test will land alongside that wrapper.
 
 func TestIsRouteHintErr_EOF(t *testing.T) {
 	cases := []struct {

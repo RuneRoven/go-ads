@@ -1,9 +1,7 @@
 package ads
 
 import (
-	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"syscall"
@@ -31,7 +29,9 @@ func isRouteHintErr(err error) bool {
 	return false
 }
 
-// send delegates to the underlying Client. Local-mode handshake only.
+// send delegates to the underlying Client. Local-mode handshake only —
+// the only caller is Session.localHandshake. Other RPC paths now bypass
+// Session and call methods directly on s.client.
 func (conn *Session) send(data []byte) ([]byte, error) {
 	if conn.client == nil {
 		return nil, ErrDisconnected
@@ -39,84 +39,6 @@ func (conn *Session) send(data []byte) ([]byte, error) {
 	return conn.client.send(data)
 }
 
-func (conn *Session) sendRequest(command CommandID, data []byte) (response []byte, err error) {
-	if conn == nil {
-		return nil, fmt.Errorf("sendRequest called on nil connection")
-	}
-	const maxAttempts = 2
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		response, err = conn.sendRequestOnce(command, data)
-		if err == nil {
-			return response, nil
-		}
-		// Only retry on context.Canceled (reconnect killed our context),
-		// never on DeadlineExceeded (that's the caller's RequestTimeout).
-		if !errors.Is(err, context.Canceled) {
-			return nil, err
-		}
-		// Don't retry if the connection is permanently closed.
-		if conn.isClosed() {
-			return nil, err
-		}
-		// Only retry if a reconnect is actually in progress.
-		if !conn.isReconnecting() {
-			return nil, err
-		}
-		// Wait for reconnect to finish before retrying.
-		conn.lifecycle.reconnectMu.Lock()
-		ch := conn.lifecycle.reconnectDone
-		conn.lifecycle.reconnectMu.Unlock()
-		if ch == nil {
-			return nil, err
-		}
-		conn.logger.Info("sendRequest retrying after reconnect",
-			"attempt", attempt+1,
-			"command", command)
-		select {
-		case <-ch:
-			// Reconnect finished — loop will retry if connection is healthy.
-			if conn.isTransportDown() {
-				return nil, ErrDisconnected
-			}
-		case <-conn.lifecycle.closedCh:
-			return nil, fmt.Errorf("connection closed while waiting for reconnect: %w", err)
-		}
-	}
-	return nil, err
-}
-
-// sendRequestOnce wraps the raw Client.sendRequest with Session-level
-// wait-for-reconnect semantics. If the transport is down at entry, it
-// waits on the active reconnect channel and re-checks before giving up.
-// Otherwise it forwards directly to Client.sendRequest.
-func (conn *Session) sendRequestOnce(command CommandID, data []byte) ([]byte, error) {
-	if conn.client == nil {
-		return nil, ErrDisconnected
-	}
-	if conn.isTransportDown() {
-		conn.lifecycle.reconnectMu.Lock()
-		ch := conn.lifecycle.reconnectDone
-		conn.lifecycle.reconnectMu.Unlock()
-		if ch == nil {
-			return nil, ErrDisconnected
-		}
-		conn.logger.Debug("sendRequest waiting for reconnect to complete")
-		conn.lifecycle.ctxMu.RLock()
-		ctxDone := conn.lifecycle.ctx.Done()
-		conn.lifecycle.ctxMu.RUnlock()
-		select {
-		case <-ch:
-			if conn.isTransportDown() {
-				return nil, ErrDisconnected
-			}
-		case <-ctxDone:
-			// Reconnect cancelled our ctx mid-wait. Return context.Canceled
-			// so the outer sendRequest retry loop re-engages.
-			return nil, context.Canceled
-		}
-	}
-	return conn.client.sendRequest(command, data)
-}
-
-// listen, recvWorker, handleReceive, transmitWorker were migrated onto
-// *Client in Phase 5.a-dial. See client.go.
+// listen, recvWorker, handleReceive, transmitWorker, sendRequest,
+// sendRequestOnce were migrated onto *Client in Phase 5.a-dial / 5.b.0.
+// See client.go.

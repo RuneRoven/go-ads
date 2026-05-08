@@ -1494,7 +1494,7 @@ func TestIntegrationSumReadFallbackForced(t *testing.T) {
 	}
 
 	// Force fallback: mark sum read as unsupported
-	conn.capabilities.SumReadCmdStore(1)
+	conn.client.capabilities.SumReadCmdStore(1)
 
 	values, err := conn.ReadMultipleSymbols(names)
 	if err != nil {
@@ -1547,7 +1547,7 @@ func TestIntegrationSumWriteFallbackForced(t *testing.T) {
 	}
 
 	// Force fallback
-	conn.capabilities.SumWriteStateStore(2) // 2 = checked + unsupported (forces fallback)
+	conn.client.capabilities.SumWriteStateStore(2) // 2 = checked + unsupported (forces fallback)
 
 	// Save originals
 	originals := make(map[string]string)
@@ -1604,7 +1604,7 @@ func TestIntegrationSumNotifFallbackForced(t *testing.T) {
 	}
 
 	// Force fallback
-	conn.capabilities.SumAddNotifStateStore(2) // 2 = checked + unsupported (forces fallback)
+	conn.client.capabilities.SumAddNotifStateStore(2) // 2 = checked + unsupported (forces fallback)
 
 	ch := make(chan *Update, 50)
 	var configs []NotificationConfig
@@ -1676,7 +1676,7 @@ func TestIntegrationSumNotifFallbackDowngrade(t *testing.T) {
 	t.Logf("symbol %q: ContextMask=%d flags=0x%04X (fallback test)", symbolName, sym.ContextMask, uint32(sym.Flags))
 
 	// Force notification fallback — v2 modes should be downgraded to v1
-	conn.capabilities.SumAddNotifStateStore(2) // 2 = checked + unsupported (forces fallback)
+	conn.client.capabilities.SumAddNotifStateStore(2) // 2 = checked + unsupported (forces fallback)
 
 	ch := make(chan *Update, 20)
 	configs := []NotificationConfig{{
@@ -1749,7 +1749,7 @@ func TestIntegrationSumReadPartialFailure(t *testing.T) {
 		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Length: 4},               // bogus
 	}
 
-	results, err := conn.SumRead(requests)
+	results, err := conn.client.SumRead(requests)
 	if err != nil {
 		t.Fatalf("SumRead failed: %v", err)
 	}
@@ -1828,7 +1828,7 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Data: []byte{0, 0}},   // bogus
 	}
 
-	results, err := conn.SumWrite(requests)
+	results, err := conn.client.SumWrite(requests)
 	if err != nil {
 		t.Fatalf("SumWrite (mixed) failed: %v", err)
 	}

@@ -159,7 +159,7 @@ func (conn *Session) downloadInChunks(group uint32, totalLength uint32, chunkSiz
 	}
 
 	// Skip if already known unsupported
-	if conn.capabilities.ChunkedDownloadCheckedLoad() && !conn.capabilities.ChunkedDownloadSupportedLoad() {
+	if conn.client.capabilities.ChunkedDownloadCheckedLoad() && !conn.client.capabilities.ChunkedDownloadSupportedLoad() {
 		return nil, fmt.Errorf("chunked download not supported by this PLC")
 	}
 
@@ -180,9 +180,9 @@ func (conn *Session) downloadInChunks(group uint32, totalLength uint32, chunkSiz
 
 		chunk, err := conn.client.Read(group, offset, readLen)
 		if err != nil {
-			if !conn.capabilities.ChunkedDownloadCheckedLoad() {
-				conn.capabilities.ChunkedDownloadSupportedStore(false)
-				conn.capabilities.ChunkedDownloadCheckedStore(true)
+			if !conn.client.capabilities.ChunkedDownloadCheckedLoad() {
+				conn.client.capabilities.ChunkedDownloadSupportedStore(false)
+				conn.client.capabilities.ChunkedDownloadCheckedStore(true)
 			}
 			return nil, fmt.Errorf("chunk read at offset %d failed: %w", offset, err)
 		}
@@ -198,9 +198,9 @@ func (conn *Session) downloadInChunks(group uint32, totalLength uint32, chunkSiz
 		}
 	}
 
-	if !conn.capabilities.ChunkedDownloadCheckedLoad() {
-		conn.capabilities.ChunkedDownloadSupportedStore(true)
-		conn.capabilities.ChunkedDownloadCheckedStore(true)
+	if !conn.client.capabilities.ChunkedDownloadCheckedLoad() {
+		conn.client.capabilities.ChunkedDownloadSupportedStore(true)
+		conn.client.capabilities.ChunkedDownloadCheckedStore(true)
 	}
 
 	if uint32(len(result)) != totalLength {

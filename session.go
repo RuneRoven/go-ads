@@ -65,9 +65,6 @@ type Session struct {
 	onDisconnect func()
 	onReconnect  func()
 
-	// Feature support state. See capabilities type for state transitions.
-	capabilities capabilities
-
 	// Route registration config (populated by WithRoute / WithForceRouteRegistration).
 	route *routeManager
 
@@ -809,9 +806,11 @@ func (conn *Session) tearDownAndReset(resetFeatureFlags bool) {
 	conn.tx.activeRequestLock.Lock()
 	conn.tx.activeRequests = map[uint32]chan []byte{}
 	conn.tx.activeRequestLock.Unlock()
-	if resetFeatureFlags {
-		conn.capabilities.reset()
-	}
+	// Capability state lives on Client. A fresh Client (allocated in
+	// dialAndStart on each reconnect attempt) has zero-value capabilities,
+	// equivalent to a reset. resetFeatureFlags is therefore implicit and
+	// the parameter is retained only for symmetric API with prior callers.
+	_ = resetFeatureFlags
 }
 
 // dialAndStart performs net.DialTimeout, configures keepalive, clears the

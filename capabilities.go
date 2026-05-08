@@ -63,13 +63,6 @@ func (c *capabilities) ChunkedDownloadSupportedStore(v bool) {
 	c.chunkedDownloadSupported.Store(v)
 }
 
-// reset clears all capability state. Used by Reconnect via tearDownAndReset(true)
-// so a fresh connection re-probes the PLC's capability set.
-func (c *capabilities) reset() {
-	c.sumReadCmd.Store(0)
-	c.sumWriteState.Store(0)
-	c.sumAddNotifState.Store(0)
-	c.sumDeleteNotifState.Store(0)
-	c.chunkedDownloadSupported.Store(false)
-	c.chunkedDownloadChecked.Store(false)
-}
+// Reset is implicit after Phase 5.b.2: capabilities lives on *Client and a
+// fresh Client is allocated on every Connect / dialAndStart, so the
+// per-attempt struct value starts zeroed.

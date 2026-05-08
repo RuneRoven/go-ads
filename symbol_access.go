@@ -169,7 +169,7 @@ func (conn *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (
 		return nil, fmt.Errorf("no valid symbols found for batch read")
 	}
 
-	results, err := conn.SumRead(requests)
+	results, err := conn.client.SumRead(requests)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
 		if retriesLeft > 0 && conn.epoch() != gen {
@@ -264,7 +264,7 @@ func (conn *Session) writeMultipleSymbolsRetry(values map[string]string, retries
 		return nil, fmt.Errorf("no valid symbols found for batch write")
 	}
 
-	results, err := conn.SumWrite(requests)
+	results, err := conn.client.SumWrite(requests)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
 		if retriesLeft > 0 && conn.epoch() != gen {

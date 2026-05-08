@@ -26,6 +26,7 @@ func craftSumReadResponse(errs []ReturnCode, dataLengths []uint32, data []byte) 
 // On 64-bit Go this is defense-in-depth; on 32-bit it is a real bug.
 func TestParseSumReadResponse_LengthOverflow(t *testing.T) {
 	conn := &Session{logger: getDefaultLogger()}
+	conn.client = &Client{logger: conn.logger}
 
 	resp := craftSumReadResponse(
 		[]ReturnCode{ReturnCodeNoErrors},
@@ -34,7 +35,7 @@ func TestParseSumReadResponse_LengthOverflow(t *testing.T) {
 	)
 	requests := []SumReadRequest{{Length: 4}}
 
-	results, err := conn.parseSumReadResponse(resp, 1, requests)
+	results, err := conn.client.parseSumReadResponse(resp, 1, requests)
 	if err != nil {
 		t.Fatalf("unexpected outer error: %v", err)
 	}
@@ -52,6 +53,7 @@ func TestParseSumReadResponse_TruncationLogsError(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	conn := &Session{logger: logger}
+	conn.client = &Client{logger: logger}
 
 	// Two items: first declares length=8, second declares length=4. Data section
 	// has only 4 bytes total — first item alone exceeds remaining bytes.
@@ -62,7 +64,7 @@ func TestParseSumReadResponse_TruncationLogsError(t *testing.T) {
 	)
 	requests := []SumReadRequest{{Length: 8}, {Length: 4}}
 
-	results, err := conn.parseSumReadResponse(resp, 2, requests)
+	results, err := conn.client.parseSumReadResponse(resp, 2, requests)
 	if err != nil {
 		t.Fatalf("unexpected outer error: %v", err)
 	}
@@ -86,6 +88,7 @@ func TestParseSumReadResponse_PerItemOversize(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	conn := &Session{logger: logger}
+	conn.client = &Client{logger: logger}
 
 	// Two items each requested as 4 bytes, but item 0 declares 8 bytes returned.
 	// Total response size accommodates 8+4=12 data bytes so the gross truncation
@@ -97,7 +100,7 @@ func TestParseSumReadResponse_PerItemOversize(t *testing.T) {
 	)
 	requests := []SumReadRequest{{Length: 4}, {Length: 4}}
 
-	results, err := conn.parseSumReadResponse(resp, 2, requests)
+	results, err := conn.client.parseSumReadResponse(resp, 2, requests)
 	if err != nil {
 		t.Fatalf("unexpected outer error: %v", err)
 	}
@@ -118,6 +121,7 @@ func TestParseSumReadResponse_PerItemOversize(t *testing.T) {
 // touches the network.
 func TestBestEffortDeleteNotifications_Empty(t *testing.T) {
 	conn := &Session{logger: getDefaultLogger()}
+	conn.client = &Client{logger: conn.logger}
 	got := conn.bestEffortDeleteNotifications(nil)
 	if got != 0 {
 		t.Errorf("expected 0, got %d", got)

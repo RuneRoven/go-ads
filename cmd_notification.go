@@ -8,12 +8,17 @@ import (
 	"time"
 )
 
-// Single-symbol device-notification commands: AddDeviceNotification,
-// DeleteDeviceNotification. The dispatcher for incoming notification packets
-// (handleNotification + deliverNotification) lives here too because it shares
-// the Update / handle bookkeeping defined by these commands.
+// Single-symbol device-notification raw RPCs on *Client (Phase 5.b.2/3):
+// AddDeviceNotification, DeleteDeviceNotification. Notifs persistence
+// + activeNotifications cleanup is the Session's wrapper concern (see
+// Session.DeleteDeviceNotification below). The cache-aware
+// handleNotification dispatcher (installed via Client.SetNotificationHandler)
+// also lives in this file because it shares Update / handle bookkeeping.
 
-func (conn *Session) AddDeviceNotification(
+// AddDeviceNotification registers a device notification with the PLC and
+// returns the PLC-assigned handle. Raw RPC: no Session-side persistence.
+// Callers wanting auto-resubscribe-on-reconnect use Session.AddSymbolNotification.
+func (c *Client) AddDeviceNotification(
 	group uint32,
 	offset uint32,
 	length uint32,
@@ -31,7 +36,6 @@ func (conn *Session) AddDeviceNotification(
 		CycleTime        uint32
 		Reserved         [16]byte
 	}
-
 	content := addDeviceNotificationCommandPacket{
 		group,
 		offset,
@@ -48,55 +52,63 @@ func (conn *Session) AddDeviceNotification(
 		Error  ReturnCode
 		Handle uint32
 	}
-	// Try to send the request
-	resp, err := conn.sendRequest(CommandIDAddDeviceNotification, request.Bytes())
+	resp, err := c.sendRequest(CommandIDAddDeviceNotification, request.Bytes())
 	if err != nil {
 		return
 	}
 	respBuffer := bytes.NewBuffer(resp)
 	notificationResponse := addDeviceNotificationResponse{}
-	err = binary.Read(respBuffer, binary.LittleEndian, &notificationResponse)
-	if err != nil {
-		conn.logger.Error("failed to parse notification response", "error", err)
+	if err = binary.Read(respBuffer, binary.LittleEndian, &notificationResponse); err != nil {
+		c.logger.Error("failed to parse notification response", "error", err)
 		return 0, err
 	}
 	if notificationResponse.Error != 0 {
-		conn.logger.Error("failed to add notification handler", "errorCode", uint32(notificationResponse.Error))
+		c.logger.Error("failed to add notification handler", "errorCode", uint32(notificationResponse.Error))
 		return 0, fmt.Errorf("unable to create notification: %w", notificationResponse.Error)
 	}
-	conn.logger.Log(context.Background(), LevelTrace, "added notification handler", "handle", notificationResponse.Handle)
-
+	c.logger.Log(context.Background(), LevelTrace, "added notification handler", "handle", notificationResponse.Handle)
 	return notificationResponse.Handle, nil
 }
 
-// DeleteDeviceNotification deletes a device notification by handle.
-func (conn *Session) DeleteDeviceNotification(handle uint32) error {
+// DeleteDeviceNotification deletes a device notification by handle. Raw RPC:
+// returns the wire-level success/error. Callers that maintain
+// activeNotifications must clean up themselves (Session does this in its
+// wrapper Session.DeleteDeviceNotification below).
+func (c *Client) DeleteDeviceNotification(handle uint32) error {
 	request := &bytes.Buffer{}
 	type deleteNotificationCommandPacket struct {
 		Handle uint32
 	}
-	content := deleteNotificationCommandPacket{
-		handle,
-	}
+	content := deleteNotificationCommandPacket{handle}
 	if err := binary.Write(request, binary.LittleEndian, content); err != nil {
 		return fmt.Errorf("binary.Write failed: %w", err)
 	}
-	// Try to send the request
-	resp, err := conn.sendRequest(CommandIDDeleteDeviceNotification, request.Bytes())
+	resp, err := c.sendRequest(CommandIDDeleteDeviceNotification, request.Bytes())
 	if err != nil {
-		conn.logger.Warn("error deleting handle", "handle", handle, "error", err)
+		c.logger.Warn("error deleting handle", "handle", handle, "error", err)
 		return err
 	}
-
-	// Check the result error code
 	respBuffer := bytes.NewBuffer(resp)
 	var adsError ReturnCode
 	if err = binary.Read(respBuffer, binary.LittleEndian, &adsError); err != nil {
 		return fmt.Errorf("failed to parse DeleteDeviceNotification response: %w", err)
 	}
 	if adsError > 0 {
-		conn.logger.Warn("error deleting handle", "handle", handle, "errorCode", uint32(adsError))
+		c.logger.Warn("error deleting handle", "handle", handle, "errorCode", uint32(adsError))
 		return fmt.Errorf("ADS error in DeleteDeviceNotification: %w", adsError)
+	}
+	c.logger.Info("deleted handle", "handle", handle)
+	return nil
+}
+
+// DeleteDeviceNotification on Session wraps the raw Client RPC with
+// notifs.lock cleanup: removes the entry from activeNotifications, drops
+// the cached notificationConfig, and clears notificationChannel when the
+// last subscription dies. Callers that want raw delete behavior use
+// the Client method directly.
+func (conn *Session) DeleteDeviceNotification(handle uint32) error {
+	if err := conn.client.DeleteDeviceNotification(handle); err != nil {
+		return err
 	}
 	conn.notifs.lock.Lock()
 	if sym := conn.notifs.activeNotifications[handle]; sym != nil {
@@ -107,8 +119,36 @@ func (conn *Session) DeleteDeviceNotification(handle uint32) error {
 		conn.notifs.notificationChannel = nil
 	}
 	conn.notifs.lock.Unlock()
-	conn.logger.Info("deleted handle", "handle", handle)
 	return nil
+}
+
+// SumDeleteDeviceNotification on Session wraps the raw Client RPC with
+// notifs.lock cleanup. Returns the per-handle ReturnCode slice from the
+// PLC. Successfully deleted handles (or handle-invalid, treated as
+// success-equivalent) are removed from activeNotifications.
+func (conn *Session) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error) {
+	errors, err := conn.client.SumDeleteDeviceNotification(handles)
+	if err != nil {
+		return nil, err
+	}
+	if len(errors) == 0 {
+		return errors, nil
+	}
+	conn.notifs.lock.Lock()
+	for i, h := range handles {
+		if errors[i] == ReturnCodeNoErrors || errors[i] == ReturnCodeDeviceNotifyHandleInvalid {
+			if sym := conn.notifs.activeNotifications[h]; sym != nil {
+				conn.removeNotificationConfig(sym.FullName)
+			}
+			delete(conn.notifs.activeNotifications, h)
+			conn.logger.Info("batch deleted notification handle", "handle", h, "errorCode", uint32(errors[i]))
+		}
+	}
+	if len(conn.notifs.activeNotifications) == 0 {
+		conn.notifs.notificationChannel = nil
+	}
+	conn.notifs.lock.Unlock()
+	return errors, nil
 }
 
 const (

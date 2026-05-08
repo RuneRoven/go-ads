@@ -3133,42 +3133,42 @@ func TestSumReadOverflowGuard(t *testing.T) {
 
 func TestSumProbeStateTransitions(t *testing.T) {
 	// Verify CAS 0→1 and 0→2 work, and second CAS is rejected
-	var conn Session
+	conn := Session{client: &Client{}}
 
 	// sumWriteState: 0→1
-	if !conn.capabilities.SumWriteStateCAS(0, 1) {
+	if !conn.client.capabilities.SumWriteStateCAS(0, 1) {
 		t.Error("CAS 0→1 should succeed")
 	}
-	if conn.capabilities.SumWriteStateLoad() != 1 {
+	if conn.client.capabilities.SumWriteStateLoad() != 1 {
 		t.Error("state should be 1")
 	}
 	// Second goroutine trying 0→2 should fail
-	if conn.capabilities.SumWriteStateCAS(0, 2) {
+	if conn.client.capabilities.SumWriteStateCAS(0, 2) {
 		t.Error("CAS 0→2 should fail when state is 1")
 	}
 
 	// sumAddNotifState: 0→2
-	if !conn.capabilities.SumAddNotifStateCAS(0, 2) {
+	if !conn.client.capabilities.SumAddNotifStateCAS(0, 2) {
 		t.Error("CAS 0→2 should succeed")
 	}
-	if conn.capabilities.SumAddNotifStateLoad() != 2 {
+	if conn.client.capabilities.SumAddNotifStateLoad() != 2 {
 		t.Error("state should be 2")
 	}
 	// sumDeleteNotifState independent of sumAddNotifState
-	if conn.capabilities.SumDeleteNotifStateLoad() != 0 {
+	if conn.client.capabilities.SumDeleteNotifStateLoad() != 0 {
 		t.Error("delete state should still be 0 (independent of add)")
 	}
 
 	// Reset works
-	conn.capabilities.SumWriteStateStore(0)
-	if conn.capabilities.SumWriteStateLoad() != 0 {
+	conn.client.capabilities.SumWriteStateStore(0)
+	if conn.client.capabilities.SumWriteStateLoad() != 0 {
 		t.Error("reset should set state to 0")
 	}
 }
 
 func TestSumProbeStateConcurrent(t *testing.T) {
 	// Concurrent CAS: only one goroutine should win
-	var conn Session
+	conn := Session{client: &Client{}}
 	const goroutines = 100
 	var wg sync.WaitGroup
 	wins := make(chan uint32, goroutines)
@@ -3181,7 +3181,7 @@ func TestSumProbeStateConcurrent(t *testing.T) {
 			if id%2 == 0 {
 				val = 2
 			}
-			if conn.capabilities.SumWriteStateCAS(0, val) {
+			if conn.client.capabilities.SumWriteStateCAS(0, val) {
 				wins <- val
 			}
 		}(i)

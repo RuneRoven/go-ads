@@ -222,6 +222,10 @@ func (conn *Session) bumpEpoch() {
 	conn.lifecycle.state.epoch.Add(1)
 }
 
+// isTransportDown is the transport-level "no live socket" signal. Phase 5.b
+// removed all callers when send/sendRequest moved onto *Client; Phase 5.c
+// reintroduces it as the gate for Session-level clientRead/Write wrappers.
+//
 // isTransportDown reports whether the underlying TCP transport is not
 // usable for sending. It reads the legacy disconnected flag, which is
 // flipped to false by dialAndStart immediately after a successful dial
@@ -233,6 +237,8 @@ func (conn *Session) bumpEpoch() {
 //
 // Phase 2 keeps this on the legacy flag. Phase 5 (Client extraction)
 // will move this signal onto the transport type, where it belongs.
+//
+//nolint:unused // re-wired by Phase 5.c.
 func (conn *Session) isTransportDown() bool {
 	return conn.lifecycle.disconnected.Load()
 }
