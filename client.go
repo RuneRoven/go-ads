@@ -390,6 +390,95 @@ func (c *Client) deviceNotification(ctx context.Context, in []byte) error {
 	return nil
 }
 
+// send is the local-mode handshake primitive. NOT safe for concurrent use —
+// it consumes from the shared systemResponse channel. Used by Session for
+// the local AMS handshake during Connect/Reconnect.
+func (c *Client) send(data []byte) ([]byte, error) {
+	c.tx.currentRequest.Inc()
+	c.tx.chanMu.RLock()
+	sendCh := c.tx.sendChannel
+	sysCh := c.tx.systemResponse
+	c.tx.chanMu.RUnlock()
+	ctx, cancel := context.WithTimeout(c.ctx, c.requestTimeout)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("send aborted, context canceled: %w", ctx.Err())
+	case sendCh <- data:
+	}
+	select {
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			err := fmt.Errorf("request aborted, deadline exceeded: %w", ctx.Err())
+			c.logger.Error("send aborted due to timeout", "error", err)
+			return nil, err
+		}
+		err := fmt.Errorf("request aborted, shutdown initiated: %w", ctx.Err())
+		c.logger.Error("send aborted due to shutdown", "error", err)
+		return nil, err
+	case response := <-sysCh:
+		return response, nil
+	}
+}
+
+// sendRequest is the single-shot RPC primitive used by every Client RPC
+// method. Encodes the AMS frame, registers a per-invoke response channel,
+// pushes the frame to the transmit worker, and waits for the response or
+// context timeout.
+//
+// No retry on transport drop — at the Client layer, drops are terminal
+// (caller observes via context.Canceled when c.ctx fires; future calls hit
+// the closed sendChannel or block on context). Session wraps this with
+// wait-for-reconnect retry semantics in its own sendRequest method.
+func (c *Client) sendRequest(command CommandID, data []byte) ([]byte, error) {
+	c.tx.activeRequestLock.Lock()
+	id := c.tx.currentRequest.Inc()
+	c.tx.activeRequests[id] = make(chan []byte, 1)
+	c.tx.activeRequestLock.Unlock()
+	defer func() {
+		c.tx.activeRequestLock.Lock()
+		delete(c.tx.activeRequests, id)
+		c.tx.activeRequestLock.Unlock()
+	}()
+	c.logger.Log(context.Background(), LevelTrace, "encoding packet",
+		"command", command, "data", data, "id", id)
+
+	pack, err := c.encode(command, data, id)
+	if err != nil {
+		c.logger.Error("Error during sendRequest encode", "error", err)
+		return nil, err
+	}
+	c.tx.chanMu.RLock()
+	sendCh := c.tx.sendChannel
+	c.tx.chanMu.RUnlock()
+	ctx, cancel := context.WithTimeout(c.ctx, c.requestTimeout)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			c.logger.Error("sendRequest aborted due to timeout")
+		} else {
+			c.logger.Info("sendRequest aborted due to shutdown")
+		}
+		return nil, ctx.Err()
+	case sendCh <- pack:
+	}
+	c.tx.activeRequestLock.Lock()
+	responseCh := c.tx.activeRequests[id]
+	c.tx.activeRequestLock.Unlock()
+	select {
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			c.logger.Error("sendRequest aborted due to timeout")
+		} else {
+			c.logger.Info("sendRequest aborted due to shutdown")
+		}
+		return nil, ctx.Err()
+	case response := <-responseCh:
+		return response, nil
+	}
+}
+
 func (c *Client) dispatchNotification(ctx context.Context, handle uint32, ts uint64, content []byte) {
 	c.notifyMu.RLock()
 	fn := c.notify

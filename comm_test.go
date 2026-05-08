@@ -127,10 +127,12 @@ func TestSendRequestOnce_CtxDoneReturnsCanceled(t *testing.T) {
 	conn := &Session{
 		logger:    getDefaultLogger(),
 		lifecycle: &reconnector{reconnectDone: make(chan struct{})},
+		tx:        &transport{},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	conn.lifecycle.ctx = ctx
 	conn.lifecycle.shutdown = cancel
+	conn.client = &Client{tx: conn.tx, logger: conn.logger, ctx: ctx}
 	conn.lifecycle.disconnected.Store(true)
 	// Walk the FSM into Disconnected so isDisconnected() reflects the synthetic
 	// state. Constructed -> Disconnected is not a legal direct transition.

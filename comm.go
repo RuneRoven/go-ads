@@ -31,39 +31,12 @@ func isRouteHintErr(err error) bool {
 	return false
 }
 
-// send is used exclusively for the local-mode handshake during Connect/Reconnect.
-// It uses the shared systemResponse channel and is NOT safe for concurrent callers.
-// For normal ADS commands, use sendRequest/sendRequestOnce which use per-invoke channels.
-func (conn *Session) send(data []byte) (response []byte, err error) {
-	conn.tx.currentRequest.Inc()
-	conn.tx.chanMu.RLock()
-	sendCh := conn.tx.sendChannel
-	sysCh := conn.tx.systemResponse
-	conn.tx.chanMu.RUnlock()
-	conn.lifecycle.ctxMu.RLock()
-	currentCtx := conn.lifecycle.ctx
-	conn.lifecycle.ctxMu.RUnlock()
-	ctx, cancel := context.WithTimeout(currentCtx, conn.requestTimeout)
-	defer cancel()
-	select {
-	case <-ctx.Done():
-		return nil, fmt.Errorf("send aborted, context canceled: %w", ctx.Err())
-	case sendCh <- data:
+// send delegates to the underlying Client. Local-mode handshake only.
+func (conn *Session) send(data []byte) ([]byte, error) {
+	if conn.client == nil {
+		return nil, ErrDisconnected
 	}
-
-	select {
-	case <-ctx.Done():
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			err = fmt.Errorf("request aborted, deadline exceeded: %w", ctx.Err())
-			conn.logger.Error("send aborted due to timeout", "error", err)
-		} else {
-			err = fmt.Errorf("request aborted, shutdown initiated: %w", ctx.Err())
-			conn.logger.Error("send aborted due to shutdown", "error", err)
-		}
-		return nil, err
-	case response = <-sysCh:
-		return response, nil
-	}
+	return conn.client.send(data)
 }
 
 func (conn *Session) sendRequest(command CommandID, data []byte) (response []byte, err error) {
@@ -112,86 +85,37 @@ func (conn *Session) sendRequest(command CommandID, data []byte) (response []byt
 	return nil, err
 }
 
-func (conn *Session) sendRequestOnce(command CommandID, data []byte) (response []byte, err error) {
+// sendRequestOnce wraps the raw Client.sendRequest with Session-level
+// wait-for-reconnect semantics. If the transport is down at entry, it
+// waits on the active reconnect channel and re-checks before giving up.
+// Otherwise it forwards directly to Client.sendRequest.
+func (conn *Session) sendRequestOnce(command CommandID, data []byte) ([]byte, error) {
+	if conn.client == nil {
+		return nil, ErrDisconnected
+	}
 	if conn.isTransportDown() {
-		// If a reconnect is in progress, wait for it to finish before giving up
 		conn.lifecycle.reconnectMu.Lock()
 		ch := conn.lifecycle.reconnectDone
 		conn.lifecycle.reconnectMu.Unlock()
-		if ch != nil {
-			conn.logger.Debug("sendRequest waiting for reconnect to complete")
-			conn.lifecycle.ctxMu.RLock()
-			ctxDone := conn.lifecycle.ctx.Done()
-			conn.lifecycle.ctxMu.RUnlock()
-			select {
-			case <-ch:
-				// Reconnect finished — check if we're still disconnected
-				if conn.isTransportDown() {
-					return nil, ErrDisconnected
-				}
-			case <-ctxDone:
-				// Reconnect cancelled our ctx mid-wait. Return context.Canceled
-				// so the outer sendRequest retry loop re-engages.
-				return nil, context.Canceled
-			}
-		} else {
+		if ch == nil {
 			return nil, ErrDisconnected
 		}
-	}
-	conn.tx.activeRequestLock.Lock()
-	// First, request a new invoke id
-	id := conn.tx.currentRequest.Inc()
-	// Create a channel for the response
-	conn.tx.activeRequests[id] = make(chan []byte, 1)
-	conn.tx.activeRequestLock.Unlock()
-	defer func() {
-		conn.tx.activeRequestLock.Lock()
-		delete(conn.tx.activeRequests, id)
-		conn.tx.activeRequestLock.Unlock()
-	}()
-	conn.logger.Log(context.Background(), LevelTrace, "encoding packet",
-		"command", command,
-		"data", data,
-		"id", id)
-
-	pack, err := conn.encode(command, data, id)
-	if err != nil {
-		conn.logger.Error("Error during sendrequest encode", "error", err)
-		return nil, err
-	}
-	conn.lifecycle.ctxMu.RLock()
-	currentCtx := conn.lifecycle.ctx
-	conn.lifecycle.ctxMu.RUnlock()
-	conn.tx.chanMu.RLock()
-	sendCh := conn.tx.sendChannel
-	conn.tx.chanMu.RUnlock()
-	ctx, cancel := context.WithTimeout(currentCtx, conn.requestTimeout)
-	defer cancel()
-	select {
-	case <-ctx.Done():
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			conn.logger.Error("sendRequest aborted due to timeout")
-		} else {
-			conn.logger.Info("sendRequest aborted due to shutdown")
+		conn.logger.Debug("sendRequest waiting for reconnect to complete")
+		conn.lifecycle.ctxMu.RLock()
+		ctxDone := conn.lifecycle.ctx.Done()
+		conn.lifecycle.ctxMu.RUnlock()
+		select {
+		case <-ch:
+			if conn.isTransportDown() {
+				return nil, ErrDisconnected
+			}
+		case <-ctxDone:
+			// Reconnect cancelled our ctx mid-wait. Return context.Canceled
+			// so the outer sendRequest retry loop re-engages.
+			return nil, context.Canceled
 		}
-		return nil, ctx.Err()
-	case sendCh <- pack:
 	}
-	// Capture channel reference under lock to avoid concurrent map read
-	conn.tx.activeRequestLock.Lock()
-	responseCh := conn.tx.activeRequests[id]
-	conn.tx.activeRequestLock.Unlock()
-	select {
-	case <-ctx.Done():
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			conn.logger.Error("sendRequest aborted due to timeout")
-		} else {
-			conn.logger.Info("sendRequest aborted due to shutdown")
-		}
-		return nil, ctx.Err()
-	case response = <-responseCh:
-		return response, nil
-	}
+	return conn.client.sendRequest(command, data)
 }
 
 // listen, recvWorker, handleReceive, transmitWorker were migrated onto

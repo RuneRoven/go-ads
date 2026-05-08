@@ -42,15 +42,18 @@ func stringToNetID(source string) (result [6]byte, err error) {
 	return
 }
 
-func (conn *Session) encode(command CommandID, data []byte, invokeID uint32) ([]byte, error) {
-	// Snapshot source under lock to avoid race with Reconnect writing conn.source.
-	// target is write-once (set in NewConnection), so no lock needed.
-	conn.tx.connMu.Lock()
-	source := conn.source
-	conn.tx.connMu.Unlock()
-	conn.logger.Log(context.Background(), LevelTrace, "Starting encoding of AMS header",
+// encode is on *Client (Phase 5.b.0). Session callers reach it via
+// s.client.encode at the rare sites still on Session.
+func (c *Client) encode(command CommandID, data []byte, invokeID uint32) ([]byte, error) {
+	// Snapshot source under lock to avoid race with Session writing c.source
+	// during reconnect's auto-derive path. target is set at construction
+	// and never mutated after that.
+	c.tx.connMu.Lock()
+	source := c.source
+	c.tx.connMu.Unlock()
+	c.logger.Log(context.Background(), LevelTrace, "Starting encoding of AMS header",
 		"command", command,
-		"target", conn.target,
+		"target", c.target,
 		"source", source,
 		"ID", invokeID,
 		"length of data", len(data))
@@ -60,7 +63,7 @@ func (conn *Session) encode(command CommandID, data []byte, invokeID uint32) ([]
 		Length:   uint32(32 + len(data)),
 	}
 	header := &amsHeader{
-		Target:    conn.target,
+		Target:    c.target,
 		Source:    source,
 		Command:   command,
 		State:     uint16(4),
@@ -70,22 +73,17 @@ func (conn *Session) encode(command CommandID, data []byte, invokeID uint32) ([]
 	}
 
 	buff := new(bytes.Buffer)
-	err := binary.Write(buff, binary.LittleEndian, tcpHeader)
-	if err != nil {
+	if err := binary.Write(buff, binary.LittleEndian, tcpHeader); err != nil {
 		return nil, err
 	}
-	err = binary.Write(buff, binary.LittleEndian, header)
-	if err != nil {
+	if err := binary.Write(buff, binary.LittleEndian, header); err != nil {
 		return nil, err
 	}
-	err = binary.Write(buff, binary.LittleEndian, data)
-	conn.logger.Log(context.Background(), LevelTrace, "data to transmit", "data", data)
-	if err != nil {
-		conn.logger.Error("binary.Write failed", "error", err)
+	if err := binary.Write(buff, binary.LittleEndian, data); err != nil {
+		c.logger.Error("binary.Write failed", "error", err)
 		return nil, err
 	}
-
-	conn.logger.Log(context.Background(), LevelTrace, "The encoded AMS header:", hexAttr("bytes", buff.Bytes()))
-
+	c.logger.Log(context.Background(), LevelTrace, "data to transmit", "data", data)
+	c.logger.Log(context.Background(), LevelTrace, "The encoded AMS header:", hexAttr("bytes", buff.Bytes()))
 	return buff.Bytes(), nil
 }

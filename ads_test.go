@@ -2321,9 +2321,10 @@ func TestEncodePacket(t *testing.T) {
 			Port:  10500,
 		},
 	}
+	conn.client = &Client{tx: conn.tx, logger: conn.logger, target: conn.target, source: conn.source}
 
 	data := []byte{0x01, 0x02, 0x03, 0x04}
-	packet, err := conn.encode(CommandIDRead, data, 7)
+	packet, err := conn.client.encode(CommandIDRead, data, 7)
 	if err != nil {
 		t.Fatalf("encode error: %v", err)
 	}
@@ -2399,8 +2400,9 @@ func TestEncodePacket_EmptyData(t *testing.T) {
 		target:    AMSAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851},
 		source:    AMSAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500},
 	}
+	conn.client = &Client{tx: conn.tx, logger: conn.logger, target: conn.target, source: conn.source}
 
-	packet, err := conn.encode(CommandIDReadDeviceInfo, nil, 0)
+	packet, err := conn.client.encode(CommandIDReadDeviceInfo, nil, 0)
 	if err != nil {
 		t.Fatalf("encode error: %v", err)
 	}
@@ -2426,6 +2428,7 @@ func TestEncodePacket_AllCommands(t *testing.T) {
 		target:    AMSAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851},
 		source:    AMSAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500},
 	}
+	conn.client = &Client{tx: conn.tx, logger: conn.logger, target: conn.target, source: conn.source}
 
 	commands := []CommandID{
 		CommandIDReadDeviceInfo,
@@ -2440,7 +2443,7 @@ func TestEncodePacket_AllCommands(t *testing.T) {
 
 	for _, cmd := range commands {
 		t.Run(fmt.Sprintf("Command_%d", cmd), func(t *testing.T) {
-			packet, err := conn.encode(cmd, []byte{0xFF}, 1)
+			packet, err := conn.client.encode(cmd, []byte{0xFF}, 1)
 			if err != nil {
 				t.Fatalf("encode error: %v", err)
 			}
