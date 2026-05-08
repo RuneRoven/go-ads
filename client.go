@@ -390,6 +390,15 @@ func (c *Client) deviceNotification(ctx context.Context, in []byte) error {
 	return nil
 }
 
+// ReleaseHandle releases a symbol handle previously acquired via
+// GetHandleByName. Wraps Write to GroupSymbolReleaseHandle so the
+// Beckhoff-equivalent surface includes a symmetric release primitive.
+func (c *Client) ReleaseHandle(handle uint32) error {
+	handleBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(handleBytes, handle)
+	return c.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes)
+}
+
 // send is the local-mode handshake primitive. NOT safe for concurrent use —
 // it consumes from the shared systemResponse channel. Used by Session for
 // the local AMS handshake during Connect/Reconnect.

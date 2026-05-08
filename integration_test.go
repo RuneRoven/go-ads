@@ -102,7 +102,7 @@ func TestIntegrationConnect(t *testing.T) {
 
 func TestIntegrationReadDeviceInfo(t *testing.T) {
 	conn := setupConnection(t)
-	info, err := conn.ReadDeviceInfo()
+	info, err := conn.client.ReadDeviceInfo()
 	if err != nil {
 		t.Fatalf("ReadDeviceInfo failed: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestIntegrationReadDeviceInfo(t *testing.T) {
 
 func TestIntegrationReadState(t *testing.T) {
 	conn := setupConnection(t)
-	state, err := conn.ReadState()
+	state, err := conn.client.ReadState()
 	if err != nil {
 		t.Fatalf("ReadState failed: %v", err)
 	}
@@ -1403,7 +1403,7 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 			readLen = uint32(n*8) + totalLen // [n*(error,length)][data]
 		}
 
-		resp, err := conn.WriteRead(uint32(cmd.group), uint32(n), readLen, writeData)
+		resp, err := conn.client.WriteRead(uint32(cmd.group), uint32(n), readLen, writeData)
 		if err != nil {
 			t.Logf("%s: NOT SUPPORTED (error: %v)", cmd.name, err)
 			continue
@@ -1461,7 +1461,7 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 	binary.LittleEndian.PutUint32(notifWriteData[16:], 1000000) // maxDelay 100ms in 100ns units
 	binary.LittleEndian.PutUint32(notifWriteData[20:], 1000000) // cycleTime 100ms in 100ns units
 
-	resp, err := conn.WriteRead(uint32(GroupSumupAddDeviceNotification), 1, 8, notifWriteData)
+	resp, err := conn.client.WriteRead(uint32(GroupSumupAddDeviceNotification), 1, 8, notifWriteData)
 	if err != nil {
 		t.Logf("SumAddDeviceNotification (0xF085): NOT SUPPORTED (error: %v)", err)
 	} else {
@@ -2852,7 +2852,7 @@ func TestIntegrationDockerRoute(t *testing.T) {
 	}
 
 	// Verify connection works (proves route is valid)
-	info, err := conn.ReadDeviceInfo()
+	info, err := conn.client.ReadDeviceInfo()
 	if err != nil {
 		t.Fatalf("ReadDeviceInfo failed: %v", err)
 	}

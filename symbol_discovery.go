@@ -178,7 +178,7 @@ func (conn *Session) downloadInChunks(group uint32, totalLength uint32, chunkSiz
 			readLen = remaining
 		}
 
-		chunk, err := conn.Read(group, offset, readLen)
+		chunk, err := conn.client.Read(group, offset, readLen)
 		if err != nil {
 			if !conn.capabilities.ChunkedDownloadCheckedLoad() {
 				conn.capabilities.ChunkedDownloadSupportedStore(false)
@@ -246,7 +246,7 @@ func (conn *Session) getSymbol(symbolName string) (*Symbol, error) {
 				conn.cache.lock.Unlock()
 				handleBytes := make([]byte, 4)
 				binary.LittleEndian.PutUint32(handleBytes, handle)
-				if err := conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+				if err := conn.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 					conn.logger.Warn("failed to release duplicate symbol handle",
 						"symbol", symbolName, "handle", handle, "error", err)
 				}
@@ -278,7 +278,7 @@ func (conn *Session) getSymbol(symbolName string) (*Symbol, error) {
 		// Release the handle we just acquired since another goroutine beat us
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, handle)
-		if err := conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+		if err := conn.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 			conn.logger.Warn("failed to release duplicate symbol handle",
 				"symbol", symbolName, "handle", handle, "error", err)
 		}
@@ -301,7 +301,7 @@ func (conn *Session) getSymbol(symbolName string) (*Symbol, error) {
 // Returns a populated Symbol with Group, Offset, Length, DataType, etc.
 // Does NOT populate Children (struct/array children require full discovery).
 func (conn *Session) getSymbolInfoByName(symbolName string) (*Symbol, error) {
-	resp, err := conn.WriteRead(
+	resp, err := conn.client.WriteRead(
 		uint32(GroupSymbolInfoByNameEx),
 		0,
 		2048,
@@ -356,7 +356,7 @@ func (conn *Session) getSymbolInfoByName(symbolName string) (*Symbol, error) {
 }
 
 func (conn *Session) GetHandleByName(symbolName string) (handle uint32, err error) {
-	resp, err := conn.WriteRead(uint32(GroupSymbolHandleByName), 0, 4, append([]byte(symbolName), 0))
+	resp, err := conn.client.WriteRead(uint32(GroupSymbolHandleByName), 0, 4, append([]byte(symbolName), 0))
 	if err != nil {
 		return 0, fmt.Errorf("getting handle for %q: %w", symbolName, err)
 	}
@@ -369,10 +369,10 @@ func (conn *Session) GetHandleByName(symbolName string) (handle uint32, err erro
 
 func (conn *Session) GetSymbolUploadInfo() (uploadInfo SymbolUploadInfo, err error) {
 	// Try extended info (0xF00F) first, fall back to basic info (0xF00C)
-	res, err := conn.Read(uint32(GroupSymbolUploadInfo2), 0, 24)
+	res, err := conn.client.Read(uint32(GroupSymbolUploadInfo2), 0, 24)
 	if err != nil {
 		conn.logger.Debug("GroupSymbolUploadInfo2 not supported, falling back to GroupSymbolUploadInfo", "error", err)
-		res, err = conn.Read(uint32(GroupSymbolUploadInfo), 0, 16)
+		res, err = conn.client.Read(uint32(GroupSymbolUploadInfo), 0, 16)
 		if err != nil {
 			return uploadInfo, fmt.Errorf("GetSymbolUploadInfo failed: %w", err)
 		}
@@ -402,7 +402,7 @@ func (conn *Session) GetSymbolUploadInfo() (uploadInfo SymbolUploadInfo, err err
 }
 
 func (conn *Session) getUploadSymbolInfoSymbols(length uint32) (data []byte, err error) {
-	res, err := conn.Read(uint32(GroupSymbolUpload), 0, length)
+	res, err := conn.client.Read(uint32(GroupSymbolUpload), 0, length)
 	if err != nil {
 		return nil, fmt.Errorf("getUploadSymbolInfoSymbols failed: %w", err)
 	}
@@ -410,7 +410,7 @@ func (conn *Session) getUploadSymbolInfoSymbols(length uint32) (data []byte, err
 }
 
 func (conn *Session) getUploadSymbolInfoDataTypes(length uint32) (data []byte, err error) {
-	data, err = conn.Read(
+	data, err = conn.client.Read(
 		uint32(GroupSymbolDataTypeUpload),
 		0x0,
 		length)
@@ -423,7 +423,7 @@ func (conn *Session) getUploadSymbolInfoDataTypes(length uint32) (data []byte, e
 // GetSymbolVersion reads the current symbol version from the PLC.
 // The symbol version is a single byte (uint8) that increments on online-change or download.
 func (conn *Session) GetSymbolVersion() (uint8, error) {
-	data, err := conn.Read(uint32(GroupSymbolVersion), 0, 1)
+	data, err := conn.client.Read(uint32(GroupSymbolVersion), 0, 1)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read symbol version: %w", err)
 	}
@@ -478,7 +478,7 @@ func (conn *Session) RefreshSymbols() error {
 	for _, h := range handleList {
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, h)
-		if err := conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+		if err := conn.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 			conn.logger.Warn("failed to release symbol handle", "error", err, "handle", h)
 		}
 	}

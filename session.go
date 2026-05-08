@@ -393,7 +393,7 @@ func (conn *Session) Close() {
 			}
 			handleBytes := make([]byte, 4)
 			binary.LittleEndian.PutUint32(handleBytes, h)
-			if err := conn.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+			if err := conn.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 				conn.logger.Warn("failed to release symbol handle during close", "error", err, "handle", h)
 			} else {
 				conn.logger.Info("handle deleted", "handle", h)

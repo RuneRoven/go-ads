@@ -32,7 +32,7 @@ func (conn *Session) writeToSymbolRetry(symbolName string, value string, retries
 	}
 
 	// Network I/O without lock
-	err = conn.Write(uint32(GroupSymbolValueByHandle), handle, data)
+	err = conn.client.Write(uint32(GroupSymbolValueByHandle), handle, data)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
 		if retriesLeft > 0 && conn.epoch() != gen {
@@ -79,7 +79,7 @@ func (conn *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (st
 	conn.cache.lock.Unlock()
 
 	// Network I/O without lock
-	data, err := conn.Read(uint32(GroupSymbolValueByHandle), handle, length)
+	data, err := conn.client.Read(uint32(GroupSymbolValueByHandle), handle, length)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
 		if retriesLeft > 0 && conn.epoch() != gen {

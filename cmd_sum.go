@@ -50,7 +50,7 @@ func executeSumCommand[Req any, Res any](conn *Session, spec sumCmdSpec[Req, Res
 		spec.encode(writeData[i*spec.itemWriteSize:(i+1)*spec.itemWriteSize], req)
 	}
 	readLen := uint32(n * spec.itemReadSize)
-	resp, err := conn.WriteRead(uint32(spec.group), uint32(n), readLen, writeData)
+	resp, err := conn.client.WriteRead(uint32(spec.group), uint32(n), readLen, writeData)
 	if err != nil {
 		if isSumCommandUnsupportedError(err) {
 			spec.stateCASToUnsupported()
@@ -139,7 +139,7 @@ func (conn *Session) SumRead(requests []SumReadRequest) ([]SumReadResult, error)
 // sumReadProbe tries SumReadEx2 then SumReadEx, caching the first that works.
 func (conn *Session) sumReadProbe(count uint32, readLen uint32, writeData []byte, requests []SumReadRequest) ([]SumReadResult, error) {
 	// Try SumReadEx2 (0xF084) first
-	resp, err := conn.WriteRead(uint32(GroupSumupReadEx2), count, readLen, writeData)
+	resp, err := conn.client.WriteRead(uint32(GroupSumupReadEx2), count, readLen, writeData)
 	if err == nil {
 		conn.capabilities.SumReadCmdStore(uint32(GroupSumupReadEx2))
 		conn.logger.Info("SumRead using SumReadEx2 (0xF084)")
@@ -151,7 +151,7 @@ func (conn *Session) sumReadProbe(count uint32, readLen uint32, writeData []byte
 	conn.logger.Info("SumReadEx2 not supported, trying SumReadEx", "error", err)
 
 	// Try SumReadEx (0xF083)
-	resp, err = conn.WriteRead(uint32(GroupSumupReadEx), count, readLen, writeData)
+	resp, err = conn.client.WriteRead(uint32(GroupSumupReadEx), count, readLen, writeData)
 	if err == nil {
 		conn.capabilities.SumReadCmdStore(uint32(GroupSumupReadEx))
 		conn.logger.Info("SumRead using SumReadEx (0xF083)")
@@ -169,7 +169,7 @@ func (conn *Session) sumReadProbe(count uint32, readLen uint32, writeData []byte
 
 // sumReadExec performs a sum read with a known-good command.
 func (conn *Session) sumReadExec(group Group, count uint32, readLen uint32, writeData []byte, requests []SumReadRequest) ([]SumReadResult, error) {
-	resp, err := conn.WriteRead(uint32(group), count, readLen, writeData)
+	resp, err := conn.client.WriteRead(uint32(group), count, readLen, writeData)
 	if err != nil {
 		return nil, fmt.Errorf("SumRead failed: %w", err)
 	}
@@ -273,7 +273,7 @@ func (conn *Session) parseSumReadResponse(resp []byte, n int, requests []SumRead
 func (conn *Session) sumReadFallback(requests []SumReadRequest) ([]SumReadResult, error) {
 	results := make([]SumReadResult, len(requests))
 	for i, req := range requests {
-		data, err := conn.Read(req.Group, req.Offset, req.Length)
+		data, err := conn.client.Read(req.Group, req.Offset, req.Length)
 		if err != nil {
 			results[i].Error = ReturnCodeDeviceError
 			conn.logger.Warn("individual read failed in SumRead fallback", "error", err, "index", i)
@@ -338,7 +338,7 @@ func (conn *Session) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, err
 	// Response: N × 4 bytes (one uint32 error code per item)
 	readLen := uint32(n * 4)
 
-	resp, err := conn.WriteRead(uint32(GroupSumupWrite), uint32(n), readLen, writeData)
+	resp, err := conn.client.WriteRead(uint32(GroupSumupWrite), uint32(n), readLen, writeData)
 	if err != nil {
 		if isSumCommandUnsupportedError(err) {
 			conn.capabilities.SumWriteStateCAS(0, 2) // atomic: only first prober sets
@@ -368,7 +368,7 @@ func (conn *Session) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, err
 func (conn *Session) sumWriteFallback(requests []SumWriteRequest) ([]SumWriteResult, error) {
 	results := make([]SumWriteResult, len(requests))
 	for i, req := range requests {
-		err := conn.Write(req.Group, req.Offset, req.Data)
+		err := conn.client.Write(req.Group, req.Offset, req.Data)
 		if err != nil {
 			results[i].Error = ReturnCodeDeviceError
 			conn.logger.Warn("individual write failed in SumWrite fallback", "error", err, "index", i)
