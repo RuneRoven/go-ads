@@ -2077,8 +2077,7 @@ func TestDeviceNotification_UnknownHandleDuringClose(t *testing.T) {
 	conn.lifecycle.closedCh = make(chan struct{})
 	defer conn.lifecycle.shutdown()
 
-	// Mark connection as closed (flag + FSM — Phase 2 readers use FSM)
-	conn.lifecycle.closed.Store(true)
+	// Mark connection as closed via the FSM (flag removed in Phase 3.b).
 	conn.lifecycle.state.transitionTo(SessionStateClosed)
 	close(conn.lifecycle.closedCh)
 

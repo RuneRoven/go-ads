@@ -1082,8 +1082,10 @@ func waitForReconnect(t *testing.T, conn *Session, timeout time.Duration) {
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 
-	// Phase 1: wait for disconnect to be detected
-	for !conn.IsDisconnected() && !conn.lifecycle.reconnecting.Load() {
+	// Phase 1: wait for disconnect to be detected. IsDisconnected() is FSM-
+	// based and true in {Disconnected, Reconnecting} — both indicate the
+	// drop was observed.
+	for !conn.IsDisconnected() {
 		select {
 		case <-deadline:
 			t.Fatal("reconnect was never triggered within timeout")
@@ -1091,12 +1093,13 @@ func waitForReconnect(t *testing.T, conn *Session, timeout time.Duration) {
 		}
 	}
 
-	// Phase 2: wait for reconnect to fully complete
-	for conn.IsDisconnected() || conn.lifecycle.reconnecting.Load() {
+	// Phase 2: wait for reconnect to fully complete. IsDisconnected() returns
+	// false only after state transitions back to Connected.
+	for conn.IsDisconnected() {
 		select {
 		case <-deadline:
-			t.Fatalf("reconnect did not complete within timeout (disconnected=%v, reconnecting=%v)",
-				conn.IsDisconnected(), conn.lifecycle.reconnecting.Load())
+			t.Fatalf("reconnect did not complete within timeout (state=%v)",
+				conn.lifecycle.state.load())
 		case <-tick.C:
 		}
 	}

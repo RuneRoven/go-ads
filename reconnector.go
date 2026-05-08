@@ -18,10 +18,8 @@ type reconnector struct {
 	waitGroup sync.WaitGroup
 
 	reconnectMu   sync.Mutex // protects reconnectDone
-	reconnecting  atomic.Bool
 	reconnectDone chan struct{}
 
-	closed   atomic.Bool
 	closedCh chan struct{}
 
 	disconnected        atomic.Bool

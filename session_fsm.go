@@ -12,11 +12,11 @@ import (
 // specs/09-fsm-design.md for the full state diagram, event taxonomy, and
 // transition table.
 //
-// During Phase 1 of the FSM rollout the state field is a SHADOW: it is
-// maintained alongside the legacy boolean flags (lifecycle.closed,
-// lifecycle.disconnected, lifecycle.reconnecting) but no code path reads
-// from it for behavior decisions. Phase 2 swaps readers; Phase 3 removes
-// the flags.
+// Phase 3 makes the FSM the source of truth for the closed and reconnecting
+// concerns. The legacy disconnected flag survives one more phase: it
+// represents transport-down (flipped false by dialAndStart), which is a
+// finer-grained signal than the FSM state. Phase 5 (Client extraction)
+// moves it onto the transport type.
 type SessionState uint32
 
 const (
@@ -65,6 +65,10 @@ var allowedTransitions = map[SessionState]map[SessionState]struct{}{
 	SessionStateConnected: {
 		SessionStateReloading:    {},
 		SessionStateDisconnected: {},
+		// Connected -> Reconnecting covers user-initiated force-reconnect
+		// (public Reconnect() call without an intervening drop). Auto-path
+		// reconnects still go Connected -> Disconnected -> Reconnecting.
+		SessionStateReconnecting: {},
 		SessionStateClosed:       {},
 	},
 	SessionStateReloading: {
@@ -104,13 +108,41 @@ func (s *sessionFSM) load() SessionState { return SessionState(s.value.Load()) }
 // prod).
 //
 // Idempotent re-entry (from == want) returns ok=true without rechecking
-// the table — harmless.
+// the table — harmless. Use transitionToOnce() if the caller needs the
+// transition to be the FIRST one to land (Close gate, single-flight
+// Reconnect launch).
 func (s *sessionFSM) transitionTo(want SessionState) (from SessionState, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	from = s.load()
 	if from == want {
 		return from, true
+	}
+	allowed, exists := allowedTransitions[from]
+	if !exists || allowed == nil {
+		return from, false
+	}
+	if _, ok := allowed[want]; !ok {
+		return from, false
+	}
+	s.value.Store(uint32(want))
+	return from, true
+}
+
+// transitionToOnce is like transitionTo but returns ok=false on idempotent
+// re-entry (from == want). Use this when the caller needs to know it is
+// the FIRST goroutine to land the transition — e.g. Close (only one
+// shutdown sequence runs) or Reconnect (only one retry loop launches).
+//
+// Concurrent callers race on s.mu; exactly one observes the from-state
+// other than want and returns ok=true. Subsequent callers see from==want
+// and return ok=false.
+func (s *sessionFSM) transitionToOnce(want SessionState) (from SessionState, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	from = s.load()
+	if from == want {
+		return from, false
 	}
 	allowed, exists := allowedTransitions[from]
 	if !exists || allowed == nil {
@@ -138,9 +170,8 @@ func (conn *Session) transitionState(want SessionState) {
 }
 
 // isClosed reports whether the session has reached the terminal Closed
-// state. Phase 2.a introduces this as the FSM-driven replacement for
-// lifecycle.closed.Load() at the read sites; the boolean flag remains
-// authoritative for writes until Phase 3.
+// state. The FSM is the only source of truth (Phase 3.b removed the
+// legacy closed flag).
 func (conn *Session) isClosed() bool {
 	return conn.lifecycle.state.load() == SessionStateClosed
 }
@@ -155,7 +186,7 @@ func (conn *Session) isDisconnected() bool {
 }
 
 // isReconnecting reports whether a reconnect attempt is in flight.
-// Phase 2.c replacement for legacy lifecycle.reconnecting.Load().
+// FSM-only (legacy reconnecting flag removed in Phase 3.c).
 func (conn *Session) isReconnecting() bool {
 	return conn.lifecycle.state.load() == SessionStateReconnecting
 }

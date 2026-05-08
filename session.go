@@ -315,15 +315,14 @@ func (conn *Session) ensureRouteOnConnect() (registered bool, err error) {
 
 // Close closes connection and waits for completion
 func (conn *Session) Close() {
-	if !conn.lifecycle.closed.CompareAndSwap(false, true) {
-		return // already closed
-	}
 	// Capture transport-disconnected state BEFORE the FSM transitions into
 	// Closed. The cleanup branch below uses this to decide whether to attempt
 	// network ops; once state is Closed, isDisconnected() returns false even
 	// if the transport was already gone.
 	wasDisconnected := conn.isDisconnected()
-	conn.transitionState(SessionStateClosed)
+	if _, ok := conn.lifecycle.state.transitionToOnce(SessionStateClosed); !ok {
+		return // already closed (or transition not permitted from current state)
+	}
 	close(conn.lifecycle.closedCh)
 	conn.logger.Info("Close called, shutting down")
 
@@ -495,9 +494,11 @@ func (conn *Session) Reconnect() error {
 	if conn.isClosed() {
 		return fmt.Errorf("connection closed")
 	}
-	// Prevent concurrent reconnect attempts
-	if !conn.lifecycle.reconnecting.CompareAndSwap(false, true) {
-		conn.logger.Info("reconnect already in progress, skipping")
+	// Prevent concurrent reconnect attempts. transitionToOnce returns
+	// ok=false on idempotent re-entry (state already Reconnecting), which
+	// is exactly the single-flight gate we want.
+	if _, ok := conn.lifecycle.state.transitionToOnce(SessionStateReconnecting); !ok {
+		conn.logger.Info("reconnect already in progress or not permitted from current state, skipping")
 		return nil
 	}
 
@@ -510,7 +511,6 @@ func (conn *Session) Reconnect() error {
 	conn.lifecycle.reconnectMu.Unlock()
 
 	defer func() {
-		conn.lifecycle.reconnecting.Store(false)
 		conn.lifecycle.reconnectMu.Lock()
 		if conn.lifecycle.reconnectDone != nil {
 			close(conn.lifecycle.reconnectDone)
@@ -521,7 +521,9 @@ func (conn *Session) Reconnect() error {
 
 	conn.logger.Info("attempting reconnect")
 	conn.lifecycle.disconnected.Store(true)
-	conn.transitionState(SessionStateReconnecting)
+	// State is already Reconnecting (transitionToOnce above). The redundant
+	// transitionState call removed — Phase 1.1 wired it before the gate
+	// existed.
 
 	// Clear active notifications (old handles invalid after reconnect).
 	conn.notifs.lock.Lock()
