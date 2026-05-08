@@ -104,7 +104,7 @@ type SymbolUploadInfo struct {
 //     Flags, ContextMask, MinUpdateInterval, Parent, Children.
 //
 //   - Guarded by Connection.cache.lock (mutated by parse/Read/Write/loadSymbols):
-//     Value, Valid, ValueParsed, Changed, LastUpdateTime.
+//     Value, Valid, ValueParsed, LastUpdateTime.
 //
 //   - Handle: write-once during getSymbol resolve under cache.lock, then
 //     stable until loadSymbols zeroes the old map (also under cache.lock).
@@ -134,7 +134,6 @@ type Symbol struct {
 	BaseType          uint32 // ADST_ numeric type code from protocol (e.g., ADSTReal32=4 for REAL)
 	Flags             SymbolFlag
 	ContextMask       uint8 // PLC task context (bits 8-11 of Flags); 0 = no task binding
-	Changed           bool
 
 	Value       string
 	Valid       bool
@@ -249,7 +248,7 @@ func (v SymbolView) ChildrenWalk(fn func(SymbolView) bool) {
 
 // collectSubtreeMaxDepth caps recursion depth as defense against malformed
 // data forming a Children cycle. Real PLC struct nesting is at most a few
-// dozen levels; matches parentChangedMaxDepth in readWriter.go.
+// dozen levels.
 const collectSubtreeMaxDepth = 256
 
 func collectSubtree(s *Symbol, conn *Connection, out *[]SymbolView) {
@@ -607,9 +606,9 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (chil
 	return
 }
 
-// GetJSON (onlyChanged bool) string
-func (symbol *Symbol) GetJSON(onlyChanged bool) string {
-	data := symbol.parseSymbol(onlyChanged)
+// GetJSON returns symbol value as JSON string.
+func (symbol *Symbol) GetJSON() string {
+	data := symbol.parseSymbol()
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		getDefaultLogger().Warn("GetJSON marshal error", "symbol", symbol.Name, "error", err)
@@ -621,7 +620,7 @@ func (symbol *Symbol) GetJSON(onlyChanged bool) string {
 var stringsList = map[string]struct{}{"STRING": {}, "WSTRING": {}, "TIME": {}, "TOD": {}, "TIME_OF_DAY": {}, "DATE": {}, "DT": {}, "DATE_AND_TIME": {}}
 
 // parseSymbol returns JSON interface for symbol
-func (symbol *Symbol) parseSymbol(onlyChanged bool) (rData interface{}) {
+func (symbol *Symbol) parseSymbol() (rData interface{}) {
 	if len(symbol.Children) == 0 {
 		if symbol.DataType == "BOOL" {
 			v, err := strconv.ParseBool(symbol.Value)
@@ -645,9 +644,7 @@ func (symbol *Symbol) parseSymbol(onlyChanged bool) (rData interface{}) {
 		for _, child := range symbol.Children {
 			s := strings.ReplaceAll(child.Name, "[", `"[`)
 			s = strings.ReplaceAll(s, "]", `]"`)
-			if !onlyChanged || child.Changed {
-				localMap[s] = child.parseSymbol(onlyChanged)
-			}
+			localMap[s] = child.parseSymbol()
 		}
 		rData = localMap
 	}

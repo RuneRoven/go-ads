@@ -207,7 +207,7 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 		notificationTime = time.Unix(timeStamp, int64(timestamp)%(windowsTick)*100)
 	}
 	// Phase 2: cache.lock for parse() — Symbol fields live in cache.symbols
-	// and parse mutates Value/Changed/Valid. Lock ordering: cache after notifs
+	// and parse mutates Value/Valid. Lock ordering: cache after notifs
 	// release (never both held).
 	// Re-resolve via cache.symbols[FullName]: the symbol fetched from
 	// activeNotifications may be stranded post-reload (loadSymbols swapped

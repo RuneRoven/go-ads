@@ -1109,7 +1109,7 @@ func TestMakeArrayChildrenNonZeroLBound(t *testing.T) {
 
 func TestGetJSON(t *testing.T) {
 	sym := &Symbol{DataType: "INT", Length: 2, Value: "42"}
-	json := sym.GetJSON(false)
+	json := sym.GetJSON()
 	if json != "42" {
 		t.Errorf("got %q, want %q", json, "42")
 	}
@@ -1117,7 +1117,7 @@ func TestGetJSON(t *testing.T) {
 
 func TestGetJSONBool(t *testing.T) {
 	sym := &Symbol{DataType: "BOOL", Length: 1, Value: "true"}
-	json := sym.GetJSON(false)
+	json := sym.GetJSON()
 	if json != "true" {
 		t.Errorf("got %q, want %q", json, "true")
 	}
@@ -1125,7 +1125,7 @@ func TestGetJSONBool(t *testing.T) {
 
 func TestGetJSONString(t *testing.T) {
 	sym := &Symbol{DataType: "STRING", Length: 20, Value: "hello"}
-	json := sym.GetJSON(false)
+	json := sym.GetJSON()
 	if json != `"hello"` {
 		t.Errorf("got %q, want %q", json, `"hello"`)
 	}
@@ -1137,25 +1137,9 @@ func TestGetJSONStruct(t *testing.T) {
 		Name: "s", FullName: "s", DataType: "ST_S", Length: 2,
 		Children: map[string]*Symbol{"x": child},
 	}
-	json := parent.GetJSON(false)
+	json := parent.GetJSON()
 	if !strings.Contains(json, "10") {
 		t.Errorf("expected JSON to contain value 10, got %q", json)
-	}
-}
-
-func TestGetJSONOnlyChanged(t *testing.T) {
-	child1 := &Symbol{Name: "x", FullName: "s.x", DataType: "INT", Length: 2, Value: "10", Changed: true}
-	child2 := &Symbol{Name: "y", FullName: "s.y", DataType: "INT", Length: 2, Value: "20", Changed: false}
-	parent := &Symbol{
-		Name: "s", FullName: "s", DataType: "ST_S", Length: 4,
-		Children: map[string]*Symbol{"x": child1, "y": child2},
-	}
-	json := parent.GetJSON(true)
-	if !strings.Contains(json, "10") {
-		t.Errorf("expected JSON to contain changed value 10, got %q", json)
-	}
-	if strings.Contains(json, "20") {
-		t.Errorf("expected JSON to NOT contain unchanged value 20, got %q", json)
 	}
 }
 
@@ -1233,28 +1217,6 @@ func TestParseUploadSymbolInfoSymbols_TruncatedEntry(t *testing.T) {
 	_, err := parseUploadSymbolInfoSymbols([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, nil)
 	if err == nil {
 		t.Error("expected error for truncated data")
-	}
-}
-
-// --- parentChanged ---
-
-func TestParentChanged(t *testing.T) {
-	// parentChanged walks ancestors only; self.Changed is set by updateValue
-	// before invoking. This isolates the ancestor-walk behavior.
-	grandparent := &Symbol{Name: "root", FullName: "root"}
-	parent := &Symbol{Name: "mid", FullName: "root.mid", Parent: grandparent}
-	child := &Symbol{Name: "leaf", FullName: "root.mid.leaf", Parent: parent}
-
-	child.parentChanged()
-	if !parent.Changed {
-		t.Error("parent should be changed")
-	}
-	if !grandparent.Changed {
-		t.Error("grandparent should be changed")
-	}
-	// child.Changed is the caller's responsibility (updateValue sets it).
-	if child.Changed {
-		t.Error("child should NOT be changed by parentChanged (caller's responsibility)")
 	}
 }
 
@@ -1924,7 +1886,7 @@ func TestWriteToNodeNestedStruct(t *testing.T) {
 
 func TestGetJSON_EmptyValue(t *testing.T) {
 	sym := &Symbol{DataType: "STRING", Length: 10, Value: ""}
-	json := sym.GetJSON(false)
+	json := sym.GetJSON()
 	if json != `""` {
 		t.Errorf("got %q, want %q", json, `""`)
 	}
@@ -1933,27 +1895,11 @@ func TestGetJSON_EmptyValue(t *testing.T) {
 func TestGetJSON_NumericOverflow(t *testing.T) {
 	// ULINT max value — verify JSON doesn't lose precision
 	sym := &Symbol{DataType: "ULINT", Length: 8, Value: "18446744073709551615"}
-	j := sym.GetJSON(false)
+	j := sym.GetJSON()
 	// parseFloat loses precision for uint64 max — this is a known limitation
 	// JSON outputs float64 representation
 	if j == "" {
 		t.Error("expected non-empty JSON output")
-	}
-}
-
-func TestGetJSON_NestedOnlyChanged(t *testing.T) {
-	inner := &Symbol{Name: "a", FullName: "s.a", DataType: "INT", Length: 2, Value: "1", Changed: true}
-	innerUnchanged := &Symbol{Name: "b", FullName: "s.b", DataType: "INT", Length: 2, Value: "2", Changed: false}
-	parent := &Symbol{
-		Name: "s", FullName: "s", DataType: "ST_S", Length: 4,
-		Children: map[string]*Symbol{"a": inner, "b": innerUnchanged},
-	}
-	j := parent.GetJSON(true)
-	if !strings.Contains(j, "1") {
-		t.Errorf("expected changed value 1 in JSON: %s", j)
-	}
-	if strings.Contains(j, `"b"`) {
-		t.Errorf("expected unchanged field b to be excluded: %s", j)
 	}
 }
 
@@ -3133,7 +3079,7 @@ func TestGetJSON_WSTRINGAsString(t *testing.T) {
 		DataType: "WSTRING",
 		Value:    "Hello World",
 	}
-	got := sym.GetJSON(false)
+	got := sym.GetJSON()
 	if got != `"Hello World"` {
 		t.Errorf("expected WSTRING as JSON string, got %s", got)
 	}

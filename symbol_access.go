@@ -88,7 +88,7 @@ func (conn *Connection) readFromSymbolRetry(symbolName string, retriesLeft int) 
 		return "", fmt.Errorf("read %q: %w", symbolName, err)
 	}
 
-	// parse() mutates Symbol fields (Value, Changed, Valid, etc.) so it must
+	// parse() mutates Symbol fields (Value, Valid, etc.) so it must
 	// run under lock to avoid racing with handleNotification.
 	conn.cache.lock.Lock()
 	value, err := symbol.parse(data, 0, datatypes)

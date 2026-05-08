@@ -12,7 +12,7 @@ import (
 // used (LoadSymbols, LoadSymbolsSlow, LoadSymbolList, LoadDataTypes).
 //
 // Lock also covers Symbol mutation during parse() — Symbol objects live
-// in the cache.symbols map and parse() rewrites their Value/Changed/Valid
+// in the cache.symbols map and parse() rewrites their Value/Valid
 // fields. Lock ordering: NEVER hold both cache.lock and notifs.lock at
 // the same time. Paths that need both must release one before acquiring
 // the other.
