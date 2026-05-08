@@ -3018,3 +3018,169 @@ func TestIntegrationReadProcessInputBit(t *testing.T) {
 	}
 	t.Logf("input bit 0.0 = %v", val)
 }
+
+// TestIntegrationDP3HandleLeak validates R-CACHE-016: eager LoadSymbols after
+// on-demand GetSymbol replaces the table. Open question per spec is whether
+// PLC-side handles acquired during on-demand resolve are released or leaked
+// when the cache is replaced. Approach: run 20 cycles of GetSymbol followed
+// by LoadSymbols, log the handle values, and let the caller inspect for
+// strict monotonic growth (= leak signal). 20 cycles is a balance — enough
+// to expose a per-cycle leak, gentle enough to avoid PLC strain.
+func TestIntegrationDP3HandleLeak(t *testing.T) {
+	conn := setupConnection(t)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("initial LoadSymbols failed: %v", err)
+	}
+	symbols, err := conn.ListSymbols()
+	if err != nil {
+		t.Fatalf("ListSymbols failed: %v", err)
+	}
+	picks := pickParseableSymbols(symbols, 2)
+	if len(picks) < 2 {
+		t.Skip("need at least 2 parseable symbols on PLC")
+	}
+	t.Logf("probing handles for %v", picks)
+
+	type sample struct {
+		cycle   int
+		handles []uint32
+	}
+	const cycles = 20
+	samples := make([]sample, 0, cycles)
+
+	for i := 0; i < cycles; i++ {
+		hs := make([]uint32, 0, len(picks))
+		for _, name := range picks {
+			view, gerr := conn.GetSymbol(name)
+			if gerr != nil {
+				t.Fatalf("cycle %d GetSymbol(%q): %v", i, name, gerr)
+			}
+			hs = append(hs, view.Handle)
+		}
+		if lerr := conn.LoadSymbols(); lerr != nil {
+			t.Fatalf("cycle %d LoadSymbols: %v", i, lerr)
+		}
+		samples = append(samples, sample{cycle: i, handles: hs})
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	for _, s := range samples {
+		t.Logf("cycle %2d  handles=%v", s.cycle, s.handles)
+	}
+
+	// Heuristic: if first symbol's handle is strictly monotonic across all
+	// cycles, that is a strong leak signal (PLC handle table never reuses).
+	// If it cycles or stays bounded, the leak is non-existent or tolerable.
+	leak := true
+	for i := 1; i < len(samples); i++ {
+		if samples[i].handles[0] <= samples[i-1].handles[0] {
+			leak = false
+			break
+		}
+	}
+	if leak {
+		t.Logf("WARNING: first-symbol handle is strictly monotonic across %d cycles — possible PLC-side handle leak", cycles)
+	} else {
+		t.Logf("first-symbol handle is NOT strictly monotonic — no obvious leak from %d cycles", cycles)
+	}
+}
+
+// TestIntegrationDP3LoadOrderEquivalence validates R-CACHE-015: LoadSymbolList
+// and LoadDataTypes are commutative — calling one then the other yields the
+// same Symbol.Children tree as the reverse order. Compares structural fields
+// (Name, DataType, Length) recursively; Value is excluded because live PLC
+// values change between the two connections.
+func TestIntegrationDP3LoadOrderEquivalence(t *testing.T) {
+	probeSym := os.Getenv("ADS_READ_STRUCT")
+	if probeSym == "" {
+		// fall back to first available top-level symbol with children
+		conn := setupConnection(t)
+		if err := conn.LoadSymbols(); err != nil {
+			t.Fatalf("LoadSymbols failed: %v", err)
+		}
+		symbols, err := conn.ListSymbols()
+		if err != nil {
+			t.Fatalf("ListSymbols failed: %v", err)
+		}
+		for name, sv := range symbols {
+			if strings.Contains(name, ".") {
+				continue
+			}
+			if len(sv.Children()) > 0 {
+				probeSym = name
+				break
+			}
+		}
+		conn.Close()
+	}
+	if probeSym == "" {
+		t.Skip("no struct symbol available to probe")
+	}
+	t.Logf("probe symbol: %q", probeSym)
+
+	collect := func(sv SymbolView) []string {
+		var out []string
+		var walk func(v SymbolView, path string)
+		walk = func(v SymbolView, path string) {
+			out = append(out, path+":"+v.DataType+"/"+strconv.FormatUint(uint64(v.Length), 10))
+			for cname, cv := range v.Children() {
+				walk(cv, path+"."+cname)
+			}
+		}
+		walk(sv, sv.FullName)
+		// Order-independent comparison: sort.
+		sortable := append([]string(nil), out...)
+		// stable sort via slices.Sort would need import; use bubble for tiny size
+		for i := 0; i < len(sortable); i++ {
+			for j := i + 1; j < len(sortable); j++ {
+				if sortable[j] < sortable[i] {
+					sortable[i], sortable[j] = sortable[j], sortable[i]
+				}
+			}
+		}
+		return sortable
+	}
+
+	// Order A: LoadSymbolList → LoadDataTypes
+	connA := setupConnection(t)
+	if err := connA.LoadSymbolList(SlowDiscoveryConfig{}); err != nil {
+		t.Fatalf("A LoadSymbolList: %v", err)
+	}
+	if err := connA.LoadDataTypes(SlowDiscoveryConfig{}); err != nil {
+		t.Fatalf("A LoadDataTypes: %v", err)
+	}
+	viewA, err := connA.GetSymbol(probeSym)
+	if err != nil {
+		t.Fatalf("A GetSymbol(%q): %v", probeSym, err)
+	}
+	treeA := collect(viewA)
+	connA.Close()
+
+	// Order B: LoadDataTypes → LoadSymbolList
+	connB := setupConnection(t)
+	if err := connB.LoadDataTypes(SlowDiscoveryConfig{}); err != nil {
+		t.Fatalf("B LoadDataTypes: %v", err)
+	}
+	if err := connB.LoadSymbolList(SlowDiscoveryConfig{}); err != nil {
+		t.Fatalf("B LoadSymbolList: %v", err)
+	}
+	viewB, err := connB.GetSymbol(probeSym)
+	if err != nil {
+		t.Fatalf("B GetSymbol(%q): %v", probeSym, err)
+	}
+	treeB := collect(viewB)
+	connB.Close()
+
+	if len(treeA) != len(treeB) {
+		t.Fatalf("tree size differs: A=%d B=%d\nA=%v\nB=%v", len(treeA), len(treeB), treeA, treeB)
+	}
+	for i := range treeA {
+		if treeA[i] != treeB[i] {
+			t.Errorf("tree[%d] differs: A=%q B=%q", i, treeA[i], treeB[i])
+		}
+	}
+	if !t.Failed() {
+		t.Logf("OK — both orders produce %d-node identical tree", len(treeA))
+	}
+}
