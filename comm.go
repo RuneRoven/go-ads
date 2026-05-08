@@ -105,7 +105,7 @@ func (conn *Session) sendRequest(command CommandID, data []byte) (response []byt
 		select {
 		case <-ch:
 			// Reconnect finished — loop will retry if connection is healthy.
-			if conn.isDisconnected() {
+			if conn.isTransportDown() {
 				return nil, ErrDisconnected
 			}
 		case <-conn.lifecycle.closedCh:
@@ -116,7 +116,7 @@ func (conn *Session) sendRequest(command CommandID, data []byte) (response []byt
 }
 
 func (conn *Session) sendRequestOnce(command CommandID, data []byte) (response []byte, err error) {
-	if conn.isDisconnected() {
+	if conn.isTransportDown() {
 		// If a reconnect is in progress, wait for it to finish before giving up
 		conn.lifecycle.reconnectMu.Lock()
 		ch := conn.lifecycle.reconnectDone
@@ -129,7 +129,7 @@ func (conn *Session) sendRequestOnce(command CommandID, data []byte) (response [
 			select {
 			case <-ch:
 				// Reconnect finished — check if we're still disconnected
-				if conn.isDisconnected() {
+				if conn.isTransportDown() {
 					return nil, ErrDisconnected
 				}
 			case <-ctxDone:

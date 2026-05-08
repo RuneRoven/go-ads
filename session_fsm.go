@@ -159,3 +159,18 @@ func (conn *Session) isDisconnected() bool {
 func (conn *Session) isReconnecting() bool {
 	return conn.lifecycle.state.load() == SessionStateReconnecting
 }
+
+// isTransportDown reports whether the underlying TCP transport is not
+// usable for sending. It reads the legacy disconnected flag, which is
+// flipped to false by dialAndStart immediately after a successful dial
+// (i.e. inside the Reconnecting state, between dial and reload). The
+// FSM-level isDisconnected() considers the entire Reconnecting state
+// "no live transport," but during reload/resubscribe the transport IS
+// alive — sendRequest needs to be able to use it to perform the reload
+// itself.
+//
+// Phase 2 keeps this on the legacy flag. Phase 5 (Client extraction)
+// will move this signal onto the transport type, where it belongs.
+func (conn *Session) isTransportDown() bool {
+	return conn.lifecycle.disconnected.Load()
+}
