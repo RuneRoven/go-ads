@@ -2959,7 +2959,7 @@ func TestIntegrationBitSymbol(t *testing.T) {
 func TestIntegrationReadProcessInputSize(t *testing.T) {
 	conn := setupConnection(t)
 
-	size, err := conn.ReadProcessInputSize()
+	size, err := conn.client.ReadProcessInputSize()
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -2976,7 +2976,7 @@ func TestIntegrationReadProcessInput(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Read first 4 bytes of input image
-	data, err := conn.ReadProcessInput(0, 4)
+	data, err := conn.client.ReadProcessInput(0, 4)
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -2993,7 +2993,7 @@ func TestIntegrationReadProcessOutput(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Read first 4 bytes of output image
-	data, err := conn.ReadProcessOutput(0, 4)
+	data, err := conn.client.ReadProcessOutput(0, 4)
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -3010,7 +3010,7 @@ func TestIntegrationReadProcessInputBit(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Read bit 0 of first input byte
-	val, err := conn.ReadProcessInputBit(0, 0)
+	val, err := conn.client.ReadProcessInputBit(0, 0)
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")

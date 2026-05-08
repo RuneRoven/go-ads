@@ -24,27 +24,27 @@ import (
 // which is safer and self-documenting.
 
 // ReadProcessInput reads bytes from the input process image at the given byte offset.
-func (conn *Session) ReadProcessInput(byteOffset, length uint32) ([]byte, error) {
-	return conn.client.Read(uint32(GroupIoImageRwib), byteOffset, length)
+func (c *Client) ReadProcessInput(byteOffset, length uint32) ([]byte, error) {
+	return c.Read(uint32(GroupIoImageRwib), byteOffset, length)
 }
 
 // ReadProcessOutput reads bytes from the output process image at the given byte offset.
-func (conn *Session) ReadProcessOutput(byteOffset, length uint32) ([]byte, error) {
-	return conn.client.Read(uint32(GroupIoImageRwob), byteOffset, length)
+func (c *Client) ReadProcessOutput(byteOffset, length uint32) ([]byte, error) {
+	return c.Read(uint32(GroupIoImageRwob), byteOffset, length)
 }
 
 // WriteProcessOutput writes bytes to the output process image at the given byte offset.
-func (conn *Session) WriteProcessOutput(byteOffset uint32, data []byte) error {
-	return conn.client.Write(uint32(GroupIoImageRwob), byteOffset, data)
+func (c *Client) WriteProcessOutput(byteOffset uint32, data []byte) error {
+	return c.Write(uint32(GroupIoImageRwob), byteOffset, data)
 }
 
 // ReadProcessInputBit reads a single bit from the input process image.
 // bitIndex must be 0-7 (bit within a single byte).
-func (conn *Session) ReadProcessInputBit(byteOffset uint32, bitIndex uint8) (bool, error) {
+func (c *Client) ReadProcessInputBit(byteOffset uint32, bitIndex uint8) (bool, error) {
 	if bitIndex > 7 {
 		return false, fmt.Errorf("bitIndex must be 0-7, got %d", bitIndex)
 	}
-	data, err := conn.client.Read(uint32(GroupIoImageRwix), byteOffset*8+uint32(bitIndex), 1)
+	data, err := c.Read(uint32(GroupIoImageRwix), byteOffset*8+uint32(bitIndex), 1)
 	if err != nil {
 		return false, err
 	}
@@ -56,7 +56,7 @@ func (conn *Session) ReadProcessInputBit(byteOffset uint32, bitIndex uint8) (boo
 
 // WriteProcessOutputBit writes a single bit to the output process image.
 // bitIndex must be 0-7 (bit within a single byte).
-func (conn *Session) WriteProcessOutputBit(byteOffset uint32, bitIndex uint8, value bool) error {
+func (c *Client) WriteProcessOutputBit(byteOffset uint32, bitIndex uint8, value bool) error {
 	if bitIndex > 7 {
 		return fmt.Errorf("bitIndex must be 0-7, got %d", bitIndex)
 	}
@@ -64,12 +64,12 @@ func (conn *Session) WriteProcessOutputBit(byteOffset uint32, bitIndex uint8, va
 	if value {
 		v = 1
 	}
-	return conn.client.Write(uint32(GroupIoImageRwox), byteOffset*8+uint32(bitIndex), []byte{v})
+	return c.Write(uint32(GroupIoImageRwox), byteOffset*8+uint32(bitIndex), []byte{v})
 }
 
 // ReadProcessInputSize returns the size of the input process image in bytes.
-func (conn *Session) ReadProcessInputSize() (uint32, error) {
-	data, err := conn.client.Read(uint32(GroupIoImageRisize), 0, 4)
+func (c *Client) ReadProcessInputSize() (uint32, error) {
+	data, err := c.Read(uint32(GroupIoImageRisize), 0, 4)
 	if err != nil {
 		return 0, err
 	}
@@ -80,11 +80,11 @@ func (conn *Session) ReadProcessInputSize() (uint32, error) {
 }
 
 // ClearProcessInputs writes all input process image bytes to zero.
-func (conn *Session) ClearProcessInputs() error {
-	return conn.client.Write(uint32(GroupIoImageCleari), 0, []byte{0})
+func (c *Client) ClearProcessInputs() error {
+	return c.Write(uint32(GroupIoImageCleari), 0, []byte{0})
 }
 
 // ClearProcessOutputs writes all output process image bytes to zero.
-func (conn *Session) ClearProcessOutputs() error {
-	return conn.client.Write(uint32(GroupIoImageClearo), 0, []byte{0})
+func (c *Client) ClearProcessOutputs() error {
+	return c.Write(uint32(GroupIoImageClearo), 0, []byte{0})
 }
