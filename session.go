@@ -136,6 +136,7 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 
 func (conn *Session) Connect(local bool) error {
 	conn.isLocal = local
+	conn.transitionState(SessionStateConnecting)
 	var err error
 	conn.logger.Debug("dialing", "ip", conn.ip, "port", conn.port)
 	if local {
@@ -271,6 +272,7 @@ func (conn *Session) Connect(local bool) error {
 		conn.cache.symbolVersion = version
 		conn.cache.lock.Unlock()
 	}
+	conn.transitionState(SessionStateConnected)
 	return nil
 }
 
@@ -316,6 +318,7 @@ func (conn *Session) Close() {
 	if !conn.lifecycle.closed.CompareAndSwap(false, true) {
 		return // already closed
 	}
+	conn.transitionState(SessionStateClosed)
 	close(conn.lifecycle.closedCh)
 	conn.logger.Info("Close called, shutting down")
 
@@ -450,6 +453,9 @@ func (conn *Session) triggerReconnect() {
 	// and sets up reconnection. Subsequent callers (e.g. both listen() and transmitWorker()
 	// detecting the same TCP failure) skip the callback to avoid double-firing.
 	firstDetector := conn.lifecycle.disconnected.CompareAndSwap(false, true)
+	if firstDetector {
+		conn.transitionState(SessionStateDisconnected)
+	}
 	conn.lifecycle.reconnectMu.Lock()
 	if conn.lifecycle.reconnectDone == nil {
 		conn.lifecycle.reconnectDone = make(chan struct{})
@@ -510,6 +516,7 @@ func (conn *Session) Reconnect() error {
 
 	conn.logger.Info("attempting reconnect")
 	conn.lifecycle.disconnected.Store(true)
+	conn.transitionState(SessionStateReconnecting)
 
 	// Clear active notifications (old handles invalid after reconnect).
 	conn.notifs.lock.Lock()
@@ -589,6 +596,7 @@ func (conn *Session) Reconnect() error {
 		conn.lifecycle.disconnected.Store(false)
 		conn.lifecycle.reconnectGeneration.Add(1)
 		conn.lifecycle.strictReconnectFailures = 0 // reset on success
+		conn.transitionState(SessionStateConnected)
 		conn.logger.Info("reconnect successful", "attempts", attempts)
 
 		// Fire reconnect callback in goroutine (must not block).

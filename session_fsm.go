@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -120,4 +121,18 @@ func (s *sessionFSM) transitionTo(want SessionState) (from SessionState, ok bool
 	}
 	s.value.Store(uint32(want))
 	return from, true
+}
+
+// transitionState advances the FSM state and logs invalid transitions at
+// WARN. Used by call sites that already maintain the legacy boolean flags;
+// the FSM call rides alongside as a shadow audit (Phase 1) until readers
+// and writers swap over.
+func (conn *Session) transitionState(want SessionState) {
+	from, ok := conn.lifecycle.state.transitionTo(want)
+	if !ok {
+		conn.logger.Warn("FSM invalid transition (Phase 1 shadow — ignoring)",
+			"from", from, "to", want)
+		return
+	}
+	conn.logger.Log(context.Background(), LevelTrace, "FSM transition", "from", from, "to", want)
 }
