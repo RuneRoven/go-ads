@@ -26,6 +26,14 @@ type transport struct {
 	currentRequest    atomic.Uint32
 	activeRequestLock sync.Mutex // protects activeRequests against concurrent map access
 	activeRequests    map[uint32]chan []byte
+
+	// disconnected reflects whether the underlying socket is usable for
+	// sending. Flipped to false by Client.Dial after a successful TCP dial
+	// (and by Session.dialAndStart on reconnect); flipped to true on
+	// triggerReconnect, Reconnect entry, resetForRetry, and Close.
+	// Phase 5.c relocated the flag from reconnector to transport so the
+	// transport-down signal lives next to the socket it represents.
+	disconnected atomic.Bool
 }
 
 // recvWorkerCount is the number of goroutines consuming recvQueue. Each

@@ -476,7 +476,7 @@ func (conn *Session) triggerReconnect() {
 	// CAS ensures only the first goroutine to detect disconnect fires the callback
 	// and sets up reconnection. Subsequent callers (e.g. both listen() and transmitWorker()
 	// detecting the same TCP failure) skip the callback to avoid double-firing.
-	firstDetector := conn.lifecycle.disconnected.CompareAndSwap(false, true)
+	firstDetector := conn.tx.disconnected.CompareAndSwap(false, true)
 	if firstDetector {
 		conn.transitionState(SessionStateDisconnected)
 	}
@@ -540,7 +540,7 @@ func (conn *Session) Reconnect() error {
 	}()
 
 	conn.logger.Info("attempting reconnect")
-	conn.lifecycle.disconnected.Store(true)
+	conn.tx.disconnected.Store(true)
 	// State is already Reconnecting (transitionToOnce above). The redundant
 	// transitionState call removed — Phase 1.1 wired it before the gate
 	// existed.
@@ -620,7 +620,7 @@ func (conn *Session) Reconnect() error {
 			continue
 		}
 
-		conn.lifecycle.disconnected.Store(false)
+		conn.tx.disconnected.Store(false)
 		conn.lifecycle.strictReconnectFailures = 0 // reset on success
 		// epoch bumps inside the transition helper when target == Connected.
 		conn.transitionState(SessionStateConnected)
@@ -827,7 +827,7 @@ func (conn *Session) dialAndStart() error {
 	conn.tx.connection = newConn
 	conn.tx.connMu.Unlock()
 	configureKeepAlive(newConn)
-	conn.lifecycle.disconnected.Store(false)
+	conn.tx.disconnected.Store(false)
 	if conn.isClosed() {
 		// Session was Closed mid-dial. Don't Add to waitGroup.
 		conn.tx.connMu.Lock()
@@ -987,7 +987,7 @@ func (conn *Session) resubscribeNotifications() error {
 // resetForRetry tears down goroutines, closes the TCP connection, and resets
 // channels/state so the next retry iteration starts clean.
 func (conn *Session) resetForRetry() {
-	conn.lifecycle.disconnected.Store(true)
+	conn.tx.disconnected.Store(true)
 	conn.tearDownAndReset(false)
 	// Allow route re-registration on next attempt (PLC may have rebooted)
 }

@@ -240,5 +240,5 @@ func (conn *Session) bumpEpoch() {
 //
 //nolint:unused // re-wired by Phase 5.c.
 func (conn *Session) isTransportDown() bool {
-	return conn.lifecycle.disconnected.Load()
+	return conn.tx.disconnected.Load()
 }

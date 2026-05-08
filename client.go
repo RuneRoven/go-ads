@@ -125,11 +125,11 @@ func Dial(
 
 // Close cancels worker goroutines, closes the TCP connection, and waits for
 // workers to exit. Idempotent: subsequent calls are no-ops returning nil.
-//
-// Phase 5.a-types: workers are not yet spawned here, so the WaitGroup is
-// zero and Wait() returns immediately. The TCP socket is closed.
+// Sets tx.disconnected so any subsequent RPC method returns
+// ErrTransportClosed immediately.
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
+		c.tx.disconnected.Store(true)
 		c.cancel()
 		c.tx.connMu.Lock()
 		if c.tx.connection != nil {
@@ -435,11 +435,14 @@ func (c *Client) send(data []byte) ([]byte, error) {
 // pushes the frame to the transmit worker, and waits for the response or
 // context timeout.
 //
-// No retry on transport drop — at the Client layer, drops are terminal
-// (caller observes via context.Canceled when c.ctx fires; future calls hit
-// the closed sendChannel or block on context). Session wraps this with
-// wait-for-reconnect retry semantics in its own sendRequest method.
+// Returns ErrTransportClosed immediately if the transport is known dead
+// (Close called or drop detected). Otherwise no retry — drops mid-flight
+// surface as context.Canceled / DeadlineExceeded; Session wraps this with
+// wait-for-reconnect retry semantics in its own helpers.
 func (c *Client) sendRequest(command CommandID, data []byte) ([]byte, error) {
+	if c.tx.disconnected.Load() {
+		return nil, ErrTransportClosed
+	}
 	c.tx.activeRequestLock.Lock()
 	id := c.tx.currentRequest.Inc()
 	c.tx.activeRequests[id] = make(chan []byte, 1)

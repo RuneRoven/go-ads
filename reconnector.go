@@ -3,8 +3,6 @@ package ads
 import (
 	"context"
 	"sync"
-
-	"go.uber.org/atomic"
 )
 
 // reconnector owns the connection lifecycle FSM state: ctx + shutdown for
@@ -21,8 +19,6 @@ type reconnector struct {
 	reconnectDone chan struct{}
 
 	closedCh chan struct{}
-
-	disconnected atomic.Bool
 
 	// state is the explicit FSM state plus the unified epoch counter
 	// (specs/09-fsm-design.md). FSM is the source of truth for closed and
