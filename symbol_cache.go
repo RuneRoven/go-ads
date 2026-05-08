@@ -11,7 +11,7 @@ import (
 //
 // Lock also covers Symbol mutation during parse() — Symbol objects live
 // in the cache.symbols map and parse() rewrites their Value/Valid
-// fields. Lock ordering: NEVER hold both cache.lock and notifs.lock at
+// fields. Lock ordering: NEVER hold both cache.lock and notifications.lock at
 // the same time. Paths that need both must release one before acquiring
 // the other.
 //
@@ -22,10 +22,10 @@ import (
 // across an insert.
 //
 // Callers that need to publish a *Symbol pointer they obtained pre-roundtrip
-// into another data structure (e.g. notifs.activeNotifications) MUST capture
+// into another data structure (e.g. notifications.activeNotifications) MUST capture
 // the epoch before resolve and recheck before commit; if the value changed,
 // the pointer is stranded and must be discarded. Closes the residual race
-// window between cache.lock release and notifs.lock acquire that the
+// window between cache.lock release and notifications.lock acquire that the
 // simple re-fetch pattern leaves open.
 type symbolCache struct {
 	lock               sync.Mutex

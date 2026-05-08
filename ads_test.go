@@ -1968,10 +1968,10 @@ func buildNotificationPacketMultiSample(stamps []struct {
 func newTestConnection() *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := &Session{
-		lifecycle: &sessionLifecycle{ctx: ctx, shutdown: cancel},
-		notifs:    &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
-		cache:     &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
-		logger:    getDefaultLogger(),
+		lifecycle:     &sessionLifecycle{ctx: ctx, shutdown: cancel},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
+		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
+		logger:        getDefaultLogger(),
 	}
 	conn.client = &Client{
 		logger: conn.logger,
@@ -2003,7 +2003,7 @@ func TestDeviceNotification_SingleSample(t *testing.T) {
 		Length:       2,
 		Notification: ch,
 	}
-	conn.notifs.activeNotifications[42] = sym
+	conn.notifications.activeNotifications[42] = sym
 	conn.cache.symbols[symbolKey(sym.FullName)] = sym
 
 	// Build INT value = 1234
@@ -2150,8 +2150,8 @@ func TestDeviceNotification_MultipleStampsAndSamples(t *testing.T) {
 	ch := make(chan *Update, 10)
 	sym1 := &Symbol{FullName: "var1", DataType: "BYTE", Length: 1, Notification: ch}
 	sym2 := &Symbol{FullName: "var2", DataType: "BYTE", Length: 1, Notification: ch}
-	conn.notifs.activeNotifications[1] = sym1
-	conn.notifs.activeNotifications[2] = sym2
+	conn.notifications.activeNotifications[1] = sym1
+	conn.notifications.activeNotifications[2] = sym2
 	conn.cache.symbols[symbolKey(sym1.FullName)] = sym1
 	conn.cache.symbols[symbolKey(sym2.FullName)] = sym2
 
@@ -2254,7 +2254,7 @@ func TestDeviceNotification_BoolType(t *testing.T) {
 
 	ch := make(chan *Update, 5)
 	sym := &Symbol{FullName: "MAIN.bFlag", DataType: "BOOL", Length: 1, Notification: ch}
-	conn.notifs.activeNotifications[10] = sym
+	conn.notifications.activeNotifications[10] = sym
 	conn.cache.symbols[symbolKey(sym.FullName)] = sym
 
 	packet := buildNotificationPacket(10, 0, []byte{1})
@@ -2279,7 +2279,7 @@ func TestDeviceNotification_StringType(t *testing.T) {
 
 	ch := make(chan *Update, 5)
 	sym := &Symbol{FullName: "MAIN.sName", DataType: "STRING", Length: 20, Notification: ch}
-	conn.notifs.activeNotifications[11] = sym
+	conn.notifications.activeNotifications[11] = sym
 	conn.cache.symbols[symbolKey(sym.FullName)] = sym
 
 	strData := make([]byte, 20)

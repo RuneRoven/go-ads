@@ -392,9 +392,9 @@ func TestIntegrationNotification(t *testing.T) {
 	}
 
 	// Verify no active notifications before subscribe
-	conn.notifs.lock.Lock()
-	beforeCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	beforeCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if beforeCount != 0 {
 		t.Fatalf("expected 0 active notifications before subscribe, got %d", beforeCount)
 	}
@@ -407,10 +407,10 @@ func TestIntegrationNotification(t *testing.T) {
 	t.Logf("notification handle: %d", handle)
 
 	// Verify handle is tracked
-	conn.notifs.lock.Lock()
-	afterCount := len(conn.notifs.activeNotifications)
-	_, tracked := conn.notifs.activeNotifications[handle]
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	afterCount := len(conn.notifications.activeNotifications)
+	_, tracked := conn.notifications.activeNotifications[handle]
+	conn.notifications.lock.Unlock()
 	if afterCount != 1 {
 		t.Errorf("expected 1 active notification after subscribe, got %d", afterCount)
 	}
@@ -430,9 +430,9 @@ func TestIntegrationNotification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteDeviceNotification(%d) failed: %v", handle, err)
 	}
-	conn.notifs.lock.Lock()
-	cleanupCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	cleanupCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if cleanupCount != 0 {
 		t.Errorf("expected 0 active notifications after delete, got %d", cleanupCount)
 	}
@@ -457,11 +457,11 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 	ch := make(chan *Update, 10)
 
 	// Verify clean state
-	conn.notifs.lock.Lock()
-	if len(conn.notifs.activeNotifications) != 0 {
-		t.Fatalf("expected 0 active notifications at start, got %d", len(conn.notifs.activeNotifications))
+	conn.notifications.lock.Lock()
+	if len(conn.notifications.activeNotifications) != 0 {
+		t.Fatalf("expected 0 active notifications at start, got %d", len(conn.notifications.activeNotifications))
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 
 	// Subscribe
 	handle, err := conn.AddSymbolNotification(symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch)
@@ -471,11 +471,11 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 	t.Logf("subscribed to %s (handle=%d)", symbolName, handle)
 
 	// Verify handle is tracked
-	conn.notifs.lock.Lock()
-	if _, ok := conn.notifs.activeNotifications[handle]; !ok {
+	conn.notifications.lock.Lock()
+	if _, ok := conn.notifications.activeNotifications[handle]; !ok {
 		t.Errorf("handle %d not tracked in activeNotifications after subscribe", handle)
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 
 	// Wait briefly for a notification
 	select {
@@ -493,14 +493,14 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 	t.Logf("unsubscribed handle %d", handle)
 
 	// Verify handle removed from tracking
-	conn.notifs.lock.Lock()
-	if _, ok := conn.notifs.activeNotifications[handle]; ok {
+	conn.notifications.lock.Lock()
+	if _, ok := conn.notifications.activeNotifications[handle]; ok {
 		t.Errorf("handle %d still in activeNotifications after DeleteDeviceNotification", handle)
 	}
-	if len(conn.notifs.activeNotifications) != 0 {
-		t.Errorf("expected 0 active notifications after unsubscribe, got %d", len(conn.notifs.activeNotifications))
+	if len(conn.notifications.activeNotifications) != 0 {
+		t.Errorf("expected 0 active notifications after unsubscribe, got %d", len(conn.notifications.activeNotifications))
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 
 	// Verify no more notifications arrive after unsubscribe
 	select {
@@ -529,9 +529,9 @@ func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
 	ch := make(chan *Update, 100)
 
 	// Verify clean state
-	conn.notifs.lock.Lock()
-	startCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	startCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if startCount != 0 {
 		t.Fatalf("expected 0 active notifications at start, got %d", startCount)
 	}
@@ -548,9 +548,9 @@ func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
 	}
 
 	// Verify all handles are tracked
-	conn.notifs.lock.Lock()
-	activeCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	activeCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if activeCount != len(handles) {
 		t.Errorf("expected %d active notifications, got %d", len(handles), activeCount)
 	}
@@ -561,9 +561,9 @@ func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DeleteDeviceNotification(%d) failed: %v", handle, err)
 		}
-		conn.notifs.lock.Lock()
-		remaining := len(conn.notifs.activeNotifications)
-		conn.notifs.lock.Unlock()
+		conn.notifications.lock.Lock()
+		remaining := len(conn.notifications.activeNotifications)
+		conn.notifications.lock.Unlock()
 		expected := len(handles) - i - 1
 		if remaining != expected {
 			t.Errorf("after deleting handle %d: expected %d active, got %d", handle, expected, remaining)
@@ -571,9 +571,9 @@ func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
 	}
 
 	// Final check: zero handles remaining
-	conn.notifs.lock.Lock()
-	finalCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	finalCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if finalCount != 0 {
 		t.Errorf("expected 0 active notifications after deleting all, got %d", finalCount)
 	}
@@ -628,9 +628,9 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	}
 
 	// Verify handles are active
-	conn.notifs.lock.Lock()
-	activeBeforeClose := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	activeBeforeClose := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if activeBeforeClose != len(handles) {
 		t.Errorf("expected %d active notifications before Close, got %d", len(handles), activeBeforeClose)
 	}
@@ -659,9 +659,9 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 
 	// If old handles leaked, subscribing again would still work (PLC allows many),
 	// but we verify no tracking leaks on our side
-	conn2.notifs.lock.Lock()
-	freshCount := len(conn2.notifs.activeNotifications)
-	conn2.notifs.lock.Unlock()
+	conn2.notifications.lock.Lock()
+	freshCount := len(conn2.notifications.activeNotifications)
+	conn2.notifications.lock.Unlock()
 	if freshCount != 0 {
 		t.Errorf("fresh connection should have 0 active notifications, got %d", freshCount)
 	}
@@ -677,9 +677,9 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 		}
 	}
 
-	conn2.notifs.lock.Lock()
-	resubCount := len(conn2.notifs.activeNotifications)
-	conn2.notifs.lock.Unlock()
+	conn2.notifications.lock.Lock()
+	resubCount := len(conn2.notifications.activeNotifications)
+	conn2.notifications.lock.Unlock()
 	if resubCount != len(symbolNames) {
 		t.Errorf("expected %d active notifications after re-subscribe, got %d", len(symbolNames), resubCount)
 	}
@@ -1295,9 +1295,9 @@ func TestIntegrationBatchNotification(t *testing.T) {
 	}
 
 	// Verify all handles tracked
-	conn.notifs.lock.Lock()
-	activeCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	activeCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if activeCount != len(names) {
 		t.Errorf("expected %d active notifications, got %d", len(names), activeCount)
 	}
@@ -1312,12 +1312,12 @@ func TestIntegrationBatchNotification(t *testing.T) {
 	}
 
 	// Batch delete via SumDeleteDeviceNotification
-	conn.notifs.lock.Lock()
+	conn.notifications.lock.Lock()
 	var handles []uint32
-	for h := range conn.notifs.activeNotifications {
+	for h := range conn.notifications.activeNotifications {
 		handles = append(handles, h)
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 
 	codes, err := conn.SumDeleteDeviceNotification(handles)
 	if err != nil {
@@ -1329,9 +1329,9 @@ func TestIntegrationBatchNotification(t *testing.T) {
 		}
 	}
 
-	conn.notifs.lock.Lock()
-	finalCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	finalCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if finalCount != 0 {
 		t.Errorf("expected 0 active notifications after batch delete, got %d", finalCount)
 	}
@@ -1623,13 +1623,13 @@ func TestIntegrationSumNotifFallbackForced(t *testing.T) {
 	}
 
 	// Verify handles tracked
-	conn.notifs.lock.Lock()
-	activeCount := len(conn.notifs.activeNotifications)
+	conn.notifications.lock.Lock()
+	activeCount := len(conn.notifications.activeNotifications)
 	var handles []uint32
-	for h := range conn.notifs.activeNotifications {
+	for h := range conn.notifications.activeNotifications {
 		handles = append(handles, h)
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 
 	if activeCount != len(names) {
 		t.Errorf("expected %d active notifications, got %d", len(names), activeCount)
@@ -1712,12 +1712,12 @@ done:
 	}
 
 	// Cleanup: copy handles first to avoid mutating map during iteration
-	conn.notifs.lock.Lock()
-	handles := make([]uint32, 0, len(conn.notifs.activeNotifications))
-	for h := range conn.notifs.activeNotifications {
+	conn.notifications.lock.Lock()
+	handles := make([]uint32, 0, len(conn.notifications.activeNotifications))
+	for h := range conn.notifications.activeNotifications {
 		handles = append(handles, h)
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 	for _, h := range handles {
 		_ = conn.DeleteDeviceNotification(h)
 	}
@@ -2492,12 +2492,12 @@ done:
 	t.Logf("total: %d notifications across %d symbols", totalSeen, len(seen))
 
 	// Cleanup
-	conn.notifs.lock.Lock()
+	conn.notifications.lock.Lock()
 	var handles []uint32
-	for h := range conn.notifs.activeNotifications {
+	for h := range conn.notifications.activeNotifications {
 		handles = append(handles, h)
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 	_, _ = conn.SumDeleteDeviceNotification(handles)
 }
 
@@ -2591,9 +2591,9 @@ func TestIntegrationLargeBatchNotification(t *testing.T) {
 	}
 
 	// Verify all tracked
-	conn.notifs.lock.Lock()
-	activeCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	activeCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if activeCount != len(names) {
 		t.Errorf("expected %d active notifications, got %d", len(names), activeCount)
 	}
@@ -2616,12 +2616,12 @@ done:
 	}
 
 	// Bulk cleanup
-	conn.notifs.lock.Lock()
+	conn.notifications.lock.Lock()
 	var handles []uint32
-	for h := range conn.notifs.activeNotifications {
+	for h := range conn.notifications.activeNotifications {
 		handles = append(handles, h)
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 	_, _ = conn.SumDeleteDeviceNotification(handles)
 }
 
@@ -2825,9 +2825,9 @@ func TestIntegrationRapidSubscribeUnsubscribe(t *testing.T) {
 	}
 
 	// Verify clean state after rapid churn
-	conn.notifs.lock.Lock()
-	remaining := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	remaining := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if remaining != 0 {
 		t.Errorf("expected 0 active notifications after %d cycles, got %d", iterations, remaining)
 	}

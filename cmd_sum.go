@@ -439,7 +439,7 @@ func (c *Client) SumAddDeviceNotification(requests []SumNotificationRequest) ([]
 //
 // Returns the per-handle ReturnCode slice from the PLC. Persistent
 // activeNotifications cleanup is the caller's responsibility; Session
-// wraps this with its notifs.lock cleanup in Session.SumDeleteDeviceNotification.
+// wraps this with its notifications.lock cleanup in Session.SumDeleteDeviceNotification.
 func (c *Client) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error) {
 	spec := sumCmdSpec[uint32, ReturnCode]{
 		stateLoad:             c.capabilities.SumDeleteNotifStateLoad,
@@ -488,7 +488,7 @@ func (c *Client) sumAddNotificationFallback(requests []SumNotificationRequest) (
 }
 
 // bestEffortDeleteNotifications attempts to delete the given handles via
-// SumDeleteDeviceNotification (Session wrapper, so notifs cleanup also
+// SumDeleteDeviceNotification (Session wrapper, so notifications cleanup also
 // fires). Errors are logged but never returned — this is for cleanup
 // paths where the caller cannot meaningfully react to a failure (e.g.
 // PLC unreachable during a reconnect retry). Returns the count of

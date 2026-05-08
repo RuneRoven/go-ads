@@ -49,18 +49,18 @@ const resubscribeMaxAttempts = 3
 // remove the PLC-side registration before the channel is no longer used.
 func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Duration, cycleTime time.Duration, transMode TransMode, updateReceiver chan *Update) (uint32, error) {
 	// Pre-check: channel match + duplicate-subscribe.
-	sess.notifs.lock.Lock()
-	if sess.notifs.notificationChannel != nil && sess.notifs.notificationChannel != updateReceiver {
-		sess.notifs.lock.Unlock()
+	sess.notifications.lock.Lock()
+	if sess.notifications.notificationChannel != nil && sess.notifications.notificationChannel != updateReceiver {
+		sess.notifications.lock.Unlock()
 		return 0, fmt.Errorf("all symbol notifications on a connection must use the same updateReceiver channel")
 	}
-	for _, cfg := range sess.notifs.notificationConfigs {
+	for _, cfg := range sess.notifications.notificationConfigs {
 		if strings.EqualFold(cfg.SymbolName, symbolName) {
-			sess.notifs.lock.Unlock()
+			sess.notifications.lock.Unlock()
 			return 0, fmt.Errorf("symbol %q already has an active notification; delete it before re-subscribing", symbolName)
 		}
 	}
-	sess.notifs.lock.Unlock()
+	sess.notifications.lock.Unlock()
 
 	symbol, err := sess.getSymbol(symbolName)
 	if err != nil {
@@ -98,10 +98,10 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 	// pre-roundtrip may be orphaned if loadSymbols swapped the cache during
 	// the network call; using the stranded pointer would write notifications
 	// into a Symbol no longer reachable via ReadFromSymbol. Take cache.lock
-	// FIRST and release before taking notifs.lock (lock-ordering rule).
-	// Capture epoch under the lock; re-check it under notifs.lock
+	// FIRST and release before taking notifications.lock (lock-ordering rule).
+	// Capture epoch under the lock; re-check it under notifications.lock
 	// (atomic Load is lock-free) to close the residual race window where a
-	// THIRD loadSymbols could run between cache.lock release and notifs.lock
+	// THIRD loadSymbols could run between cache.lock release and notifications.lock
 	// acquire and re-strand `fresh`.
 	sess.cache.lock.Lock()
 	fresh := sess.cache.symbols[symbolKey(symbolName)]
@@ -114,29 +114,29 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 		}
 		return 0, fmt.Errorf("symbol %q removed from cache during subscribe (likely online change or LoadSymbols)", symbolName)
 	}
-	// Re-check under notifs.lock to defend the channel/duplicate invariants
+	// Re-check under notifications.lock to defend the channel/duplicate invariants
 	// against concurrent callers that passed the pre-check while we were
 	// doing the PLC roundtrip. On mismatch, release the just-acquired PLC handle.
-	sess.notifs.lock.Lock()
+	sess.notifications.lock.Lock()
 	if sess.epoch() != cacheGen {
-		sess.notifs.lock.Unlock()
+		sess.notifications.lock.Unlock()
 		if delErr := sess.DeleteDeviceNotification(handle); delErr != nil {
 			sess.logger.Warn("failed to release PLC handle after cache reload during subscribe",
 				"handle", handle, "symbol", symbolName, "error", delErr)
 		}
 		return 0, fmt.Errorf("symbol %q stranded by concurrent cache reload during subscribe", symbolName)
 	}
-	if sess.notifs.notificationChannel != nil && sess.notifs.notificationChannel != updateReceiver {
-		sess.notifs.lock.Unlock()
+	if sess.notifications.notificationChannel != nil && sess.notifications.notificationChannel != updateReceiver {
+		sess.notifications.lock.Unlock()
 		if delErr := sess.DeleteDeviceNotification(handle); delErr != nil {
 			sess.logger.Warn("failed to release PLC handle after channel-mismatch reject",
 				"handle", handle, "symbol", symbolName, "error", delErr)
 		}
 		return 0, fmt.Errorf("all symbol notifications on a connection must use the same updateReceiver channel")
 	}
-	for _, cfg := range sess.notifs.notificationConfigs {
+	for _, cfg := range sess.notifications.notificationConfigs {
 		if strings.EqualFold(cfg.SymbolName, symbolName) {
-			sess.notifs.lock.Unlock()
+			sess.notifications.lock.Unlock()
 			if delErr := sess.DeleteDeviceNotification(handle); delErr != nil {
 				sess.logger.Warn("failed to release PLC handle after duplicate-subscribe reject",
 					"handle", handle, "symbol", symbolName, "error", delErr)
@@ -144,23 +144,23 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 			return 0, fmt.Errorf("symbol %q already has an active notification; delete it before re-subscribing", symbolName)
 		}
 	}
-	defer sess.notifs.lock.Unlock()
+	defer sess.notifications.lock.Unlock()
 	fresh.Notification = updateReceiver
-	sess.notifs.activeNotifications[handle] = fresh
+	sess.notifications.activeNotifications[handle] = fresh
 
 	// Save config for reconnect re-subscribe
-	sess.notifs.notificationConfigs = append(sess.notifs.notificationConfigs, NotificationConfig{
+	sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs, NotificationConfig{
 		SymbolName:       symbolName,
 		MaxDelay:         maxDelay,
 		CycleTime:        cycleTime,
 		TransmissionMode: transMode,
 	})
-	sess.notifs.notificationChannel = updateReceiver
+	sess.notifications.notificationChannel = updateReceiver
 	// record subscribe time so handleNotification suppresses the
 	// "unknown handle" Warn for any notifications arriving in the small
 	// race window between PLC firing the first sample and the map insert
 	// completing here.
-	sess.notifs.lastSubscribeNs.Store(time.Now().UnixNano())
+	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
 
 	return handle, nil
 }
@@ -192,16 +192,16 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 	// Snapshot already-subscribed symbol names so we can reject duplicates
 	// pre-flight; the same check is repeated under the post-PLC lock to close
 	// the TOCTOU window where a concurrent caller subscribed mid-roundtrip.
-	sess.notifs.lock.Lock()
-	if sess.notifs.notificationChannel != nil && sess.notifs.notificationChannel != ch {
-		sess.notifs.lock.Unlock()
+	sess.notifications.lock.Lock()
+	if sess.notifications.notificationChannel != nil && sess.notifications.notificationChannel != ch {
+		sess.notifications.lock.Unlock()
 		return nil, fmt.Errorf("all symbol notifications on a connection must use the same updateReceiver channel")
 	}
-	existing := make(map[string]struct{}, len(sess.notifs.notificationConfigs))
-	for _, cfg := range sess.notifs.notificationConfigs {
+	existing := make(map[string]struct{}, len(sess.notifications.notificationConfigs))
+	for _, cfg := range sess.notifications.notificationConfigs {
 		existing[symbolKey(cfg.SymbolName)] = struct{}{}
 	}
-	sess.notifs.lock.Unlock()
+	sess.notifications.lock.Unlock()
 
 	// Resolve symbols and build requests; track which result index maps to
 	// which request slot so we can splice the sum response back.
@@ -277,9 +277,9 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 	// pointer would be orphaned (Handle=0, Value=""), and later
 	// handleNotification would parse into the stranded Symbol while
 	// ReadFromSymbol would see a different fresh entry.
-	// Capture epoch under the lock; re-check it under notifs.lock
+	// Capture epoch under the lock; re-check it under notifications.lock
 	// to close the residual race where a third loadSymbols runs between
-	// cache.lock release and notifs.lock acquire.
+	// cache.lock release and notifications.lock acquire.
 	freshSymbols := make([]*Symbol, len(infos))
 	sess.cache.lock.Lock()
 	for i, info := range infos {
@@ -288,8 +288,8 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 	cacheGen := sess.epoch()
 	sess.cache.lock.Unlock()
 
-	sess.notifs.lock.Lock()
-	defer sess.notifs.lock.Unlock()
+	sess.notifications.lock.Lock()
+	defer sess.notifications.lock.Unlock()
 
 	// Generation re-check: if cache swapped between our cache.lock release
 	// and now, every freshSymbols[] entry is potentially stranded - mark all
@@ -312,8 +312,8 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 	// TOCTOU re-check: another goroutine may have subscribed one of our names
 	// while we were doing the PLC roundtrip. Mark such items Skipped and
 	// surface handle so the caller can release the PLC-side registration.
-	postExisting := make(map[string]struct{}, len(sess.notifs.notificationConfigs))
-	for _, cfg := range sess.notifs.notificationConfigs {
+	postExisting := make(map[string]struct{}, len(sess.notifications.notificationConfigs))
+	for _, cfg := range sess.notifications.notificationConfigs {
 		postExisting[symbolKey(cfg.SymbolName)] = struct{}{}
 	}
 
@@ -347,13 +347,13 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 		}
 		results[info.configIndex] = r
 		fresh.Notification = ch
-		sess.notifs.activeNotifications[r.Handle] = fresh
+		sess.notifications.activeNotifications[r.Handle] = fresh
 		// Reset resubscribe attempts on successful subscribe; if this entry
 		// originated from a previous reconnect Skipped retry, the counter is
 		// no longer relevant.
 		commitCfg := info.config
 		commitCfg.resubscribeAttempts = 0
-		sess.notifs.notificationConfigs = append(sess.notifs.notificationConfigs, commitCfg)
+		sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs, commitCfg)
 		postExisting[key] = struct{}{}
 		successes++
 		sess.logger.Info("batch notification created",
@@ -362,23 +362,23 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 	}
 
 	if successes > 0 {
-		sess.notifs.notificationChannel = ch
+		sess.notifications.notificationChannel = ch
 		// record subscribe time so handleNotification suppresses the
 		// "unknown handle" Warn for any notifications arriving in the small
 		// race window between PLC firing the first sample and the map insert
 		// completing here.
-		sess.notifs.lastSubscribeNs.Store(time.Now().UnixNano())
+		sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
 	}
 
 	return results, nil
 }
 
 // removeNotificationConfig removes the first config matching symbolName.
-// Must be called with notifs.lock held.
+// Must be called with notifications.lock held.
 func (sess *Session) removeNotificationConfig(symbolName string) {
-	for i, cfg := range sess.notifs.notificationConfigs {
+	for i, cfg := range sess.notifications.notificationConfigs {
 		if strings.EqualFold(cfg.SymbolName, symbolName) {
-			sess.notifs.notificationConfigs = append(sess.notifs.notificationConfigs[:i], sess.notifs.notificationConfigs[i+1:]...)
+			sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs[:i], sess.notifications.notificationConfigs[i+1:]...)
 			return
 		}
 	}

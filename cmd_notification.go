@@ -102,7 +102,7 @@ func (c *Client) DeleteDeviceNotification(handle uint32) error {
 }
 
 // DeleteDeviceNotification on Session wraps the raw Client RPC with
-// notifs.lock cleanup: removes the entry from activeNotifications, drops
+// notifications.lock cleanup: removes the entry from activeNotifications, drops
 // the cached notificationConfig, and clears notificationChannel when the
 // last subscription dies. Callers that want raw delete behavior use
 // the Client method directly.
@@ -110,20 +110,20 @@ func (sess *Session) DeleteDeviceNotification(handle uint32) error {
 	if err := sess.client.DeleteDeviceNotification(handle); err != nil {
 		return err
 	}
-	sess.notifs.lock.Lock()
-	if sym := sess.notifs.activeNotifications[handle]; sym != nil {
+	sess.notifications.lock.Lock()
+	if sym := sess.notifications.activeNotifications[handle]; sym != nil {
 		sess.removeNotificationConfig(sym.FullName)
 	}
-	delete(sess.notifs.activeNotifications, handle)
-	if len(sess.notifs.activeNotifications) == 0 {
-		sess.notifs.notificationChannel = nil
+	delete(sess.notifications.activeNotifications, handle)
+	if len(sess.notifications.activeNotifications) == 0 {
+		sess.notifications.notificationChannel = nil
 	}
-	sess.notifs.lock.Unlock()
+	sess.notifications.lock.Unlock()
 	return nil
 }
 
 // SumDeleteDeviceNotification on Session wraps the raw Client RPC with
-// notifs.lock cleanup. Returns the per-handle ReturnCode slice from the
+// notifications.lock cleanup. Returns the per-handle ReturnCode slice from the
 // PLC. Successfully deleted handles (or handle-invalid, treated as
 // success-equivalent) are removed from activeNotifications.
 func (sess *Session) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error) {
@@ -134,20 +134,20 @@ func (sess *Session) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode
 	if len(errors) == 0 {
 		return errors, nil
 	}
-	sess.notifs.lock.Lock()
+	sess.notifications.lock.Lock()
 	for i, h := range handles {
 		if errors[i] == ReturnCodeNoErrors || errors[i] == ReturnCodeDeviceNotifyHandleInvalid {
-			if sym := sess.notifs.activeNotifications[h]; sym != nil {
+			if sym := sess.notifications.activeNotifications[h]; sym != nil {
 				sess.removeNotificationConfig(sym.FullName)
 			}
-			delete(sess.notifs.activeNotifications, h)
+			delete(sess.notifications.activeNotifications, h)
 			sess.logger.Info("batch deleted notification handle", "handle", h, "errorCode", uint32(errors[i]))
 		}
 	}
-	if len(sess.notifs.activeNotifications) == 0 {
-		sess.notifs.notificationChannel = nil
+	if len(sess.notifications.activeNotifications) == 0 {
+		sess.notifications.notificationChannel = nil
 	}
-	sess.notifs.lock.Unlock()
+	sess.notifications.lock.Unlock()
 	return errors, nil
 }
 
@@ -175,11 +175,11 @@ type NotificationSample struct {
 // from Session.Connect.
 
 func (sess *Session) handleNotification(ctx context.Context, handle uint32, timestamp uint64, content []byte) {
-	// Phase 1: notifs.lock for handle lookup + symbol pointer/field snapshot.
-	sess.notifs.lock.Lock()
-	symbol, ok := sess.notifs.activeNotifications[handle]
+	// Phase 1: notifications.lock for handle lookup + symbol pointer/field snapshot.
+	sess.notifications.lock.Lock()
+	symbol, ok := sess.notifications.activeNotifications[handle]
 	if !ok {
-		sess.notifs.lock.Unlock()
+		sess.notifications.lock.Unlock()
 		// Stale notifications are expected during:
 		// - Close(): handles deleted from activeNotifications while listen() still drains
 		// - Reconnect: activeNotifications cleared (connection.go:575) before new subscriptions
@@ -191,7 +191,7 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 		switch {
 		case sess.isClosed() || sess.isReconnecting():
 			sess.logger.Debug("received notification for deleted handle (expected during close/reconnect)", "handle", handle)
-		case time.Now().UnixNano()-sess.notifs.lastSubscribeNs.Load() < subscribeRaceWindowNs:
+		case time.Now().UnixNano()-sess.notifications.lastSubscribeNs.Load() < subscribeRaceWindowNs:
 			sess.logger.Debug("received notification for unknown handle (likely first-sample race)", "handle", handle)
 		default:
 			sess.logger.Warn("received notification for unknown handle", "handle", handle)
@@ -200,7 +200,7 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 	}
 	notification := symbol.Notification
 	fullName := symbol.FullName
-	sess.notifs.lock.Unlock()
+	sess.notifications.lock.Unlock()
 
 	var notificationTime time.Time
 	if timestamp == 0 {
@@ -210,7 +210,7 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 		notificationTime = time.Unix(timeStamp, int64(timestamp)%(windowsTick)*100)
 	}
 	// Phase 2: cache.lock for parse() — Symbol fields live in cache.symbols
-	// and parse mutates Value/Valid. Lock ordering: cache after notifs
+	// and parse mutates Value/Valid. Lock ordering: cache after notifications
 	// release (never both held).
 	// Re-resolve via cache.symbols[FullName]: the symbol fetched from
 	// activeNotifications may be stranded post-reload (loadSymbols swapped

@@ -12,7 +12,7 @@ import (
 // the timestamp of the most recent successful subscribe (used to suppress
 // "unknown handle" warnings during the first-sample race window).
 //
-// Lock ordering: NEVER hold both cache.lock and notifs.lock simultaneously.
+// Lock ordering: NEVER hold both cache.lock and notifications.lock simultaneously.
 type notificationManager struct {
 	lock                sync.Mutex
 	activeNotifications map[uint32]*Symbol

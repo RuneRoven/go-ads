@@ -101,7 +101,7 @@ type Session struct {
 
 	// Notification state (activeNotifications, notificationConfigs,
 	// notificationChannel, lastSubscribeNs).
-	notifs *notificationManager
+	notifications *notificationManager
 
 	// Lifecycle FSM (ctx, shutdown, waitGroup, reconnect/closed flags + channels,
 	// generation counter, retry policy).
@@ -136,7 +136,7 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 		port:           port,
 		requestTimeout: requestTimeout,
 		route:          &routeManager{},
-		notifs:         &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
+		notifications:  &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
 		cache: &symbolCache{
 			symbols:         map[string]*Symbol{},
 			onDemandSymbols: map[string]bool{},
@@ -395,12 +395,12 @@ func (sess *Session) Close() {
 	// Skip handle cleanup if already disconnected — all commands would timeout
 	if !wasDisconnected {
 		// Delete all active notifications (uses sum command with automatic fallback to individual)
-		sess.notifs.lock.Lock()
-		handles := make([]uint32, 0, len(sess.notifs.activeNotifications))
-		for handle := range sess.notifs.activeNotifications {
+		sess.notifications.lock.Lock()
+		handles := make([]uint32, 0, len(sess.notifications.activeNotifications))
+		for handle := range sess.notifications.activeNotifications {
 			handles = append(handles, handle)
 		}
-		sess.notifs.lock.Unlock()
+		sess.notifications.lock.Unlock()
 		if len(handles) > 0 {
 			codes, err := sess.SumDeleteDeviceNotification(handles)
 			if err != nil {
@@ -595,9 +595,9 @@ func (sess *Session) Reconnect() error {
 	// existed.
 
 	// Clear active notifications (old handles invalid after reconnect).
-	sess.notifs.lock.Lock()
-	sess.notifs.activeNotifications = make(map[uint32]*Symbol)
-	sess.notifs.lock.Unlock()
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications = make(map[uint32]*Symbol)
+	sess.notifications.lock.Unlock()
 
 	sess.tearDownAndReset(true)
 
@@ -932,11 +932,11 @@ func (sess *Session) localHandshake() error {
 // successes and restores the saved configs so they can be retried by
 // the next reconnect attempt.
 func (sess *Session) resubscribeNotifications() error {
-	sess.notifs.lock.Lock()
-	savedConfigs := sess.notifs.notificationConfigs
-	savedChannel := sess.notifs.notificationChannel
-	sess.notifs.notificationConfigs = nil // Clear before re-adding to prevent duplicates
-	sess.notifs.lock.Unlock()
+	sess.notifications.lock.Lock()
+	savedConfigs := sess.notifications.notificationConfigs
+	savedChannel := sess.notifications.notificationChannel
+	sess.notifications.notificationConfigs = nil // Clear before re-adding to prevent duplicates
+	sess.notifications.lock.Unlock()
 	if len(savedConfigs) == 0 || savedChannel == nil {
 		return nil
 	}
@@ -944,9 +944,9 @@ func (sess *Session) resubscribeNotifications() error {
 	if len(validConfigs) == 0 {
 		// All symbols gone (e.g., PLC online change removed all subscribed vars).
 		// Clear channel reference so a future AddSymbolNotification can use a new channel.
-		sess.notifs.lock.Lock()
-		sess.notifs.notificationChannel = nil
-		sess.notifs.lock.Unlock()
+		sess.notifications.lock.Lock()
+		sess.notifications.notificationChannel = nil
+		sess.notifications.lock.Unlock()
 		return nil
 	}
 	// Snapshot active handles before the re-subscribe attempt. If
@@ -954,12 +954,12 @@ func (sess *Session) resubscribeNotifications() error {
 	// snapshot diff to roll back the PLC-side registrations created during
 	// this attempt. Without rollback, repeated reconnect retries
 	// accumulate orphaned PLC notifications until the next TCP disconnect.
-	sess.notifs.lock.Lock()
-	preHandles := make(map[uint32]struct{}, len(sess.notifs.activeNotifications))
-	for h := range sess.notifs.activeNotifications {
+	sess.notifications.lock.Lock()
+	preHandles := make(map[uint32]struct{}, len(sess.notifications.activeNotifications))
+	for h := range sess.notifications.activeNotifications {
 		preHandles[h] = struct{}{}
 	}
-	sess.notifs.lock.Unlock()
+	sess.notifications.lock.Unlock()
 
 	subResults, err := sess.AddSymbolNotifications(validConfigs, savedChannel)
 
@@ -995,9 +995,9 @@ func (sess *Session) resubscribeNotifications() error {
 			"deleted", deleted)
 	}
 	if len(retryConfigs) > 0 {
-		sess.notifs.lock.Lock()
-		sess.notifs.notificationConfigs = append(sess.notifs.notificationConfigs, retryConfigs...)
-		sess.notifs.lock.Unlock()
+		sess.notifications.lock.Lock()
+		sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs, retryConfigs...)
+		sess.notifications.lock.Unlock()
 		sess.logger.Info("resubscribe: queued Skipped configs for next reconnect retry",
 			"retry_count", len(retryConfigs))
 	}
@@ -1009,19 +1009,19 @@ func (sess *Session) resubscribeNotifications() error {
 
 	if err != nil {
 		// Identify handles created during THIS attempt and best-effort delete.
-		sess.notifs.lock.Lock()
+		sess.notifications.lock.Lock()
 		var newHandles []uint32
-		for h := range sess.notifs.activeNotifications {
+		for h := range sess.notifications.activeNotifications {
 			if _, existed := preHandles[h]; !existed {
 				newHandles = append(newHandles, h)
 				// Drop client-side bookkeeping for the rollback handles.
-				delete(sess.notifs.activeNotifications, h)
+				delete(sess.notifications.activeNotifications, h)
 			}
 		}
 		// Restore configs so they can be retried by the next reconnect attempt.
-		sess.notifs.notificationConfigs = savedConfigs
-		sess.notifs.notificationChannel = savedChannel
-		sess.notifs.lock.Unlock()
+		sess.notifications.notificationConfigs = savedConfigs
+		sess.notifications.notificationChannel = savedChannel
+		sess.notifications.lock.Unlock()
 		if len(newHandles) > 0 {
 			deleted := sess.bestEffortDeleteNotifications(newHandles)
 			sess.logger.Warn("resubscribe rollback: deleted partial-success handles",

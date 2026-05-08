@@ -113,7 +113,7 @@ type SymbolUploadInfo struct {
 //     fails the next PLC operation (ReturnCodeDeviceNotifyHandleInvalid),
 //     prompting re-resolve via GetSymbol.
 //
-//   - Guarded by Session.notifs.lock (mutated by AddSymbolNotification(s)
+//   - Guarded by Session.notifications.lock (mutated by AddSymbolNotification(s)
 //     and DeleteDeviceNotification):
 //     Notification.
 //
