@@ -130,6 +130,11 @@ func TestSendRequestOnce_CtxDoneReturnsCanceled(t *testing.T) {
 	conn.lifecycle.ctx = ctx
 	conn.lifecycle.shutdown = cancel
 	conn.lifecycle.disconnected.Store(true)
+	// Walk the FSM into Disconnected so isDisconnected() reflects the synthetic
+	// state. Constructed -> Disconnected is not a legal direct transition.
+	conn.lifecycle.state.transitionTo(SessionStateConnecting)
+	conn.lifecycle.state.transitionTo(SessionStateConnected)
+	conn.lifecycle.state.transitionTo(SessionStateDisconnected)
 
 	cancel()
 

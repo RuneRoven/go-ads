@@ -318,12 +318,17 @@ func (conn *Session) Close() {
 	if !conn.lifecycle.closed.CompareAndSwap(false, true) {
 		return // already closed
 	}
+	// Capture transport-disconnected state BEFORE the FSM transitions into
+	// Closed. The cleanup branch below uses this to decide whether to attempt
+	// network ops; once state is Closed, isDisconnected() returns false even
+	// if the transport was already gone.
+	wasDisconnected := conn.isDisconnected()
 	conn.transitionState(SessionStateClosed)
 	close(conn.lifecycle.closedCh)
 	conn.logger.Info("Close called, shutting down")
 
 	// Skip handle cleanup if already disconnected — all commands would timeout
-	if !conn.lifecycle.disconnected.Load() {
+	if !wasDisconnected {
 		// Delete all active notifications (uses sum command with automatic fallback to individual)
 		conn.notifs.lock.Lock()
 		handles := make([]uint32, 0, len(conn.notifs.activeNotifications))
@@ -361,7 +366,7 @@ func (conn *Session) Close() {
 		// (listen detects EOF → triggerReconnect → disconnected=true) doesn't
 		// force every remaining Write to time out. Bail out early.
 		for i, h := range symHandles {
-			if conn.lifecycle.disconnected.Load() {
+			if conn.isDisconnected() {
 				conn.logger.Info("close: disconnected during handle release, stopping cleanup",
 					"released", i,
 					"remaining", len(symHandles)-i)
@@ -1035,7 +1040,7 @@ func (conn *Session) AddRoute(routeName, username, password string) error {
 
 // IsDisconnected returns whether the connection is currently in a disconnected state.
 func (conn *Session) IsDisconnected() bool {
-	return conn.lifecycle.disconnected.Load()
+	return conn.isDisconnected()
 }
 
 // isRunningInContainer returns true if the process is running inside a

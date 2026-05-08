@@ -144,3 +144,12 @@ func (conn *Session) transitionState(want SessionState) {
 func (conn *Session) isClosed() bool {
 	return conn.lifecycle.state.load() == SessionStateClosed
 }
+
+// isDisconnected reports whether the session has no live transport — either
+// a drop has been detected (Disconnected) or a reconnect attempt is in
+// progress (Reconnecting). Phase 2.b replacement for the legacy
+// lifecycle.disconnected.Load() reader sites.
+func (conn *Session) isDisconnected() bool {
+	s := conn.lifecycle.state.load()
+	return s == SessionStateDisconnected || s == SessionStateReconnecting
+}
