@@ -1,3 +1,24 @@
+// Package ads is a pure-Go client for the Beckhoff TwinCAT ADS protocol.
+//
+// The package exposes two layers:
+//
+//   - Client (this file): a thin Beckhoff-equivalent RPC layer. One TCP
+//     connection, raw AMS framing, request multiplexing, no cache, no
+//     reconnect, no notification persistence. Construct via Dial; once the
+//     transport drops, every subsequent method returns ErrTransportClosed
+//     and the caller reconstructs a new Client. Suitable for one-shot
+//     consumers (CLI tools, web ADS browsers).
+//
+//   - Session (session.go): a managed wrapper that adds the symbol cache,
+//     name-based read/write, persistent notifications with auto-resubscribe
+//     after a reconnect, auto-reconnect with backoff, lifecycle callbacks,
+//     and an explicit FSM (specs/09-fsm-design.md). Construct via
+//     NewSession + Connect.
+//
+// Session does NOT embed *Client; pick a layer at construction time. Raw
+// methods (Read, Write, Sum*, AddDeviceNotification, ReadProcess*, etc.)
+// live on *Client only. Cache-aware methods (ReadFromSymbol,
+// AddSymbolNotification, LoadSymbols, …) live on *Session only.
 package ads
 
 import (

@@ -31,14 +31,30 @@ func (s secret) LogValue() slog.Value {
 	return slog.StringValue("[REDACTED]")
 }
 
+// Session is the managed wrapper around a single ADS *Client. It owns the
+// symbol cache, persistent notifications (with auto-resubscribe across
+// reconnect), the lifecycle FSM, the auto-reconnect retry loop, and the
+// route-registration state. Construct via NewSession; call Connect to dial
+// the PLC and start the workers.
+//
+// Session does NOT embed *Client. Raw RPC methods (Read, Write, Sum*,
+// process-image, etc.) are NOT exposed on Session; reach them by
+// constructing a separate *Client via Dial. Session's public surface is
+// limited to the cache-aware / persistence-aware / lifecycle-aware
+// methods: ReadFromSymbol, WriteToSymbol, ReadMultipleSymbols,
+// WriteMultipleSymbols, GetSymbol, ListSymbols, BrowseSymbols,
+// AddSymbolNotification(s), LoadSymbols, LoadSymbolsSlow, LoadSymbolList,
+// LoadDataTypes, RefreshSymbols, CheckSymbolVersion, AddRoute, Connect,
+// Close, Reconnect, IsDisconnected.
+//
+// See specs/09-fsm-design.md for the full layered architecture.
 type Session struct {
 	ip   string
 	port int
 
 	// Underlying RPC client. nil until Connect succeeds; replaced on
-	// Reconnect; shut down by Close. Phase 5.a-types declares the field;
-	// Phase 5.a-dial + Phase 5.b populate and drive it.
-	client *Client //nolint:unused // Phase 5.a-dial wires this.
+	// Reconnect; shut down by Close.
+	client *Client
 
 	// TCP socket + request multiplexing + listen/transmit channels.
 	tx *transport
