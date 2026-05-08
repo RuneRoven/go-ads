@@ -35,6 +35,11 @@ type Session struct {
 	ip   string
 	port int
 
+	// Underlying RPC client. nil until Connect succeeds; replaced on
+	// Reconnect; shut down by Close. Phase 5.a-types declares the field;
+	// Phase 5.a-dial + Phase 5.b populate and drive it.
+	client *Client //nolint:unused // Phase 5.a-dial wires this.
+
 	// TCP socket + request multiplexing + listen/transmit channels.
 	tx *transport
 
