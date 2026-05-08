@@ -236,8 +236,11 @@ func (symbol *Symbol) updateValue(newValue string) {
 // or malformed data that could form a cycle and stack-overflow the runtime.
 const parentChangedMaxDepth = 256
 
+// parentChanged walks up the Parent chain marking each ancestor's Changed.
+// updateValue (the only caller) already sets symbol.Changed=true before
+// invoking, so we start at symbol.Parent.
 func (symbol *Symbol) parentChanged() {
-	s, depth := symbol, 0
+	s, depth := symbol.Parent, 0
 	for ; s != nil && depth < parentChangedMaxDepth; s, depth = s.Parent, depth+1 {
 		s.Changed = true
 	}
@@ -525,7 +528,7 @@ func (symbol *Symbol) writeToNode(value string, datatypes map[string]SymbolUploa
 		copy(newBuf, src)
 		buf.Write(newBuf)
 	case "WSTRING":
-		// WSTRING needs at least 2 bytes for the UTnull terminator.
+		// WSTRING needs at least 2 bytes for the UTF-16 null terminator.
 		if symbol.Length < 2 {
 			return nil, fmt.Errorf("WSTRING write requires symbol.Length >= 2, got %d", symbol.Length)
 		}

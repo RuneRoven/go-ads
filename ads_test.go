@@ -1239,19 +1239,22 @@ func TestParseUploadSymbolInfoSymbols_TruncatedEntry(t *testing.T) {
 // --- parentChanged ---
 
 func TestParentChanged(t *testing.T) {
+	// parentChanged walks ancestors only; self.Changed is set by updateValue
+	// before invoking. This isolates the ancestor-walk behavior.
 	grandparent := &Symbol{Name: "root", FullName: "root"}
 	parent := &Symbol{Name: "mid", FullName: "root.mid", Parent: grandparent}
 	child := &Symbol{Name: "leaf", FullName: "root.mid.leaf", Parent: parent}
 
 	child.parentChanged()
-	if !child.Changed {
-		t.Error("child should be changed")
-	}
 	if !parent.Changed {
 		t.Error("parent should be changed")
 	}
 	if !grandparent.Changed {
 		t.Error("grandparent should be changed")
+	}
+	// child.Changed is the caller's responsibility (updateValue sets it).
+	if child.Changed {
+		t.Error("child should NOT be changed by parentChanged (caller's responsibility)")
 	}
 }
 

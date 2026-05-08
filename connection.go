@@ -93,6 +93,7 @@ func NewConnection(ip string, port int, netid string, amsPort int, localNetID st
 		tx: &transport{
 			sendChannel:    make(chan []byte),
 			systemResponse: make(chan []byte),
+			recvQueue:      make(chan []byte, recvQueueSize),
 			activeRequests: map[uint32]chan []byte{},
 		},
 		lifecycle: &reconnector{
@@ -155,10 +156,15 @@ func (conn *Connection) Connect(local bool) error {
 		"local", conn.tx.connection.LocalAddr().String(),
 		"remote", conn.tx.connection.RemoteAddr().String())
 
-	// Auto-derive source AMS NetID from local IP if source NetID is all zeros
+	// Auto-derive source AMS NetID from local IP if source NetID is all zeros.
+	// Take connMu around the read+write of conn.source so encode() at ams.go
+	// (which reads conn.source under connMu) cannot interleave even in the
+	// theoretical case of a goroutine surviving across reconnect cycles.
+	conn.tx.connMu.Lock()
 	if conn.source.NetID == [6]byte{} {
 		localAddr, ok := conn.tx.connection.LocalAddr().(*net.TCPAddr)
 		if !ok {
+			conn.tx.connMu.Unlock()
 			return fmt.Errorf("unexpected local address type: %T", conn.tx.connection.LocalAddr())
 		}
 		ip := localAddr.IP.To4()
@@ -185,6 +191,7 @@ func (conn *Connection) Connect(local bool) error {
 			}
 		}
 	}
+	conn.tx.connMu.Unlock()
 
 	// Log container detection — auto-derived NetID works in containers because
 	// the PLC stores the UDP source IP (post-NAT) for routes, not the computerName tag.
@@ -204,9 +211,12 @@ func (conn *Connection) Connect(local bool) error {
 		"target", fmt.Sprintf("%d.%d.%d.%d.%d.%d:%d", conn.target.NetID[0], conn.target.NetID[1], conn.target.NetID[2], conn.target.NetID[3], conn.target.NetID[4], conn.target.NetID[5], conn.target.Port))
 
 	conn.logger.Log(context.Background(), LevelTrace, "connected")
-	conn.lifecycle.waitGroup.Add(2)
+	conn.lifecycle.waitGroup.Add(2 + recvWorkerCount)
 	go conn.listen()
 	go conn.transmitWorker()
+	for i := 0; i < recvWorkerCount; i++ {
+		go conn.recvWorker()
+	}
 	if local {
 		resp, err := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 		if err != nil {
@@ -746,6 +756,7 @@ func (conn *Connection) tearDownAndReset(resetFeatureFlags bool) {
 	conn.tx.chanMu.Lock()
 	conn.tx.sendChannel = make(chan []byte)
 	conn.tx.systemResponse = make(chan []byte)
+	conn.tx.recvQueue = make(chan []byte, recvQueueSize)
 	conn.tx.chanMu.Unlock()
 	conn.tx.activeRequestLock.Lock()
 	conn.tx.activeRequests = map[uint32]chan []byte{}
@@ -778,9 +789,12 @@ func (conn *Connection) dialAndStart() error {
 		conn.tx.connMu.Unlock()
 		return fmt.Errorf("connection closed during dial")
 	}
-	conn.lifecycle.waitGroup.Add(2)
+	conn.lifecycle.waitGroup.Add(2 + recvWorkerCount)
 	go conn.listen()
 	go conn.transmitWorker()
+	for i := 0; i < recvWorkerCount; i++ {
+		go conn.recvWorker()
+	}
 	return nil
 }
 
@@ -843,11 +857,25 @@ func (conn *Connection) resubscribeNotifications() error {
 	// for items where the PLC accepted but the library refused to commit
 	// (concurrent-subscribe TOCTOU loss, cache-stranded post-roundtrip).
 	// Those handles are NOT in activeNotifications - they would leak unless
-	// we explicitly release them.
+	// we explicitly release them. Re-append the corresponding config to
+	// notificationConfigs (with attempt counter incremented) so the NEXT
+	// reconnect retries; drop after resubscribeMaxAttempts to prevent infinite
+	// churn on persistently-flapping symbols.
 	var orphanHandles []uint32
-	for _, r := range subResults {
+	var retryConfigs []NotificationConfig
+	var droppedConfigs []string
+	for i, r := range subResults {
 		if r.Skipped != nil && r.Handle != 0 {
 			orphanHandles = append(orphanHandles, r.Handle)
+		}
+		if r.Skipped != nil && i < len(validConfigs) {
+			cfg := validConfigs[i]
+			cfg.resubscribeAttempts++
+			if cfg.resubscribeAttempts >= resubscribeMaxAttempts {
+				droppedConfigs = append(droppedConfigs, cfg.SymbolName)
+				continue
+			}
+			retryConfigs = append(retryConfigs, cfg)
 		}
 	}
 	if len(orphanHandles) > 0 {
@@ -855,6 +883,18 @@ func (conn *Connection) resubscribeNotifications() error {
 		conn.logger.Warn("resubscribe: released PLC handles for Skipped+Handle entries",
 			"orphan_handles", len(orphanHandles),
 			"deleted", deleted)
+	}
+	if len(retryConfigs) > 0 {
+		conn.notifs.lock.Lock()
+		conn.notifs.notificationConfigs = append(conn.notifs.notificationConfigs, retryConfigs...)
+		conn.notifs.lock.Unlock()
+		conn.logger.Info("resubscribe: queued Skipped configs for next reconnect retry",
+			"retry_count", len(retryConfigs))
+	}
+	if len(droppedConfigs) > 0 {
+		conn.logger.Warn("resubscribe: dropping configs after max retries",
+			"dropped", droppedConfigs,
+			"max_attempts", resubscribeMaxAttempts)
 	}
 
 	if err != nil {

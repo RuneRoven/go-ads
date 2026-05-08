@@ -148,7 +148,7 @@ type Symbol struct {
 
 // SymbolView is a read-only snapshot of a symbol's metadata and current
 // cached value, captured atomically under cache.lock at view creation.
-// All fields - including Value and Valid - reflect the cache state at the
+// All fields - including Value and Parsed - reflect the cache state at the
 // instant GetSymbol/ListSymbols returned. The view does NOT track later
 // updates; for fresh data, call GetSymbol again or subscribe via
 // AddSymbolNotification.
@@ -156,8 +156,8 @@ type Symbol struct {
 // Trade-offs of the snapshot model:
 //   - Read-only ergonomics: every field access is a cheap struct read, no
 //     locks, no allocation, no deadlock risk.
-//   - Internally consistent: Valid and Value were captured together, so
-//     callers cannot observe a "Valid=true, Value=empty" tear.
+//   - Internally consistent: Parsed and Value were captured together, so
+//     callers cannot observe a "Parsed=true, Value=empty" tear.
 //   - Stale after concurrent loadSymbols / online-change: if the cache is
 //     swapped after the view is built, the view shows the prior state.
 //
@@ -177,7 +177,7 @@ type SymbolView struct {
 	BaseType    uint32 // ADST_ numeric type code from protocol
 	Flags       SymbolFlag
 	ContextMask uint8 // PLC task context (bits 8-11 of Flags); 0 = no task binding
-	Valid       bool  // true if Value has been parsed at least once at snapshot time
+	Parsed      bool  // true if Value has been parsed at least once at snapshot time
 	IsRoot      bool  // true if this symbol has no parent (top-level program/global var)
 	Value       string
 
@@ -287,7 +287,7 @@ func (s *Symbol) view(conn *Connection) SymbolView {
 		BaseType:    s.BaseType,
 		Flags:       s.Flags,
 		ContextMask: s.ContextMask,
-		Valid:       s.Valid,
+		Parsed:      s.Valid,
 		IsRoot:      s.Parent == nil,
 		Value:       s.Value,
 		conn:        conn,
@@ -374,8 +374,25 @@ func addSymbol(symbol symbolUploadSymbol, datatypes map[string]SymbolUploadDataT
 	return sym
 }
 
+// addOffsetMaxDepth caps recursion depth in datatype tree expansion. Real
+// PLC nesting is at most a few dozen levels; the cap defends against a
+// malformed datatype table forming a self-cycle (forbidden by IEC 61131-3
+// but not enforced over the wire).
+const addOffsetMaxDepth = 256
+
 func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string]SymbolUploadDataType, group uint32) (children map[string]*Symbol) {
+	return data.addOffsetDepth(parent, datatypes, group, 0)
+}
+
+func (data *SymbolUploadDataType) addOffsetDepth(parent *Symbol, datatypes map[string]SymbolUploadDataType, group uint32, depth int) (children map[string]*Symbol) {
 	children = map[string]*Symbol{}
+	if depth >= addOffsetMaxDepth {
+		getDefaultLogger().Warn("addOffset hit depth cap; possible datatype self-cycle in PLC response",
+			"parent", parent.FullName,
+			"datatype", data.DataType,
+			"max_depth", addOffsetMaxDepth)
+		return
+	}
 
 	for key, segment := range data.Children {
 		var path string
@@ -406,7 +423,7 @@ func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string
 		// Enums have children (enum constants) but should be parsed as
 		// their base type (e.g. INT), not expanded as struct fields.
 		if dt, ok := datatypes[segment.DataType]; ok && !isEnumDataType(&dt) {
-			child.Children = dt.addOffset(&child, datatypes, child.Group)
+			child.Children = dt.addOffsetDepth(&child, datatypes, child.Group, depth+1)
 		}
 
 		children[key] = &child

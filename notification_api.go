@@ -16,12 +16,24 @@ type Update struct {
 // NotificationConfig holds configuration for a symbol notification, used for batch add and reconnect re-subscribe.
 // MaxDelay and CycleTime use time.Duration for consistency with SumNotificationRequest
 // and the rest of the standard library.
+//
+// resubscribeAttempts is incremented each time a reconnect re-subscribe round
+// returns this config as Skipped (e.g. TOCTOU loss against a concurrent
+// caller, cache stranded mid-batch). Above resubscribeMaxAttempts the
+// library drops the config rather than retrying forever.
 type NotificationConfig struct {
-	SymbolName       string
-	MaxDelay         time.Duration
-	CycleTime        time.Duration
-	TransmissionMode TransMode
+	SymbolName          string
+	MaxDelay            time.Duration
+	CycleTime           time.Duration
+	TransmissionMode    TransMode
+	resubscribeAttempts int // unexported; reset on successful re-subscribe
 }
+
+// resubscribeMaxAttempts caps Skipped-config retries across reconnect cycles
+// to prevent infinite churn on persistently-flapping symbols. After the cap
+// the config is dropped with a Warn log; the user must re-subscribe via
+// AddSymbolNotification to re-establish.
+const resubscribeMaxAttempts = 3
 
 // AddSymbolNotification registers a notification for a single symbol.
 // All notifications on one connection must share the same updateReceiver
@@ -336,7 +348,12 @@ func (conn *Connection) AddSymbolNotifications(configs []NotificationConfig, ch 
 		results[info.configIndex] = r
 		fresh.Notification = ch
 		conn.notifs.activeNotifications[r.Handle] = fresh
-		conn.notifs.notificationConfigs = append(conn.notifs.notificationConfigs, info.config)
+		// Reset resubscribe attempts on successful subscribe; if this entry
+		// originated from a previous reconnect Skipped retry, the counter is
+		// no longer relevant.
+		commitCfg := info.config
+		commitCfg.resubscribeAttempts = 0
+		conn.notifs.notificationConfigs = append(conn.notifs.notificationConfigs, commitCfg)
 		postExisting[key] = struct{}{}
 		successes++
 		conn.logger.Info("batch notification created",

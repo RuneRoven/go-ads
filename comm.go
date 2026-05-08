@@ -280,7 +280,39 @@ func (conn *Connection) listen() {
 				return
 			}
 		} else {
-			go conn.handleReceive(conn.lifecycle.ctx, data)
+			// Push to bounded recvQueue. If workers are saturated, drop the
+			// packet with a Warn log rather than spawn an unbounded goroutine.
+			// recvQueueSize buffer + recvWorkerCount workers cap concurrent
+			// decode work; an adversarial PLC firing notifications faster
+			// than we can dispatch will see drops, not goroutine explosion.
+			select {
+			case conn.tx.recvQueue <- data:
+			case <-conn.lifecycle.ctx.Done():
+				return
+			default:
+				conn.logger.Warn("recvQueue full, dropping inbound packet (PLC overrun or slow handler)",
+					"queue_size", recvQueueSize,
+					"workers", recvWorkerCount,
+					"packet_bytes", len(data))
+			}
+		}
+	}
+}
+
+// recvWorker consumes packets from tx.recvQueue and dispatches via
+// handleReceive. recvWorkerCount such goroutines run for the lifetime of
+// the dialAndStart batch; ctx cancellation drains and exits.
+func (conn *Connection) recvWorker() {
+	defer conn.lifecycle.waitGroup.Done()
+	for {
+		select {
+		case <-conn.lifecycle.ctx.Done():
+			return
+		case data, ok := <-conn.tx.recvQueue:
+			if !ok {
+				return
+			}
+			conn.handleReceive(conn.lifecycle.ctx, data)
 		}
 	}
 }

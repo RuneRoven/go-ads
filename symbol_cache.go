@@ -17,14 +17,17 @@ import (
 // the same time. Paths that need both must release one before acquiring
 // the other.
 //
-// generation increments under lock on every cache.symbols swap (loadSymbols,
-// LoadSymbolList, LoadDataTypes). Callers that need to publish a *Symbol
-// pointer they obtained pre-roundtrip into another data structure (e.g.
-// notifs.activeNotifications) MUST capture the generation before resolve
-// and recheck before commit; if the value changed, the pointer is stranded
-// and must be discarded. Closes the residual race window between
-// cache.lock release and notifs.lock acquire that the simple re-fetch
-// pattern leaves open.
+// generation increments under lock on every cache.symbols SWAP (loadSymbols,
+// LoadSymbolList, LoadDataTypes, on-demand reset in reloadSymbols). It does
+// NOT increment on simple insert (e.g. on-demand getSymbol) - existing
+// pointers stay valid across an insert, so insert is not a stranding event.
+//
+// Callers that need to publish a *Symbol pointer they obtained pre-roundtrip
+// into another data structure (e.g. notifs.activeNotifications) MUST capture
+// the generation before resolve and recheck before commit; if the value
+// changed, the pointer is stranded and must be discarded. Closes the
+// residual race window between cache.lock release and notifs.lock acquire
+// that the simple re-fetch pattern leaves open.
 type symbolCache struct {
 	lock               sync.Mutex
 	generation         atomic.Uint64
