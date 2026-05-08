@@ -34,7 +34,7 @@ func TestListen_TwoSequentialPackets(t *testing.T) {
 	conn := &Session{
 		tx:        &transport{connection: client, systemResponse: make(chan []byte, 2)},
 		logger:    getDefaultLogger(),
-		lifecycle: &reconnector{},
+		lifecycle: &sessionLifecycle{},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	conn.lifecycle.ctx = ctx
@@ -86,7 +86,7 @@ func TestListen_OversizePacketTriggersReconnect(t *testing.T) {
 	conn := &Session{
 		tx:        &transport{connection: client, systemResponse: make(chan []byte, 1)},
 		logger:    getDefaultLogger(),
-		lifecycle: &reconnector{closedCh: make(chan struct{})},
+		lifecycle: &sessionLifecycle{closedCh: make(chan struct{})},
 	}
 	// Mark closed via FSM (legacy closed flag removed in Phase 3.b).
 	conn.lifecycle.state.transitionTo(SessionStateClosed)

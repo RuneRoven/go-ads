@@ -31,7 +31,7 @@ type transport struct {
 	// sending. Flipped to false by Client.Dial after a successful TCP dial
 	// (and by Session.dialAndStart on reconnect); flipped to true on
 	// triggerReconnect, Reconnect entry, resetForRetry, and Close.
-	// Phase 5.c relocated the flag from reconnector to transport so the
+	// Phase 5.c relocated the flag from sessionLifecycle to transport so the
 	// transport-down signal lives next to the socket it represents.
 	disconnected atomic.Bool
 }

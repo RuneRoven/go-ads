@@ -33,6 +33,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -40,6 +41,27 @@ import (
 // TCP transport has been closed (Close called, drop detected, dial failed).
 // Callers reconstruct a new *Client to re-establish.
 var ErrTransportClosed = errors.New("ads: client transport closed")
+
+// isRouteHintErr returns true if err indicates a likely missing-AMS-route
+// condition (PLC closed the TCP connection because no route exists for our
+// NetID). Detects wrapped io.EOF and ECONNRESET via the standard
+// errors.Is/As mechanism. Used by listen to add a hint to the
+// "transport down" log line.
+func isRouteHintErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		if errors.Is(netErr.Err, syscall.ECONNRESET) {
+			return true
+		}
+	}
+	return errors.Is(err, syscall.ECONNRESET)
+}
 
 // notificationHandler is the callback the recvWorker invokes when it decodes
 // a DeviceNotification packet. Session installs its handleNotification here;

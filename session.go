@@ -11,8 +11,41 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// sessionLifecycle owns Session's lifecycle plumbing: cancellation context,
+// goroutine waitgroup, single-flight reconnect signaling, the explicit FSM
+// state + unified epoch counter, and the retry policy. Folded into session.go
+// because every field here is owned and mutated by Session methods only —
+// no other type touches it.
+type sessionLifecycle struct {
+	ctxMu     sync.RWMutex // protects ctx and shutdown against concurrent access during reconnect
+	ctx       context.Context
+	shutdown  context.CancelFunc
+	waitGroup sync.WaitGroup
+
+	reconnectMu   sync.Mutex // protects reconnectDone
+	reconnectDone chan struct{}
+
+	closedCh chan struct{}
+
+	// state is the explicit FSM state plus the unified epoch counter
+	// (specs/09-fsm-design.md). FSM is the source of truth for closed and
+	// reconnecting. epoch replaces the previous cache.generation and
+	// reconnectGeneration counters and bumps on every Connected entry plus
+	// on user-driven cache swaps that don't (yet) transition through
+	// Reloading.
+	state sessionFSM
+
+	autoReconnect              bool
+	maxReconnectAttempts       int
+	backoffConfig              BackoffConfig
+	strictReconnect            bool
+	strictReconnectMaxAttempts int
+	strictReconnectFailures    int
+}
 
 // secret is an internal wrapper around password/credential strings that
 // implements String() and slog.LogValuer to return "[REDACTED]" instead
@@ -72,7 +105,7 @@ type Session struct {
 
 	// Lifecycle FSM (ctx, shutdown, waitGroup, reconnect/closed flags + channels,
 	// generation counter, retry policy).
-	lifecycle *reconnector
+	lifecycle *sessionLifecycle
 
 	requestTimeout time.Duration
 	isLocal        bool
@@ -114,7 +147,7 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 			recvQueue:      make(chan []byte, recvQueueSize),
 			activeRequests: map[uint32]chan []byte{},
 		},
-		lifecycle: &reconnector{
+		lifecycle: &sessionLifecycle{
 			autoReconnect:        true,
 			maxReconnectAttempts: 0, // 0 = infinite retries
 			backoffConfig:        DefaultBackoffConfig(),
@@ -256,7 +289,7 @@ func (conn *Session) Connect(local bool) error {
 	conn.client.SetOnDrop(conn.triggerReconnect)
 	conn.client.startWorkers()
 	if local {
-		resp, err := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
+		resp, err := conn.client.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 		if err != nil {
 			conn.tearDownAndReset(false)
 			return fmt.Errorf("local mode handshake failed: %w", err)
@@ -878,7 +911,7 @@ func (conn *Session) dialAndStart() error {
 // localHandshake performs the local-mode AMSAddress probe used after dial when
 // isLocal is true. Updates conn.source on success.
 func (conn *Session) localHandshake() error {
-	resp, err := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
+	resp, err := conn.client.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 	if err != nil {
 		return fmt.Errorf("local handshake send: %w", err)
 	}

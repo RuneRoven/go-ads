@@ -1968,7 +1968,7 @@ func buildNotificationPacketMultiSample(stamps []struct {
 func newTestConnection() *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := &Session{
-		lifecycle: &reconnector{ctx: ctx, shutdown: cancel},
+		lifecycle: &sessionLifecycle{ctx: ctx, shutdown: cancel},
 		notifs:    &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
 		cache:     &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:    getDefaultLogger(),
@@ -2310,7 +2310,7 @@ func TestEncodePacket(t *testing.T) {
 	defer cancel()
 	conn := &Session{
 		tx:        &transport{},
-		lifecycle: &reconnector{ctx: ctx},
+		lifecycle: &sessionLifecycle{ctx: ctx},
 		logger:    getDefaultLogger(),
 		target: AMSAddress{
 			NetID: [6]byte{5, 154, 236, 19, 1, 1},
@@ -2395,7 +2395,7 @@ func TestEncodePacket_EmptyData(t *testing.T) {
 	defer cancel()
 	conn := &Session{
 		tx:        &transport{},
-		lifecycle: &reconnector{ctx: ctx},
+		lifecycle: &sessionLifecycle{ctx: ctx},
 		logger:    getDefaultLogger(),
 		target:    AMSAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851},
 		source:    AMSAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500},
@@ -2423,7 +2423,7 @@ func TestEncodePacket_AllCommands(t *testing.T) {
 	defer cancel()
 	conn := &Session{
 		tx:        &transport{},
-		lifecycle: &reconnector{ctx: ctx},
+		lifecycle: &sessionLifecycle{ctx: ctx},
 		logger:    getDefaultLogger(),
 		target:    AMSAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851},
 		source:    AMSAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500},
@@ -2464,7 +2464,7 @@ func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	conn := &Session{
-		lifecycle: &reconnector{ctx: ctx},
+		lifecycle: &sessionLifecycle{ctx: ctx},
 		logger:    getDefaultLogger(),
 		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
 	}
@@ -2506,7 +2506,7 @@ func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	conn := &Session{
-		lifecycle: &reconnector{ctx: ctx},
+		lifecycle: &sessionLifecycle{ctx: ctx},
 		logger:    getDefaultLogger(),
 		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
 	}
@@ -2531,7 +2531,7 @@ func TestHandleReceive_TooShort(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	conn := &Session{
-		lifecycle: &reconnector{ctx: ctx},
+		lifecycle: &sessionLifecycle{ctx: ctx},
 		logger:    getDefaultLogger(),
 		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
 	}
