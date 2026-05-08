@@ -42,12 +42,12 @@ import (
 // Callers reconstruct a new *Client to re-establish.
 var ErrTransportClosed = errors.New("ads: client transport closed")
 
-// isRouteHintErr returns true if err indicates a likely missing-AMS-route
+// isLikelyMissingRoute returns true if err indicates a likely missing-AMS-route
 // condition (PLC closed the TCP connection because no route exists for our
 // NetID). Detects wrapped io.EOF and ECONNRESET via the standard
 // errors.Is/As mechanism. Used by listen to add a hint to the
 // "transport down" log line.
-func isRouteHintErr(err error) bool {
+func isLikelyMissingRoute(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -243,7 +243,7 @@ func (c *Client) listen() {
 			default:
 			}
 			hint := ""
-			if isRouteHintErr(err) {
+			if isLikelyMissingRoute(err) {
 				hint = "PLC may not have an AMS route for this NetID — check route credentials or register route via WithRoute()"
 			}
 			if hint != "" {

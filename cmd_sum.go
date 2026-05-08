@@ -497,13 +497,13 @@ func (c *Client) sumAddNotificationFallback(requests []SumNotificationRequest) (
 //
 // Lives on *Session because it routes through Session.SumDeleteDeviceNotification
 // to keep activeNotifications consistent with the PLC.
-func (conn *Session) bestEffortDeleteNotifications(handles []uint32) int {
+func (sess *Session) bestEffortDeleteNotifications(handles []uint32) int {
 	if len(handles) == 0 {
 		return 0
 	}
-	errors, err := conn.SumDeleteDeviceNotification(handles)
+	errors, err := sess.SumDeleteDeviceNotification(handles)
 	if err != nil {
-		conn.logger.Warn("bestEffortDelete: SumDeleteDeviceNotification failed",
+		sess.logger.Warn("bestEffortDelete: SumDeleteDeviceNotification failed",
 			"error", err,
 			"handles", len(handles))
 		return 0
@@ -515,7 +515,7 @@ func (conn *Session) bestEffortDeleteNotifications(handles []uint32) int {
 		}
 	}
 	if deleted < len(handles) {
-		conn.logger.Warn("bestEffortDelete: some handles not cleaned up",
+		sess.logger.Warn("bestEffortDelete: some handles not cleaned up",
 			"deleted", deleted,
 			"requested", len(handles))
 	}

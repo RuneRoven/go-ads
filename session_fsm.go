@@ -175,51 +175,51 @@ func (s *sessionFSM) transitionToOnce(want SessionState) (from SessionState, ok 
 // WARN. Used by call sites that already maintain the legacy boolean flags;
 // the FSM call rides alongside as a shadow audit (Phase 1) until readers
 // and writers swap over.
-func (conn *Session) transitionState(want SessionState) {
-	from, ok := conn.lifecycle.state.transitionTo(want)
+func (sess *Session) transitionState(want SessionState) {
+	from, ok := sess.lifecycle.state.transitionTo(want)
 	if !ok {
-		conn.logger.Warn("FSM invalid transition (Phase 1 shadow — ignoring)",
+		sess.logger.Warn("FSM invalid transition (Phase 1 shadow — ignoring)",
 			"from", from, "to", want)
 		return
 	}
-	conn.logger.Log(context.Background(), LevelTrace, "FSM transition", "from", from, "to", want)
+	sess.logger.Log(context.Background(), LevelTrace, "FSM transition", "from", from, "to", want)
 }
 
 // isClosed reports whether the session has reached the terminal Closed
 // state. The FSM is the only source of truth (Phase 3.b removed the
 // legacy closed flag).
-func (conn *Session) isClosed() bool {
-	return conn.lifecycle.state.load() == SessionStateClosed
+func (sess *Session) isClosed() bool {
+	return sess.lifecycle.state.load() == SessionStateClosed
 }
 
 // isDisconnected reports whether the session has no live transport — either
 // a drop has been detected (Disconnected) or a reconnect attempt is in
 // progress (Reconnecting). Phase 2.b replacement for the legacy
 // lifecycle.disconnected.Load() reader sites.
-func (conn *Session) isDisconnected() bool {
-	s := conn.lifecycle.state.load()
+func (sess *Session) isDisconnected() bool {
+	s := sess.lifecycle.state.load()
 	return s == SessionStateDisconnected || s == SessionStateReconnecting
 }
 
 // isReconnecting reports whether a reconnect attempt is in flight.
 // FSM-only (legacy reconnecting flag removed in Phase 3.c).
-func (conn *Session) isReconnecting() bool {
-	return conn.lifecycle.state.load() == SessionStateReconnecting
+func (sess *Session) isReconnecting() bool {
+	return sess.lifecycle.state.load() == SessionStateReconnecting
 }
 
 // epoch returns the unified generation counter for this session. See the
 // sessionFSM doc for the full bump semantics. Retry helpers and TOCTOU
 // re-checks use this to detect "something changed" since they captured.
-func (conn *Session) epoch() uint64 {
-	return conn.lifecycle.state.epoch.Load()
+func (sess *Session) epoch() uint64 {
+	return sess.lifecycle.state.epoch.Load()
 }
 
 // bumpEpoch advances the counter for cache.symbols swaps that do NOT
 // (yet) go through a Connected re-entry transition. Phase 6 wires the
 // Reloading state for user-driven LoadSymbols/LoadSymbolList/RefreshSymbols
 // and removes these manual bumps in favor of the transition-driven one.
-func (conn *Session) bumpEpoch() {
-	conn.lifecycle.state.epoch.Add(1)
+func (sess *Session) bumpEpoch() {
+	sess.lifecycle.state.epoch.Add(1)
 }
 
 // waitForReconnect blocks until any in-flight reconnect completes (or the
@@ -232,19 +232,19 @@ func (conn *Session) bumpEpoch() {
 // the user observes a transient failure that strict R-TX-005 says should
 // have been transparent. With waitForReconnect inserted before the epoch
 // re-check, the helper retries through the post-reconnect Client.
-func (conn *Session) waitForReconnect() {
-	if conn.isClosed() {
+func (sess *Session) waitForReconnect() {
+	if sess.isClosed() {
 		return
 	}
-	conn.lifecycle.reconnectMu.Lock()
-	ch := conn.lifecycle.reconnectDone
-	conn.lifecycle.reconnectMu.Unlock()
+	sess.lifecycle.reconnectMu.Lock()
+	ch := sess.lifecycle.reconnectDone
+	sess.lifecycle.reconnectMu.Unlock()
 	if ch == nil {
 		return
 	}
 	select {
 	case <-ch:
-	case <-conn.lifecycle.closedCh:
+	case <-sess.lifecycle.closedCh:
 	}
 }
 
@@ -265,6 +265,6 @@ func (conn *Session) waitForReconnect() {
 // will move this signal onto the transport type, where it belongs.
 //
 //nolint:unused // re-wired by Phase 5.c.
-func (conn *Session) isTransportDown() bool {
-	return conn.tx.disconnected.Load()
+func (sess *Session) isTransportDown() bool {
+	return sess.tx.disconnected.Load()
 }

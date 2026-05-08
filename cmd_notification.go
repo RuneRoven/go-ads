@@ -106,19 +106,19 @@ func (c *Client) DeleteDeviceNotification(handle uint32) error {
 // the cached notificationConfig, and clears notificationChannel when the
 // last subscription dies. Callers that want raw delete behavior use
 // the Client method directly.
-func (conn *Session) DeleteDeviceNotification(handle uint32) error {
-	if err := conn.client.DeleteDeviceNotification(handle); err != nil {
+func (sess *Session) DeleteDeviceNotification(handle uint32) error {
+	if err := sess.client.DeleteDeviceNotification(handle); err != nil {
 		return err
 	}
-	conn.notifs.lock.Lock()
-	if sym := conn.notifs.activeNotifications[handle]; sym != nil {
-		conn.removeNotificationConfig(sym.FullName)
+	sess.notifs.lock.Lock()
+	if sym := sess.notifs.activeNotifications[handle]; sym != nil {
+		sess.removeNotificationConfig(sym.FullName)
 	}
-	delete(conn.notifs.activeNotifications, handle)
-	if len(conn.notifs.activeNotifications) == 0 {
-		conn.notifs.notificationChannel = nil
+	delete(sess.notifs.activeNotifications, handle)
+	if len(sess.notifs.activeNotifications) == 0 {
+		sess.notifs.notificationChannel = nil
 	}
-	conn.notifs.lock.Unlock()
+	sess.notifs.lock.Unlock()
 	return nil
 }
 
@@ -126,28 +126,28 @@ func (conn *Session) DeleteDeviceNotification(handle uint32) error {
 // notifs.lock cleanup. Returns the per-handle ReturnCode slice from the
 // PLC. Successfully deleted handles (or handle-invalid, treated as
 // success-equivalent) are removed from activeNotifications.
-func (conn *Session) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error) {
-	errors, err := conn.client.SumDeleteDeviceNotification(handles)
+func (sess *Session) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error) {
+	errors, err := sess.client.SumDeleteDeviceNotification(handles)
 	if err != nil {
 		return nil, err
 	}
 	if len(errors) == 0 {
 		return errors, nil
 	}
-	conn.notifs.lock.Lock()
+	sess.notifs.lock.Lock()
 	for i, h := range handles {
 		if errors[i] == ReturnCodeNoErrors || errors[i] == ReturnCodeDeviceNotifyHandleInvalid {
-			if sym := conn.notifs.activeNotifications[h]; sym != nil {
-				conn.removeNotificationConfig(sym.FullName)
+			if sym := sess.notifs.activeNotifications[h]; sym != nil {
+				sess.removeNotificationConfig(sym.FullName)
 			}
-			delete(conn.notifs.activeNotifications, h)
-			conn.logger.Info("batch deleted notification handle", "handle", h, "errorCode", uint32(errors[i]))
+			delete(sess.notifs.activeNotifications, h)
+			sess.logger.Info("batch deleted notification handle", "handle", h, "errorCode", uint32(errors[i]))
 		}
 	}
-	if len(conn.notifs.activeNotifications) == 0 {
-		conn.notifs.notificationChannel = nil
+	if len(sess.notifs.activeNotifications) == 0 {
+		sess.notifs.notificationChannel = nil
 	}
-	conn.notifs.lock.Unlock()
+	sess.notifs.lock.Unlock()
 	return errors, nil
 }
 
@@ -174,12 +174,12 @@ type NotificationSample struct {
 // below is the cache-aware handler installed via Client.SetNotificationHandler
 // from Session.Connect.
 
-func (conn *Session) handleNotification(ctx context.Context, handle uint32, timestamp uint64, content []byte) {
+func (sess *Session) handleNotification(ctx context.Context, handle uint32, timestamp uint64, content []byte) {
 	// Phase 1: notifs.lock for handle lookup + symbol pointer/field snapshot.
-	conn.notifs.lock.Lock()
-	symbol, ok := conn.notifs.activeNotifications[handle]
+	sess.notifs.lock.Lock()
+	symbol, ok := sess.notifs.activeNotifications[handle]
 	if !ok {
-		conn.notifs.lock.Unlock()
+		sess.notifs.lock.Unlock()
 		// Stale notifications are expected during:
 		// - Close(): handles deleted from activeNotifications while listen() still drains
 		// - Reconnect: activeNotifications cleared (connection.go:575) before new subscriptions
@@ -189,18 +189,18 @@ func (conn *Session) handleNotification(ctx context.Context, handle uint32, time
 		//   the most recent successful subscribe.
 		const subscribeRaceWindowNs = int64(100 * time.Millisecond)
 		switch {
-		case conn.isClosed() || conn.isReconnecting():
-			conn.logger.Debug("received notification for deleted handle (expected during close/reconnect)", "handle", handle)
-		case time.Now().UnixNano()-conn.notifs.lastSubscribeNs.Load() < subscribeRaceWindowNs:
-			conn.logger.Debug("received notification for unknown handle (likely first-sample race)", "handle", handle)
+		case sess.isClosed() || sess.isReconnecting():
+			sess.logger.Debug("received notification for deleted handle (expected during close/reconnect)", "handle", handle)
+		case time.Now().UnixNano()-sess.notifs.lastSubscribeNs.Load() < subscribeRaceWindowNs:
+			sess.logger.Debug("received notification for unknown handle (likely first-sample race)", "handle", handle)
 		default:
-			conn.logger.Warn("received notification for unknown handle", "handle", handle)
+			sess.logger.Warn("received notification for unknown handle", "handle", handle)
 		}
 		return
 	}
 	notification := symbol.Notification
 	fullName := symbol.FullName
-	conn.notifs.lock.Unlock()
+	sess.notifs.lock.Unlock()
 
 	var notificationTime time.Time
 	if timestamp == 0 {
@@ -217,30 +217,30 @@ func (conn *Session) handleNotification(ctx context.Context, handle uint32, time
 	// the cache between subscribe and now), in which case parse with the
 	// FRESH cache.datatypes against the OLD symbol's DataType key may
 	// mismatch. If the symbol is gone from the live cache, log + skip.
-	conn.cache.lock.Lock()
-	live := conn.cache.symbols[symbolKey(fullName)]
+	sess.cache.lock.Lock()
+	live := sess.cache.symbols[symbolKey(fullName)]
 	if live == nil {
-		conn.cache.lock.Unlock()
-		conn.logger.Warn("notification target symbol no longer in cache; skipping parse",
+		sess.cache.lock.Unlock()
+		sess.logger.Warn("notification target symbol no longer in cache; skipping parse",
 			"handle", handle, "symbol", fullName)
 		return
 	}
-	value, err := live.parse(content, 0, conn.cache.datatypes)
+	value, err := live.parse(content, 0, sess.cache.datatypes)
 	if err != nil {
-		conn.cache.lock.Unlock()
-		conn.logger.Error("error during parse of notification",
+		sess.cache.lock.Unlock()
+		sess.logger.Error("error during parse of notification",
 			"handle", handle, "symbol", fullName, "dataType", live.DataType, "error", err)
 		return
 	}
-	conn.cache.lock.Unlock()
+	sess.cache.lock.Unlock()
 
-	conn.logger.Log(context.Background(), LevelTrace, "update received", "update", value)
+	sess.logger.Log(context.Background(), LevelTrace, "update received", "update", value)
 	updateStruct := &Update{
 		Variable:  fullName,
 		Value:     value,
 		TimeStamp: notificationTime,
 	}
-	conn.deliverNotification(ctx, notification, updateStruct, handle, fullName)
+	sess.deliverNotification(ctx, notification, updateStruct, handle, fullName)
 }
 
 // deliverNotification performs a non-blocking send on the caller-owned channel.
@@ -250,10 +250,10 @@ func (conn *Session) handleNotification(ctx context.Context, handle uint32, time
 //
 // Caller must NOT close the update channel while subscriptions exist on this
 // connection; see AddSymbolNotification(s) godoc for the ownership rule.
-func (conn *Session) deliverNotification(ctx context.Context, ch chan<- *Update, update *Update, handle uint32, fullName string) {
+func (sess *Session) deliverNotification(ctx context.Context, ch chan<- *Update, update *Update, handle uint32, fullName string) {
 	defer func() {
 		if r := recover(); r != nil {
-			conn.logger.Error("notification send panicked — caller closed the update channel?",
+			sess.logger.Error("notification send panicked — caller closed the update channel?",
 				"handle", handle,
 				"symbol", fullName,
 				"panic", r)
@@ -266,9 +266,9 @@ func (conn *Session) deliverNotification(ctx context.Context, ch chan<- *Update,
 	select {
 	case <-ctx.Done():
 	case ch <- update:
-		conn.logger.Debug("Successfully delivered notification", "handle", handle)
+		sess.logger.Debug("Successfully delivered notification", "handle", handle)
 	default:
-		conn.logger.Warn("notification dropped (channel full, receiver too slow)",
+		sess.logger.Warn("notification dropped (channel full, receiver too slow)",
 			"handle", handle,
 			"symbol", fullName)
 	}

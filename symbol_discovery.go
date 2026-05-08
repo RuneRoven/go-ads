@@ -14,15 +14,15 @@ import (
 //
 // ListSymbols returns read-only SymbolViews for every symbol discovered
 // via LoadSymbols/LoadSymbolsSlow. Keys are PLC-cased FullNames.
-func (conn *Session) ListSymbols() (map[string]SymbolView, error) {
-	conn.cache.lock.Lock()
-	defer conn.cache.lock.Unlock()
-	if !conn.cache.symbolsFullyLoaded {
+func (sess *Session) ListSymbols() (map[string]SymbolView, error) {
+	sess.cache.lock.Lock()
+	defer sess.cache.lock.Unlock()
+	if !sess.cache.symbolsFullyLoaded {
 		return nil, fmt.Errorf("full symbol discovery has not been run; call LoadSymbols() or LoadSymbolsSlow() first")
 	}
-	out := make(map[string]SymbolView, len(conn.cache.symbols))
-	for _, v := range conn.cache.symbols {
-		out[v.FullName] = v.view(conn)
+	out := make(map[string]SymbolView, len(sess.cache.symbols))
+	for _, v := range sess.cache.symbols {
+		out[v.FullName] = v.view(sess)
 	}
 	return out, nil
 }
@@ -33,15 +33,15 @@ func (conn *Session) ListSymbols() (map[string]SymbolView, error) {
 // This downloads the entire symbol and datatype tables in single requests,
 // which may cause real-time jitter on the PLC. For large programs, consider
 // LoadSymbolsSlow() instead.
-func (conn *Session) LoadSymbols() error {
-	err := conn.loadSymbols()
+func (sess *Session) LoadSymbols() error {
+	err := sess.loadSymbols()
 	if err != nil {
 		return err
 	}
-	conn.cache.lock.Lock()
-	conn.cache.symbolsFullyLoaded = true
-	conn.cache.onDemandSymbols = map[string]bool{}
-	conn.cache.lock.Unlock()
+	sess.cache.lock.Lock()
+	sess.cache.symbolsFullyLoaded = true
+	sess.cache.onDemandSymbols = map[string]bool{}
+	sess.cache.lock.Unlock()
 	return nil
 }
 
@@ -70,21 +70,21 @@ func (cfg *SlowDiscoveryConfig) applyDefaults() {
 // between each chunk, to minimize disruption to the PLC's real-time task.
 // If the PLC does not support offset-based chunked reads, it falls back
 // to downloading each table in a single request with a delay between them.
-func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
+func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Step 1: Read symbol version
-	version, err := conn.client.GetSymbolVersion()
+	version, err := sess.client.GetSymbolVersion()
 	if err != nil {
-		conn.logger.Warn("failed to read symbol version during slow discovery", "error", err)
+		sess.logger.Warn("failed to read symbol version during slow discovery", "error", err)
 	} else {
-		conn.cache.lock.Lock()
-		conn.cache.symbolVersion = version
-		conn.cache.lock.Unlock()
+		sess.cache.lock.Lock()
+		sess.cache.symbolVersion = version
+		sess.cache.lock.Unlock()
 	}
 
 	// Step 2: Get upload info (small request)
-	uploadInfo, err := conn.client.GetSymbolUploadInfo()
+	uploadInfo, err := sess.client.GetSymbolUploadInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
@@ -92,7 +92,7 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Step 3: Download datatypes in chunks
-	datatypesData, err := conn.client.DownloadInChunks(
+	datatypesData, err := sess.client.DownloadInChunks(
 		uint32(GroupSymbolDataTypeUpload),
 		uploadInfo.DataTypeLength,
 		cfg.ChunkSize,
@@ -100,8 +100,8 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	)
 	if err != nil {
 		// Fallback: download datatypes in one request
-		conn.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
-		datatypesData, err = conn.client.DownloadDataTypes(uploadInfo.DataTypeLength)
+		sess.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
+		datatypesData, err = sess.client.DownloadDataTypes(uploadInfo.DataTypeLength)
 		if err != nil {
 			return fmt.Errorf("failed to download datatypes: %w", err)
 		}
@@ -114,7 +114,7 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Step 4: Download symbols in chunks
-	symbolsData, err := conn.client.DownloadInChunks(
+	symbolsData, err := sess.client.DownloadInChunks(
 		uint32(GroupSymbolUpload),
 		uploadInfo.SymbolLength,
 		cfg.ChunkSize,
@@ -122,8 +122,8 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	)
 	if err != nil {
 		// Fallback: download symbols in one request
-		conn.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
-		symbolsData, err = conn.client.DownloadSymbolList(uploadInfo.SymbolLength)
+		sess.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
+		symbolsData, err = sess.client.DownloadSymbolList(uploadInfo.SymbolLength)
 		if err != nil {
 			return fmt.Errorf("failed to download symbols: %w", err)
 		}
@@ -134,15 +134,15 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	}
 
 	// Step 5: Store results
-	conn.cache.lock.Lock()
-	conn.cache.datatypes = datatypes
-	conn.cache.symbols = symbols
-	conn.cache.symbolsFullyLoaded = true
-	conn.cache.onDemandSymbols = map[string]bool{}
-	conn.bumpEpoch()
-	conn.cache.lock.Unlock()
+	sess.cache.lock.Lock()
+	sess.cache.datatypes = datatypes
+	sess.cache.symbols = symbols
+	sess.cache.symbolsFullyLoaded = true
+	sess.cache.onDemandSymbols = map[string]bool{}
+	sess.bumpEpoch()
+	sess.cache.lock.Unlock()
 
-	conn.logger.Info("slow symbol discovery complete",
+	sess.logger.Info("slow symbol discovery complete",
 		"symbolCount", uploadInfo.SymbolCount,
 		"datatypeCount", uploadInfo.DataTypeCount)
 
@@ -207,82 +207,82 @@ func (c *Client) DownloadInChunks(group uint32, totalLength uint32, chunkSize ui
 // GetSymbol returns a read-only SymbolView for the named symbol.
 // Resolves on-demand if the symbol is not in the cache (single-symbol
 // lookup against the PLC).
-func (conn *Session) GetSymbol(symbolName string) (SymbolView, error) {
-	sym, err := conn.getSymbol(symbolName)
+func (sess *Session) GetSymbol(symbolName string) (SymbolView, error) {
+	sym, err := sess.getSymbol(symbolName)
 	if err != nil {
 		return SymbolView{}, err
 	}
-	conn.cache.lock.Lock()
-	defer conn.cache.lock.Unlock()
-	return sym.view(conn), nil
+	sess.cache.lock.Lock()
+	defer sess.cache.lock.Unlock()
+	return sym.view(sess), nil
 }
 
 // getSymbol returns the internal *Symbol for the named symbol. Used by
 // in-package code paths that need direct access to mutable Symbol state
 // (notifications, reads, writes). External callers should use GetSymbol.
-func (conn *Session) getSymbol(symbolName string) (*Symbol, error) {
-	conn.cache.lock.Lock()
-	localSymbol, ok := conn.cache.symbols[symbolKey(symbolName)]
+func (sess *Session) getSymbol(symbolName string) (*Symbol, error) {
+	sess.cache.lock.Lock()
+	localSymbol, ok := sess.cache.symbols[symbolKey(symbolName)]
 	needHandle := ok && localSymbol.Handle == 0
-	conn.cache.lock.Unlock()
+	sess.cache.lock.Unlock()
 
 	if ok {
 		if needHandle {
 			// Network I/O must happen outside the lock to avoid deadlock
 			// with handleNotification which also acquires cache.lock.
-			handle, err := conn.client.GetHandleByName(symbolName)
+			handle, err := sess.client.GetHandleByName(symbolName)
 			if err != nil {
 				return nil, err
 			}
-			conn.cache.lock.Lock()
+			sess.cache.lock.Lock()
 			if localSymbol.Handle != 0 {
 				// Another goroutine set the handle while we were waiting — release ours.
-				conn.cache.lock.Unlock()
+				sess.cache.lock.Unlock()
 				handleBytes := make([]byte, 4)
 				binary.LittleEndian.PutUint32(handleBytes, handle)
-				if err := conn.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
-					conn.logger.Warn("failed to release duplicate symbol handle",
+				if err := sess.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+					sess.logger.Warn("failed to release duplicate symbol handle",
 						"symbol", symbolName, "handle", handle, "error", err)
 				}
 			} else {
 				localSymbol.Handle = handle
-				conn.cache.lock.Unlock()
+				sess.cache.lock.Unlock()
 			}
 		}
-		conn.logger.Log(context.Background(), LevelTrace, "symbol got", "symbol", localSymbol)
+		sess.logger.Log(context.Background(), LevelTrace, "symbol got", "symbol", localSymbol)
 		return localSymbol, nil
 	}
 
 	// On-demand resolution: query the PLC for this specific symbol
-	sym, err := conn.client.GetSymbolInfoByName(symbolName)
+	sym, err := sess.client.GetSymbolInfoByName(symbolName)
 	if err != nil {
 		return nil, fmt.Errorf("symbol %q not found and on-demand lookup failed: %w", symbolName, err)
 	}
 
-	handle, err := conn.client.GetHandleByName(symbolName)
+	handle, err := sess.client.GetHandleByName(symbolName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get handle for %q: %w", symbolName, err)
 	}
 	sym.Handle = handle
 
-	conn.cache.lock.Lock()
+	sess.cache.lock.Lock()
 	// Check if another goroutine resolved this symbol while we were waiting
-	if existing, ok := conn.cache.symbols[symbolKey(symbolName)]; ok {
-		conn.cache.lock.Unlock()
+	if existing, ok := sess.cache.symbols[symbolKey(symbolName)]; ok {
+		sess.cache.lock.Unlock()
 		// Release the handle we just acquired since another goroutine beat us
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, handle)
-		if err := conn.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
-			conn.logger.Warn("failed to release duplicate symbol handle",
+		if err := sess.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+			sess.logger.Warn("failed to release duplicate symbol handle",
 				"symbol", symbolName, "handle", handle, "error", err)
 		}
 		return existing, nil
 	}
-	conn.cache.symbols[symbolKey(symbolName)] = sym
-	conn.cache.onDemandSymbols[symbolKey(symbolName)] = true
-	conn.cache.lock.Unlock()
+	sess.cache.symbols[symbolKey(symbolName)] = sym
+	sess.cache.onDemandSymbols[symbolKey(symbolName)] = true
+	sess.cache.lock.Unlock()
 
-	conn.logger.Info("symbol resolved on-demand",
+	sess.logger.Info("symbol resolved on-demand",
 		"symbol", symbolName,
 		"dataType", sym.DataType,
 		"length", sym.Length)
@@ -430,16 +430,16 @@ func (c *Client) GetSymbolVersion() (uint8, error) {
 
 // CheckSymbolVersion compares the current PLC symbol version against the stored version.
 // Returns true if the version has changed.
-func (conn *Session) CheckSymbolVersion() (changed bool, err error) {
-	version, err := conn.client.GetSymbolVersion()
+func (sess *Session) CheckSymbolVersion() (changed bool, err error) {
+	version, err := sess.client.GetSymbolVersion()
 	if err != nil {
 		return false, err
 	}
-	conn.cache.lock.Lock()
-	oldVersion := conn.cache.symbolVersion
-	conn.cache.lock.Unlock()
+	sess.cache.lock.Lock()
+	oldVersion := sess.cache.symbolVersion
+	sess.cache.lock.Unlock()
 	if version != oldVersion {
-		conn.logger.Info("symbol version changed",
+		sess.logger.Info("symbol version changed",
 			"old", oldVersion,
 			"new", version)
 		return true, nil
@@ -449,8 +449,8 @@ func (conn *Session) CheckSymbolVersion() (changed bool, err error) {
 
 // RefreshSymbols reloads the symbol table if the symbol version has changed.
 // It releases old handles, reloads symbol/datatype tables, and re-acquires handles for active symbols.
-func (conn *Session) RefreshSymbols() error {
-	changed, err := conn.CheckSymbolVersion()
+func (sess *Session) RefreshSymbols() error {
+	changed, err := sess.CheckSymbolVersion()
 	if err != nil {
 		return err
 	}
@@ -459,35 +459,35 @@ func (conn *Session) RefreshSymbols() error {
 	}
 
 	// Collect handles under lock, then release without holding the lock
-	// to avoid deadlock (conn.Write does network I/O and waits for response).
-	conn.cache.lock.Lock()
+	// to avoid deadlock (sess.Write does network I/O and waits for response).
+	sess.cache.lock.Lock()
 	var handleList []uint32
-	for _, symbol := range conn.cache.symbols {
+	for _, symbol := range sess.cache.symbols {
 		if symbol.Handle != 0 {
 			handleList = append(handleList, symbol.Handle)
 			symbol.Handle = 0
 		}
 	}
-	conn.cache.lock.Unlock()
+	sess.cache.lock.Unlock()
 
 	for _, h := range handleList {
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, h)
-		if err := conn.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
-			conn.logger.Warn("failed to release symbol handle", "error", err, "handle", h)
+		if err := sess.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+			sess.logger.Warn("failed to release symbol handle", "error", err, "handle", h)
 		}
 	}
 
 	// Reload symbols
-	err = conn.loadSymbols()
+	err = sess.loadSymbols()
 	if err != nil {
 		return fmt.Errorf("failed to refresh symbols: %w", err)
 	}
 
-	conn.cache.lock.Lock()
-	v := conn.cache.symbolVersion
-	conn.cache.lock.Unlock()
-	conn.logger.Info("symbols refreshed", "version", v)
+	sess.cache.lock.Lock()
+	v := sess.cache.symbolVersion
+	sess.cache.lock.Unlock()
+	sess.logger.Info("symbols refreshed", "version", v)
 	return nil
 }
 
@@ -495,21 +495,21 @@ func (conn *Session) RefreshSymbols() error {
 // This is the smaller of the two tables and enables browsing top-level symbol names.
 // After calling this, BrowseSymbols() can list root symbols and navigate by prefix.
 // To also expand struct/array children, call LoadDataTypes() afterwards.
-func (conn *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
+func (sess *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Read symbol version
-	version, err := conn.client.GetSymbolVersion()
+	version, err := sess.client.GetSymbolVersion()
 	if err != nil {
-		conn.logger.Warn("failed to read symbol version during LoadSymbolList", "error", err)
+		sess.logger.Warn("failed to read symbol version during LoadSymbolList", "error", err)
 	} else {
-		conn.cache.lock.Lock()
-		conn.cache.symbolVersion = version
-		conn.cache.lock.Unlock()
+		sess.cache.lock.Lock()
+		sess.cache.symbolVersion = version
+		sess.cache.lock.Unlock()
 	}
 
 	// Get upload info
-	uploadInfo, err := conn.client.GetSymbolUploadInfo()
+	uploadInfo, err := sess.client.GetSymbolUploadInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
@@ -517,7 +517,7 @@ func (conn *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Download symbols in chunks
-	symbolsData, err := conn.client.DownloadInChunks(
+	symbolsData, err := sess.client.DownloadInChunks(
 		uint32(GroupSymbolUpload),
 		uploadInfo.SymbolLength,
 		cfg.ChunkSize,
@@ -525,8 +525,8 @@ func (conn *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	)
 	if err != nil {
 		// Fallback: download symbols in one request
-		conn.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
-		symbolsData, err = conn.client.DownloadSymbolList(uploadInfo.SymbolLength)
+		sess.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
+		symbolsData, err = sess.client.DownloadSymbolList(uploadInfo.SymbolLength)
 		if err != nil {
 			return fmt.Errorf("failed to download symbols: %w", err)
 		}
@@ -538,19 +538,19 @@ func (conn *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 		return fmt.Errorf("failed to parse symbols: %w", err)
 	}
 
-	conn.cache.lock.Lock()
-	conn.cache.symbols = symbols
-	conn.cache.symbolListLoaded = true
-	conn.cache.onDemandSymbols = map[string]bool{}
+	sess.cache.lock.Lock()
+	sess.cache.symbols = symbols
+	sess.cache.symbolListLoaded = true
+	sess.cache.onDemandSymbols = map[string]bool{}
 
 	// If datatypes were already loaded, retroactively expand children
-	if conn.cache.datatypesLoaded && conn.cache.datatypes != nil {
-		conn.rebuildSymbolChildrenLocked()
+	if sess.cache.datatypesLoaded && sess.cache.datatypes != nil {
+		sess.rebuildSymbolChildrenLocked()
 	}
-	conn.bumpEpoch()
-	conn.cache.lock.Unlock()
+	sess.bumpEpoch()
+	sess.cache.lock.Unlock()
 
-	conn.logger.Info("symbol list loaded (browse mode)",
+	sess.logger.Info("symbol list loaded (browse mode)",
 		"symbolCount", uploadInfo.SymbolCount)
 
 	return nil
@@ -559,11 +559,11 @@ func (conn *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 // LoadDataTypes downloads only the datatype table (0xF00E) from the PLC in chunks.
 // After calling this along with LoadSymbolList(), struct/array children can be
 // browsed and expanded via BrowseSymbols().
-func (conn *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
+func (sess *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Get upload info
-	uploadInfo, err := conn.client.GetSymbolUploadInfo()
+	uploadInfo, err := sess.client.GetSymbolUploadInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
@@ -571,7 +571,7 @@ func (conn *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Download datatypes in chunks
-	datatypesData, err := conn.client.DownloadInChunks(
+	datatypesData, err := sess.client.DownloadInChunks(
 		uint32(GroupSymbolDataTypeUpload),
 		uploadInfo.DataTypeLength,
 		cfg.ChunkSize,
@@ -579,8 +579,8 @@ func (conn *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	)
 	if err != nil {
 		// Fallback: download datatypes in one request
-		conn.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
-		datatypesData, err = conn.client.DownloadDataTypes(uploadInfo.DataTypeLength)
+		sess.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
+		datatypesData, err = sess.client.DownloadDataTypes(uploadInfo.DataTypeLength)
 		if err != nil {
 			return fmt.Errorf("failed to download datatypes: %w", err)
 		}
@@ -591,18 +591,18 @@ func (conn *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 		return fmt.Errorf("failed to parse datatypes: %w", err)
 	}
 
-	conn.cache.lock.Lock()
-	conn.cache.datatypes = datatypes
-	conn.cache.datatypesLoaded = true
+	sess.cache.lock.Lock()
+	sess.cache.datatypes = datatypes
+	sess.cache.datatypesLoaded = true
 
 	// If symbols were already loaded, retroactively expand children
-	if conn.cache.symbolListLoaded && conn.cache.symbols != nil {
-		conn.rebuildSymbolChildrenLocked()
+	if sess.cache.symbolListLoaded && sess.cache.symbols != nil {
+		sess.rebuildSymbolChildrenLocked()
 	}
-	conn.bumpEpoch()
-	conn.cache.lock.Unlock()
+	sess.bumpEpoch()
+	sess.cache.lock.Unlock()
 
-	conn.logger.Info("datatypes loaded",
+	sess.logger.Info("datatypes loaded",
 		"datatypeCount", uploadInfo.DataTypeCount)
 
 	return nil
@@ -610,25 +610,25 @@ func (conn *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 
 // rebuildSymbolChildrenLocked rebuilds children for all symbols using the datatype table.
 // Must be called with cache.lock held.
-func (conn *Session) rebuildSymbolChildrenLocked() {
-	if conn.cache.symbols == nil || conn.cache.datatypes == nil {
+func (sess *Session) rebuildSymbolChildrenLocked() {
+	if sess.cache.symbols == nil || sess.cache.datatypes == nil {
 		return
 	}
 
 	// Collect top-level symbol names (those without a dot, i.e., not children)
 	// We rebuild from the original top-level symbols only
 	topLevel := make(map[string]*Symbol)
-	for name, sym := range conn.cache.symbols {
+	for name, sym := range sess.cache.symbols {
 		topLevel[name] = sym
 	}
 
 	for _, sym := range topLevel {
-		dt, ok := conn.cache.datatypes[sym.DataType]
+		dt, ok := sess.cache.datatypes[sym.DataType]
 		if ok {
-			sym.Children = dt.addOffset(sym, conn.cache.datatypes, sym.Group)
-			addChildren(sym, conn.cache.symbols)
+			sym.Children = dt.addOffset(sym, sess.cache.datatypes, sym.Group)
+			addChildren(sym, sess.cache.symbols)
 		}
 	}
 
-	conn.logger.Info("symbol children rebuilt from datatypes", "symbols", len(conn.cache.symbols))
+	sess.logger.Info("symbol children rebuilt from datatypes", "symbols", len(sess.cache.symbols))
 }

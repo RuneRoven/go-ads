@@ -21,28 +21,28 @@ type SymbolBrowseEntry struct {
 // If path is empty, returns root-level groupings (first path segments).
 // If path is specified, returns children of that symbol or prefix.
 // Requires LoadSymbolList() or LoadSymbols() to have been called first.
-func (conn *Session) BrowseSymbols(path string) ([]SymbolBrowseEntry, error) {
-	conn.cache.lock.Lock()
-	defer conn.cache.lock.Unlock()
+func (sess *Session) BrowseSymbols(path string) ([]SymbolBrowseEntry, error) {
+	sess.cache.lock.Lock()
+	defer sess.cache.lock.Unlock()
 
-	if !conn.cache.symbolListLoaded && !conn.cache.symbolsFullyLoaded {
+	if !sess.cache.symbolListLoaded && !sess.cache.symbolsFullyLoaded {
 		return nil, fmt.Errorf("symbol list not loaded; call LoadSymbolList() or LoadSymbols() first")
 	}
 
 	if path == "" {
-		return conn.browseRoot(), nil
+		return sess.browseRoot(), nil
 	}
 
-	return conn.browseChildren(path), nil
+	return sess.browseChildren(path), nil
 }
 
 // browseRoot returns unique root-level entries (first segment of each symbol name).
 // Must be called with cache.lock held.
-func (conn *Session) browseRoot() []SymbolBrowseEntry {
+func (sess *Session) browseRoot() []SymbolBrowseEntry {
 	roots := make(map[string]bool)
 	var entries []SymbolBrowseEntry
 
-	for name, sym := range conn.cache.symbols {
+	for name, sym := range sess.cache.symbols {
 		// Skip children (only top-level symbols from the upload have no Parent)
 		if sym.Parent != nil {
 			continue
@@ -59,7 +59,7 @@ func (conn *Session) browseRoot() []SymbolBrowseEntry {
 					FullName:    sym.FullName,
 					DataType:    sym.DataType,
 					Size:        sym.Length,
-					HasChildren: conn.symbolHasChildren(sym),
+					HasChildren: sess.symbolHasChildren(sym),
 					Comment:     sym.Comment,
 				})
 			}
@@ -70,7 +70,7 @@ func (conn *Session) browseRoot() []SymbolBrowseEntry {
 		if !roots[root] {
 			roots[root] = true
 			// Check if the root itself is a symbol
-			if rootSym, ok := conn.cache.symbols[symbolKey(root)]; ok {
+			if rootSym, ok := sess.cache.symbols[symbolKey(root)]; ok {
 				entries = append(entries, SymbolBrowseEntry{
 					Name:        rootSym.Name,
 					FullName:    rootSym.FullName,
@@ -98,9 +98,9 @@ func (conn *Session) browseRoot() []SymbolBrowseEntry {
 
 // browseChildren returns children of a given path.
 // Must be called with cache.lock held.
-func (conn *Session) browseChildren(path string) []SymbolBrowseEntry {
+func (sess *Session) browseChildren(path string) []SymbolBrowseEntry {
 	// First: check if the exact symbol exists and has Children
-	if sym, ok := conn.cache.symbols[symbolKey(path)]; ok && len(sym.Children) > 0 {
+	if sym, ok := sess.cache.symbols[symbolKey(path)]; ok && len(sym.Children) > 0 {
 		entries := make([]SymbolBrowseEntry, 0, len(sym.Children))
 		for _, child := range sym.Children {
 			entries = append(entries, SymbolBrowseEntry{
@@ -108,7 +108,7 @@ func (conn *Session) browseChildren(path string) []SymbolBrowseEntry {
 				FullName:    child.FullName,
 				DataType:    child.DataType,
 				Size:        child.Length,
-				HasChildren: conn.symbolHasChildren(child),
+				HasChildren: sess.symbolHasChildren(child),
 				Comment:     child.Comment,
 			})
 		}
@@ -123,7 +123,7 @@ func (conn *Session) browseChildren(path string) []SymbolBrowseEntry {
 	seen := make(map[string]bool)
 	var entries []SymbolBrowseEntry
 
-	for name := range conn.cache.symbols {
+	for name := range sess.cache.symbols {
 		if !strings.HasPrefix(name, prefix) {
 			continue
 		}
@@ -144,13 +144,13 @@ func (conn *Session) browseChildren(path string) []SymbolBrowseEntry {
 		}
 		seen[childFullName] = true
 
-		if childSym, ok := conn.cache.symbols[symbolKey(childFullName)]; ok {
+		if childSym, ok := sess.cache.symbols[symbolKey(childFullName)]; ok {
 			entries = append(entries, SymbolBrowseEntry{
 				Name:        childSym.Name,
 				FullName:    childSym.FullName,
 				DataType:    childSym.DataType,
 				Size:        childSym.Length,
-				HasChildren: conn.symbolHasChildren(childSym),
+				HasChildren: sess.symbolHasChildren(childSym),
 				Comment:     childSym.Comment,
 			})
 		} else {
@@ -164,7 +164,7 @@ func (conn *Session) browseChildren(path string) []SymbolBrowseEntry {
 	}
 
 	// Also check for the exact symbol with no deeper children
-	if sym, ok := conn.cache.symbols[symbolKey(path)]; ok && len(entries) == 0 {
+	if sym, ok := sess.cache.symbols[symbolKey(path)]; ok && len(entries) == 0 {
 		entries = append(entries, SymbolBrowseEntry{
 			Name:        sym.Name,
 			FullName:    sym.FullName,
@@ -183,15 +183,15 @@ func (conn *Session) browseChildren(path string) []SymbolBrowseEntry {
 
 // symbolHasChildren determines if a symbol likely has children.
 // Must be called with cache.lock held.
-func (conn *Session) symbolHasChildren(sym *Symbol) bool {
+func (sess *Session) symbolHasChildren(sym *Symbol) bool {
 	// If we already have expanded children, yes
 	if len(sym.Children) > 0 {
 		return true
 	}
 
 	// If datatypes are loaded, check the datatype table
-	if conn.cache.datatypesLoaded && conn.cache.datatypes != nil {
-		if dt, ok := conn.cache.datatypes[sym.DataType]; ok {
+	if sess.cache.datatypesLoaded && sess.cache.datatypes != nil {
+		if dt, ok := sess.cache.datatypes[sym.DataType]; ok {
 			return len(dt.Children) > 0
 		}
 	}

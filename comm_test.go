@@ -137,9 +137,9 @@ func TestIsRouteHintErr_EOF(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := isRouteHintErr(tc.err)
+			got := isLikelyMissingRoute(tc.err)
 			if got != tc.want {
-				t.Errorf("isRouteHintErr(%v) = %v, want %v", tc.err, got, tc.want)
+				t.Errorf("isLikelyMissingRoute(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}
@@ -153,7 +153,7 @@ func TestIsRouteHintErr_ECONNRESET(t *testing.T) {
 		Err: &net.OpError{Err: syscall.ECONNRESET},
 	}
 	wrapped := fmt.Errorf("during listen: %w", innerErr)
-	if !isRouteHintErr(wrapped) {
-		t.Errorf("isRouteHintErr did not detect ECONNRESET in wrapped *net.OpError")
+	if !isLikelyMissingRoute(wrapped) {
+		t.Errorf("isLikelyMissingRoute did not detect ECONNRESET in wrapped *net.OpError")
 	}
 }
