@@ -47,7 +47,7 @@ const resubscribeMaxAttempts = 3
 // channel will silently drop notifications and emit Error logs. To stop
 // receiving notifications, call DeleteDeviceNotification or Close() — these
 // remove the PLC-side registration before the channel is no longer used.
-func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay time.Duration, cycleTime time.Duration, transMode TransMode, updateReceiver chan *Update) (uint32, error) {
+func (conn *Session) AddSymbolNotification(symbolName string, maxDelay time.Duration, cycleTime time.Duration, transMode TransMode, updateReceiver chan *Update) (uint32, error) {
 	// Pre-check: channel match + duplicate-subscribe.
 	conn.notifs.lock.Lock()
 	if conn.notifs.notificationChannel != nil && conn.notifs.notificationChannel != updateReceiver {
@@ -182,7 +182,7 @@ func (conn *Connection) AddSymbolNotification(symbolName string, maxDelay time.D
 // active on this connection. To stop receiving notifications, call
 // DeleteDeviceNotification or Close() — these remove the PLC-side registration
 // before the channel is no longer used.
-func (conn *Connection) AddSymbolNotifications(configs []NotificationConfig, ch chan *Update) ([]SumNotificationResult, error) {
+func (conn *Session) AddSymbolNotifications(configs []NotificationConfig, ch chan *Update) ([]SumNotificationResult, error) {
 	if len(configs) == 0 {
 		return nil, nil
 	}
@@ -375,7 +375,7 @@ func (conn *Connection) AddSymbolNotifications(configs []NotificationConfig, ch 
 
 // removeNotificationConfig removes the first config matching symbolName.
 // Must be called with notifs.lock held.
-func (conn *Connection) removeNotificationConfig(symbolName string) {
+func (conn *Session) removeNotificationConfig(symbolName string) {
 	for i, cfg := range conn.notifs.notificationConfigs {
 		if strings.EqualFold(cfg.SymbolName, symbolName) {
 			conn.notifs.notificationConfigs = append(conn.notifs.notificationConfigs[:i], conn.notifs.notificationConfigs[i+1:]...)

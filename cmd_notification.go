@@ -13,7 +13,7 @@ import (
 // (handleNotification + deliverNotification) lives here too because it shares
 // the Update / handle bookkeeping defined by these commands.
 
-func (conn *Connection) AddDeviceNotification(
+func (conn *Session) AddDeviceNotification(
 	group uint32,
 	offset uint32,
 	length uint32,
@@ -70,7 +70,7 @@ func (conn *Connection) AddDeviceNotification(
 }
 
 // DeleteDeviceNotification deletes a device notification by handle.
-func (conn *Connection) DeleteDeviceNotification(handle uint32) error {
+func (conn *Session) DeleteDeviceNotification(handle uint32) error {
 	request := &bytes.Buffer{}
 	type deleteNotificationCommandPacket struct {
 		Handle uint32
@@ -130,7 +130,7 @@ type NotificationSample struct {
 }
 
 // DeviceNotification - ADS command id: 8
-func (conn *Connection) DeviceNotification(ctx context.Context, in []byte) error {
+func (conn *Session) DeviceNotification(ctx context.Context, in []byte) error {
 	var stream NotificationStream
 	var header StampHeader
 	var sample NotificationSample
@@ -171,7 +171,7 @@ func (conn *Connection) DeviceNotification(ctx context.Context, in []byte) error
 	return nil
 }
 
-func (conn *Connection) handleNotification(ctx context.Context, handle uint32, timestamp uint64, content []byte) {
+func (conn *Session) handleNotification(ctx context.Context, handle uint32, timestamp uint64, content []byte) {
 	// Phase 1: notifs.lock for handle lookup + symbol pointer/field snapshot.
 	conn.notifs.lock.Lock()
 	symbol, ok := conn.notifs.activeNotifications[handle]
@@ -247,7 +247,7 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 //
 // Caller must NOT close the update channel while subscriptions exist on this
 // connection; see AddSymbolNotification(s) godoc for the ownership rule.
-func (conn *Connection) deliverNotification(ctx context.Context, ch chan<- *Update, update *Update, handle uint32, fullName string) {
+func (conn *Session) deliverNotification(ctx context.Context, ch chan<- *Update, update *Update, handle uint32, fullName string) {
 	defer func() {
 		if r := recover(); r != nil {
 			conn.logger.Error("notification send panicked — caller closed the update channel?",

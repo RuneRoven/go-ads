@@ -27,6 +27,11 @@ type reconnector struct {
 	disconnected        atomic.Bool
 	reconnectGeneration atomic.Uint64
 
+	// state is the explicit FSM state (specs/09-fsm-design.md). Phase 1
+	// SHADOW: maintained alongside the boolean flags above but not yet read
+	// for behavior decisions. Phase 2/3 swap readers and remove the flags.
+	state sessionFSM
+
 	autoReconnect              bool
 	maxReconnectAttempts       int
 	backoffConfig              BackoffConfig

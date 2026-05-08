@@ -19,7 +19,7 @@ func TestDeliverNotification_ClosedChannelDoesNotPanic(t *testing.T) {
 		}
 	}()
 
-	conn := &Connection{logger: getDefaultLogger()}
+	conn := &Session{logger: getDefaultLogger()}
 	ctx := context.Background()
 	update := &Update{Variable: "x", Value: "1", TimeStamp: time.Now()}
 
@@ -29,7 +29,7 @@ func TestDeliverNotification_ClosedChannelDoesNotPanic(t *testing.T) {
 // Verify normal happy-path delivery on an open buffered channel.
 func TestDeliverNotification_DeliversOnOpenChannel(t *testing.T) {
 	ch := make(chan *Update, 1)
-	conn := &Connection{logger: getDefaultLogger()}
+	conn := &Session{logger: getDefaultLogger()}
 	ctx := context.Background()
 	update := &Update{Variable: "x", Value: "1", TimeStamp: time.Now()}
 
@@ -56,7 +56,7 @@ func TestDeliverNotification_DropsWhenChannelFull(t *testing.T) {
 		}
 	}()
 
-	conn := &Connection{logger: getDefaultLogger()}
+	conn := &Session{logger: getDefaultLogger()}
 	ctx := context.Background()
 	update := &Update{Variable: "x", Value: "1", TimeStamp: time.Now()}
 

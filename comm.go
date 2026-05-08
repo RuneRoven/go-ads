@@ -37,7 +37,7 @@ func isRouteHintErr(err error) bool {
 // send is used exclusively for the local-mode handshake during Connect/Reconnect.
 // It uses the shared systemResponse channel and is NOT safe for concurrent callers.
 // For normal ADS commands, use sendRequest/sendRequestOnce which use per-invoke channels.
-func (conn *Connection) send(data []byte) (response []byte, err error) {
+func (conn *Session) send(data []byte) (response []byte, err error) {
 	conn.tx.currentRequest.Inc()
 	conn.tx.chanMu.RLock()
 	sendCh := conn.tx.sendChannel
@@ -69,7 +69,7 @@ func (conn *Connection) send(data []byte) (response []byte, err error) {
 	}
 }
 
-func (conn *Connection) sendRequest(command CommandID, data []byte) (response []byte, err error) {
+func (conn *Session) sendRequest(command CommandID, data []byte) (response []byte, err error) {
 	if conn == nil {
 		return nil, fmt.Errorf("sendRequest called on nil connection")
 	}
@@ -115,7 +115,7 @@ func (conn *Connection) sendRequest(command CommandID, data []byte) (response []
 	return nil, err
 }
 
-func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (response []byte, err error) {
+func (conn *Session) sendRequestOnce(command CommandID, data []byte) (response []byte, err error) {
 	if conn.lifecycle.disconnected.Load() {
 		// If a reconnect is in progress, wait for it to finish before giving up
 		conn.lifecycle.reconnectMu.Lock()
@@ -207,7 +207,7 @@ func (conn *Connection) sendRequestOnce(command CommandID, data []byte) (respons
 // goroutines. The `go` statement establishes happens-before, so a new listen()
 // always sees the post-swap field values. No goroutine is alive concurrent with
 // the field swap.
-func (conn *Connection) listen() {
+func (conn *Session) listen() {
 	defer conn.lifecycle.waitGroup.Done()
 	reader := bufio.NewReader(conn.tx.connection)
 	const maxAMSPacket = 4 * 1024 * 1024 // 4 MB sanity limit
@@ -302,7 +302,7 @@ func (conn *Connection) listen() {
 // recvWorker consumes packets from tx.recvQueue and dispatches via
 // handleReceive. recvWorkerCount such goroutines run for the lifetime of
 // the dialAndStart batch; ctx cancellation drains and exits.
-func (conn *Connection) recvWorker() {
+func (conn *Session) recvWorker() {
 	defer conn.lifecycle.waitGroup.Done()
 	for {
 		select {
@@ -317,7 +317,7 @@ func (conn *Connection) recvWorker() {
 	}
 }
 
-func (conn *Connection) handleReceive(ctx context.Context, data []byte) {
+func (conn *Session) handleReceive(ctx context.Context, data []byte) {
 	conn.logger.Log(context.Background(), LevelTrace, "in read")
 	if len(data) < 32 {
 		conn.logger.Error("header too short")
@@ -381,7 +381,7 @@ func (conn *Connection) handleReceive(ctx context.Context, data []byte) {
 	}
 }
 
-func (conn *Connection) transmitWorker() {
+func (conn *Session) transmitWorker() {
 	defer conn.lifecycle.waitGroup.Done()
 	writer := bufio.NewWriter(conn.tx.connection)
 	conn.lifecycle.ctxMu.RLock()

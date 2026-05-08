@@ -6,11 +6,11 @@ import (
 	"time"
 )
 
-func (conn *Connection) WriteToSymbol(symbolName string, value string) error {
+func (conn *Session) WriteToSymbol(symbolName string, value string) error {
 	return conn.writeToSymbolRetry(symbolName, value, 1)
 }
 
-func (conn *Connection) writeToSymbolRetry(symbolName string, value string, retriesLeft int) error {
+func (conn *Session) writeToSymbolRetry(symbolName string, value string, retriesLeft int) error {
 	gen := conn.lifecycle.reconnectGeneration.Load()
 
 	symbol, err := conn.getSymbol(symbolName)
@@ -53,11 +53,11 @@ func (conn *Connection) writeToSymbolRetry(symbolName string, value string, retr
 	return nil
 }
 
-func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
+func (conn *Session) ReadFromSymbol(symbolName string) (string, error) {
 	return conn.readFromSymbolRetry(symbolName, 1)
 }
 
-func (conn *Connection) readFromSymbolRetry(symbolName string, retriesLeft int) (string, error) {
+func (conn *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (string, error) {
 	gen := conn.lifecycle.reconnectGeneration.Load()
 
 	symbol, err := conn.getSymbol(symbolName)
@@ -135,11 +135,11 @@ func symbolSumAddress(sym *Symbol) (group, offset uint32) {
 
 // ReadMultipleSymbols reads multiple symbols in a single ADS round-trip using SumRead.
 // Returns a map of symbol name to parsed string value.
-func (conn *Connection) ReadMultipleSymbols(names []string) (map[string]string, error) {
+func (conn *Session) ReadMultipleSymbols(names []string) (map[string]string, error) {
 	return conn.readMultipleSymbolsRetry(names, 1)
 }
 
-func (conn *Connection) readMultipleSymbolsRetry(names []string, retriesLeft int) (map[string]string, error) {
+func (conn *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (map[string]string, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
@@ -217,11 +217,11 @@ func (conn *Connection) readMultipleSymbolsRetry(names []string, retriesLeft int
 // Returns a map of symbol name to per-symbol error code.
 // Uses direct iGroup/iOffs addressing when available (after LoadSymbols),
 // falling back to handle-based addressing for on-demand symbols.
-func (conn *Connection) WriteMultipleSymbols(values map[string]string) (map[string]ReturnCode, error) {
+func (conn *Session) WriteMultipleSymbols(values map[string]string) (map[string]ReturnCode, error) {
 	return conn.writeMultipleSymbolsRetry(values, 1)
 }
 
-func (conn *Connection) writeMultipleSymbolsRetry(values map[string]string, retriesLeft int) (map[string]ReturnCode, error) {
+func (conn *Session) writeMultipleSymbolsRetry(values map[string]string, retriesLeft int) (map[string]ReturnCode, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}

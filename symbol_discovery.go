@@ -14,7 +14,7 @@ import (
 //
 // ListSymbols returns read-only SymbolViews for every symbol discovered
 // via LoadSymbols/LoadSymbolsSlow. Keys are PLC-cased FullNames.
-func (conn *Connection) ListSymbols() (map[string]SymbolView, error) {
+func (conn *Session) ListSymbols() (map[string]SymbolView, error) {
 	conn.cache.lock.Lock()
 	defer conn.cache.lock.Unlock()
 	if !conn.cache.symbolsFullyLoaded {
@@ -33,7 +33,7 @@ func (conn *Connection) ListSymbols() (map[string]SymbolView, error) {
 // This downloads the entire symbol and datatype tables in single requests,
 // which may cause real-time jitter on the PLC. For large programs, consider
 // LoadSymbolsSlow() instead.
-func (conn *Connection) LoadSymbols() error {
+func (conn *Session) LoadSymbols() error {
 	err := conn.loadSymbols()
 	if err != nil {
 		return err
@@ -70,7 +70,7 @@ func (cfg *SlowDiscoveryConfig) applyDefaults() {
 // between each chunk, to minimize disruption to the PLC's real-time task.
 // If the PLC does not support offset-based chunked reads, it falls back
 // to downloading each table in a single request with a delay between them.
-func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
+func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Step 1: Read symbol version
@@ -153,7 +153,7 @@ func (conn *Connection) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 // the offset parameter of the ADS Read command.
 // If chunked downloads are already known to be unsupported (e.g. TwinCAT 2),
 // this returns an error immediately so the caller can use the single-request fallback.
-func (conn *Connection) downloadInChunks(group uint32, totalLength uint32, chunkSize uint32, delay time.Duration) ([]byte, error) {
+func (conn *Session) downloadInChunks(group uint32, totalLength uint32, chunkSize uint32, delay time.Duration) ([]byte, error) {
 	if totalLength == 0 {
 		return []byte{}, nil
 	}
@@ -213,7 +213,7 @@ func (conn *Connection) downloadInChunks(group uint32, totalLength uint32, chunk
 // GetSymbol returns a read-only SymbolView for the named symbol.
 // Resolves on-demand if the symbol is not in the cache (single-symbol
 // lookup against the PLC).
-func (conn *Connection) GetSymbol(symbolName string) (SymbolView, error) {
+func (conn *Session) GetSymbol(symbolName string) (SymbolView, error) {
 	sym, err := conn.getSymbol(symbolName)
 	if err != nil {
 		return SymbolView{}, err
@@ -226,7 +226,7 @@ func (conn *Connection) GetSymbol(symbolName string) (SymbolView, error) {
 // getSymbol returns the internal *Symbol for the named symbol. Used by
 // in-package code paths that need direct access to mutable Symbol state
 // (notifications, reads, writes). External callers should use GetSymbol.
-func (conn *Connection) getSymbol(symbolName string) (*Symbol, error) {
+func (conn *Session) getSymbol(symbolName string) (*Symbol, error) {
 	conn.cache.lock.Lock()
 	localSymbol, ok := conn.cache.symbols[symbolKey(symbolName)]
 	needHandle := ok && localSymbol.Handle == 0
@@ -300,7 +300,7 @@ func (conn *Connection) getSymbol(symbolName string) (*Symbol, error) {
 // using GroupSymbolInfoByNameEx (0xF009).
 // Returns a populated Symbol with Group, Offset, Length, DataType, etc.
 // Does NOT populate Children (struct/array children require full discovery).
-func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) {
+func (conn *Session) getSymbolInfoByName(symbolName string) (*Symbol, error) {
 	resp, err := conn.WriteRead(
 		uint32(GroupSymbolInfoByNameEx),
 		0,
@@ -355,7 +355,7 @@ func (conn *Connection) getSymbolInfoByName(symbolName string) (*Symbol, error) 
 	return sym, nil
 }
 
-func (conn *Connection) GetHandleByName(symbolName string) (handle uint32, err error) {
+func (conn *Session) GetHandleByName(symbolName string) (handle uint32, err error) {
 	resp, err := conn.WriteRead(uint32(GroupSymbolHandleByName), 0, 4, append([]byte(symbolName), 0))
 	if err != nil {
 		return 0, fmt.Errorf("getting handle for %q: %w", symbolName, err)
@@ -367,7 +367,7 @@ func (conn *Connection) GetHandleByName(symbolName string) (handle uint32, err e
 	return handle, nil
 }
 
-func (conn *Connection) GetSymbolUploadInfo() (uploadInfo SymbolUploadInfo, err error) {
+func (conn *Session) GetSymbolUploadInfo() (uploadInfo SymbolUploadInfo, err error) {
 	// Try extended info (0xF00F) first, fall back to basic info (0xF00C)
 	res, err := conn.Read(uint32(GroupSymbolUploadInfo2), 0, 24)
 	if err != nil {
@@ -401,7 +401,7 @@ func (conn *Connection) GetSymbolUploadInfo() (uploadInfo SymbolUploadInfo, err 
 	return
 }
 
-func (conn *Connection) getUploadSymbolInfoSymbols(length uint32) (data []byte, err error) {
+func (conn *Session) getUploadSymbolInfoSymbols(length uint32) (data []byte, err error) {
 	res, err := conn.Read(uint32(GroupSymbolUpload), 0, length)
 	if err != nil {
 		return nil, fmt.Errorf("getUploadSymbolInfoSymbols failed: %w", err)
@@ -409,7 +409,7 @@ func (conn *Connection) getUploadSymbolInfoSymbols(length uint32) (data []byte, 
 	return res, nil
 }
 
-func (conn *Connection) getUploadSymbolInfoDataTypes(length uint32) (data []byte, err error) {
+func (conn *Session) getUploadSymbolInfoDataTypes(length uint32) (data []byte, err error) {
 	data, err = conn.Read(
 		uint32(GroupSymbolDataTypeUpload),
 		0x0,
@@ -422,7 +422,7 @@ func (conn *Connection) getUploadSymbolInfoDataTypes(length uint32) (data []byte
 
 // GetSymbolVersion reads the current symbol version from the PLC.
 // The symbol version is a single byte (uint8) that increments on online-change or download.
-func (conn *Connection) GetSymbolVersion() (uint8, error) {
+func (conn *Session) GetSymbolVersion() (uint8, error) {
 	data, err := conn.Read(uint32(GroupSymbolVersion), 0, 1)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read symbol version: %w", err)
@@ -435,7 +435,7 @@ func (conn *Connection) GetSymbolVersion() (uint8, error) {
 
 // CheckSymbolVersion compares the current PLC symbol version against the stored version.
 // Returns true if the version has changed.
-func (conn *Connection) CheckSymbolVersion() (changed bool, err error) {
+func (conn *Session) CheckSymbolVersion() (changed bool, err error) {
 	version, err := conn.GetSymbolVersion()
 	if err != nil {
 		return false, err
@@ -454,7 +454,7 @@ func (conn *Connection) CheckSymbolVersion() (changed bool, err error) {
 
 // RefreshSymbols reloads the symbol table if the symbol version has changed.
 // It releases old handles, reloads symbol/datatype tables, and re-acquires handles for active symbols.
-func (conn *Connection) RefreshSymbols() error {
+func (conn *Session) RefreshSymbols() error {
 	changed, err := conn.CheckSymbolVersion()
 	if err != nil {
 		return err
@@ -500,7 +500,7 @@ func (conn *Connection) RefreshSymbols() error {
 // This is the smaller of the two tables and enables browsing top-level symbol names.
 // After calling this, BrowseSymbols() can list root symbols and navigate by prefix.
 // To also expand struct/array children, call LoadDataTypes() afterwards.
-func (conn *Connection) LoadSymbolList(cfg SlowDiscoveryConfig) error {
+func (conn *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Read symbol version
@@ -564,7 +564,7 @@ func (conn *Connection) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 // LoadDataTypes downloads only the datatype table (0xF00E) from the PLC in chunks.
 // After calling this along with LoadSymbolList(), struct/array children can be
 // browsed and expanded via BrowseSymbols().
-func (conn *Connection) LoadDataTypes(cfg SlowDiscoveryConfig) error {
+func (conn *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Get upload info
@@ -615,7 +615,7 @@ func (conn *Connection) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 
 // rebuildSymbolChildrenLocked rebuilds children for all symbols using the datatype table.
 // Must be called with cache.lock held.
-func (conn *Connection) rebuildSymbolChildrenLocked() {
+func (conn *Session) rebuildSymbolChildrenLocked() {
 	if conn.cache.symbols == nil || conn.cache.datatypes == nil {
 		return
 	}

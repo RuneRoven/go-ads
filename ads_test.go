@@ -1961,10 +1961,10 @@ func buildNotificationPacketMultiSample(stamps []struct {
 	return buf.Bytes()
 }
 
-// newTestConnection creates a minimal Connection for unit testing notification parsing.
-func newTestConnection() *Connection {
+// newTestConnection creates a minimal Session for unit testing notification parsing.
+func newTestConnection() *Session {
 	ctx, cancel := context.WithCancel(context.Background())
-	conn := &Connection{
+	conn := &Session{
 		lifecycle: &reconnector{ctx: ctx, shutdown: cancel},
 		notifs:    &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
 		cache:     &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
@@ -2290,7 +2290,7 @@ func TestDeviceNotification_StringType(t *testing.T) {
 func TestEncodePacket(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	conn := &Connection{
+	conn := &Session{
 		tx:        &transport{},
 		lifecycle: &reconnector{ctx: ctx},
 		logger:    getDefaultLogger(),
@@ -2374,7 +2374,7 @@ func TestEncodePacket(t *testing.T) {
 func TestEncodePacket_EmptyData(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	conn := &Connection{
+	conn := &Session{
 		tx:        &transport{},
 		lifecycle: &reconnector{ctx: ctx},
 		logger:    getDefaultLogger(),
@@ -2401,7 +2401,7 @@ func TestEncodePacket_EmptyData(t *testing.T) {
 func TestEncodePacket_AllCommands(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	conn := &Connection{
+	conn := &Session{
 		tx:        &transport{},
 		lifecycle: &reconnector{ctx: ctx},
 		logger:    getDefaultLogger(),
@@ -2442,7 +2442,7 @@ func TestEncodePacket_AllCommands(t *testing.T) {
 func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	conn := &Connection{
+	conn := &Session{
 		lifecycle: &reconnector{ctx: ctx},
 		logger:    getDefaultLogger(),
 		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
@@ -2483,7 +2483,7 @@ func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	conn := &Connection{
+	conn := &Session{
 		lifecycle: &reconnector{ctx: ctx},
 		logger:    getDefaultLogger(),
 		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
@@ -2507,7 +2507,7 @@ func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 func TestHandleReceive_TooShort(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	conn := &Connection{
+	conn := &Session{
 		lifecycle: &reconnector{ctx: ctx},
 		logger:    getDefaultLogger(),
 		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
@@ -3109,7 +3109,7 @@ func TestSumReadOverflowGuard(t *testing.T) {
 
 func TestSumProbeStateTransitions(t *testing.T) {
 	// Verify CAS 0→1 and 0→2 work, and second CAS is rejected
-	var conn Connection
+	var conn Session
 
 	// sumWriteState: 0→1
 	if !conn.capabilities.SumWriteStateCAS(0, 1) {
@@ -3144,7 +3144,7 @@ func TestSumProbeStateTransitions(t *testing.T) {
 
 func TestSumProbeStateConcurrent(t *testing.T) {
 	// Concurrent CAS: only one goroutine should win
-	var conn Connection
+	var conn Session
 	const goroutines = 100
 	var wg sync.WaitGroup
 	wins := make(chan uint32, goroutines)

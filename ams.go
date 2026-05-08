@@ -42,7 +42,7 @@ func stringToNetID(source string) (result [6]byte, err error) {
 	return
 }
 
-func (conn *Connection) encode(command CommandID, data []byte, invokeID uint32) ([]byte, error) {
+func (conn *Session) encode(command CommandID, data []byte, invokeID uint32) ([]byte, error) {
 	// Snapshot source under lock to avoid race with Reconnect writing conn.source.
 	// target is write-once (set in NewConnection), so no lock needed.
 	conn.tx.connMu.Lock()

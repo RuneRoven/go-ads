@@ -25,7 +25,7 @@ func craftSumReadResponse(errs []ReturnCode, dataLengths []uint32, data []byte) 
 // a negative int cast (32-bit Go) or huge make() allocation.
 // On 64-bit Go this is defense-in-depth; on 32-bit it is a real bug.
 func TestParseSumReadResponse_LengthOverflow(t *testing.T) {
-	conn := &Connection{logger: getDefaultLogger()}
+	conn := &Session{logger: getDefaultLogger()}
 
 	resp := craftSumReadResponse(
 		[]ReturnCode{ReturnCodeNoErrors},
@@ -51,7 +51,7 @@ func TestParseSumReadResponse_LengthOverflow(t *testing.T) {
 func TestParseSumReadResponse_TruncationLogsError(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	conn := &Connection{logger: logger}
+	conn := &Session{logger: logger}
 
 	// Two items: first declares length=8, second declares length=4. Data section
 	// has only 4 bytes total — first item alone exceeds remaining bytes.
@@ -85,7 +85,7 @@ func TestParseSumReadResponse_TruncationLogsError(t *testing.T) {
 func TestParseSumReadResponse_PerItemOversize(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	conn := &Connection{logger: logger}
+	conn := &Session{logger: logger}
 
 	// Two items each requested as 4 bytes, but item 0 declares 8 bytes returned.
 	// Total response size accommodates 8+4=12 data bytes so the gross truncation
@@ -117,7 +117,7 @@ func TestParseSumReadResponse_PerItemOversize(t *testing.T) {
 // bestEffortDeleteNotifications returns 0 for an empty input slice and never
 // touches the network.
 func TestBestEffortDeleteNotifications_Empty(t *testing.T) {
-	conn := &Connection{logger: getDefaultLogger()}
+	conn := &Session{logger: getDefaultLogger()}
 	got := conn.bestEffortDeleteNotifications(nil)
 	if got != 0 {
 		t.Errorf("expected 0, got %d", got)

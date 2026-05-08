@@ -21,7 +21,7 @@ type SymbolBrowseEntry struct {
 // If path is empty, returns root-level groupings (first path segments).
 // If path is specified, returns children of that symbol or prefix.
 // Requires LoadSymbolList() or LoadSymbols() to have been called first.
-func (conn *Connection) BrowseSymbols(path string) ([]SymbolBrowseEntry, error) {
+func (conn *Session) BrowseSymbols(path string) ([]SymbolBrowseEntry, error) {
 	conn.cache.lock.Lock()
 	defer conn.cache.lock.Unlock()
 
@@ -38,7 +38,7 @@ func (conn *Connection) BrowseSymbols(path string) ([]SymbolBrowseEntry, error) 
 
 // browseRoot returns unique root-level entries (first segment of each symbol name).
 // Must be called with cache.lock held.
-func (conn *Connection) browseRoot() []SymbolBrowseEntry {
+func (conn *Session) browseRoot() []SymbolBrowseEntry {
 	roots := make(map[string]bool)
 	var entries []SymbolBrowseEntry
 
@@ -98,7 +98,7 @@ func (conn *Connection) browseRoot() []SymbolBrowseEntry {
 
 // browseChildren returns children of a given path.
 // Must be called with cache.lock held.
-func (conn *Connection) browseChildren(path string) []SymbolBrowseEntry {
+func (conn *Session) browseChildren(path string) []SymbolBrowseEntry {
 	// First: check if the exact symbol exists and has Children
 	if sym, ok := conn.cache.symbols[symbolKey(path)]; ok && len(sym.Children) > 0 {
 		entries := make([]SymbolBrowseEntry, 0, len(sym.Children))
@@ -183,7 +183,7 @@ func (conn *Connection) browseChildren(path string) []SymbolBrowseEntry {
 
 // symbolHasChildren determines if a symbol likely has children.
 // Must be called with cache.lock held.
-func (conn *Connection) symbolHasChildren(sym *Symbol) bool {
+func (conn *Session) symbolHasChildren(sym *Symbol) bool {
 	// If we already have expanded children, yes
 	if len(sym.Children) > 0 {
 		return true

@@ -82,7 +82,7 @@ func TestBrowseAllSymbols(t *testing.T) {
 	t.Logf("Wrote %s (%d symbols)", filename, len(symbols))
 }
 
-func browseSetupConnection(t *testing.T) *Connection {
+func browseSetupConnection(t *testing.T) *Session {
 	t.Helper()
 	return setupConnectionWithDefaults(t, connDefaults{
 		ip:        "192.168.0.1",

@@ -84,7 +84,7 @@ func pickParseableSymbols(symbols map[string]SymbolView, n int) []string {
 	return names
 }
 
-func setupConnection(t *testing.T) *Connection {
+func setupConnection(t *testing.T) *Session {
 	t.Helper()
 	return setupConnectionWithDefaults(t, connDefaults{
 		ip:        "192.168.3.224",
@@ -592,7 +592,7 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	}
 	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
 
-	conn, err := NewConnection(ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second)
+	conn, err := NewSession(ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second)
 	if err != nil {
 		t.Fatalf("NewConnection failed: %v", err)
 	}
@@ -642,7 +642,7 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	// Reconnect and verify no stale handles exist by subscribing to the same
 	// symbols again — if Close() didn't release, the PLC would eventually
 	// run out of handles.
-	conn2, err := NewConnection(ip, 48898, targetAMS, targetPort, localAMS, 10501, 5*time.Second)
+	conn2, err := NewSession(ip, 48898, targetAMS, targetPort, localAMS, 10501, 5*time.Second)
 	if err != nil {
 		t.Fatalf("second NewConnection failed: %v", err)
 	}
@@ -1076,7 +1076,7 @@ func TestIntegrationReadProcessData(t *testing.T) {
 // waitForReconnect waits for the full reconnect cycle: first waits for the
 // connection to become disconnected (confirming the error was detected), then
 // waits for reconnect to fully complete (disconnected=false AND reconnecting=false).
-func waitForReconnect(t *testing.T, conn *Connection, timeout time.Duration) {
+func waitForReconnect(t *testing.T, conn *Session, timeout time.Duration) {
 	t.Helper()
 	deadline := time.After(timeout)
 	tick := time.NewTicker(50 * time.Millisecond)
@@ -1856,7 +1856,6 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 // ============================================================
 // SumWrite raw debug diagnostic
 // ============================================================
-
 
 // ============================================================
 // SumRead/SumWrite functional verification
@@ -2795,7 +2794,6 @@ func TestIntegrationReadAllParseableTypes(t *testing.T) {
 		}
 	}
 }
-
 
 // TestIntegrationRapidSubscribeUnsubscribe subscribes and unsubscribes quickly
 // in a loop to verify handle management under rapid lifecycle churn.

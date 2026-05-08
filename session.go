@@ -19,7 +19,7 @@ import (
 // of the raw value. Defends against accidental leaks via fmt.Sprintf("%+v",
 // conn) or slog.Any("conn", conn).
 //
-// Kept unexported. The Connection's public API for credentials remains
+// Kept unexported. The Session's public API for credentials remains
 // plain string — conversion happens at the boundary.
 type secret string
 
@@ -31,7 +31,7 @@ func (s secret) LogValue() slog.Value {
 	return slog.StringValue("[REDACTED]")
 }
 
-type Connection struct {
+type Session struct {
 	ip   string
 	port int
 
@@ -76,11 +76,11 @@ type Connection struct {
 // The connection manages its own lifecycle context internally so that Close()
 // can send cleanup commands regardless of any caller context state.
 // Use conn.Close() to shut down the connection.
-func NewConnection(ip string, port int, netid string, amsPort int, localNetID string, localPort int, requestTimeout time.Duration, opts ...ConnectionOption) (conn *Connection, err error) {
+func NewSession(ip string, port int, netid string, amsPort int, localNetID string, localPort int, requestTimeout time.Duration, opts ...SessionOption) (conn *Session, err error) {
 	if requestTimeout <= 0 {
 		requestTimeout = 5000 * time.Millisecond
 	}
-	conn = &Connection{
+	conn = &Session{
 		ip:             ip,
 		port:           port,
 		requestTimeout: requestTimeout,
@@ -105,6 +105,10 @@ func NewConnection(ip string, port int, netid string, amsPort int, localNetID st
 		logger: slog.Default(),
 	}
 	conn.lifecycle.ctx, conn.lifecycle.shutdown = context.WithCancel(context.Background()) //nolint:gosec // cancel stored in lifecycle.shutdown, called from Close
+	// FSM Phase 1 (shadow): explicit Constructed entry. Idempotent — state
+	// zero value already maps to SessionStateConstructed. Real transitions
+	// land in subsequent commits as readers/writers swap over.
+	conn.lifecycle.state.transitionTo(SessionStateConstructed)
 	for _, opt := range opts {
 		opt(conn)
 	}
@@ -130,7 +134,7 @@ func NewConnection(ip string, port int, netid string, amsPort int, localNetID st
 	return
 }
 
-func (conn *Connection) Connect(local bool) error {
+func (conn *Session) Connect(local bool) error {
 	conn.isLocal = local
 	var err error
 	conn.logger.Debug("dialing", "ip", conn.ip, "port", conn.port)
@@ -273,7 +277,7 @@ func (conn *Connection) Connect(local bool) error {
 // ensureRouteOnConnect probes the PLC and registers a route if needed during Connect().
 // Returns (registered bool, err error) where registered=true means a route was added
 // and the caller should TCP-reconnect.
-func (conn *Connection) ensureRouteOnConnect() (registered bool, err error) {
+func (conn *Session) ensureRouteOnConnect() (registered bool, err error) {
 	if conn.lifecycle.closed.Load() {
 		return false, fmt.Errorf("connection closed")
 	}
@@ -308,7 +312,7 @@ func (conn *Connection) ensureRouteOnConnect() (registered bool, err error) {
 }
 
 // Close closes connection and waits for completion
-func (conn *Connection) Close() {
+func (conn *Session) Close() {
 	if !conn.lifecycle.closed.CompareAndSwap(false, true) {
 		return // already closed
 	}
@@ -404,7 +408,7 @@ var ErrDisconnected = errors.New("connection is disconnected")
 
 // reconnectBackoff returns the delay for the given reconnect attempt number (1-indexed)
 // based on the configured BackoffConfig tiers.
-func (conn *Connection) reconnectBackoff(attempt int) time.Duration {
+func (conn *Session) reconnectBackoff(attempt int) time.Duration {
 	cfg := conn.lifecycle.backoffConfig
 	switch {
 	case attempt <= cfg.InitialAttempts:
@@ -420,7 +424,7 @@ func (conn *Connection) reconnectBackoff(attempt int) time.Duration {
 
 // reconnectSleep sleeps for the appropriate backoff duration based on the attempt
 // number. Returns early if Close() is called.
-func (conn *Connection) reconnectSleep(attempt int) error {
+func (conn *Session) reconnectSleep(attempt int) error {
 	delay := conn.reconnectBackoff(attempt)
 	conn.logger.Info("reconnect backoff", "attempt", attempt, "delay", delay)
 	timer := time.NewTimer(delay)
@@ -438,7 +442,7 @@ func (conn *Connection) reconnectSleep(attempt int) error {
 // and creates the reconnectDone channel BEFORE launching the goroutine, eliminating
 // the race window where callers could see a "healthy" connection between the trigger
 // and Reconnect() being scheduled.
-func (conn *Connection) triggerReconnect() {
+func (conn *Session) triggerReconnect() {
 	if conn.lifecycle.closed.Load() {
 		return
 	}
@@ -453,7 +457,7 @@ func (conn *Connection) triggerReconnect() {
 	conn.lifecycle.reconnectMu.Unlock()
 
 	// Fire disconnect callback in goroutine (must not block).
-	// Callback must not call Connection methods — connection may be closing.
+	// Callback must not call Session methods — connection may be closing.
 	if firstDetector && conn.onDisconnect != nil && !conn.lifecycle.closed.Load() {
 		go conn.onDisconnect()
 	}
@@ -476,7 +480,7 @@ func (conn *Connection) triggerReconnect() {
 // and re-subscribe to previously registered notifications.
 // Uses configurable backoff (see WithBackoff) with fast initial retries and
 // progressive slowdown. Backoff resets on each successful reconnect.
-func (conn *Connection) Reconnect() error {
+func (conn *Session) Reconnect() error {
 	if conn.lifecycle.closed.Load() {
 		return fmt.Errorf("connection closed")
 	}
@@ -588,7 +592,7 @@ func (conn *Connection) Reconnect() error {
 		conn.logger.Info("reconnect successful", "attempts", attempts)
 
 		// Fire reconnect callback in goroutine (must not block).
-		// Callback must not call Connection methods — connection may be closing.
+		// Callback must not call Session methods — connection may be closing.
 		if conn.onReconnect != nil && !conn.lifecycle.closed.Load() {
 			go conn.onReconnect()
 		}
@@ -600,7 +604,7 @@ func (conn *Connection) Reconnect() error {
 // On force mode or after repeated probe failures, skips the probe.
 // Returns a non-nil error only if registration was attempted and failed critically
 // (requiring a TCP reset / retry).
-func (conn *Connection) ensureRoute() error {
+func (conn *Session) ensureRoute() error {
 	if conn.route.name == "" {
 		return nil
 	}
@@ -644,7 +648,7 @@ func (conn *Connection) ensureRoute() error {
 
 // filterValidNotificationConfigs returns only configs whose symbols still exist
 // in the current symbol table. Logs a warning for dropped subscriptions.
-func (conn *Connection) filterValidNotificationConfigs(configs []NotificationConfig) []NotificationConfig {
+func (conn *Session) filterValidNotificationConfigs(configs []NotificationConfig) []NotificationConfig {
 	conn.cache.lock.Lock()
 	defer conn.cache.lock.Unlock()
 
@@ -664,7 +668,7 @@ func (conn *Connection) filterValidNotificationConfigs(configs []NotificationCon
 
 // reloadSymbols re-establishes the symbol table after a reconnect, matching
 // the discovery mode that was used before the connection dropped.
-func (conn *Connection) reloadSymbols() error {
+func (conn *Session) reloadSymbols() error {
 	conn.cache.lock.Lock()
 	fullyLoaded := conn.cache.symbolsFullyLoaded
 	listLoaded := conn.cache.symbolListLoaded
@@ -740,7 +744,7 @@ func (conn *Connection) reloadSymbols() error {
 //   - Connect()'s post-route-registration TCP teardown
 //   - Reconnect()'s pre-retry-loop reset
 //   - resetForRetry()
-func (conn *Connection) tearDownAndReset(resetFeatureFlags bool) {
+func (conn *Session) tearDownAndReset(resetFeatureFlags bool) {
 	conn.lifecycle.ctxMu.RLock()
 	conn.lifecycle.shutdown()
 	conn.lifecycle.ctxMu.RUnlock()
@@ -771,7 +775,7 @@ func (conn *Connection) tearDownAndReset(resetFeatureFlags bool) {
 // Connect()'s post-route-registration redial path and Reconnect()'s retry loop.
 // Re-checks closed before waitGroup.Add(2) to prevent the sync.WaitGroup
 // misuse race.
-func (conn *Connection) dialAndStart() error {
+func (conn *Session) dialAndStart() error {
 	newConn, err := net.DialTimeout("tcp", net.JoinHostPort(conn.ip, strconv.Itoa(conn.port)), conn.requestTimeout)
 	if err != nil {
 		return err
@@ -782,7 +786,7 @@ func (conn *Connection) dialAndStart() error {
 	configureKeepAlive(newConn)
 	conn.lifecycle.disconnected.Store(false)
 	if conn.lifecycle.closed.Load() {
-		// Connection was Closed mid-dial. Don't Add to waitGroup.
+		// Session was Closed mid-dial. Don't Add to waitGroup.
 		conn.tx.connMu.Lock()
 		newConn.Close()
 		conn.tx.connection = nil
@@ -800,7 +804,7 @@ func (conn *Connection) dialAndStart() error {
 
 // localHandshake performs the local-mode AMSAddress probe used after dial when
 // isLocal is true. Updates conn.source on success.
-func (conn *Connection) localHandshake() error {
+func (conn *Session) localHandshake() error {
 	resp, err := conn.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 	if err != nil {
 		return fmt.Errorf("local handshake send: %w", err)
@@ -821,7 +825,7 @@ func (conn *Connection) localHandshake() error {
 // no longer exist after symbol reload. On error, rolls back partial PLC-side
 // successes and restores the saved configs so they can be retried by
 // the next reconnect attempt.
-func (conn *Connection) resubscribeNotifications() error {
+func (conn *Session) resubscribeNotifications() error {
 	conn.notifs.lock.Lock()
 	savedConfigs := conn.notifs.notificationConfigs
 	savedChannel := conn.notifs.notificationChannel
@@ -925,7 +929,7 @@ func (conn *Connection) resubscribeNotifications() error {
 
 // resetForRetry tears down goroutines, closes the TCP connection, and resets
 // channels/state so the next retry iteration starts clean.
-func (conn *Connection) resetForRetry() {
+func (conn *Session) resetForRetry() {
 	conn.lifecycle.disconnected.Store(true)
 	conn.tearDownAndReset(false)
 	// Allow route re-registration on next attempt (PLC may have rebooted)
@@ -963,7 +967,7 @@ func zeroOldSymbolHandles(m map[string]*Symbol) {
 }
 
 // loadSymbols loads symbol table and datatypes from the PLC, and saves the symbol version.
-func (conn *Connection) loadSymbols() error {
+func (conn *Session) loadSymbols() error {
 	// Read and store symbol version
 	version, err := conn.GetSymbolVersion()
 	if err != nil {
@@ -1011,7 +1015,7 @@ func (conn *Connection) loadSymbols() error {
 // AddRoute registers a route on the remote PLC using this connection's settings.
 // It uses callbackIP (from WithHostIP) if set, otherwise derives the callback
 // address from the source AMS NetID (first 4 bytes = IP).
-func (conn *Connection) AddRoute(routeName, username, password string) error {
+func (conn *Session) AddRoute(routeName, username, password string) error {
 	hostIP := conn.callbackIP
 	if hostIP == "" {
 		hostIP = fmt.Sprintf("%d.%d.%d.%d",
@@ -1022,7 +1026,7 @@ func (conn *Connection) AddRoute(routeName, username, password string) error {
 }
 
 // IsDisconnected returns whether the connection is currently in a disconnected state.
-func (conn *Connection) IsDisconnected() bool {
+func (conn *Session) IsDisconnected() bool {
 	return conn.lifecycle.disconnected.Load()
 }
 

@@ -8,10 +8,10 @@ import (
 )
 
 // Single-symbol ADS commands: Read, Write, WriteRead, ReadState.
-// Basic per-symbol primitives used directly via Connection.{Read,Write,WriteRead}
+// Basic per-symbol primitives used directly via Session.{Read,Write,WriteRead}
 // and indirectly via ReadFromSymbol/WriteToSymbol in symbol_access.go.
 
-func (conn *Connection) Read(group uint32, offset uint32, length uint32) (data []byte, err error) {
+func (conn *Session) Read(group uint32, offset uint32, length uint32) (data []byte, err error) {
 	request := new(bytes.Buffer)
 	type readCommandPacket struct {
 		Group  uint32
@@ -64,7 +64,7 @@ func (conn *Connection) Read(group uint32, offset uint32, length uint32) (data [
 }
 
 // Write - ADS command id: 3
-func (conn *Connection) Write(group uint32, offset uint32, data []byte) error {
+func (conn *Session) Write(group uint32, offset uint32, data []byte) error {
 	type writeCommandPacket struct {
 		Group  uint32
 		Offset uint32
@@ -107,7 +107,7 @@ func (conn *Connection) Write(group uint32, offset uint32, data []byte) error {
 	return nil
 }
 
-func (conn *Connection) WriteRead(group uint32, offset uint32, readLength uint32, send []byte) (data []byte, err error) {
+func (conn *Session) WriteRead(group uint32, offset uint32, readLength uint32, send []byte) (data []byte, err error) {
 	request := new(bytes.Buffer)
 	type writeReadCommandPacket struct {
 		Group       uint32
@@ -167,7 +167,7 @@ type States struct {
 	DeviceState uint16
 }
 
-func (conn *Connection) ReadState() (response States, err error) {
+func (conn *Session) ReadState() (response States, err error) {
 	// Try to send the request
 	resp, err := conn.sendRequest(CommandIDReadState, []byte{})
 	if err != nil {
@@ -202,7 +202,7 @@ type DeviceInfo struct {
 	DeviceName [16]byte
 }
 
-func (conn *Connection) ReadDeviceInfo() (response DeviceInfo, err error) {
+func (conn *Session) ReadDeviceInfo() (response DeviceInfo, err error) {
 	// Try to send the request
 	resp, err := conn.sendRequest(CommandIDReadDeviceInfo, []byte{})
 	if err != nil {

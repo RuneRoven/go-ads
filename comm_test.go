@@ -31,7 +31,7 @@ func TestListen_TwoSequentialPackets(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	conn := &Connection{
+	conn := &Session{
 		tx:        &transport{connection: client, systemResponse: make(chan []byte, 2)},
 		logger:    getDefaultLogger(),
 		lifecycle: &reconnector{},
@@ -82,7 +82,7 @@ func TestListen_OversizePacketTriggersReconnect(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	conn := &Connection{
+	conn := &Session{
 		tx:        &transport{connection: client, systemResponse: make(chan []byte, 1)},
 		logger:    getDefaultLogger(),
 		lifecycle: &reconnector{closedCh: make(chan struct{})},
@@ -118,10 +118,10 @@ func TestListen_OversizePacketTriggersReconnect(t *testing.T) {
 // Verify sendRequestOnce ctxDone branch returns context.Canceled (not ErrDisconnected),
 // so the outer sendRequest retry loop re-engages.
 //
-// Simulates the disconnected-wait state by setting up a Connection with
+// Simulates the disconnected-wait state by setting up a Session with
 // disconnected=true and a non-nil reconnectDone channel, then cancelling the ctx.
 func TestSendRequestOnce_CtxDoneReturnsCanceled(t *testing.T) {
-	conn := &Connection{
+	conn := &Session{
 		logger:    getDefaultLogger(),
 		lifecycle: &reconnector{reconnectDone: make(chan struct{})},
 	}

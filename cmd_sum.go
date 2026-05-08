@@ -10,7 +10,7 @@ import (
 // Batched ADS sum commands: SumRead, SumWrite, SumAddDeviceNotification,
 // SumDeleteDeviceNotification. Each falls back to individual commands when
 // the PLC does not support the sum variant. Capability state is tracked via
-// the capabilities type on Connection.
+// the capabilities type on Session.
 
 // sumCmdSpec describes a single sum-command's protocol contract for use
 // with executeSumCommand. SumAddDeviceNotification and SumDeleteDeviceNotification
@@ -37,7 +37,7 @@ type sumCmdSpec[Req any, Res any] struct {
 //  4. On error: if isSumCommandUnsupportedError, CAS state to unsupported,
 //     log Warn, call fallback. Otherwise propagate.
 //  5. On success: CAS state to supported, length-check response, decode.
-func executeSumCommand[Req any, Res any](conn *Connection, spec sumCmdSpec[Req, Res], requests []Req) ([]Res, error) {
+func executeSumCommand[Req any, Res any](conn *Session, spec sumCmdSpec[Req, Res], requests []Req) ([]Res, error) {
 	if len(requests) == 0 {
 		return nil, nil
 	}
@@ -97,7 +97,7 @@ type SumReadResult struct {
 // cleanly — migrating would require either two helper invocations or a spec
 // extension that couples the helper to one caller's quirk. Custom orchestration
 // is clearer here.
-func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, error) {
+func (conn *Session) SumRead(requests []SumReadRequest) ([]SumReadResult, error) {
 	if len(requests) == 0 {
 		return nil, nil
 	}
@@ -137,7 +137,7 @@ func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, err
 }
 
 // sumReadProbe tries SumReadEx2 then SumReadEx, caching the first that works.
-func (conn *Connection) sumReadProbe(count uint32, readLen uint32, writeData []byte, requests []SumReadRequest) ([]SumReadResult, error) {
+func (conn *Session) sumReadProbe(count uint32, readLen uint32, writeData []byte, requests []SumReadRequest) ([]SumReadResult, error) {
 	// Try SumReadEx2 (0xF084) first
 	resp, err := conn.WriteRead(uint32(GroupSumupReadEx2), count, readLen, writeData)
 	if err == nil {
@@ -168,7 +168,7 @@ func (conn *Connection) sumReadProbe(count uint32, readLen uint32, writeData []b
 }
 
 // sumReadExec performs a sum read with a known-good command.
-func (conn *Connection) sumReadExec(group Group, count uint32, readLen uint32, writeData []byte, requests []SumReadRequest) ([]SumReadResult, error) {
+func (conn *Session) sumReadExec(group Group, count uint32, readLen uint32, writeData []byte, requests []SumReadRequest) ([]SumReadResult, error) {
 	resp, err := conn.WriteRead(uint32(group), count, readLen, writeData)
 	if err != nil {
 		return nil, fmt.Errorf("SumRead failed: %w", err)
@@ -182,7 +182,7 @@ func (conn *Connection) sumReadExec(group Group, count uint32, readLen uint32, w
 // Note: The official Beckhoff PDF shows 0xF083 with a separate error array (like 0xF080),
 // but empirical testing on both TwinCAT 2 and TwinCAT 3 confirms 0xF083 returns the
 // interleaved format identical to 0xF084. See PROTOCOL.md for details.
-func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumReadRequest) ([]SumReadResult, error) {
+func (conn *Session) parseSumReadResponse(resp []byte, n int, requests []SumReadRequest) ([]SumReadResult, error) {
 	if len(resp) < n*8 {
 		return nil, fmt.Errorf("SumRead response too short: got %d bytes, expected at least %d", len(resp), n*8)
 	}
@@ -270,7 +270,7 @@ func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumR
 }
 
 // sumReadFallback performs individual reads when no sum read command is supported.
-func (conn *Connection) sumReadFallback(requests []SumReadRequest) ([]SumReadResult, error) {
+func (conn *Session) sumReadFallback(requests []SumReadRequest) ([]SumReadResult, error) {
 	results := make([]SumReadResult, len(requests))
 	for i, req := range requests {
 		data, err := conn.Read(req.Group, req.Offset, req.Length)
@@ -305,7 +305,7 @@ type SumWriteResult struct {
 // has a header section (Group+Offset+Length per item) followed by a concatenated
 // data section (variable-size Data bytes per item). The generic helper's fixed
 // itemWriteSize cannot represent this. Custom orchestration is required.
-func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, error) {
+func (conn *Session) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, error) {
 	if len(requests) == 0 {
 		return nil, nil
 	}
@@ -365,7 +365,7 @@ func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, 
 }
 
 // sumWriteFallback performs individual writes when sum write is not supported.
-func (conn *Connection) sumWriteFallback(requests []SumWriteRequest) ([]SumWriteResult, error) {
+func (conn *Session) sumWriteFallback(requests []SumWriteRequest) ([]SumWriteResult, error) {
 	results := make([]SumWriteResult, len(requests))
 	for i, req := range requests {
 		err := conn.Write(req.Group, req.Offset, req.Data)
@@ -403,7 +403,7 @@ type SumNotificationResult struct {
 // SumAddDeviceNotification adds multiple device notifications in a single ADS
 // round-trip using GroupSumupAddDeviceNotification (0xF085). Falls back to
 // individual AddDeviceNotification calls on older PLCs.
-func (conn *Connection) SumAddDeviceNotification(requests []SumNotificationRequest) ([]SumNotificationResult, error) {
+func (conn *Session) SumAddDeviceNotification(requests []SumNotificationRequest) ([]SumNotificationResult, error) {
 	spec := sumCmdSpec[SumNotificationRequest, SumNotificationResult]{
 		stateLoad:             conn.capabilities.SumAddNotifStateLoad,
 		stateCASToSupported:   func() bool { return conn.capabilities.SumAddNotifStateCAS(0, 1) },
@@ -436,7 +436,7 @@ func (conn *Connection) SumAddDeviceNotification(requests []SumNotificationReque
 // SumDeleteDeviceNotification deletes multiple device notifications by handle
 // in a single ADS round-trip using GroupSumupDeleteDeviceNotification (0xF086).
 // Falls back to individual DeleteDeviceNotification calls on older PLCs.
-func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error) {
+func (conn *Session) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error) {
 	spec := sumCmdSpec[uint32, ReturnCode]{
 		stateLoad:             conn.capabilities.SumDeleteNotifStateLoad,
 		stateCASToSupported:   func() bool { return conn.capabilities.SumDeleteNotifStateCAS(0, 1) },
@@ -487,7 +487,7 @@ func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnC
 
 // sumAddNotificationFallback adds notifications individually when sum commands are not supported.
 // It also downgrades v2 transmission modes to v1 equivalents since older PLCs silently ignore v2 modes.
-func (conn *Connection) sumAddNotificationFallback(requests []SumNotificationRequest) ([]SumNotificationResult, error) {
+func (conn *Session) sumAddNotificationFallback(requests []SumNotificationRequest) ([]SumNotificationResult, error) {
 	results := make([]SumNotificationResult, len(requests))
 	for i, req := range requests {
 		// Downgrade v2 modes for older PLCs that don't support them
@@ -515,7 +515,7 @@ func (conn *Connection) sumAddNotificationFallback(requests []SumNotificationReq
 // (e.g. PLC unreachable during a reconnect retry). Returns the count of
 // successfully deleted handles for logging. Treats ReturnCodeDeviceNotifyHandleInvalid
 // as success-equivalent (handle already gone PLC-side).
-func (conn *Connection) bestEffortDeleteNotifications(handles []uint32) int {
+func (conn *Session) bestEffortDeleteNotifications(handles []uint32) int {
 	if len(handles) == 0 {
 		return 0
 	}
@@ -541,7 +541,7 @@ func (conn *Connection) bestEffortDeleteNotifications(handles []uint32) int {
 }
 
 // sumDeleteNotificationFallback deletes notifications individually when sum commands are not supported.
-func (conn *Connection) sumDeleteNotificationFallback(handles []uint32) ([]ReturnCode, error) {
+func (conn *Session) sumDeleteNotificationFallback(handles []uint32) ([]ReturnCode, error) {
 	errors := make([]ReturnCode, len(handles))
 	for i, h := range handles {
 		err := conn.DeleteDeviceNotification(h)

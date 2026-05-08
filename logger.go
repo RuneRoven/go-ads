@@ -18,12 +18,12 @@ func hexAttr(key string, data []byte) slog.Attr {
 }
 
 // ConnectionOption configures optional parameters for NewConnection.
-type ConnectionOption func(*Connection)
+type SessionOption func(*Session)
 
 // WithLogger sets the logger for the connection.
 // If not provided, slog.Default() is used.
-func WithLogger(logger *slog.Logger) ConnectionOption {
-	return func(c *Connection) {
+func WithLogger(logger *slog.Logger) SessionOption {
+	return func(c *Session) {
 		if logger != nil {
 			c.logger = logger
 		}
@@ -34,8 +34,8 @@ func WithLogger(logger *slog.Logger) ConnectionOption {
 // Required in Docker/VPN/NAT scenarios where the local TCP socket address
 // differs from the externally routable IP. When set, AddRoute uses this IP
 // as the callback address instead of deriving it from the AMS NetID.
-func WithHostIP(ip string) ConnectionOption {
-	return func(c *Connection) {
+func WithHostIP(ip string) SessionOption {
+	return func(c *Session) {
 		c.callbackIP = ip
 	}
 }
@@ -50,8 +50,8 @@ func WithHostIP(ip string) ConnectionOption {
 // Security: Beckhoff's route registration protocol transmits credentials in cleartext
 // over UDP. This is a protocol-level limitation — there is no encrypted alternative.
 // Ensure route registration only occurs on trusted networks.
-func WithRoute(routeName, username, password string) ConnectionOption {
-	return func(c *Connection) {
+func WithRoute(routeName, username, password string) SessionOption {
+	return func(c *Session) {
 		c.route.name = routeName
 		c.route.username = username
 		c.route.password = secret(password)
@@ -87,8 +87,8 @@ func DefaultBackoffConfig() BackoffConfig {
 
 // WithBackoff sets the reconnect backoff configuration.
 // If not provided, DefaultBackoffConfig() is used.
-func WithBackoff(cfg BackoffConfig) ConnectionOption {
-	return func(c *Connection) {
+func WithBackoff(cfg BackoffConfig) SessionOption {
+	return func(c *Session) {
 		c.lifecycle.backoffConfig = cfg
 	}
 }
@@ -96,8 +96,8 @@ func WithBackoff(cfg BackoffConfig) ConnectionOption {
 // WithMaxReconnectAttempts limits total TCP reconnection attempts before giving up.
 // Default is 0 (infinite retries). When the limit is reached, the reconnect
 // goroutine returns an error and the connection stays in disconnected state.
-func WithMaxReconnectAttempts(n int) ConnectionOption {
-	return func(c *Connection) {
+func WithMaxReconnectAttempts(n int) SessionOption {
+	return func(c *Session) {
 		c.lifecycle.maxReconnectAttempts = n
 	}
 }
@@ -110,8 +110,8 @@ func WithMaxReconnectAttempts(n int) ConnectionOption {
 // Note: this option is also used as the net.DialTimeout for initial Connect
 // and reconnect dial. A single value covers both ADS request and TCP dial
 // semantics — split if you need different deadlines.
-func WithRequestTimeout(d time.Duration) ConnectionOption {
-	return func(c *Connection) {
+func WithRequestTimeout(d time.Duration) SessionOption {
+	return func(c *Session) {
 		if d > 0 {
 			c.requestTimeout = d
 		}
@@ -121,8 +121,8 @@ func WithRequestTimeout(d time.Duration) ConnectionOption {
 // WithForceRouteRegistration disables route probing and always registers the route
 // with credentials on every Connect and Reconnect. Use this in environments where
 // routes are not persistent or must be refreshed on each connection.
-func WithForceRouteRegistration() ConnectionOption {
-	return func(c *Connection) {
+func WithForceRouteRegistration() SessionOption {
+	return func(c *Session) {
 		c.route.forceRouteRegistration = true
 	}
 }
@@ -133,8 +133,8 @@ func WithForceRouteRegistration() ConnectionOption {
 // maxAttempts controls how many reconnect attempts are allowed before giving up:
 //   - 0 = fail immediately on first missing symbol
 //   - N > 0 = retry up to N times, then return error (connection closes)
-func WithStrictReconnect(maxAttempts int) ConnectionOption {
-	return func(c *Connection) {
+func WithStrictReconnect(maxAttempts int) SessionOption {
+	return func(c *Session) {
 		c.lifecycle.strictReconnect = true
 		c.lifecycle.strictReconnectMaxAttempts = maxAttempts
 	}
@@ -145,30 +145,30 @@ func WithStrictReconnect(maxAttempts int) ConnectionOption {
 // When disabled, triggerReconnect sets the disconnected flag but does not launch
 // a reconnect goroutine. sendRequest returns ErrDisconnected immediately.
 // The caller must call Reconnect() manually to re-establish the connection.
-func WithAutoReconnect(enabled bool) ConnectionOption {
-	return func(c *Connection) {
+func WithAutoReconnect(enabled bool) SessionOption {
+	return func(c *Session) {
 		c.lifecycle.autoReconnect = enabled
 	}
 }
 
 // WithOnDisconnect registers a callback invoked when a disconnect is detected.
 // The callback runs in a separate goroutine and must not block.
-func WithOnDisconnect(fn func()) ConnectionOption {
-	return func(c *Connection) {
+func WithOnDisconnect(fn func()) SessionOption {
+	return func(c *Session) {
 		c.onDisconnect = fn
 	}
 }
 
 // WithOnReconnect registers a callback invoked after a successful reconnect.
 // The callback runs in a separate goroutine and must not block.
-func WithOnReconnect(fn func()) ConnectionOption {
-	return func(c *Connection) {
+func WithOnReconnect(fn func()) SessionOption {
+	return func(c *Session) {
 		c.onReconnect = fn
 	}
 }
 
 // defaultLoggerPtr is used by package-level functions (e.g., AddRemoteRoute)
-// that are not associated with a Connection instance.
+// that are not associated with a Session instance.
 var defaultLoggerPtr atomic.Pointer[slog.Logger]
 
 func init() {

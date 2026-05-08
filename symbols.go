@@ -103,7 +103,7 @@ type SymbolUploadInfo struct {
 //     FullName, Name, DataType, Comment, Group, Offset, Length, BaseType,
 //     Flags, ContextMask, MinUpdateInterval, Parent, Children.
 //
-//   - Guarded by Connection.cache.lock (mutated by parse/Read/Write/loadSymbols):
+//   - Guarded by Session.cache.lock (mutated by parse/Read/Write/loadSymbols):
 //     Value, Valid, ValueParsed, LastUpdateTime.
 //
 //   - Handle: write-once during getSymbol resolve under cache.lock, then
@@ -113,7 +113,7 @@ type SymbolUploadInfo struct {
 //     fails the next PLC operation (ReturnCodeDeviceNotifyHandleInvalid),
 //     prompting re-resolve via GetSymbol.
 //
-//   - Guarded by Connection.notifs.lock (mutated by AddSymbolNotification(s)
+//   - Guarded by Session.notifs.lock (mutated by AddSymbolNotification(s)
 //     and DeleteDeviceNotification):
 //     Notification.
 //
@@ -162,7 +162,7 @@ type Symbol struct {
 //
 // IsValid() returns false for the zero-value SymbolView. Children() and
 // ChildrenWalk() collect snapshots under cache.lock and release before
-// invoking the caller's iterator - safe to call any Connection method
+// invoking the caller's iterator - safe to call any Session method
 // from within a walk.
 type SymbolView struct {
 	Name        string
@@ -180,7 +180,7 @@ type SymbolView struct {
 	IsRoot      bool  // true if this symbol has no parent (top-level program/global var)
 	Value       string
 
-	conn *Connection
+	conn *Session
 }
 
 // IsValid reports whether the view is backed by a live connection. Zero-value
@@ -195,7 +195,7 @@ func (v SymbolView) IsValid() bool { return v.conn != nil && v.FullName != "" }
 //
 // Each child is a freshly-snapshotted SymbolView (lookups walk the cache
 // under cache.lock once per call, then release). Caller code in a walk loop
-// is free to call any Connection method - no lock held.
+// is free to call any Session method - no lock held.
 func (v SymbolView) Children() map[string]SymbolView {
 	if v.conn == nil {
 		return nil
@@ -220,7 +220,7 @@ func (v SymbolView) Children() map[string]SymbolView {
 // ChildrenWalk visits every symbol in the subtree rooted at this view in
 // depth-first order. Snapshots the entire subtree under cache.lock once,
 // releases the lock, then invokes fn for each entry. fn is free to call
-// any Connection method (Value field reads are lock-free, GetSymbol etc.
+// any Session method (Value field reads are lock-free, GetSymbol etc.
 // take their own locks - no deadlock risk).
 //
 // Walk terminates early if fn returns false.
@@ -251,11 +251,11 @@ func (v SymbolView) ChildrenWalk(fn func(SymbolView) bool) {
 // dozen levels.
 const collectSubtreeMaxDepth = 256
 
-func collectSubtree(s *Symbol, conn *Connection, out *[]SymbolView) {
+func collectSubtree(s *Symbol, conn *Session, out *[]SymbolView) {
 	collectSubtreeDepth(s, conn, out, 0)
 }
 
-func collectSubtreeDepth(s *Symbol, conn *Connection, out *[]SymbolView, depth int) {
+func collectSubtreeDepth(s *Symbol, conn *Session, out *[]SymbolView, depth int) {
 	if depth >= collectSubtreeMaxDepth {
 		getDefaultLogger().Warn("collectSubtree hit depth cap; possible Children cycle or malformed Symbol tree",
 			"symbol", s.FullName,
@@ -273,7 +273,7 @@ func collectSubtreeDepth(s *Symbol, conn *Connection, out *[]SymbolView, depth i
 
 // view builds a SymbolView for s. Caller must hold cache.lock so the
 // snapshot of metadata + value is internally consistent. O(1).
-func (s *Symbol) view(conn *Connection) SymbolView {
+func (s *Symbol) view(conn *Session) SymbolView {
 	return SymbolView{
 		Name:        s.Name,
 		FullName:    s.FullName,
