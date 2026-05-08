@@ -139,7 +139,7 @@ func (conn *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	conn.cache.symbols = symbols
 	conn.cache.symbolsFullyLoaded = true
 	conn.cache.onDemandSymbols = map[string]bool{}
-	conn.cache.generation.Inc()
+	conn.bumpEpoch()
 	conn.cache.lock.Unlock()
 
 	conn.logger.Info("slow symbol discovery complete",
@@ -552,7 +552,7 @@ func (conn *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	if conn.cache.datatypesLoaded && conn.cache.datatypes != nil {
 		conn.rebuildSymbolChildrenLocked()
 	}
-	conn.cache.generation.Inc()
+	conn.bumpEpoch()
 	conn.cache.lock.Unlock()
 
 	conn.logger.Info("symbol list loaded (browse mode)",
@@ -604,7 +604,7 @@ func (conn *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	if conn.cache.symbolListLoaded && conn.cache.symbols != nil {
 		conn.rebuildSymbolChildrenLocked()
 	}
-	conn.cache.generation.Inc()
+	conn.bumpEpoch()
 	conn.cache.lock.Unlock()
 
 	conn.logger.Info("datatypes loaded",

@@ -11,7 +11,7 @@ func (conn *Session) WriteToSymbol(symbolName string, value string) error {
 }
 
 func (conn *Session) writeToSymbolRetry(symbolName string, value string, retriesLeft int) error {
-	gen := conn.lifecycle.reconnectGeneration.Load()
+	gen := conn.epoch()
 
 	symbol, err := conn.getSymbol(symbolName)
 	if err != nil {
@@ -35,7 +35,7 @@ func (conn *Session) writeToSymbolRetry(symbolName string, value string, retries
 	err = conn.Write(uint32(GroupSymbolValueByHandle), handle, data)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
-		if retriesLeft > 0 && conn.lifecycle.reconnectGeneration.Load() != gen {
+		if retriesLeft > 0 && conn.epoch() != gen {
 			return conn.writeToSymbolRetry(symbolName, value, retriesLeft-1)
 		}
 		return fmt.Errorf("write to %q: %w", symbolName, err)
@@ -58,7 +58,7 @@ func (conn *Session) ReadFromSymbol(symbolName string) (string, error) {
 }
 
 func (conn *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (string, error) {
-	gen := conn.lifecycle.reconnectGeneration.Load()
+	gen := conn.epoch()
 
 	symbol, err := conn.getSymbol(symbolName)
 	if err != nil {
@@ -82,7 +82,7 @@ func (conn *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (st
 	data, err := conn.Read(uint32(GroupSymbolValueByHandle), handle, length)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
-		if retriesLeft > 0 && conn.lifecycle.reconnectGeneration.Load() != gen {
+		if retriesLeft > 0 && conn.epoch() != gen {
 			return conn.readFromSymbolRetry(symbolName, retriesLeft-1)
 		}
 		return "", fmt.Errorf("read %q: %w", symbolName, err)
@@ -144,7 +144,7 @@ func (conn *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (
 		return nil, nil
 	}
 
-	gen := conn.lifecycle.reconnectGeneration.Load()
+	gen := conn.epoch()
 
 	// Resolve symbols and build SumRead requests
 	type symbolInfo struct {
@@ -172,7 +172,7 @@ func (conn *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (
 	results, err := conn.SumRead(requests)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
-		if retriesLeft > 0 && conn.lifecycle.reconnectGeneration.Load() != gen {
+		if retriesLeft > 0 && conn.epoch() != gen {
 			return conn.readMultipleSymbolsRetry(names, retriesLeft-1)
 		}
 		return nil, fmt.Errorf("batch read failed: %w", err)
@@ -226,7 +226,7 @@ func (conn *Session) writeMultipleSymbolsRetry(values map[string]string, retries
 		return nil, nil
 	}
 
-	gen := conn.lifecycle.reconnectGeneration.Load()
+	gen := conn.epoch()
 
 	// Snapshot datatypes under lock
 	conn.cache.lock.Lock()
@@ -267,7 +267,7 @@ func (conn *Session) writeMultipleSymbolsRetry(values map[string]string, retries
 	results, err := conn.SumWrite(requests)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
-		if retriesLeft > 0 && conn.lifecycle.reconnectGeneration.Load() != gen {
+		if retriesLeft > 0 && conn.epoch() != gen {
 			return conn.writeMultipleSymbolsRetry(values, retriesLeft-1)
 		}
 		return nil, fmt.Errorf("batch write failed: %w", err)

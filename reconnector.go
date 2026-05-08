@@ -22,12 +22,14 @@ type reconnector struct {
 
 	closedCh chan struct{}
 
-	disconnected        atomic.Bool
-	reconnectGeneration atomic.Uint64
+	disconnected atomic.Bool
 
-	// state is the explicit FSM state (specs/09-fsm-design.md). Phase 1
-	// SHADOW: maintained alongside the boolean flags above but not yet read
-	// for behavior decisions. Phase 2/3 swap readers and remove the flags.
+	// state is the explicit FSM state plus the unified epoch counter
+	// (specs/09-fsm-design.md). FSM is the source of truth for closed and
+	// reconnecting (Phase 3 removed the legacy flags). epoch replaces the
+	// previous cache.generation and reconnectGeneration counters and bumps
+	// on every Connected entry plus on user-driven cache swaps that don't
+	// (yet) transition through Reloading.
 	state sessionFSM
 
 	autoReconnect              bool

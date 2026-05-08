@@ -90,9 +90,19 @@ var allowedTransitions = map[SessionState]map[SessionState]struct{}{
 
 // sessionFSM wraps the atomic state field plus a transition mutex. The mutex
 // serializes transitions; readers can Load lock-free.
+//
+// epoch is the unified generation counter (Phase 4): bumped on every
+// transition INTO Connected and on every cache.symbols swap during Connected
+// (user-driven LoadSymbols/LoadSymbolList/LoadDataTypes/RefreshSymbols).
+// Replaces the previous cache.generation and reconnectGeneration counters.
+// Retry helpers and TOCTOU re-checks load epoch at start, compare at retry
+// point; any change means "something the caller cared about advanced."
+// False-positive retries (e.g. a transition + a swap during one reconnect)
+// are harmless.
 type sessionFSM struct {
 	mu    sync.Mutex
 	value atomic.Uint32
+	epoch atomic.Uint64
 }
 
 func (s *sessionFSM) load() SessionState { return SessionState(s.value.Load()) }
@@ -126,6 +136,9 @@ func (s *sessionFSM) transitionTo(want SessionState) (from SessionState, ok bool
 		return from, false
 	}
 	s.value.Store(uint32(want))
+	if want == SessionStateConnected {
+		s.epoch.Add(1)
+	}
 	return from, true
 }
 
@@ -152,6 +165,9 @@ func (s *sessionFSM) transitionToOnce(want SessionState) (from SessionState, ok 
 		return from, false
 	}
 	s.value.Store(uint32(want))
+	if want == SessionStateConnected {
+		s.epoch.Add(1)
+	}
 	return from, true
 }
 
@@ -189,6 +205,21 @@ func (conn *Session) isDisconnected() bool {
 // FSM-only (legacy reconnecting flag removed in Phase 3.c).
 func (conn *Session) isReconnecting() bool {
 	return conn.lifecycle.state.load() == SessionStateReconnecting
+}
+
+// epoch returns the unified generation counter for this session. See the
+// sessionFSM doc for the full bump semantics. Retry helpers and TOCTOU
+// re-checks use this to detect "something changed" since they captured.
+func (conn *Session) epoch() uint64 {
+	return conn.lifecycle.state.epoch.Load()
+}
+
+// bumpEpoch advances the counter for cache.symbols swaps that do NOT
+// (yet) go through a Connected re-entry transition. Phase 6 wires the
+// Reloading state for user-driven LoadSymbols/LoadSymbolList/RefreshSymbols
+// and removes these manual bumps in favor of the transition-driven one.
+func (conn *Session) bumpEpoch() {
+	conn.lifecycle.state.epoch.Add(1)
 }
 
 // isTransportDown reports whether the underlying TCP transport is not

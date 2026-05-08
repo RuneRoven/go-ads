@@ -99,13 +99,13 @@ func (conn *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 	// the network call; using the stranded pointer would write notifications
 	// into a Symbol no longer reachable via ReadFromSymbol. Take cache.lock
 	// FIRST and release before taking notifs.lock (lock-ordering rule).
-	// Capture cache.generation under the lock; re-check it under notifs.lock
+	// Capture epoch under the lock; re-check it under notifs.lock
 	// (atomic Load is lock-free) to close the residual race window where a
 	// THIRD loadSymbols could run between cache.lock release and notifs.lock
 	// acquire and re-strand `fresh`.
 	conn.cache.lock.Lock()
 	fresh := conn.cache.symbols[symbolKey(symbolName)]
-	cacheGen := conn.cache.generation.Load()
+	cacheGen := conn.epoch()
 	conn.cache.lock.Unlock()
 	if fresh == nil {
 		if delErr := conn.DeleteDeviceNotification(handle); delErr != nil {
@@ -118,7 +118,7 @@ func (conn *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 	// against concurrent callers that passed the pre-check while we were
 	// doing the PLC roundtrip. On mismatch, release the just-acquired PLC handle.
 	conn.notifs.lock.Lock()
-	if conn.cache.generation.Load() != cacheGen {
+	if conn.epoch() != cacheGen {
 		conn.notifs.lock.Unlock()
 		if delErr := conn.DeleteDeviceNotification(handle); delErr != nil {
 			conn.logger.Warn("failed to release PLC handle after cache reload during subscribe",
@@ -277,7 +277,7 @@ func (conn *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 	// pointer would be orphaned (Handle=0, Value=""), and later
 	// handleNotification would parse into the stranded Symbol while
 	// ReadFromSymbol would see a different fresh entry.
-	// Capture cache.generation under the lock; re-check it under notifs.lock
+	// Capture epoch under the lock; re-check it under notifs.lock
 	// to close the residual race where a third loadSymbols runs between
 	// cache.lock release and notifs.lock acquire.
 	freshSymbols := make([]*Symbol, len(infos))
@@ -285,7 +285,7 @@ func (conn *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 	for i, info := range infos {
 		freshSymbols[i] = conn.cache.symbols[symbolKey(info.config.SymbolName)]
 	}
-	cacheGen := conn.cache.generation.Load()
+	cacheGen := conn.epoch()
 	conn.cache.lock.Unlock()
 
 	conn.notifs.lock.Lock()
@@ -294,7 +294,7 @@ func (conn *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 	// Generation re-check: if cache swapped between our cache.lock release
 	// and now, every freshSymbols[] entry is potentially stranded - mark all
 	// PLC-accepted entries as Skipped and surface handles for caller cleanup.
-	if conn.cache.generation.Load() != cacheGen {
+	if conn.epoch() != cacheGen {
 		for i, r := range subResults {
 			info := infos[i]
 			if r.Error == ReturnCodeNoErrors {

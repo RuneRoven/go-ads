@@ -601,8 +601,8 @@ func (conn *Session) Reconnect() error {
 		}
 
 		conn.lifecycle.disconnected.Store(false)
-		conn.lifecycle.reconnectGeneration.Add(1)
 		conn.lifecycle.strictReconnectFailures = 0 // reset on success
+		// epoch bumps inside the transition helper when target == Connected.
 		conn.transitionState(SessionStateConnected)
 		conn.logger.Info("reconnect successful", "attempts", attempts)
 
@@ -717,7 +717,7 @@ func (conn *Session) reloadSymbols() error {
 		oldSymbols := conn.cache.onDemandSymbols
 		conn.cache.symbols = make(map[string]*Symbol)
 		conn.cache.onDemandSymbols = make(map[string]bool)
-		conn.cache.generation.Inc()
+		conn.bumpEpoch()
 		conn.cache.lock.Unlock()
 
 		for name := range oldSymbols {
@@ -1022,7 +1022,7 @@ func (conn *Session) loadSymbols() error {
 	zeroOldSymbolHandles(conn.cache.symbols)
 	conn.cache.datatypes = datatypes
 	conn.cache.symbols = symbols
-	conn.cache.generation.Inc()
+	conn.bumpEpoch()
 	conn.cache.lock.Unlock()
 	return nil
 }
