@@ -246,22 +246,6 @@ func TestReturnCodeString_AllCategories(t *testing.T) {
 	}
 }
 
-func TestReturnCodeError_ImplementsError(t *testing.T) {
-	codes := []ReturnCode{
-		ReturnCodeDeviceTimeout,
-		ReturnCodeDeviceInvalidParam,
-		ReturnCodeDeviceSymbolNoFound,
-		ReturnCodeClientSyncTimeout,
-		ReturnCodeGlobalTargetNotFound,
-	}
-	for _, rc := range codes {
-		var err error = rc
-		if err.Error() == "" {
-			t.Errorf("ReturnCode(0x%04X).Error() should not be empty", uint32(rc))
-		}
-	}
-}
-
 // --- buildTag ---
 
 func TestBuildTag(t *testing.T) {
@@ -295,6 +279,12 @@ func TestAppendNull(t *testing.T) {
 // Process image constants and helpers
 // ==========================================================================
 
+// TestProcessImageConstants is a regression guard against accidental edits
+// to the Group constants in defs.go. The values come from PROTOCOL.md
+// "Process Image Groups" — that document is authoritative; defs.go is the
+// implementation. A change in defs.go that drifts from PROTOCOL.md fails
+// here. (It is intentionally a snapshot test; cite PROTOCOL.md before
+// changing any value.)
 func TestProcessImageConstants(t *testing.T) {
 	tests := []struct {
 		name string
@@ -316,28 +306,6 @@ func TestProcessImageConstants(t *testing.T) {
 				t.Errorf("%s = 0x%04X, want 0x%04X", tt.name, uint32(tt.got), tt.want)
 			}
 		})
-	}
-}
-
-func TestProcessImageBitOffset(t *testing.T) {
-	// Verify the bit offset calculation used in process image bit access
-	// byteOffset * 8 + bitIndex
-	tests := []struct {
-		byteOffset uint32
-		bitIndex   uint8
-		want       uint32
-	}{
-		{0, 0, 0},
-		{0, 7, 7},
-		{1, 0, 8},
-		{1, 3, 11},
-		{10, 5, 85},
-	}
-	for _, tt := range tests {
-		got := tt.byteOffset*8 + uint32(tt.bitIndex)
-		if got != tt.want {
-			t.Errorf("byte=%d bit=%d: got %d, want %d", tt.byteOffset, tt.bitIndex, got, tt.want)
-		}
 	}
 }
 

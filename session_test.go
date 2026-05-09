@@ -2,18 +2,36 @@ package ads
 
 import (
 	"testing"
+	"time"
 )
 
-// F-20: loadSymbols replaces conn.cache.symbols map with fresh entries (Handle=0).
-// Callers may hold *Symbol pointers from the OLD map (e.g. infos[i].symbol
-// in readMultipleSymbolsRetry). After the swap, those old pointers retain
-// stale Handle values. Defensive fix: zero Handle on every old *Symbol
-// before replacing the map.
+// TestZeroOldSymbolHandles validates R-CACHE-004 in full: loadSymbols
+// replaces the cache.symbols map, but callers (e.g. readMultipleSymbolsRetry)
+// may hold *Symbol pointers into the OLD map. zeroOldSymbolHandles MUST
+// clear Handle, Value, Valid, ValueParsed, and LastUpdateTime so stale
+// data cannot leak post-reconnect.
+//
+// Validates: R-CACHE-004.
 func TestZeroOldSymbolHandles(t *testing.T) {
+	t0 := time.Now()
 	oldMap := map[string]*Symbol{
-		"a": {Name: "a", Handle: 0x1234},
-		"b": {Name: "b", Handle: 0x5678},
-		"c": {Name: "c", Handle: 0}, // already zero
+		"a": {
+			Name:           "a",
+			Handle:         0x1234,
+			Value:          "42",
+			Valid:          true,
+			ValueParsed:    true,
+			LastUpdateTime: t0,
+		},
+		"b": {
+			Name:           "b",
+			Handle:         0x5678,
+			Value:          "hello",
+			Valid:          true,
+			ValueParsed:    true,
+			LastUpdateTime: t0,
+		},
+		"c": {Name: "c"}, // already zero across all fields
 	}
 	pa := oldMap["a"]
 	pb := oldMap["b"]
@@ -21,18 +39,26 @@ func TestZeroOldSymbolHandles(t *testing.T) {
 
 	zeroOldSymbolHandles(oldMap)
 
-	if pa.Handle != 0 {
-		t.Errorf("pa.Handle = 0x%X, want 0", pa.Handle)
-	}
-	if pb.Handle != 0 {
-		t.Errorf("pb.Handle = 0x%X, want 0", pb.Handle)
-	}
-	if pc.Handle != 0 {
-		t.Errorf("pc.Handle = 0x%X, want 0", pc.Handle)
+	for _, p := range []*Symbol{pa, pb, pc} {
+		if p.Handle != 0 {
+			t.Errorf("%s.Handle = 0x%X, want 0", p.Name, p.Handle)
+		}
+		if p.Value != "" {
+			t.Errorf("%s.Value = %q, want empty string", p.Name, p.Value)
+		}
+		if p.Valid {
+			t.Errorf("%s.Valid = true, want false", p.Name)
+		}
+		if p.ValueParsed {
+			t.Errorf("%s.ValueParsed = true, want false", p.Name)
+		}
+		if !p.LastUpdateTime.IsZero() {
+			t.Errorf("%s.LastUpdateTime = %v, want zero", p.Name, p.LastUpdateTime)
+		}
 	}
 }
 
-// Nil and empty input must not panic.
+// Nil and empty input must not panic. Validates: R-CACHE-004 (defensive).
 func TestZeroOldSymbolHandles_NilSafe(t *testing.T) {
 	zeroOldSymbolHandles(nil)
 	zeroOldSymbolHandles(map[string]*Symbol{})
