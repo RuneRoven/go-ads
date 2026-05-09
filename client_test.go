@@ -451,17 +451,27 @@ func TestEncodePacket_EmptyData(t *testing.T) {
 	}
 }
 
+// TestEncodePacket_AllCommands round-trips encode against every supported
+// CommandID and asserts the full set of header fields and payload —
+// command, AMS state (request=4), invokeID, target+source AMS addresses,
+// length, and payload bytes. The previous version asserted only the
+// command field, which would have missed bugs in any of the other
+// header positions.
+//
+// Validates: R-CMD-002 (header layout) per command kind.
 func TestEncodePacket_AllCommands(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	target := AMSAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851}
+	source := AMSAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500}
 	conn := &Session{
 		tx:        &transport{},
 		lifecycle: &sessionLifecycle{ctx: ctx},
 		logger:    getDefaultLogger(),
-		target:    AMSAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851},
-		source:    AMSAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500},
+		target:    target,
+		source:    source,
 	}
-	conn.client = &Client{tx: conn.tx, logger: conn.logger, target: conn.target, source: conn.source}
+	conn.client = &Client{tx: conn.tx, logger: conn.logger, target: target, source: source}
 
 	commands := []CommandID{
 		CommandIDReadDeviceInfo,
@@ -474,16 +484,56 @@ func TestEncodePacket_AllCommands(t *testing.T) {
 		CommandIDReadWrite,
 	}
 
-	for _, cmd := range commands {
+	for i, cmd := range commands {
+		invokeID := uint32(100 + i) // distinct per command so we catch swapped fields
+		payload := []byte{0xDE, 0xAD, 0xBE, byte(cmd & 0xFF)}
 		t.Run(fmt.Sprintf("Command_%d", cmd), func(t *testing.T) {
-			packet, err := conn.client.encode(cmd, []byte{0xFF}, 1)
+			packet, err := conn.client.encode(cmd, payload, invokeID)
 			if err != nil {
-				t.Fatalf("encode error: %v", err)
+				t.Fatalf("encode: %v", err)
 			}
-			// Verify command in header
-			encodedCmd := binary.LittleEndian.Uint16(packet[22:24])
-			if CommandID(encodedCmd) != cmd {
-				t.Errorf("encoded command = %d, want %d", encodedCmd, cmd)
+			// Layout: 6-byte amsTCPHeader + 32-byte amsHeader + payload.
+			if len(packet) != 6+32+len(payload) {
+				t.Fatalf("packet length %d, want %d", len(packet), 6+32+len(payload))
+			}
+			// amsTCPHeader: bytes 0-1 unknown/system (zero), 2-5 length (LE).
+			if got := binary.LittleEndian.Uint32(packet[2:6]); got != uint32(32+len(payload)) {
+				t.Errorf("TCP length = %d, want %d", got, 32+len(payload))
+			}
+			// amsHeader at offset 6: target (8) + source (8) + cmd (2) + state (2) + length (4) + errcode (4) + invokeID (4).
+			gotTargetNetID := *(*[6]byte)(packet[6 : 6+6])
+			if gotTargetNetID != target.NetID {
+				t.Errorf("target NetID = %v, want %v", gotTargetNetID, target.NetID)
+			}
+			gotTargetPort := binary.LittleEndian.Uint16(packet[12:14])
+			if gotTargetPort != target.Port {
+				t.Errorf("target port = %d, want %d", gotTargetPort, target.Port)
+			}
+			gotSourceNetID := *(*[6]byte)(packet[14 : 14+6])
+			if gotSourceNetID != source.NetID {
+				t.Errorf("source NetID = %v, want %v", gotSourceNetID, source.NetID)
+			}
+			gotSourcePort := binary.LittleEndian.Uint16(packet[20:22])
+			if gotSourcePort != source.Port {
+				t.Errorf("source port = %d, want %d", gotSourcePort, source.Port)
+			}
+			if got := binary.LittleEndian.Uint16(packet[22:24]); CommandID(got) != cmd {
+				t.Errorf("command = %d, want %d", got, cmd)
+			}
+			if got := binary.LittleEndian.Uint16(packet[24:26]); got != 4 {
+				t.Errorf("state = %d, want 4 (request)", got)
+			}
+			if got := binary.LittleEndian.Uint32(packet[26:30]); got != uint32(len(payload)) {
+				t.Errorf("payload length = %d, want %d", got, len(payload))
+			}
+			if got := binary.LittleEndian.Uint32(packet[30:34]); got != 0 {
+				t.Errorf("error code = %d, want 0", got)
+			}
+			if got := binary.LittleEndian.Uint32(packet[34:38]); got != invokeID {
+				t.Errorf("invokeID = %d, want %d", got, invokeID)
+			}
+			if !bytes.Equal(packet[38:], payload) {
+				t.Errorf("payload bytes = %v, want %v", packet[38:], payload)
 			}
 		})
 	}

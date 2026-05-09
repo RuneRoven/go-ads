@@ -355,29 +355,66 @@ func TestDeviceNotification_StringType(t *testing.T) {
 // Notification timestamp conversion
 // ==========================================================================
 
+// TestWindowsFiletimeConversion drives hard-coded raw Windows FILETIME
+// values through the production deviceNotification → handleNotification
+// path and asserts the resulting Update.TimeStamp.
+//
+// The previous version computed the encoding (filetime = (unixSec +
+// secToUnixEpoch) * windowsTick) and then immediately reversed it with
+// the same constants — neither side touched the production handler, so
+// a constant drift in the production code would shift both sides in
+// lockstep and the test would still pass. This rewrite pins literal
+// FILETIME values from external authority (Wolfram Alpha / Boost
+// reference) so a constant drift surfaces here as an explicit failure.
+//
+// Validates: R-NOT-012 (Windows-100ns to time.Time conversion).
 func TestWindowsFiletimeConversion(t *testing.T) {
-	// Windows FILETIME: 100-nanosecond intervals since 1601-01-01
-	// Unix epoch: 1970-01-01 = 11644473600 seconds after 1601-01-01
 	tests := []struct {
-		name      string
-		unixSec   int64
-		wantYear  int
-		wantMonth time.Month
-		wantDay   int
+		name     string
+		filetime uint64    // raw Windows FILETIME, externally calculated.
+		want     time.Time // expected UTC instant.
 	}{
-		{"Unix epoch", 0, 1970, time.January, 1},
-		{"Y2K", 946684800, 2000, time.January, 1},
-		{"2024", 1704067200, 2024, time.January, 1},
+		// Unix epoch, 1970-01-01 00:00:00 UTC.
+		// 11644473600 sec since 1601-01-01, * 10^7 ticks/sec.
+		{"unix_epoch", 116444736000000000, time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)},
+		// Y2K, 2000-01-01 00:00:00 UTC.
+		// (11644473600 + 946684800) * 10^7.
+		{"y2k", 125911584000000000, time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)},
+		// 2024-01-01 00:00:00 UTC.
+		// (11644473600 + 1704067200) * 10^7.
+		{"2024", 133485408000000000, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			filetime := uint64((tt.unixSec + secToUnixEpoch) * windowsTick)
-			// Reverse conversion (same as handleNotification)
-			ts := int64(filetime)/windowsTick - secToUnixEpoch
-			result := time.Unix(ts, 0).UTC()
-			if result.Year() != tt.wantYear || result.Month() != tt.wantMonth || result.Day() != tt.wantDay {
-				t.Errorf("got %v, want %d-%02d-%02d", result, tt.wantYear, tt.wantMonth, tt.wantDay)
+			conn := newTestConnection()
+			defer conn.lifecycle.shutdown()
+
+			ch := make(chan *Update, 1)
+			sym := &Symbol{
+				FullName:     "MAIN.x",
+				DataType:     "INT",
+				Length:       2,
+				Notification: ch,
+			}
+			conn.notifications.activeNotifications[7] = sym
+			conn.cache.symbols[symbolKey(sym.FullName)] = sym
+
+			data := make([]byte, 2)
+			binary.LittleEndian.PutUint16(data, 1)
+			packet := buildNotificationPacket(7, tt.filetime, data)
+
+			if err := conn.drivePacket(conn.lifecycle.ctx, packet); err != nil {
+				t.Fatalf("drivePacket: %v", err)
+			}
+
+			select {
+			case update := <-ch:
+				if !update.TimeStamp.Equal(tt.want) {
+					t.Errorf("TimeStamp = %v, want %v", update.TimeStamp.UTC(), tt.want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("no update received")
 			}
 		})
 	}

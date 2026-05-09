@@ -137,21 +137,38 @@ func TestBestEffortDeleteNotifications_Empty(t *testing.T) {
 
 // --- SumRead overflow guard ---
 
+// TestSumReadOverflowGuard exercises the production guard in
+// Client.SumRead that rejects request slices whose summed Length plus
+// per-item header overhead would overflow uint32. Drives the production
+// code path with a synthetic two-request slice that crosses MaxUint32
+// and asserts SumRead returns the documented error.
+//
+// Validates: R-SUM-006 (data-section integrity).
 func TestSumReadOverflowGuard(t *testing.T) {
-	// Verify that totalReadLen uses uint64 and the overflow check catches >4GiB
-	n := 2
+	// Build a Client without a live transport. SumRead's overflow check
+	// runs before any wire I/O, so we never reach sendRequest. The
+	// capabilities zero-value (sumReadCmd == 0) routes the call through
+	// the probe path, which still computes totalReadLen first.
+	c := &Client{
+		logger: getDefaultLogger(),
+		tx: &transport{
+			sendChannel:    make(chan []byte),
+			systemResponse: make(chan []byte),
+			recvQueue:      make(chan []byte),
+			activeRequests: map[uint32]chan []byte{},
+		},
+	}
 	requests := []SumReadRequest{
 		{Group: 1, Offset: 0, Length: math.MaxUint32},
 		{Group: 1, Offset: 0, Length: 1}, // total > MaxUint32
 	}
 
-	var totalReadLen uint64
-	for _, req := range requests {
-		totalReadLen += uint64(req.Length)
+	_, err := c.SumRead(requests)
+	if err == nil {
+		t.Fatal("expected overflow error, got nil")
 	}
-	total := uint64(n)*8 + totalReadLen
-	if total <= math.MaxUint32 {
-		t.Fatalf("expected total > MaxUint32, got %d", total)
+	if !strings.Contains(err.Error(), "exceeds uint32 max") {
+		t.Errorf("expected 'exceeds uint32 max' error, got: %v", err)
 	}
 }
 

@@ -115,9 +115,17 @@ func TestWSTRINGSurrogatePairTruncation(t *testing.T) {
 	}
 }
 
-// TestSumNotificationResultTriState exercises the three states of the
-// Skipped+Error+Handle field on SumNotificationResult to ensure callers can
-// distinguish library-skipped from PLC-errored from successful entries.
+// TestSumNotificationResultTriState pins the documented classification
+// rules for SumNotificationResult against synthetic struct values. It does
+// NOT drive the production AddSymbolNotifications path — a real end-to-end
+// test that exercises the four scenarios (success / PLC error / library
+// skip / TOCTOU race) requires Session-level stubbing scaffolding that
+// arrives in Tier 3 of the test audit. Until then this test serves as a
+// contract-documentation snapshot: the docstring on SumNotificationResult
+// MUST match these classification rules.
+//
+// Validates: R-NOT-009 / R-SUM-004 (contract documentation only;
+// production-path coverage TODO).
 func TestSumNotificationResultTriState(t *testing.T) {
 	cases := []struct {
 		name        string

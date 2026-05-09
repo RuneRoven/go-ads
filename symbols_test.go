@@ -579,13 +579,19 @@ func TestGetJSON_EmptyValue(t *testing.T) {
 }
 
 func TestGetJSON_NumericOverflow(t *testing.T) {
-	// ULINT max value — verify JSON doesn't lose precision
+	// GetJSON parses Value via strconv.ParseFloat then encodes as JSON
+	// number. For ULINT max (2^64-1) this is lossy: float64 rounds to
+	// the nearest representable value (1.8446744073709552e+19, which is
+	// 2^64 = 18446744073709551616, ONE more than the input). The test
+	// pins this documented limitation: any change to the encoding path
+	// (e.g. switching to a JSON string for large integers) should
+	// surface here as an explicit failure rather than silently changing
+	// observable output.
 	sym := &Symbol{DataType: "ULINT", Length: 8, Value: "18446744073709551615"}
-	j := sym.GetJSON()
-	// parseFloat loses precision for uint64 max — this is a known limitation
-	// JSON outputs float64 representation
-	if j == "" {
-		t.Error("expected non-empty JSON output")
+	got := sym.GetJSON()
+	const wantLossy = "18446744073709552000"
+	if got != wantLossy {
+		t.Errorf("ULINT max GetJSON() = %q, want %q (lossy float64 round-trip — fix when integer-as-string encoding lands)", got, wantLossy)
 	}
 }
 
