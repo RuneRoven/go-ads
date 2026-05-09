@@ -2,10 +2,12 @@ package ads
 
 import (
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // notifications_test.go — Session.AddSymbolNotification(s) + DeleteDeviceNotification
@@ -176,39 +178,291 @@ func TestAddSymbolNotifications_DuplicateRejected(t *testing.T) {
 	})
 }
 
-// TestAddSymbolNotification_StrandedSymbol_DetectedByEpoch is the canonical
-// R-NOT-004 regression test. We can't easily intercept the PLC roundtrip
-// (Client.AddDeviceNotification needs a stub), but we CAN drive the
-// epoch-mismatch detection by:
-//  1. Seeding the cache with MAIN.x.
-//  2. Calling AddSymbolNotification.
-//  3. Production code captures cacheGen between the (failed) network
-//     call and the post-roundtrip lock; we can't get that far without
-//     a stub.
+// TestAddSymbolNotification_StrandedSymbol_DetectedByEpoch drives the
+// post-roundtrip stranded-symbol detection in AddSymbolNotification
+// (notification_api.go). Two production branches detect strands:
 //
-// Direct path-level test: skip with TODO. Indirect path: assert the
-// epoch-mismatch BRANCH (cache swap detection) by exercising a pure
-// call to the helper logic. Since the path is tightly coupled to the
-// network roundtrip, mark this as a TODO.
+//	(a) fresh == nil: cache.symbols no longer contains the key after roundtrip.
+//	    Returns "removed from cache during subscribe (likely online change
+//	    or LoadSymbols)" and releases the just-acquired PLC handle.
 //
-// Validates: R-NOT-004 (skipped — needs stub Client harness).
+//	(b) epoch != cacheGen: another reload landed AFTER the post-roundtrip
+//	    cache.lock release but BEFORE notifications.lock acquire (the
+//	    residual race window). Returns "stranded by concurrent cache reload
+//	    during subscribe" and releases the handle.
+//
+// This test exercises (a), the deterministic vanish path: pre-seed cache,
+// kick off AddSymbolNotification, and during the in-flight roundtrip
+// delete the symbol from cache + bumpEpoch (mimicking loadSymbols). After
+// the network roundtrip, fresh is nil → branch (a) fires.
+//
+// Branch (b) is a narrow race window (between two specific lock release/
+// acquire points) and is not deterministically reproducible from a test;
+// branch (a) fully exercises the orphan-handle release path that R-NOT-004
+// guards.
+//
+// Validates: R-NOT-004 (post-roundtrip stranded-Symbol detected; handle released).
 func TestAddSymbolNotification_StrandedSymbol_DetectedByEpoch(t *testing.T) {
-	t.Skip("TODO: requires stub Client to drive AddDeviceNotification roundtrip; the production epoch-mismatch detection path can only fire end-to-end. Indirect coverage exists via the epoch atomic + cache lock invariants tested in cache_test.go (TestCacheEpoch_BumpsOnSwapNotInsert).")
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	const fakeHandle uint32 = 0xBEEF0001
+
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		return addNotifResponse{Handle: fakeHandle, Error: ReturnCodeNoErrors}
+	})
+	// 100ms server-side delay gives the test goroutine time to bump epoch
+	// + delete the symbol before the response is sent.
+	srv.delayBefore(CommandIDAddDeviceNotification, 0, 100*time.Millisecond)
+
+	var deletes atomic.Int32
+	srv.onDeleteDeviceNotification(func(h uint32) ReturnCode {
+		if h == fakeHandle {
+			deletes.Add(1)
+		}
+		return ReturnCodeNoErrors
+	})
+
+	sess, _ := newWiredTestSession(t, srv)
+	preSeedSymbol(sess, "MAIN.x")
+
+	ch := make(chan *Update, 1)
+	addErr := make(chan error, 1)
+	go func() {
+		_, err := sess.AddSymbolNotification("MAIN.x", 0, 0, TransModeServerOnChange, ch)
+		addErr <- err
+	}()
+
+	// Mid-roundtrip: simulate loadSymbols swap by deleting MAIN.x and
+	// bumping the epoch. After the response returns, the post-roundtrip
+	// re-fetch finds nil → fresh==nil branch fires.
+	time.Sleep(30 * time.Millisecond)
+	sess.cache.lock.Lock()
+	delete(sess.cache.symbols, symbolKey("MAIN.x"))
+	sess.bumpEpoch()
+	sess.cache.lock.Unlock()
+
+	select {
+	case err := <-addErr:
+		if err == nil {
+			t.Fatal("AddSymbolNotification: err = nil, want vanished-cache error")
+		}
+		// Accept either branch's wording; both are valid R-NOT-004 outcomes.
+		if !strings.Contains(err.Error(), "removed from cache") &&
+			!strings.Contains(err.Error(), "stranded by concurrent cache reload") {
+			t.Errorf("AddSymbolNotification err = %v, want 'removed from cache' OR 'stranded by concurrent cache reload'", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("AddSymbolNotification: timeout (>5s)")
+	}
+
+	// Production releases the orphaned PLC handle. Wait briefly for the
+	// async-issued DeleteDeviceNotification to land.
+	deadline := time.Now().Add(2 * time.Second)
+	for deletes.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := deletes.Load(); got < 1 {
+		t.Errorf("DeleteDeviceNotification calls = %d, want at least 1 (handle release after stranding)", got)
+	}
+
+	// activeNotifications must NOT contain the stranded handle.
+	sess.notifications.lock.Lock()
+	_, present := sess.notifications.activeNotifications[fakeHandle]
+	sess.notifications.lock.Unlock()
+	if present {
+		t.Errorf("activeNotifications still contains stranded handle 0x%X", fakeHandle)
+	}
 }
 
-// TestAddSymbolNotification_TOCTOURecheck the same — needs stub Client.
+// TestAddSymbolNotification_TOCTOURecheck drives the post-roundtrip duplicate
+// re-check (R-NOT-003) in AddSymbolNotification. Two concurrent calls for the
+// same symbol must both pass the pre-check but only one can commit; the loser
+// observes the duplicate-already-subscribed re-check and returns an error
+// after releasing the just-acquired PLC handle.
 //
-// Validates: R-NOT-003 (skipped — same reason).
+// Strategy: server adds 100ms delay before each AddDeviceNotification response.
+// Both goroutines enter the roundtrip, both pass the pre-check (no existing
+// config), the PLC issues both handles. The first to reach the post-roundtrip
+// check commits; the second re-check finds the duplicate and rejects.
+//
+// Validates: R-NOT-003 (TOCTOU re-check after PLC roundtrip).
 func TestAddSymbolNotification_TOCTOURecheck(t *testing.T) {
-	t.Skip("TODO: requires stub Client to allow AddDeviceNotification roundtrip while a concurrent subscribe wins; the post-roundtrip duplicate re-check is the contract under test.")
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xAB000001)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		h := nextHandle.Add(1) - 1
+		return addNotifResponse{Handle: h, Error: ReturnCodeNoErrors}
+	})
+	srv.delayBefore(CommandIDAddDeviceNotification, 0, 100*time.Millisecond)
+
+	var deletes atomic.Int32
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode {
+		deletes.Add(1)
+		return ReturnCodeNoErrors
+	})
+
+	sess, _ := newWiredTestSession(t, srv)
+	preSeedSymbol(sess, "MAIN.x")
+
+	ch := make(chan *Update, 4)
+	type result struct {
+		handle uint32
+		err    error
+	}
+	resCh := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			h, err := sess.AddSymbolNotification("MAIN.x", 0, 0, TransModeServerOnChange, ch)
+			resCh <- result{handle: h, err: err}
+		}()
+	}
+
+	res := make([]result, 2)
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-resCh:
+			res[i] = r
+		case <-time.After(5 * time.Second):
+			t.Fatalf("AddSymbolNotification[%d] timeout", i)
+		}
+	}
+
+	// One success, one duplicate-rejection error.
+	successes, errors := 0, 0
+	var errStr string
+	for _, r := range res {
+		if r.err == nil {
+			successes++
+		} else {
+			errors++
+			errStr = r.err.Error()
+		}
+	}
+	if successes != 1 || errors != 1 {
+		t.Fatalf("results: successes=%d errors=%d (want 1/1); res=%+v", successes, errors, res)
+	}
+	if !strings.Contains(errStr, "already has an active notification") {
+		t.Errorf("loser err = %q, want 'already has an active notification'", errStr)
+	}
+	// Loser must release its just-acquired PLC handle.
+	deadline := time.Now().Add(2 * time.Second)
+	for deletes.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := deletes.Load(); got < 1 {
+		t.Errorf("DeleteDeviceNotification calls = %d, want at least 1 (loser releases handle)", got)
+	}
+
+	// Exactly one entry in activeNotifications.
+	sess.notifications.lock.Lock()
+	got := len(sess.notifications.activeNotifications)
+	sess.notifications.lock.Unlock()
+	if got != 1 {
+		t.Errorf("activeNotifications size = %d, want 1", got)
+	}
 }
 
-// TestDeleteDeviceNotification_ClearsState requires Client.DeleteDeviceNotification
-// to round-trip; without a stub we cannot exercise the success path.
+// TestDeleteDeviceNotification_ClearsState pins the cleanup contract:
+// after a successful DeleteDeviceNotification, the activeNotifications entry
+// is removed, the corresponding notificationConfigs entry is removed, and
+// when the last subscription dies notificationChannel is reset to nil.
 //
-// Validates: R-NOT-008 (skipped — needs stub Client).
+// Variant (handle_invalid): when the PLC returns ReturnCodeDeviceNotifyHandleInvalid
+// (0x745), Session.DeleteDeviceNotification surfaces the error to the caller
+// and does NOT clean up state — only the success path clears state. This
+// preserves caller signal that something was wrong.
+//
+// Validates: R-NOT-008 (DeleteDeviceNotification clears state on success).
 func TestDeleteDeviceNotification_ClearsState(t *testing.T) {
-	t.Skip("TODO: requires stub Client to round-trip DeleteDeviceNotification; the activeNotifications cleanup path cannot run otherwise.")
+	t.Run("success_clears_state", func(t *testing.T) {
+		srv := startScriptableServer(t)
+		defer srv.stop()
+
+		const fakeHandle uint32 = 0x11110001
+		srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+			return addNotifResponse{Handle: fakeHandle, Error: ReturnCodeNoErrors}
+		})
+		srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode {
+			return ReturnCodeNoErrors
+		})
+
+		sess, _ := newWiredTestSession(t, srv)
+		preSeedSymbol(sess, "MAIN.x")
+
+		ch := make(chan *Update, 1)
+		h, err := sess.AddSymbolNotification("MAIN.x", 0, 0, TransModeServerOnChange, ch)
+		if err != nil {
+			t.Fatalf("AddSymbolNotification: %v", err)
+		}
+		if h != fakeHandle {
+			t.Fatalf("handle = 0x%X, want 0x%X", h, fakeHandle)
+		}
+		// Sanity: state populated.
+		sess.notifications.lock.Lock()
+		_, hasNotif := sess.notifications.activeNotifications[h]
+		nConfigs := len(sess.notifications.notificationConfigs)
+		hasChan := sess.notifications.notificationChannel != nil
+		sess.notifications.lock.Unlock()
+		if !hasNotif || nConfigs != 1 || !hasChan {
+			t.Fatalf("post-add: hasNotif=%v configs=%d chanSet=%v", hasNotif, nConfigs, hasChan)
+		}
+
+		if err := sess.DeleteDeviceNotification(h); err != nil {
+			t.Fatalf("DeleteDeviceNotification: %v", err)
+		}
+
+		sess.notifications.lock.Lock()
+		_, stillThere := sess.notifications.activeNotifications[h]
+		nConfigs = len(sess.notifications.notificationConfigs)
+		chanNil := sess.notifications.notificationChannel == nil
+		sess.notifications.lock.Unlock()
+		if stillThere {
+			t.Errorf("activeNotifications still contains 0x%X after delete", h)
+		}
+		if nConfigs != 0 {
+			t.Errorf("notificationConfigs len = %d, want 0", nConfigs)
+		}
+		if !chanNil {
+			t.Errorf("notificationChannel not nil after last delete")
+		}
+	})
+
+	t.Run("handle_invalid_surfaces_error", func(t *testing.T) {
+		// Production behavior pinned (Session.DeleteDeviceNotification at
+		// cmd_notification.go:109): when the underlying client RPC returns
+		// a non-success code, the wrapper returns the error before running
+		// activeNotifications cleanup. So state survives the call.
+		// This is what production does today; if the contract changes to
+		// treat 0x745 as success-equivalent (matching SumDeleteDeviceNotification),
+		// this assertion will surface the divergence.
+		srv := startScriptableServer(t)
+		defer srv.stop()
+
+		const fakeHandle uint32 = 0x22220001
+		srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+			return addNotifResponse{Handle: fakeHandle, Error: ReturnCodeNoErrors}
+		})
+		srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode {
+			return ReturnCodeDeviceNotifyHandleInvalid
+		})
+
+		sess, _ := newWiredTestSession(t, srv)
+		preSeedSymbol(sess, "MAIN.x")
+
+		ch := make(chan *Update, 1)
+		h, err := sess.AddSymbolNotification("MAIN.x", 0, 0, TransModeServerOnChange, ch)
+		if err != nil {
+			t.Fatalf("AddSymbolNotification: %v", err)
+		}
+		err = sess.DeleteDeviceNotification(h)
+		if err == nil {
+			t.Errorf("DeleteDeviceNotification with 0x745: err = nil, want non-nil (Session wrapper surfaces RPC error)")
+		}
+	})
 }
 
 // TestNotificationChannel_SetOnFirstSuccess pins the invariant that
@@ -300,12 +554,92 @@ func TestNotificationChannel_SetOnFirstSuccess(t *testing.T) {
 	})
 }
 
-// TestResubscribeRetry_UpToMax exercises the resubscribeMaxAttempts cap
-// path. Direct exercise requires a stub Client; mark as TODO.
+// TestResubscribeRetry_UpToMax exercises the resubscribeMaxAttempts cap path.
+// On each call to resubscribeNotifications, configs that come back as Skipped
+// have their counter incremented and are re-queued until counter >= max,
+// at which point they are dropped with a WARN log.
 //
-// Validates: R-NOT-013 (skipped — needs stub Client).
+// Drive Skipped: server returns SumAddDeviceNotification success with valid
+// handles, but the test's onWriteRead handler removes the symbol from cache
+// during the request. The post-roundtrip re-fetch finds nil → Skipped+Handle
+// fires. Then we restore the symbol so the next iteration's filter keeps it.
+//
+// Counts WARN log emissions and confirms the config is dropped at the cap.
+//
+// Validates: R-NOT-013 (resubscribe retry-up-to-max with cap enforcement).
 func TestResubscribeRetry_UpToMax(t *testing.T) {
-	t.Skip("TODO: requires stub Client to simulate transient SumAddDeviceNotification rejection; resubscribe path's retry-then-drop logic can only run end-to-end.")
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	logHandler := &testLogHandler{}
+	logger := slog.New(logHandler)
+
+	sess, _ := newWiredTestSession(t, srv)
+	sess.logger = logger
+	preSeedSymbol(sess, "MAIN.x")
+	// Pre-populate config + channel so resubscribe has work to do.
+	ch := make(chan *Update, 1)
+	sess.notifications.lock.Lock()
+	sess.notifications.notificationConfigs = []NotificationConfig{
+		{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange},
+	}
+	sess.notifications.notificationChannel = ch
+	sess.notifications.lock.Unlock()
+
+	var sumHandle atomic.Uint32
+	sumHandle.Store(0xCC000001)
+
+	// Sum-add request: respond with a fresh handle but FIRST swap the cache
+	// to empty so the post-roundtrip re-fetch finds nil and Skipped fires.
+	srv.onWriteRead(GroupSumupAddDeviceNotification, func(_ []byte) []byte {
+		sess.cache.lock.Lock()
+		sess.cache.symbols = map[string]*Symbol{}
+		sess.cache.lock.Unlock()
+		h := sumHandle.Add(1) - 1
+		return buildSumAddNotifPayload([]sumNotifResponse{{Handle: h, Error: ReturnCodeNoErrors}})
+	})
+	// bestEffortDelete after Skipped+Handle uses SumDeleteDeviceNotification.
+	srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(req []byte) []byte {
+		// One handle per request (4 bytes). Always succeed.
+		nItems := len(req) / 4
+		codes := make([]ReturnCode, nItems)
+		for i := range codes {
+			codes[i] = ReturnCodeNoErrors
+		}
+		return buildSumDeleteNotifPayload(codes)
+	})
+
+	// Run resubscribeMaxAttempts (=3) iterations. Each attempt must be
+	// preceded by re-seeding the symbol so filterValidNotificationConfigs
+	// keeps it. After each, the config is re-queued with attempts++ until
+	// the cap is reached.
+	for i := 0; i < resubscribeMaxAttempts; i++ {
+		preSeedSymbol(sess, "MAIN.x")
+		// Re-pin the channel since resubscribe clears it when there are no
+		// valid configs at the start.
+		sess.notifications.lock.Lock()
+		sess.notifications.notificationChannel = ch
+		sess.notifications.lock.Unlock()
+
+		if err := sess.resubscribeNotifications(); err != nil {
+			t.Fatalf("iter %d: resubscribeNotifications: %v", i, err)
+		}
+	}
+
+	// After resubscribeMaxAttempts iterations: the config must be DROPPED,
+	// not requeued.
+	sess.notifications.lock.Lock()
+	leftover := len(sess.notifications.notificationConfigs)
+	sess.notifications.lock.Unlock()
+	if leftover != 0 {
+		t.Errorf("after %d retries: notificationConfigs still has %d entries, want 0 (dropped at cap)",
+			resubscribeMaxAttempts, leftover)
+	}
+
+	// At least one WARN log about dropping configs after max retries.
+	if logHandler.findByMessage("dropping configs after max retries") == nil {
+		t.Errorf("expected WARN log 'dropping configs after max retries' was not emitted")
+	}
 }
 
 // TestBestEffortDeleteNotifications_MixedSuccess pins the helper's
@@ -326,8 +660,34 @@ func TestBestEffortDeleteNotifications_MixedSuccess(t *testing.T) {
 		}
 	})
 
-	t.Run("mixed_results_TODO", func(t *testing.T) {
-		t.Skip("TODO: requires stub Client.SumDeleteDeviceNotification returning [NoErrors, ReturnCodeDeviceNotifyHandleInvalid, ReturnCodeDeviceError] to verify count = success + invalid-handle, errors logged.")
+	t.Run("mixed_results", func(t *testing.T) {
+		srv := startScriptableServer(t)
+		defer srv.stop()
+
+		// Sum-delete returns [NoErrors, NotifyHandleInvalid, DeviceError].
+		// Per bestEffortDeleteNotifications: NoErrors + NotifyHandleInvalid
+		// count as success (handle gone PLC-side); DeviceError does NOT.
+		srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(_ []byte) []byte {
+			return buildSumDeleteNotifPayload([]ReturnCode{
+				ReturnCodeNoErrors,
+				ReturnCodeDeviceNotifyHandleInvalid,
+				ReturnCodeDeviceError,
+			})
+		})
+
+		logHandler := &testLogHandler{}
+		sess, _ := newWiredTestSession(t, srv)
+		sess.logger = slog.New(logHandler)
+
+		got := sess.bestEffortDeleteNotifications([]uint32{1, 2, 3})
+		if got != 2 {
+			t.Errorf("deleted count = %d, want 2 (NoErrors + handle-invalid)", got)
+		}
+		// One handle did not clean up, so there must be a WARN log
+		// reporting the partial cleanup.
+		if logHandler.findByMessage("some handles not cleaned up") == nil {
+			t.Errorf("expected WARN 'some handles not cleaned up' (mixed-success path)")
+		}
 	})
 }
 

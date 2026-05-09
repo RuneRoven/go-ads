@@ -1,8 +1,11 @@
 package ads
 
 import (
+	"encoding/binary"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // cache_test.go — symbolCache unit tests.
@@ -173,14 +176,75 @@ func TestCacheLockOrdering_NoSimultaneousHold(t *testing.T) {
 // TestCache_OnDemandResolve_DuplicateHandleReleased is the canonical R-CACHE-007
 // test: two goroutines call sess.getSymbol("MAIN.x") concurrently; one
 // must observe the in-cache symbol from the other; the loser must release
-// the duplicate handle to the PLC.
+// the duplicate handle to the PLC via Write(GroupSymbolReleaseHandle, ...).
 //
-// Driving this requires a stub *Client that responds to GetSymbolInfoByName
-// and GetHandleByName plus tracks GroupSymbolReleaseHandle Writes —
-// substantial scaffolding that doesn't yet exist in the repo. Marked
-// t.Skip with TODO to make the gap explicit.
-//
-// Validates: R-CACHE-007 (skipped — needs stub Client harness).
+// Validates: R-CACHE-007 (concurrent on-demand resolve duplicate-handle release).
 func TestCache_OnDemandResolve_DuplicateHandleReleased(t *testing.T) {
-	t.Skip("TODO: requires stub Client that synthesizes GetSymbolInfoByName + GetHandleByName + tracks ReleaseHandle Writes; production path validated only via integration tests today.")
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	const fakeHandle uint32 = 0xCAFE0001
+	srv.onWriteRead(GroupSymbolInfoByNameEx, func(_ []byte) []byte {
+		return buildSymbolInfoPayload(
+			"MAIN.x", "INT", "",
+			0x4040, 0x100, 2, ADSTInt16, 0)
+	})
+	srv.onWriteRead(GroupSymbolHandleByName, func(_ []byte) []byte {
+		return buildHandlePayload(fakeHandle)
+	})
+	// Inject a small delay before GetHandleByName so both goroutines pass
+	// the cache.lock check, hit the network, and race on commit.
+	srv.delayBefore(CommandIDReadWrite, uint32(GroupSymbolHandleByName), 50*time.Millisecond)
+
+	var releases atomic.Int32
+	srv.onWrite(GroupSymbolReleaseHandle, func(_, _ uint32, data []byte) ReturnCode {
+		if len(data) == 4 && binary.LittleEndian.Uint32(data) == fakeHandle {
+			releases.Add(1)
+		}
+		return ReturnCodeNoErrors
+	})
+
+	sess, _ := newWiredTestSession(t, srv)
+
+	const N = 4
+	results := make([]*Symbol, N)
+	errs := make([]error, N)
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sym, err := sess.getSymbol("MAIN.x")
+			results[idx] = sym
+			errs[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("getSymbol[%d]: %v", i, e)
+		}
+	}
+	// All goroutines must observe the SAME *Symbol pointer.
+	for i := 1; i < N; i++ {
+		if results[i] != results[0] {
+			t.Errorf("results[%d] (%p) != results[0] (%p) — duplicate cache entries", i, results[i], results[0])
+		}
+	}
+	// Cache must contain exactly one entry for MAIN.x.
+	sess.cache.lock.Lock()
+	got := len(sess.cache.symbols)
+	sess.cache.lock.Unlock()
+	if got != 1 {
+		t.Errorf("cache.symbols size = %d, want 1", got)
+	}
+	// At least one duplicate handle must have been released. Production
+	// code's TOCTOU loser releases its just-acquired handle. With N=4 and
+	// a 50ms delay all four hit the network; one wins the commit race and
+	// 3 must release. Allow >=1 to keep the assertion robust against
+	// scheduler variations on slow CI.
+	if rel := releases.Load(); rel < 1 {
+		t.Errorf("ReleaseHandle calls = %d, want at least 1 (duplicate-handle release path)", rel)
+	}
 }
