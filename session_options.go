@@ -154,3 +154,51 @@ func WithOnReconnect(fn func()) SessionOption {
 		s.onReconnect = fn
 	}
 }
+
+// WithSymbolVersionStrategy selects the online-change handling strategy.
+// Default: SymbolVersionAutoReload. Values outside the enumeration are
+// rejected at Connect-time per R-SES-006.
+//
+// Validates: R-SES-011.
+func WithSymbolVersionStrategy(s SymbolVersionStrategy) SessionOption {
+	return func(sess *Session) {
+		sess.versionStrategy = s
+	}
+}
+
+// WithMaxSymbolVersionReloadAttempts caps reload attempts under
+// SymbolVersionAutoReload within a sliding window. Default: 3. n<1 rejected.
+//
+// Validates: R-CACHE-013.
+func WithMaxSymbolVersionReloadAttempts(n int) SessionOption {
+	return func(sess *Session) {
+		if n < 1 {
+			return
+		}
+		sess.maxReloadAttempts = n
+	}
+}
+
+// WithSymbolVersionReloadWindow sets the sliding window for reload-attempt
+// counting. Default: 60s. d<=0 rejected.
+//
+// Validates: R-CACHE-013.
+func WithSymbolVersionReloadWindow(d time.Duration) SessionOption {
+	return func(sess *Session) {
+		if d <= 0 {
+			return
+		}
+		sess.reloadWindow = d
+	}
+}
+
+// WithOnSymbolVersionChanged registers a callback fired once per
+// R-CACHE-009 detection. The reason argument matches R-NOT-016 enumerated
+// values. Callback runs in its own goroutine (R-SES-007) — do NOT block.
+//
+// Validates: R-SES-011.
+func WithOnSymbolVersionChanged(fn func(reason string)) SessionOption {
+	return func(sess *Session) {
+		sess.versionCallback = fn
+	}
+}

@@ -114,6 +114,20 @@ type Session struct {
 	onDisconnect func()
 	onReconnect  func()
 
+	// Online-change handling (R-SES-011, R-CACHE-013).
+	// reloadAttempts/reloadMu/staleHandles/staleHandlesMu reserved for Tasks
+	// 5+ (handleStaleDetection / next-sample stale flag wiring); declaring
+	// them now keeps the Session struct shape stable across the staged
+	// online-change rollout.
+	versionStrategy   SymbolVersionStrategy
+	versionCallback   func(reason string)
+	maxReloadAttempts int
+	reloadWindow      time.Duration
+	reloadAttempts    []time.Time       //nolint:unused // wired in Task 5
+	reloadMu          sync.Mutex        //nolint:unused // wired in Task 5
+	staleHandles      map[uint32]string //nolint:unused // wired in Task 9
+	staleHandlesMu    sync.Mutex        //nolint:unused // wired in Task 9
+
 	// Route registration config (populated by WithRoute / WithForceRouteRegistration).
 	route *routeManager
 
@@ -160,6 +174,12 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 	// zero value already maps to SessionStateConstructed. Real transitions
 	// land in subsequent commits as readers/writers swap over.
 	sess.lifecycle.state.transitionTo(SessionStateConstructed)
+	// Online-change defaults (R-SES-011, R-CACHE-013). Applied before opts so
+	// callers can override. versionStrategy zero-value = SymbolVersionAutoReload
+	// is intentional — no init needed (verified by
+	// TestSymbolVersionStrategy_ZeroValueIsAutoReload).
+	sess.maxReloadAttempts = 3
+	sess.reloadWindow = 60 * time.Second
 	for _, opt := range opts {
 		opt(sess)
 	}
