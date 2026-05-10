@@ -267,3 +267,38 @@ func TestUpdate_StaleReasonFields(t *testing.T) {
 		t.Errorf("Reason field missing or wrong: %q", u.Reason)
 	}
 }
+
+// Validates: R-SES-011.
+func TestSymbolVersionStrategy_String(t *testing.T) {
+	tests := []struct {
+		s    SymbolVersionStrategy
+		want string
+	}{
+		{SymbolVersionAutoReload, "AutoReload"},
+		{SymbolVersionClose, "Close"},
+		{SymbolVersionIgnore, "Ignore"},
+	}
+	for _, tt := range tests {
+		if got := tt.s.String(); got != tt.want {
+			t.Errorf("strategy %d → %q, want %q", tt.s, got, tt.want)
+		}
+	}
+}
+
+// Validates: R-NOT-016 reason enumeration.
+func TestStaleReasonConstants(t *testing.T) {
+	cases := map[string]string{
+		ReasonSymbolVersionInvalid: "symbol-version-invalid",
+		ReasonSymbolNotFound:       "symbol-not-found",
+		ReasonInvalidOffset:        "invalid-offset",
+		ReasonSymbolNotActive:      "symbol-not-active",
+		ReasonNotifyHandleInvalid:  "notify-handle-invalid",
+		ReasonReloadCapExhausted:   "reload-cap-exhausted",
+		ReasonReloadInProgress:     "reload-in-progress",
+	}
+	for got, want := range cases {
+		if got != want {
+			t.Errorf("constant value drift: got %q, want %q", got, want)
+		}
+	}
+}

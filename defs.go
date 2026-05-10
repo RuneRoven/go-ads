@@ -635,3 +635,38 @@ func isSumCommandUnsupportedError(err error) bool {
 		rc == ReturnCodeGlobalUnknownCommandID ||
 		rc == ReturnCodeGlobalUnknownAdsCommand
 }
+
+// SymbolVersionStrategy selects online-change detection behavior.
+// Validates: R-SES-011.
+type SymbolVersionStrategy uint8
+
+const (
+	SymbolVersionAutoReload SymbolVersionStrategy = iota // default — full reload + resub
+	SymbolVersionClose                                   // terminate session on detection
+	SymbolVersionIgnore                                  // surface error + mark Stale
+)
+
+// String returns the human-readable name of the strategy.
+func (s SymbolVersionStrategy) String() string {
+	switch s {
+	case SymbolVersionAutoReload:
+		return "AutoReload"
+	case SymbolVersionClose:
+		return "Close"
+	case SymbolVersionIgnore:
+		return "Ignore"
+	default:
+		return "Unknown"
+	}
+}
+
+// Stale reasons per R-NOT-016. Used in Update.Reason field.
+const (
+	ReasonSymbolVersionInvalid = "symbol-version-invalid"
+	ReasonSymbolNotFound       = "symbol-not-found"
+	ReasonInvalidOffset        = "invalid-offset"
+	ReasonSymbolNotActive      = "symbol-not-active"
+	ReasonNotifyHandleInvalid  = "notify-handle-invalid"
+	ReasonReloadCapExhausted   = "reload-cap-exhausted"
+	ReasonReloadInProgress     = "reload-in-progress"
+)
