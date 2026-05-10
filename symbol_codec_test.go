@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf16"
 )
 
 // F-16: int(symbol.Length) wraps on 32-bit Go. Validate symbol.Length against
@@ -1296,5 +1297,58 @@ func TestParseWithBaseType_FallbackToInfer(t *testing.T) {
 	}
 	if val != "1337" {
 		t.Errorf("expected 1337, got %s", val)
+	}
+}
+
+// TestWSTRINGSurrogatePairTruncation verifies that truncation of a WSTRING
+// write that lands on a UTF-16 high surrogate drops the unpaired surrogate
+// instead of writing a malformed sequence to the PLC.
+// Validates: R-PARSE-004.
+func TestWSTRINGSurrogatePairTruncation(t *testing.T) {
+	// String with one BMP char followed by a non-BMP char (encodes as 2
+	// UTF-16 code units forming a surrogate pair).
+	// "A" = 1 code unit, "𝐀" (MATHEMATICAL BOLD CAPITAL A, U+1D400) = 2
+	// code units (surrogate pair).
+	value := "A\U0001D400"
+	encoded := utf16.Encode([]rune(value))
+	if len(encoded) != 3 {
+		t.Fatalf("expected 3 UTF-16 code units, got %d", len(encoded))
+	}
+	if encoded[0] != 0x0041 {
+		t.Errorf("expected 'A' = 0x0041, got 0x%04X", encoded[0])
+	}
+	if encoded[1] < 0xD800 || encoded[1] > 0xDBFF {
+		t.Errorf("expected high surrogate in 0xD800-0xDBFF, got 0x%04X", encoded[1])
+	}
+	if encoded[2] < 0xDC00 || encoded[2] > 0xDFFF {
+		t.Errorf("expected low surrogate in 0xDC00-0xDFFF, got 0x%04X", encoded[2])
+	}
+
+	// Symbol with Length such that maxChars = (Length-2)/2 lands the
+	// truncation between the high+low surrogates. Length=6 => maxChars=2,
+	// truncate keeps encoded[0:2] = ['A', high-surrogate]. The surrogate
+	// fix should drop the high surrogate to avoid emitting an unpaired
+	// surrogate to the PLC.
+	sym := &Symbol{
+		Name:     "ws",
+		FullName: "ws",
+		DataType: "WSTRING",
+		Length:   6, // 2 chars + 2-byte null = 4+2
+	}
+	data, err := sym.writeToNode(value, nil)
+	if err != nil {
+		t.Fatalf("writeToNode error: %v", err)
+	}
+	if len(data) != 6 {
+		t.Fatalf("expected 6 bytes (3 code units), got %d", len(data))
+	}
+	// First 2 bytes: 'A' little-endian = 0x41 0x00
+	if data[0] != 0x41 || data[1] != 0x00 {
+		t.Errorf("expected 'A' at bytes 0-1, got 0x%02X 0x%02X", data[0], data[1])
+	}
+	// Bytes 2-3 should be ZEROS (the would-be high surrogate dropped),
+	// followed by 2-byte null terminator at bytes 4-5.
+	if data[2] != 0x00 || data[3] != 0x00 {
+		t.Errorf("expected high surrogate dropped (zero bytes 2-3 - either truncated or null), got 0x%02X 0x%02X", data[2], data[3])
 	}
 }

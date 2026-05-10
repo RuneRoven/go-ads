@@ -830,3 +830,39 @@ func TestSymbolSumAddress_DirectFallbackNestedChild(t *testing.T) {
 		t.Errorf("offset = 0x%X, want 0x2084 (0x2000 + 0x0080 + 0x0004)", offset)
 	}
 }
+
+// TestAddOffsetDepthCap verifies the recursion cap defends against malformed
+// PLC datatype tables that form a self-cycle (forbidden by IEC 61131-3 but
+// not enforced over the wire).
+// Validates: R-SYM-002.
+func TestAddOffsetDepthCap(t *testing.T) {
+	// Build a self-cycle: type "MyStruct" has a child of type "MyStruct".
+	// Real PLCs reject this at compile time; the wire response could in
+	// theory contain it through a buggy or malicious target.
+	cyclic := SymbolUploadDataType{
+		DataType: "MyStruct",
+		Children: map[string]*SymbolUploadDataType{
+			"member": {
+				Name:     "member",
+				DataType: "MyStruct",
+				DatatypeEntry: datatypeEntry{
+					Size: 4,
+					Offs: 0,
+				},
+			},
+		},
+	}
+	datatypes := map[string]SymbolUploadDataType{
+		"MyStruct": cyclic,
+	}
+
+	parent := &Symbol{Name: "root", FullName: "root", Length: 4}
+	// Should NOT stack-overflow even though the cycle would otherwise recurse
+	// indefinitely.
+	children := cyclic.addOffset(parent, datatypes, 0x4020)
+	if len(children) == 0 {
+		t.Fatal("expected at least one child before depth cap fired")
+	}
+	// The cap fires partway down; depth 256 produces ~256 nested children
+	// before the warn-and-return. Sanity check we didn't blow the stack.
+}

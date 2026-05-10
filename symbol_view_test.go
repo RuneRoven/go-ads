@@ -244,3 +244,27 @@ func TestSymbolView_FieldReadAfterClose(t *testing.T) {
 	}()
 	_ = view.Children()
 }
+
+// TestCollectSubtreeDepthCap verifies the recursion cap on Symbol.Children
+// walks defends against tree corruption (cycle in Children map).
+// Validates: R-VIEW-004.
+func TestCollectSubtreeDepthCap(t *testing.T) {
+	// Build a Symbol cycle: A -> B -> A. addOffset cannot produce this in
+	// real cache data, but defensively we should not stack-overflow.
+	a := &Symbol{Name: "A", FullName: "A"}
+	b := &Symbol{Name: "B", FullName: "A.B"}
+	a.Children = map[string]*Symbol{"B": b}
+	b.Children = map[string]*Symbol{"A": a}
+
+	conn := newTestConnection()
+	defer conn.lifecycle.shutdown()
+
+	// Walk via collectSubtree (lock not actually needed for this test
+	// because we are not touching cache.symbols).
+	var collected []SymbolView
+	collectSubtree(a, conn, &collected)
+	// Should NOT stack-overflow; cap=256 limits the walk.
+	if len(collected) == 0 {
+		t.Fatal("expected at least one collected view before cap fires")
+	}
+}
