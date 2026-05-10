@@ -35,8 +35,7 @@ func (sess *Session) writeToSymbolRetry(symbolName string, value string, retries
 	// Network I/O without lock
 	err = sess.client.Write(uint32(GroupSymbolValueByHandle), handle, data)
 	if err != nil {
-		// R-CACHE-009: classify ReturnCode-typed errors and dispatch the
-		// configured online-change strategy before surfacing to caller.
+		// Online-change detection (R-CACHE-009).
 		var rc ReturnCode
 		if errors.As(err, &rc) {
 			sess.handleStaleDetection(rc)
@@ -89,8 +88,7 @@ func (sess *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (st
 	// Network I/O without lock
 	data, err := sess.client.Read(uint32(GroupSymbolValueByHandle), handle, length)
 	if err != nil {
-		// R-CACHE-009: classify ReturnCode-typed errors and dispatch the
-		// configured online-change strategy before surfacing to caller.
+		// Online-change detection (R-CACHE-009).
 		var rc ReturnCode
 		if errors.As(err, &rc) {
 			sess.handleStaleDetection(rc)
