@@ -638,3 +638,34 @@ func TestSession_ReadFromSymbol_LengthMismatchTriggersDetection(t *testing.T) {
 		t.Fatal("onSymbolVersionChanged callback did not fire within 2s on Length mismatch")
 	}
 }
+
+// TestSession_IsClosed_FalseBeforeClose validates that IsClosed reports
+// false on a freshly-constructed session that has not transitioned into
+// the terminal Closed state.
+//
+// Validates: lifecycle observation contract — IsClosed wraps the private
+// FSM probe.
+func TestSession_IsClosed_FalseBeforeClose(t *testing.T) {
+	sess := newTestConnection()
+	defer sess.lifecycle.shutdown()
+	if sess.IsClosed() {
+		t.Error("IsClosed=true on fresh session, want false")
+	}
+}
+
+// TestSession_IsClosed_TrueAfterClose validates that IsClosed reports
+// true once the FSM has reached the terminal Closed state. We drive the
+// FSM directly rather than calling Close() because newTestConnection
+// produces a minimal Session without the transport / closedCh / waitgroup
+// machinery Close() depends on. The wrapper itself is the unit under
+// test, not Close()'s cleanup pathway.
+func TestSession_IsClosed_TrueAfterClose(t *testing.T) {
+	sess := newTestConnection()
+	defer sess.lifecycle.shutdown()
+	if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateClosed); !ok {
+		t.Fatal("FSM transition to Closed not permitted from Constructed")
+	}
+	if !sess.IsClosed() {
+		t.Error("IsClosed=false after transition to Closed, want true")
+	}
+}

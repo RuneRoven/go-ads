@@ -310,7 +310,8 @@ By default, missing on-demand symbols after reconnect are skipped with a warning
 | `Connect(local bool)` | TCP dial + start goroutines + probe/register route |
 | `Close()` | Delete notifs, release handles, close TCP |
 | `Reconnect()` | Re-establish after failure (called automatically or manually) |
-| `IsDisconnected()` | Check connection state |
+| `IsDisconnected()` | Transient transport-level loss (auto-reconnect may resolve) |
+| `IsClosed()` | Terminal Closed state (Close() or internal terminal transition, e.g. SymbolVersionClose). Session cannot be reused — construct a new one via NewSession |
 
 ### Connection Options
 

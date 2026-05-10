@@ -1331,6 +1331,13 @@ func (sess *Session) IsDisconnected() bool {
 	return sess.isDisconnected()
 }
 
+// IsClosed reports whether the session has reached the terminal Closed
+// state. A closed session cannot be reused; construct a new one via
+// NewSession. Distinct from IsDisconnected (transient transport loss).
+func (sess *Session) IsClosed() bool {
+	return sess.isClosed()
+}
+
 // isRunningInContainer returns true if the process is running inside a
 // Docker, Podman, or Kubernetes container. Uses filesystem markers rather
 // than IP range heuristics (10.x is common in industrial OT networks).
