@@ -293,6 +293,7 @@ func TestStaleReasonConstants(t *testing.T) {
 		ReasonInvalidOffset:        "invalid-offset",
 		ReasonSymbolNotActive:      "symbol-not-active",
 		ReasonNotifyHandleInvalid:  "notify-handle-invalid",
+		ReasonInvalidSize:          "invalid-size",
 		ReasonReloadCapExhausted:   "reload-cap-exhausted",
 		ReasonReloadInProgress:     "reload-in-progress",
 	}
@@ -316,6 +317,7 @@ func TestDetectStaleCache(t *testing.T) {
 		{ReturnCodeDeviceInvalidOffset, true, ReasonInvalidOffset},               // 0x703
 		{ReturnCodeDeviceSymbolNotActive, true, ReasonSymbolNotActive},           // 0x722
 		{ReturnCodeDeviceNotifyHandleInvalid, true, ReasonNotifyHandleInvalid},   // 0x714
+		{ReturnCodeDeviceInvalidSize, true, ReasonInvalidSize},                   // 0x705
 		// Negative cases — must NOT trigger.
 		{ReturnCodeNoErrors, false, ""},
 		{ReturnCodeDeviceTimeout, false, ""},

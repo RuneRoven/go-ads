@@ -103,6 +103,20 @@ func (sess *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (st
 		return "", fmt.Errorf("read %q: %w", symbolName, err)
 	}
 
+	// R-CACHE-009 supplementary detection: the cached symbol.Length disagreeing
+	// with the PLC-returned payload length indicates an online change (e.g.
+	// operator toggled nProbeA INT↔LREAL). The PLC ships data of the new size,
+	// but our cache still has the old size — parse() would fail with
+	// "symbol.Length N exceeds data buffer size M" and never surface a
+	// ReturnCode, so handleStaleDetection would be bypassed. Detect here
+	// (Session-wrapper layer where sess is in scope) and dispatch the
+	// configured strategy. Returns a ReturnCode-typed error so chained
+	// errors.As on the caller side keeps matching.
+	if data != nil && length > 0 && uint32(len(data)) != length {
+		sess.handleStaleDetection(ReturnCodeDeviceInvalidSize)
+		return "", fmt.Errorf("read %q: %w", symbolName, ReturnCodeDeviceInvalidSize)
+	}
+
 	// parse() mutates Symbol fields (Value, Valid, etc.) so it must
 	// run under lock to avoid racing with handleNotification.
 	sess.cache.lock.Lock()

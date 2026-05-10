@@ -667,6 +667,7 @@ const (
 	ReasonInvalidOffset        = "invalid-offset"
 	ReasonSymbolNotActive      = "symbol-not-active"
 	ReasonNotifyHandleInvalid  = "notify-handle-invalid"
+	ReasonInvalidSize          = "invalid-size"
 	ReasonReloadCapExhausted   = "reload-cap-exhausted"
 	ReasonReloadInProgress     = "reload-in-progress"
 )
@@ -690,6 +691,8 @@ func detectStaleCache(rc ReturnCode) (stale bool, reason string) {
 		return true, ReasonSymbolNotActive
 	case ReturnCodeDeviceNotifyHandleInvalid: // 0x714
 		return true, ReasonNotifyHandleInvalid
+	case ReturnCodeDeviceInvalidSize: // 0x705 — surfaces when cached symbol.Length disagrees with PLC's new size post-online-change (e.g. operator toggle INT↔LREAL)
+		return true, ReasonInvalidSize
 	}
 	return false, ""
 }

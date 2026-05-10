@@ -531,3 +531,76 @@ func TestSession_AutoReload_CapExhaustion_FiresCallback(t *testing.T) {
 		t.Fatal("cap exhaustion did not fire callback w/ ReasonReloadCapExhausted within 3s")
 	}
 }
+
+// TestSession_ReadFromSymbol_LengthMismatchTriggersDetection validates the
+// supplementary R-CACHE-009 detection path: when the PLC returns a payload
+// whose length disagrees with the cached symbol.Length (e.g. operator
+// toggled nProbeA INT↔LREAL via TC3 online change with ServerCycle), the
+// PLC does NOT surface a ReturnCode — the parse method would fail with
+// "symbol.Length N exceeds data buffer size M" and bypass detection.
+// readFromSymbolRetry MUST detect the Length mismatch BEFORE parse, fire
+// handleStaleDetection (Ignore strategy here so callback fires), and
+// return a ReturnCode-typed error (ReturnCodeDeviceInvalidSize / 0x705)
+// that callers can match via errors.As.
+//
+// Closes hardware test gap from TestSymbolVersionClose_OnDetection where
+// TC3 type-change only manifests as Go-side parse error.
+//
+// Validates: R-CACHE-009 (extends detection set with Length-mismatch
+// signal) + R-NOT-016 (ReasonInvalidSize wired through callback).
+func TestSession_ReadFromSymbol_LengthMismatchTriggersDetection(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	const fakeHandle uint32 = 0xCAFEBABE
+	// PLC returns 2 bytes (post-online-change INT size) on Read by handle.
+	// Cache will hold Length=8 (pre-change LREAL) — the mismatch is the
+	// detection trigger.
+	srv.onRead(GroupSymbolValueByHandle, func(_, offset, length uint32) (ReturnCode, []byte) {
+		if offset != fakeHandle {
+			return ReturnCodeDeviceInvalidParam, nil
+		}
+		_ = length // requested length is 8 (cached LREAL); we deliberately ship 2.
+		return ReturnCodeNoErrors, []byte{0x05, 0x00}
+	})
+
+	cbReason := make(chan string, 1)
+	sess, _ := newWiredTestSession(t, srv,
+		WithSymbolVersionStrategy(SymbolVersionIgnore),
+		WithOnSymbolVersionChanged(func(r string) { cbReason <- r }),
+	)
+
+	// Pre-seed the cache with a stale LREAL (Length=8) symbol carrying an
+	// already-resolved handle so getSymbol returns it without hitting the
+	// network. This emulates the post-online-change state where the cache
+	// still holds the pre-change type metadata.
+	const symName = "MAIN_DP1.nProbeA"
+	sess.cache.symbols[symbolKey(symName)] = &Symbol{
+		FullName: symName,
+		Name:     symName,
+		Handle:   fakeHandle,
+		Length:   8,
+		DataType: "LREAL",
+	}
+
+	_, err := sess.ReadFromSymbol(symName)
+	if err == nil {
+		t.Fatal("expected error from ReadFromSymbol on length mismatch, got nil")
+	}
+	var rc ReturnCode
+	if !errors.As(err, &rc) {
+		t.Fatalf("error is not ReturnCode-typed: %v", err)
+	}
+	if rc != ReturnCodeDeviceInvalidSize {
+		t.Errorf("rc = 0x%X, want 0x%X (ReturnCodeDeviceInvalidSize)", uint32(rc), uint32(ReturnCodeDeviceInvalidSize))
+	}
+
+	select {
+	case r := <-cbReason:
+		if r != ReasonInvalidSize {
+			t.Errorf("callback reason = %q, want %q", r, ReasonInvalidSize)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("onSymbolVersionChanged callback did not fire within 2s on Length mismatch")
+	}
+}
