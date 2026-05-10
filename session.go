@@ -123,8 +123,8 @@ type Session struct {
 	versionCallback   func(reason string)
 	maxReloadAttempts int
 	reloadWindow      time.Duration
-	reloadAttempts    []time.Time       //nolint:unused // wired in Task 5
-	reloadMu          sync.Mutex        //nolint:unused // wired in Task 5
+	reloadAttempts    []time.Time
+	reloadMu          sync.Mutex
 	staleHandles      map[uint32]string //nolint:unused // wired in Task 9
 	staleHandlesMu    sync.Mutex        //nolint:unused // wired in Task 9
 
@@ -456,12 +456,82 @@ func (sess *Session) closeOnStaleDetection(reason string) {
 	sess.Close()
 }
 
-// autoReloadOnStaleDetection is the SymbolVersionAutoReload entry point.
-// Placeholder — Task 7 fills in the rate-limited reload + resub logic.
+// tryRecordReloadAttempt prunes attempts outside the sliding window then
+// records a new attempt and returns true. Returns false when the cap is
+// exhausted within the window — caller MUST then degrade to Ignore.
 //
-// Validates: R-CACHE-010 (TODO).
+// Validates: R-CACHE-013.
+func (sess *Session) tryRecordReloadAttempt() bool {
+	sess.reloadMu.Lock()
+	defer sess.reloadMu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-sess.reloadWindow)
+	pruned := sess.reloadAttempts[:0]
+	for _, t := range sess.reloadAttempts {
+		if t.After(cutoff) {
+			pruned = append(pruned, t)
+		}
+	}
+	sess.reloadAttempts = pruned
+	if len(sess.reloadAttempts) >= sess.maxReloadAttempts {
+		return false
+	}
+	sess.reloadAttempts = append(sess.reloadAttempts, now)
+	return true
+}
+
+// autoReloadOnStaleDetection runs full re-discovery + resubscribe under
+// SymbolVersionAutoReload. Capped by R-CACHE-013 — on cap exhaustion, logs
+// WARN, fires callback with ReasonReloadCapExhausted, and degrades to
+// Ignore semantics for this call (no further reload attempts until window
+// slides out).
+//
+// Sequence (R-CACHE-010): bumpEpoch → zero old handles → LoadSymbols →
+// resubscribeNotifications → fire onReconnect.
+//
+// Validates: R-CACHE-010.
 func (sess *Session) autoReloadOnStaleDetection(reason string) {
-	sess.logger.Warn("auto-reload not yet implemented", "reason", reason)
+	if !sess.tryRecordReloadAttempt() {
+		sess.logger.Warn("reload cap exhausted - degrading to Ignore",
+			"reason", reason, "max", sess.maxReloadAttempts, "window", sess.reloadWindow)
+		if sess.versionCallback != nil {
+			go sess.versionCallback(ReasonReloadCapExhausted)
+		}
+		return
+	}
+
+	if sess.isClosed() {
+		sess.logger.Debug("auto-reload skipped - session closed", "reason", reason)
+		return
+	}
+
+	sess.logger.Info("auto-reload starting", "reason", reason)
+	// Bump epoch first so any in-flight retry helpers observing epoch
+	// will see the change immediately (R-CACHE-003).
+	sess.bumpEpoch()
+	// Zero old handles so callers holding *Symbol pointers force
+	// on-demand re-resolution (R-CACHE-004).
+	sess.cache.lock.Lock()
+	zeroOldSymbolHandles(sess.cache.symbols)
+	sess.cache.lock.Unlock()
+
+	if err := sess.reloadSymbolsAndResubscribe(); err != nil {
+		sess.logger.Error("auto-reload failed", "err", err)
+		return
+	}
+	sess.logger.Info("auto-reload complete")
+	if sess.onReconnect != nil {
+		go sess.onReconnect()
+	}
+}
+
+// reloadSymbolsAndResubscribe re-runs symbol discovery + notification
+// resub. Re-uses existing reconnect-path helpers (R-NOT-013).
+func (sess *Session) reloadSymbolsAndResubscribe() error {
+	if err := sess.LoadSymbols(); err != nil {
+		return fmt.Errorf("LoadSymbols: %w", err)
+	}
+	return sess.resubscribeNotifications()
 }
 
 // Close closes connection and waits for completion

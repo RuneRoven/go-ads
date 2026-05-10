@@ -416,3 +416,118 @@ func TestSession_HandleStaleDetection_Close(t *testing.T) {
 		t.Error("session not in Closed state after Close strategy")
 	}
 }
+
+// TestSession_TryRecordReloadAttempt_CapEnforced validates that
+// tryRecordReloadAttempt returns true until the per-window cap is reached
+// and false thereafter. Pure unit — no PLC stub needed.
+//
+// Validates: R-CACHE-013 (sliding-window cap).
+func TestSession_TryRecordReloadAttempt_CapEnforced(t *testing.T) {
+	sess := &Session{
+		maxReloadAttempts: 2,
+		reloadWindow:      10 * time.Second,
+	}
+	if !sess.tryRecordReloadAttempt() {
+		t.Error("attempt 1 must succeed")
+	}
+	if !sess.tryRecordReloadAttempt() {
+		t.Error("attempt 2 must succeed")
+	}
+	if sess.tryRecordReloadAttempt() {
+		t.Error("attempt 3 must be rejected (cap=2)")
+	}
+}
+
+// TestSession_TryRecordReloadAttempt_SlidingWindow validates that entries
+// older than reloadWindow are pruned, freeing capacity for new attempts.
+//
+// Validates: R-CACHE-013 (sliding window).
+func TestSession_TryRecordReloadAttempt_SlidingWindow(t *testing.T) {
+	sess := &Session{
+		maxReloadAttempts: 2,
+		reloadWindow:      50 * time.Millisecond,
+	}
+	if !sess.tryRecordReloadAttempt() {
+		t.Fatal("attempt 1")
+	}
+	if !sess.tryRecordReloadAttempt() {
+		t.Fatal("attempt 2")
+	}
+	// Wait for window to slide past.
+	time.Sleep(80 * time.Millisecond)
+	if !sess.tryRecordReloadAttempt() {
+		t.Error("attempt after window slide must succeed")
+	}
+}
+
+// TestSession_AutoReload_BumpsEpoch validates that handleStaleDetection
+// under SymbolVersionAutoReload triggers autoReloadOnStaleDetection which
+// bumps the session epoch (R-CACHE-003) before attempting reload. The
+// scriptable server doesn't implement the full reload sequence — but
+// epoch is bumped BEFORE reload is attempted, so the test succeeds even
+// when LoadSymbols() ultimately errors out.
+//
+// Validates: R-CACHE-010 (AutoReload bumps epoch + invalidates handles).
+func TestSession_AutoReload_BumpsEpoch(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, _ := newWiredTestSession(t, srv,
+		WithSymbolVersionStrategy(SymbolVersionAutoReload),
+		WithMaxSymbolVersionReloadAttempts(3),
+		WithSymbolVersionReloadWindow(60*time.Second),
+	)
+
+	preEpoch := sess.epoch()
+
+	sess.handleStaleDetection(ReturnCodeDeviceSymbolVersionInvalid)
+
+	deadline := time.After(5 * time.Second)
+	for sess.epoch() == preEpoch {
+		select {
+		case <-deadline:
+			t.Fatal("AutoReload did not bump epoch within 5s")
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+// TestSession_AutoReload_CapExhaustion_FiresCallback validates that once
+// the sliding-window cap is exceeded, the callback fires with
+// ReasonReloadCapExhausted and the strategy degrades to Ignore semantics
+// (no further reload attempts within the window).
+//
+// Validates: R-CACHE-013 (cap exhaustion fires callback w/ specific reason).
+func TestSession_AutoReload_CapExhaustion_FiresCallback(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	exhausted := make(chan string, 4)
+	cb := func(reason string) {
+		if reason == ReasonReloadCapExhausted {
+			select {
+			case exhausted <- reason:
+			default:
+			}
+		}
+	}
+
+	sess, _ := newWiredTestSession(t, srv,
+		WithSymbolVersionStrategy(SymbolVersionAutoReload),
+		WithMaxSymbolVersionReloadAttempts(2),
+		WithSymbolVersionReloadWindow(10*time.Second),
+		WithOnSymbolVersionChanged(cb))
+
+	for i := 0; i < 4; i++ {
+		sess.handleStaleDetection(ReturnCodeDeviceSymbolVersionInvalid)
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	select {
+	case <-exhausted:
+		// pass
+	case <-time.After(3 * time.Second):
+		t.Fatal("cap exhaustion did not fire callback w/ ReasonReloadCapExhausted within 3s")
+	}
+}
