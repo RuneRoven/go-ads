@@ -7,11 +7,13 @@ import (
 	"fmt"
 )
 
-// Single-symbol ADS commands: Read, Write, WriteRead, ReadState.
-// Basic per-symbol primitives used directly via Connection.{Read,Write,WriteRead}
-// and indirectly via ReadFromSymbol/WriteToSymbol in symbol_access.go.
+// Single-symbol ADS commands on *Client: Read, Write, WriteRead,
+// ReadState, ReadDeviceInfo. Beckhoff-equivalent thin RPC surface.
+// Cache-aware Session methods (ReadFromSymbol etc.) in symbol_access.go
+// call s.client.Read/Write internally.
 
-func (conn *Connection) Read(group uint32, offset uint32, length uint32) (data []byte, err error) {
+// Read issues ADS Read (cmd 2) against the given index group/offset.
+func (c *Client) Read(group uint32, offset uint32, length uint32) (data []byte, err error) {
 	request := new(bytes.Buffer)
 	type readCommandPacket struct {
 		Group  uint32
@@ -26,16 +28,16 @@ func (conn *Connection) Read(group uint32, offset uint32, length uint32) (data [
 
 	err = binary.Write(request, binary.LittleEndian, content)
 	if err != nil {
-		conn.logger.Error("binary.Write failed", "error", err)
+		c.logger.Error("binary.Write failed", "error", err)
 		return nil, err
 	}
 
-	conn.logger.Log(context.Background(), LevelTrace, "request", "request", content)
+	c.logger.Log(context.Background(), LevelTrace, "request", "request", content)
 
 	// Try to send the request
-	resp, err := conn.sendRequest(CommandIDRead, request.Bytes())
+	resp, err := c.sendRequest(CommandIDRead, request.Bytes())
 	if err != nil {
-		conn.logger.Error("send request failed", "error", err)
+		c.logger.Error("send request failed", "error", err)
 		return
 	}
 
@@ -64,7 +66,7 @@ func (conn *Connection) Read(group uint32, offset uint32, length uint32) (data [
 }
 
 // Write - ADS command id: 3
-func (conn *Connection) Write(group uint32, offset uint32, data []byte) error {
+func (c *Client) Write(group uint32, offset uint32, data []byte) error {
 	type writeCommandPacket struct {
 		Group  uint32
 		Offset uint32
@@ -79,19 +81,19 @@ func (conn *Connection) Write(group uint32, offset uint32, data []byte) error {
 
 	err := binary.Write(request, binary.LittleEndian, writeRequest)
 	if err != nil {
-		conn.logger.Error("binary.Write failed", "error", err)
+		c.logger.Error("binary.Write failed", "error", err)
 		return err
 	}
 	err = binary.Write(request, binary.LittleEndian, data)
 	if err != nil {
-		conn.logger.Error("binary.Write failed", "error", err)
+		c.logger.Error("binary.Write failed", "error", err)
 		return err
 	}
 
 	// Try to send the request
-	resp, err := conn.sendRequest(CommandIDWrite, request.Bytes())
+	resp, err := c.sendRequest(CommandIDWrite, request.Bytes())
 	if err != nil {
-		conn.logger.Error("error during send request for write", "error", err)
+		c.logger.Error("error during send request for write", "error", err)
 		return err
 	}
 	respBuffer := bytes.NewBuffer(resp)
@@ -107,7 +109,9 @@ func (conn *Connection) Write(group uint32, offset uint32, data []byte) error {
 	return nil
 }
 
-func (conn *Connection) WriteRead(group uint32, offset uint32, readLength uint32, send []byte) (data []byte, err error) {
+// WriteRead issues ADS ReadWrite (cmd 9): writes send and reads back up to
+// readLength bytes in a single round-trip.
+func (c *Client) WriteRead(group uint32, offset uint32, readLength uint32, send []byte) (data []byte, err error) {
 	request := new(bytes.Buffer)
 	type writeReadCommandPacket struct {
 		Group       uint32
@@ -136,10 +140,10 @@ func (conn *Connection) WriteRead(group uint32, offset uint32, readLength uint32
 		return nil, fmt.Errorf("binary.Write failed: %w", err)
 	}
 
-	conn.logger.Log(context.Background(), LevelTrace, "request", "request", request)
+	c.logger.Log(context.Background(), LevelTrace, "request", "request", request)
 
 	// Try to send the request
-	resp, err := conn.sendRequest(CommandIDReadWrite, request.Bytes())
+	resp, err := c.sendRequest(CommandIDReadWrite, request.Bytes())
 	if err != nil {
 		return
 	}
@@ -167,14 +171,15 @@ type States struct {
 	DeviceState uint16
 }
 
-func (conn *Connection) ReadState() (response States, err error) {
+// ReadState issues ADS ReadState (cmd 4) and returns the PLC's ADS+device state.
+func (c *Client) ReadState() (response States, err error) {
 	// Try to send the request
-	resp, err := conn.sendRequest(CommandIDReadState, []byte{})
+	resp, err := c.sendRequest(CommandIDReadState, []byte{})
 	if err != nil {
-		conn.logger.Error("Error during read state", "error", err)
+		c.logger.Error("Error during read state", "error", err)
 		return
 	}
-	conn.logger.Log(context.Background(), LevelTrace, "response from plc for state", "data", resp)
+	c.logger.Log(context.Background(), LevelTrace, "response from plc for state", "data", resp)
 	type readStateResponse struct {
 		Error ReturnCode
 		States
@@ -187,7 +192,7 @@ func (conn *Connection) ReadState() (response States, err error) {
 	if stateResponse.Error > 0 {
 		return response, fmt.Errorf("ADS error in ReadState: %w", stateResponse.Error)
 	}
-	conn.logger.Debug("read state response",
+	c.logger.Debug("read state response",
 		"ADSState", uint16(stateResponse.ADSState),
 		"deviceState", stateResponse.DeviceState)
 
@@ -202,9 +207,10 @@ type DeviceInfo struct {
 	DeviceName [16]byte
 }
 
-func (conn *Connection) ReadDeviceInfo() (response DeviceInfo, err error) {
+// ReadDeviceInfo issues ADS ReadDeviceInfo (cmd 1).
+func (c *Client) ReadDeviceInfo() (response DeviceInfo, err error) {
 	// Try to send the request
-	resp, err := conn.sendRequest(CommandIDReadDeviceInfo, []byte{})
+	resp, err := c.sendRequest(CommandIDReadDeviceInfo, []byte{})
 	if err != nil {
 		return
 	}

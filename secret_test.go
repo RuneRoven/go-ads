@@ -10,6 +10,8 @@ import (
 
 // F-25: secret type must redact via fmt.Sprintf "%v", "%+v", "%s" — all paths
 // that call String().
+//
+// Validates: R-LOCK-004.
 func TestSecret_StringRedacted(t *testing.T) {
 	s := secret("supersecret123")
 
@@ -30,6 +32,8 @@ func TestSecret_StringRedacted(t *testing.T) {
 }
 
 // F-25: slog.LogValue must return [REDACTED], not the raw value.
+//
+// Validates: R-LOCK-004.
 func TestSecret_LogValueRedacted(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))

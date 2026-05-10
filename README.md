@@ -2,16 +2,19 @@
 
 A pure Go library for communicating with Beckhoff TwinCAT PLCs using the ADS (Automation Device Specification) protocol.
 
+> **v2.1 breaking change**: the previous `Connection` type has been renamed to `Session`, and the raw RPC surface has been split off into a separate `Client` type. The constructor is now `NewSession` (no context argument). See [Two layers](#two-layers) for the new architecture and the migration story. v2.0.x is deprecated.
+
 ## Features
 
 - Connect to TwinCAT 2 and TwinCAT 3 PLCs over TCP
+- Two-layer API: a Beckhoff-equivalent raw `Client` for one-shot consumers and a managed `Session` that adds caching, notification persistence, and auto-reconnect
 - Read/write PLC symbols by name
 - Batch read multiple symbols in a single round-trip (SumRead)
 - Subscribe to symbol change notifications (single and batch)
 - Automatic symbol table and datatype discovery
 - Auto-reconnect with configurable backoff and notification re-subscribe
 - Smart AMS route registration (probe-first, credential fallback)
-- Stale handle detection across reconnects (generation counter)
+- Stale handle detection across reconnects (epoch counter)
 - Disconnect/reconnect event callbacks
 - Symbol version change detection and refresh
 
@@ -27,7 +30,6 @@ go get github.com/RuneRoven/go-ads/v2
 package main
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -35,44 +37,104 @@ import (
 )
 
 func main() {
-	ctx := context.Background()
-	conn, _ := ads.NewConnection(ctx, "192.168.1.100", 48898, "5.1.2.3.1.1", 851, "auto", 10500, 5*time.Second,
+	sess, _ := ads.NewSession("192.168.1.100", 48898, "5.1.2.3.1.1", 851, "auto", 10500, 5*time.Second,
 		ads.WithRoute("my-route", "Administrator", "1"),
 	)
-	conn.Connect(false)
-	defer conn.Close()
+	if err := sess.Connect(false); err != nil {
+		panic(err)
+	}
+	defer sess.Close()
 
-	info, _ := conn.ReadDeviceInfo()
-	fmt.Printf("Device: %s\n", string(info.DeviceName[:]))
-
-	// Symbols are resolved on-demand — no full discovery needed
-	value, _ := conn.ReadFromSymbol("MAIN.myVar")
+	// Symbols are resolved on-demand — no full discovery needed.
+	value, _ := sess.ReadFromSymbol("MAIN.myVar")
 	fmt.Println("Value:", value)
 
-	// Optional: load full symbol table for listing/struct access
-	conn.LoadSymbols()
-	symbols, _ := conn.ListSymbols()
+	// Optional: load full symbol table for listing / struct access.
+	sess.LoadSymbols()
+	symbols, _ := sess.ListSymbols()
 	fmt.Printf("Total symbols: %d\n", len(symbols))
+}
+```
+
+## Two layers
+
+The library exposes two types. Pick the one that fits your consumer.
+
+### Client — raw RPC (Beckhoff-equivalent)
+
+`Client` is a thin wrapper around one TCP connection. Each method is a single ADS round-trip. No symbol cache, no notification persistence, no auto-reconnect. If the transport drops, every subsequent call returns `ErrTransportClosed` and the caller reconstructs a new `Client`.
+
+Use this for one-shot consumers — CLI tools, web ADS browsers doing a quick probe, scripts that send a single command and exit.
+
+```go
+client, err := ads.Dial(
+    "192.168.1.100", 48898,
+    ads.AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851},
+    ads.AMSAddress{NetID: [6]byte{192, 168, 1, 50, 1, 1}, Port: 30000},
+    5*time.Second,
+    ads.WithClientLogger(slog.Default()),
+)
+if err != nil {
+    panic(err)
+}
+defer client.Close()
+
+info, _ := client.ReadDeviceInfo()
+fmt.Printf("Device: %s\n", string(info.DeviceName[:]))
+
+handle, _ := client.GetHandleByName("MAIN.myVar")
+defer client.ReleaseHandle(handle)
+
+data, _ := client.Read(uint32(ads.GroupSymbolValueByHandle), handle, 4)
+fmt.Printf("Value bytes: %v\n", data)
+```
+
+### Session — managed (long-running consumers)
+
+`Session` wraps a `Client` and adds the value-add for long-running consumers: symbol cache, name-based read/write, notification persistence with auto-resubscribe, auto-reconnect with backoff, online-change handling, lifecycle callbacks. `Session` does NOT promote Client methods — call `sess.ReadFromSymbol(name)` for cache-aware access; raw consumers construct a separate `*Client`.
+
+Use this for daemons, message brokers, or anything that should survive a network blip without manual intervention.
+
+```go
+sess, _ := ads.NewSession("192.168.1.100", 48898, "5.1.2.3.1.1", 851, "auto", 10500, 5*time.Second,
+    ads.WithRoute("my-route", "Administrator", "1"),
+    ads.WithAutoReconnect(true),
+    ads.WithOnReconnect(func() { log.Println("back online") }),
+)
+sess.Connect(false)
+defer sess.Close()
+
+// Cache-aware read (resolves on-demand, then caches for the connection's lifetime).
+value, _ := sess.ReadFromSymbol("MAIN.myVar")
+
+// Persistent subscription (resubscribes automatically after a reconnect).
+ch := make(chan *ads.Update, 64)
+sess.AddSymbolNotification("MAIN.bCounter", 100*time.Millisecond, 100*time.Millisecond,
+    ads.TransModeServerOnChange, ch)
+for update := range ch {
+    fmt.Println(update.Variable, update.Value)
 }
 ```
 
 ## Example CLI
 
-A ready-to-run example is included:
+A ready-to-run example is included with two demo modes (Session-managed and
+raw Client). Selection is interactive by default, or via `ADS_DEMO`:
 
 ```bash
-cd examples/simple
-go run . -ip 192.168.1.100 -netid 5.1.2.3.1.1 -list
+cd examples/cli
+ADS_PLC_IP=192.168.1.100 ADS_TARGET_AMS=5.1.2.3.1.1 \
+ADS_SYMBOL_NAME=MAIN.bCounter ADS_DEMO=session go run .
 ```
 
-See `examples/simple/main.go` for all available flags.
+See `examples/cli/README.md` for the full env-var reference.
 
 ## Connection options
 
-All options are passed to `NewConnection` and have sensible defaults:
+All options are passed to `NewSession` and have sensible defaults:
 
 ```go
-conn, _ := ads.NewConnection(ctx, ip, 48898, netid, 851, "auto", 10500, 5*time.Second,
+sess, _ := ads.NewSession(ip, 48898, netid, 851, "auto", 10500, 5*time.Second,
     // Route registration — probe first, register with credentials only if needed
     ads.WithRoute("my-route", "Administrator", "1"),
 
@@ -90,7 +152,7 @@ conn, _ := ads.NewConnection(ctx, ip, 48898, netid, 851, "auto", 10500, 5*time.S
         MaxInterval:     30 * time.Second,
     }),
 
-    // Disable auto-reconnect (caller must call conn.Reconnect() manually)
+    // Disable auto-reconnect (caller must call sess.Reconnect() manually)
     ads.WithAutoReconnect(false),
 
     // Event callbacks (run in goroutine, must not block)
@@ -120,6 +182,10 @@ conn, _ := ads.NewConnection(ctx, ip, 48898, netid, 851, "auto", 10500, 5*time.S
 | `WithForceRouteRegistration()` | Probe first | Always register route with credentials (skip probe). Requires `WithRoute` |
 | `WithHostIP(ip)` | Derived from AMS NetID | IP the PLC uses to reach this client (Docker/VPN/NAT). Requires `WithRoute` |
 | `WithLogger(logger)` | `slog.Default()` | Custom structured logger |
+| `WithSymbolVersionStrategy(s)` | `SymbolVersionAutoReload` | Online-change handling strategy (`AutoReload` / `Close` / `Ignore`) |
+| `WithMaxSymbolVersionReloadAttempts(n)` | `3` | Cap reload attempts within the sliding window (AutoReload only) |
+| `WithSymbolVersionReloadWindow(d)` | `60s` | Sliding window length for the reload-attempt cap |
+| `WithOnSymbolVersionChanged(fn)` | None | Callback fired once per online-change detection (`reason` from R-NOT-016) |
 
 ### Combining options
 
@@ -156,23 +222,23 @@ If you see `"notification dropped (channel full)"` warnings, either:
 
 ## Process image I/O (experimental)
 
-> **Warning:** Direct process image access bypasses the symbol table and writes raw bytes to I/O memory. Writing to the wrong offset can cause unexpected physical output changes (motors, valves, actuators). The PLC runtime may overwrite your changes on the next scan cycle. **For normal operation, use symbol-based access (`ReadFromSymbol`/`WriteToSymbol`).**
+> **Warning:** Direct process image access bypasses the symbol table and writes raw bytes to I/O memory. Writing to the wrong offset can cause unexpected physical output changes (motors, valves, actuators). The PLC runtime may overwrite your changes on the next scan cycle. **For normal operation, use symbol-based access (`sess.ReadFromSymbol`/`sess.WriteToSymbol`).**
 
-Convenience methods for diagnostics, commissioning, and I/O wiring verification:
+Process image methods live on `*Client` only — they are pure wire ops with no cache or notification dependency. Session users who need them construct a raw `*Client` via `Dial` alongside their `Session` (or use `Dial` exclusively if they never need cache-aware features).
 
 ```go
 // Read 4 bytes from input image at byte offset 0
-data, _ := conn.ReadProcessInput(0, 4)
+data, _ := client.ReadProcessInput(0, 4)
 
 // Read a single input bit (byte 2, bit 3)
-val, _ := conn.ReadProcessInputBit(2, 3)
+val, _ := client.ReadProcessInputBit(2, 3)
 
 // Write to output image (use with extreme caution)
-conn.WriteProcessOutput(10, []byte{0xFF})
-conn.WriteProcessOutputBit(10, 0, true)
+client.WriteProcessOutput(10, []byte{0xFF})
+client.WriteProcessOutputBit(10, 0, true)
 
 // Query input image size
-size, _ := conn.ReadProcessInputSize()
+size, _ := client.ReadProcessInputSize()
 ```
 
 ## Development
@@ -207,7 +273,7 @@ make build      # build all packages
 
 | Port | Protocol | Direction | Purpose | Configurable |
 |------|----------|-----------|---------|--------------|
-| 48898 | TCP | Client → PLC | ADS data (commands, responses, notifications) | Yes (`NewConnection` port param) |
+| 48898 | TCP | Client → PLC | ADS data (commands, responses, notifications) | Yes (`NewSession` port param) |
 | 48899 | UDP | Client → PLC | AMS route registration (`WithRoute`) | No (Beckhoff fixed) |
 
 Both ports must be open in firewalls between the client and PLC. If only TCP 48898 is open,
@@ -218,10 +284,10 @@ ADS works with pre-existing routes but `WithRoute` cannot register new ones.
 Only route credentials are needed — `WithHostIP` and `ADS_LOCAL_AMS` are optional:
 
 ```go
-conn, _ := ads.NewConnection(ctx, plcIP, 48898, targetAMS, 851, "auto", 10500, 5*time.Second,
+sess, _ := ads.NewSession(plcIP, 48898, targetAMS, 851, "auto", 10500, 5*time.Second,
     ads.WithRoute("my-route", "Administrator", "password"),
 )
-conn.Connect(false)
+sess.Connect(false)
 ```
 
 The PLC stores the UDP source IP (post-NAT) for the route, not the `computerName` from the

@@ -2,18 +2,21 @@ package ads
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
 
-func (conn *Connection) WriteToSymbol(symbolName string, value string) error {
-	return conn.writeToSymbolRetry(symbolName, value, 1)
+// WriteToSymbol writes a value to a PLC symbol by name (handle resolved
+// on-demand and cached).
+func (sess *Session) WriteToSymbol(symbolName string, value string) error {
+	return sess.writeToSymbolRetry(symbolName, value, 1)
 }
 
-func (conn *Connection) writeToSymbolRetry(symbolName string, value string, retriesLeft int) error {
-	gen := conn.lifecycle.reconnectGeneration.Load()
+func (sess *Session) writeToSymbolRetry(symbolName string, value string, retriesLeft int) error {
+	gen := sess.epoch()
 
-	symbol, err := conn.getSymbol(symbolName)
+	symbol, err := sess.getSymbol(symbolName)
 	if err != nil {
 		return fmt.Errorf("write to %q: %w", symbolName, err)
 	}
@@ -21,10 +24,10 @@ func (conn *Connection) writeToSymbolRetry(symbolName string, value string, retr
 	// Snapshot datatypes and handle under lock, then serialize without holding the lock.
 	// writeToNode reads symbol.Length and symbol.DataType internally — these fields are
 	// set at construction and never mutated, so no lock is needed for them.
-	conn.cache.lock.Lock()
-	datatypes := conn.cache.datatypes
+	sess.cache.lock.Lock()
+	datatypes := sess.cache.datatypes
 	handle := symbol.Handle
-	conn.cache.lock.Unlock()
+	sess.cache.lock.Unlock()
 
 	data, err := symbol.writeToNode(value, datatypes)
 	if err != nil {
@@ -32,75 +35,103 @@ func (conn *Connection) writeToSymbolRetry(symbolName string, value string, retr
 	}
 
 	// Network I/O without lock
-	err = conn.Write(uint32(GroupSymbolValueByHandle), handle, data)
+	err = sess.client.Write(uint32(GroupSymbolValueByHandle), handle, data)
 	if err != nil {
+		// Online-change detection (R-CACHE-009).
+		var rc ReturnCode
+		if errors.As(err, &rc) {
+			sess.handleStaleDetection(rc)
+		}
 		// If a reconnect happened during our operation, retry once with fresh handles
-		if retriesLeft > 0 && conn.lifecycle.reconnectGeneration.Load() != gen {
-			return conn.writeToSymbolRetry(symbolName, value, retriesLeft-1)
+		sess.waitForReconnect()
+		if retriesLeft > 0 && sess.epoch() != gen {
+			return sess.writeToSymbolRetry(symbolName, value, retriesLeft-1)
 		}
 		return fmt.Errorf("write to %q: %w", symbolName, err)
 	}
 
 	// Invalidate cached value so the next ReadFromSymbol fetches fresh data
-	conn.cache.lock.Lock()
+	sess.cache.lock.Lock()
 	symbol.Value = ""
 	symbol.ValueParsed = false
-	conn.cache.lock.Unlock()
+	sess.cache.lock.Unlock()
 
-	conn.logger.Log(context.Background(), LevelTrace, "wrote to symbol",
+	sess.logger.Log(context.Background(), LevelTrace, "wrote to symbol",
 		"symbol", symbolName,
 		"value", value)
 	return nil
 }
 
-func (conn *Connection) ReadFromSymbol(symbolName string) (string, error) {
-	return conn.readFromSymbolRetry(symbolName, 1)
+// ReadFromSymbol reads a PLC symbol by name and returns its stringified
+// value (handle resolved on-demand and cached).
+func (sess *Session) ReadFromSymbol(symbolName string) (string, error) {
+	return sess.readFromSymbolRetry(symbolName, 1)
 }
 
-func (conn *Connection) readFromSymbolRetry(symbolName string, retriesLeft int) (string, error) {
-	gen := conn.lifecycle.reconnectGeneration.Load()
+func (sess *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (string, error) {
+	gen := sess.epoch()
 
-	symbol, err := conn.getSymbol(symbolName)
+	symbol, err := sess.getSymbol(symbolName)
 	if err != nil {
 		return "", fmt.Errorf("read %q: %w", symbolName, err)
 	}
 
 	// Check cache under lock
-	conn.cache.lock.Lock()
+	sess.cache.lock.Lock()
 	now := time.Now()
 	if now.Sub(symbol.LastUpdateTime) < symbol.MinUpdateInterval && symbol.Value != "" {
 		cached := symbol.Value
-		conn.cache.lock.Unlock()
+		sess.cache.lock.Unlock()
 		return cached, nil
 	}
 	handle := symbol.Handle
 	length := symbol.Length
-	datatypes := conn.cache.datatypes
-	conn.cache.lock.Unlock()
+	datatypes := sess.cache.datatypes
+	sess.cache.lock.Unlock()
 
 	// Network I/O without lock
-	data, err := conn.Read(uint32(GroupSymbolValueByHandle), handle, length)
+	data, err := sess.client.Read(uint32(GroupSymbolValueByHandle), handle, length)
 	if err != nil {
+		// Online-change detection (R-CACHE-009).
+		var rc ReturnCode
+		if errors.As(err, &rc) {
+			sess.handleStaleDetection(rc)
+		}
 		// If a reconnect happened during our operation, retry once with fresh handles
-		if retriesLeft > 0 && conn.lifecycle.reconnectGeneration.Load() != gen {
-			return conn.readFromSymbolRetry(symbolName, retriesLeft-1)
+		sess.waitForReconnect()
+		if retriesLeft > 0 && sess.epoch() != gen {
+			return sess.readFromSymbolRetry(symbolName, retriesLeft-1)
 		}
 		return "", fmt.Errorf("read %q: %w", symbolName, err)
 	}
 
-	// parse() mutates Symbol fields (Value, Changed, Valid, etc.) so it must
+	// R-CACHE-009 supplementary detection: the cached symbol.Length disagreeing
+	// with the PLC-returned payload length indicates an online change (e.g.
+	// operator toggled nProbeA INT↔LREAL). The PLC ships data of the new size,
+	// but our cache still has the old size — parse() would fail with
+	// "symbol.Length N exceeds data buffer size M" and never surface a
+	// ReturnCode, so handleStaleDetection would be bypassed. Detect here
+	// (Session-wrapper layer where sess is in scope) and dispatch the
+	// configured strategy. Returns a ReturnCode-typed error so chained
+	// errors.As on the caller side keeps matching.
+	if data != nil && length > 0 && uint32(len(data)) != length {
+		sess.handleStaleDetection(ReturnCodeDeviceInvalidSize)
+		return "", fmt.Errorf("read %q: %w", symbolName, ReturnCodeDeviceInvalidSize)
+	}
+
+	// parse() mutates Symbol fields (Value, Valid, etc.) so it must
 	// run under lock to avoid racing with handleNotification.
-	conn.cache.lock.Lock()
+	sess.cache.lock.Lock()
 	value, err := symbol.parse(data, 0, datatypes)
 	if err != nil {
-		conn.cache.lock.Unlock()
+		sess.cache.lock.Unlock()
 		return "", fmt.Errorf("read %q: parse failed: %w", symbolName, err)
 	}
 	symbol.LastUpdateTime = time.Now()
 	symbol.Value = value
-	conn.cache.lock.Unlock()
+	sess.cache.lock.Unlock()
 
-	conn.logger.Log(context.Background(), LevelTrace, "Read from symbol",
+	sess.logger.Log(context.Background(), LevelTrace, "Read from symbol",
 		"symbol", symbolName,
 		"Value", value)
 
@@ -135,16 +166,16 @@ func symbolSumAddress(sym *Symbol) (group, offset uint32) {
 
 // ReadMultipleSymbols reads multiple symbols in a single ADS round-trip using SumRead.
 // Returns a map of symbol name to parsed string value.
-func (conn *Connection) ReadMultipleSymbols(names []string) (map[string]string, error) {
-	return conn.readMultipleSymbolsRetry(names, 1)
+func (sess *Session) ReadMultipleSymbols(names []string) (map[string]string, error) {
+	return sess.readMultipleSymbolsRetry(names, 1)
 }
 
-func (conn *Connection) readMultipleSymbolsRetry(names []string, retriesLeft int) (map[string]string, error) {
+func (sess *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (map[string]string, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
 
-	gen := conn.lifecycle.reconnectGeneration.Load()
+	gen := sess.epoch()
 
 	// Resolve symbols and build SumRead requests
 	type symbolInfo struct {
@@ -155,9 +186,9 @@ func (conn *Connection) readMultipleSymbolsRetry(names []string, retriesLeft int
 	var requests []SumReadRequest
 
 	for _, name := range names {
-		symbol, err := conn.getSymbol(name)
+		symbol, err := sess.getSymbol(name)
 		if err != nil {
-			conn.logger.Error("error getting symbol for batch read", "error", err, "symbol", name)
+			sess.logger.Error("error getting symbol for batch read", "error", err, "symbol", name)
 			continue
 		}
 		infos = append(infos, symbolInfo{name: name, symbol: symbol})
@@ -169,22 +200,37 @@ func (conn *Connection) readMultipleSymbolsRetry(names []string, retriesLeft int
 		return nil, fmt.Errorf("no valid symbols found for batch read")
 	}
 
-	results, err := conn.SumRead(requests)
+	results, err := sess.client.SumRead(requests)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
-		if retriesLeft > 0 && conn.lifecycle.reconnectGeneration.Load() != gen {
-			return conn.readMultipleSymbolsRetry(names, retriesLeft-1)
+		sess.waitForReconnect()
+		if retriesLeft > 0 && sess.epoch() != gen {
+			return sess.readMultipleSymbolsRetry(names, retriesLeft-1)
 		}
 		return nil, fmt.Errorf("batch read failed: %w", err)
 	}
 
+	// R-CACHE-009: fire online-change detection for first stale per-item code.
+	// Once-per-batch semantics avoid callback amplification when N items in
+	// the same response carry the same stale code (R-SES-011 "once per
+	// detection").
+	for _, r := range results {
+		if r.Error == ReturnCodeNoErrors {
+			continue
+		}
+		if stale, _ := detectStaleCache(r.Error); stale {
+			sess.handleStaleDetection(r.Error)
+			break
+		}
+	}
+
 	values := make(map[string]string, len(results))
-	conn.cache.lock.Lock()
-	defer conn.cache.lock.Unlock()
+	sess.cache.lock.Lock()
+	defer sess.cache.lock.Unlock()
 
 	for i, result := range results {
 		if result.Error != ReturnCodeNoErrors {
-			conn.logger.Warn("symbol read error in batch",
+			sess.logger.Warn("symbol read error in batch",
 				"symbol", infos[i].name,
 				"errorCode", uint32(result.Error))
 			continue
@@ -193,15 +239,15 @@ func (conn *Connection) readMultipleSymbolsRetry(names []string, retriesLeft int
 		// loadSymbols swapped the cache during the SumRead roundtrip. Parse
 		// + Value mutation must target the live entry, otherwise
 		// ReadFromSymbol returns "" while parse silently writes the orphan.
-		live := conn.cache.symbols[symbolKey(infos[i].name)]
+		live := sess.cache.symbols[symbolKey(infos[i].name)]
 		if live == nil {
-			conn.logger.Warn("batch read result for symbol no longer in cache; skipping",
+			sess.logger.Warn("batch read result for symbol no longer in cache; skipping",
 				"symbol", infos[i].name)
 			continue
 		}
-		value, err := live.parse(result.Data, 0, conn.cache.datatypes)
+		value, err := live.parse(result.Data, 0, sess.cache.datatypes)
 		if err != nil {
-			conn.logger.Error("error parsing symbol in batch read", "error", err, "symbol", infos[i].name)
+			sess.logger.Error("error parsing symbol in batch read", "error", err, "symbol", infos[i].name)
 			continue
 		}
 		now := time.Now()
@@ -217,21 +263,21 @@ func (conn *Connection) readMultipleSymbolsRetry(names []string, retriesLeft int
 // Returns a map of symbol name to per-symbol error code.
 // Uses direct iGroup/iOffs addressing when available (after LoadSymbols),
 // falling back to handle-based addressing for on-demand symbols.
-func (conn *Connection) WriteMultipleSymbols(values map[string]string) (map[string]ReturnCode, error) {
-	return conn.writeMultipleSymbolsRetry(values, 1)
+func (sess *Session) WriteMultipleSymbols(values map[string]string) (map[string]ReturnCode, error) {
+	return sess.writeMultipleSymbolsRetry(values, 1)
 }
 
-func (conn *Connection) writeMultipleSymbolsRetry(values map[string]string, retriesLeft int) (map[string]ReturnCode, error) {
+func (sess *Session) writeMultipleSymbolsRetry(values map[string]string, retriesLeft int) (map[string]ReturnCode, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}
 
-	gen := conn.lifecycle.reconnectGeneration.Load()
+	gen := sess.epoch()
 
 	// Snapshot datatypes under lock
-	conn.cache.lock.Lock()
-	datatypes := conn.cache.datatypes
-	conn.cache.lock.Unlock()
+	sess.cache.lock.Lock()
+	datatypes := sess.cache.datatypes
+	sess.cache.lock.Unlock()
 
 	type symbolInfo struct {
 		name   string
@@ -241,15 +287,15 @@ func (conn *Connection) writeMultipleSymbolsRetry(values map[string]string, retr
 	var requests []SumWriteRequest
 
 	for name, value := range values {
-		symbol, err := conn.getSymbol(name)
+		symbol, err := sess.getSymbol(name)
 		if err != nil {
-			conn.logger.Error("error getting symbol for batch write", "error", err, "symbol", name)
+			sess.logger.Error("error getting symbol for batch write", "error", err, "symbol", name)
 			continue
 		}
 
 		data, err := symbol.writeToNode(value, datatypes)
 		if err != nil {
-			conn.logger.Error("error serializing symbol for batch write", "error", err, "symbol", name)
+			sess.logger.Error("error serializing symbol for batch write", "error", err, "symbol", name)
 			continue
 		}
 
@@ -264,17 +310,30 @@ func (conn *Connection) writeMultipleSymbolsRetry(values map[string]string, retr
 		return nil, fmt.Errorf("no valid symbols found for batch write")
 	}
 
-	results, err := conn.SumWrite(requests)
+	results, err := sess.client.SumWrite(requests)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
-		if retriesLeft > 0 && conn.lifecycle.reconnectGeneration.Load() != gen {
-			return conn.writeMultipleSymbolsRetry(values, retriesLeft-1)
+		sess.waitForReconnect()
+		if retriesLeft > 0 && sess.epoch() != gen {
+			return sess.writeMultipleSymbolsRetry(values, retriesLeft-1)
 		}
 		return nil, fmt.Errorf("batch write failed: %w", err)
 	}
 
+	// R-CACHE-009: fire online-change detection for first stale per-item code.
+	// Once-per-batch semantics — see readMultipleSymbolsRetry for rationale.
+	for _, r := range results {
+		if r.Error == ReturnCodeNoErrors {
+			continue
+		}
+		if stale, _ := detectStaleCache(r.Error); stale {
+			sess.handleStaleDetection(r.Error)
+			break
+		}
+	}
+
 	codes := make(map[string]ReturnCode, len(results))
-	conn.cache.lock.Lock()
+	sess.cache.lock.Lock()
 	for i, result := range results {
 		codes[infos[i].name] = result.Error
 		// Invalidate cached value for successful writes so next read is fresh.
@@ -282,13 +341,13 @@ func (conn *Connection) writeMultipleSymbolsRetry(values map[string]string, retr
 		// loadSymbols swapped during the SumWrite roundtrip; clearing the
 		// orphan would leave the live entry showing stale Value.
 		if result.Error == ReturnCodeNoErrors {
-			if live := conn.cache.symbols[symbolKey(infos[i].name)]; live != nil {
+			if live := sess.cache.symbols[symbolKey(infos[i].name)]; live != nil {
 				live.Value = ""
 				live.ValueParsed = false
 			}
 		}
 	}
-	conn.cache.lock.Unlock()
+	sess.cache.lock.Unlock()
 
 	return codes, nil
 }

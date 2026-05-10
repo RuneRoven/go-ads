@@ -34,7 +34,7 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 				return "", fmt.Errorf("parsing child %q: %w", value.Name, err)
 			}
 		}
-		newValue = symbol.GetJSON(false)
+		newValue = symbol.GetJSON()
 		symbol.updateValue(newValue)
 		return symbol.Value, nil
 	}
@@ -226,28 +226,6 @@ func (symbol *Symbol) updateValue(newValue string) {
 		symbol.Value = newValue
 		symbol.Valid = true
 		symbol.ValueParsed = true
-		symbol.Changed = true
-		symbol.parentChanged()
-	}
-}
-
-// parentChangedMaxDepth caps walk up the Parent chain. Real PLC struct
-// nesting is at most a few dozen levels; the cap defends against pathological
-// or malformed data that could form a cycle and stack-overflow the runtime.
-const parentChangedMaxDepth = 256
-
-func (symbol *Symbol) parentChanged() {
-	s, depth := symbol, 0
-	for ; s != nil && depth < parentChangedMaxDepth; s, depth = s.Parent, depth+1 {
-		s.Changed = true
-	}
-	if depth >= parentChangedMaxDepth && s != nil {
-		// Likely cycle in Symbol.Parent chain or pathological depth.
-		// Cap-hit indicates corruption — surface for debugging instead of
-		// silently truncating Changed propagation.
-		getDefaultLogger().Warn("parentChanged hit depth cap; possible Parent cycle or malformed Symbol tree",
-			"symbol", symbol.FullName,
-			"max_depth", parentChangedMaxDepth)
 	}
 }
 
@@ -525,7 +503,7 @@ func (symbol *Symbol) writeToNode(value string, datatypes map[string]SymbolUploa
 		copy(newBuf, src)
 		buf.Write(newBuf)
 	case "WSTRING":
-		// WSTRING needs at least 2 bytes for the UTnull terminator.
+		// WSTRING needs at least 2 bytes for the UTF-16 null terminator.
 		if symbol.Length < 2 {
 			return nil, fmt.Errorf("WSTRING write requires symbol.Length >= 2, got %d", symbol.Length)
 		}

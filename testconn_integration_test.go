@@ -17,7 +17,7 @@ type connDefaults struct {
 }
 
 // setupConnectionWithDefaults creates a PLC connection using env vars with provided fallbacks.
-func setupConnectionWithDefaults(t *testing.T, d connDefaults) *Connection {
+func setupConnectionWithDefaults(t *testing.T, d connDefaults) *Session {
 	t.Helper()
 
 	ip := getEnvOrDefault("ADS_PLC_IP", d.ip)
@@ -29,7 +29,7 @@ func setupConnectionWithDefaults(t *testing.T, d connDefaults) *Connection {
 	}
 	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
 
-	var opts []ConnectionOption
+	var opts []SessionOption
 	hostIP := os.Getenv("ADS_HOST_IP")
 	if hostIP != "" {
 		opts = append(opts, WithHostIP(hostIP))
@@ -40,7 +40,7 @@ func setupConnectionWithDefaults(t *testing.T, d connDefaults) *Connection {
 		opts = append(opts, WithRoute(d.routeName, routeUser, routePass))
 	}
 
-	conn, err := NewConnection(ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second, opts...)
+	conn, err := NewSession(ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second, opts...)
 	if err != nil {
 		t.Fatalf("NewConnection failed: %v", err)
 	}

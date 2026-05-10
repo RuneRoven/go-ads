@@ -10,7 +10,7 @@ import (
 // Batched ADS sum commands: SumRead, SumWrite, SumAddDeviceNotification,
 // SumDeleteDeviceNotification. Each falls back to individual commands when
 // the PLC does not support the sum variant. Capability state is tracked via
-// the capabilities type on Connection.
+// the capabilities type on Session.
 
 // sumCmdSpec describes a single sum-command's protocol contract for use
 // with executeSumCommand. SumAddDeviceNotification and SumDeleteDeviceNotification
@@ -37,7 +37,7 @@ type sumCmdSpec[Req any, Res any] struct {
 //  4. On error: if isSumCommandUnsupportedError, CAS state to unsupported,
 //     log Warn, call fallback. Otherwise propagate.
 //  5. On success: CAS state to supported, length-check response, decode.
-func executeSumCommand[Req any, Res any](conn *Connection, spec sumCmdSpec[Req, Res], requests []Req) ([]Res, error) {
+func executeSumCommand[Req any, Res any](c *Client, spec sumCmdSpec[Req, Res], requests []Req) ([]Res, error) {
 	if len(requests) == 0 {
 		return nil, nil
 	}
@@ -50,11 +50,11 @@ func executeSumCommand[Req any, Res any](conn *Connection, spec sumCmdSpec[Req, 
 		spec.encode(writeData[i*spec.itemWriteSize:(i+1)*spec.itemWriteSize], req)
 	}
 	readLen := uint32(n * spec.itemReadSize)
-	resp, err := conn.WriteRead(uint32(spec.group), uint32(n), readLen, writeData)
+	resp, err := c.WriteRead(uint32(spec.group), uint32(n), readLen, writeData)
 	if err != nil {
 		if isSumCommandUnsupportedError(err) {
 			spec.stateCASToUnsupported()
-			conn.logger.Warn("sum command not supported by PLC, using fallback",
+			c.logger.Warn("sum command not supported by PLC, using fallback",
 				"group", uint32(spec.group),
 				"error", err)
 			return spec.fallback(requests)
@@ -97,15 +97,15 @@ type SumReadResult struct {
 // cleanly — migrating would require either two helper invocations or a spec
 // extension that couples the helper to one caller's quirk. Custom orchestration
 // is clearer here.
-func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, error) {
+func (c *Client) SumRead(requests []SumReadRequest) ([]SumReadResult, error) {
 	if len(requests) == 0 {
 		return nil, nil
 	}
 
-	cmd := conn.capabilities.SumReadCmdLoad()
+	cmd := c.capabilities.SumReadCmdLoad()
 	if cmd == 1 {
 		// Already determined: no sum read support
-		return conn.sumReadFallback(requests)
+		return c.sumReadFallback(requests)
 	}
 
 	n := len(requests)
@@ -129,51 +129,51 @@ func (conn *Connection) SumRead(requests []SumReadRequest) ([]SumReadResult, err
 
 	if cmd != 0 {
 		// Already probed — use cached command
-		return conn.sumReadExec(Group(cmd), uint32(n), readLen, writeData, requests)
+		return c.sumReadExec(Group(cmd), uint32(n), readLen, writeData, requests)
 	}
 
 	// First call: probe starting with Ex2, then Ex
-	return conn.sumReadProbe(uint32(n), readLen, writeData, requests)
+	return c.sumReadProbe(uint32(n), readLen, writeData, requests)
 }
 
 // sumReadProbe tries SumReadEx2 then SumReadEx, caching the first that works.
-func (conn *Connection) sumReadProbe(count uint32, readLen uint32, writeData []byte, requests []SumReadRequest) ([]SumReadResult, error) {
+func (c *Client) sumReadProbe(count uint32, readLen uint32, writeData []byte, requests []SumReadRequest) ([]SumReadResult, error) {
 	// Try SumReadEx2 (0xF084) first
-	resp, err := conn.WriteRead(uint32(GroupSumupReadEx2), count, readLen, writeData)
+	resp, err := c.WriteRead(uint32(GroupSumupReadEx2), count, readLen, writeData)
 	if err == nil {
-		conn.capabilities.SumReadCmdStore(uint32(GroupSumupReadEx2))
-		conn.logger.Info("SumRead using SumReadEx2 (0xF084)")
-		return conn.parseSumReadResponse(resp, int(count), requests)
+		c.capabilities.SumReadCmdStore(uint32(GroupSumupReadEx2))
+		c.logger.Info("SumRead using SumReadEx2 (0xF084)")
+		return c.parseSumReadResponse(resp, int(count), requests)
 	}
 	if !isSumCommandUnsupportedError(err) {
 		return nil, fmt.Errorf("SumRead failed: %w", err)
 	}
-	conn.logger.Info("SumReadEx2 not supported, trying SumReadEx", "error", err)
+	c.logger.Info("SumReadEx2 not supported, trying SumReadEx", "error", err)
 
 	// Try SumReadEx (0xF083)
-	resp, err = conn.WriteRead(uint32(GroupSumupReadEx), count, readLen, writeData)
+	resp, err = c.WriteRead(uint32(GroupSumupReadEx), count, readLen, writeData)
 	if err == nil {
-		conn.capabilities.SumReadCmdStore(uint32(GroupSumupReadEx))
-		conn.logger.Info("SumRead using SumReadEx (0xF083)")
-		return conn.parseSumReadResponse(resp, int(count), requests)
+		c.capabilities.SumReadCmdStore(uint32(GroupSumupReadEx))
+		c.logger.Info("SumRead using SumReadEx (0xF083)")
+		return c.parseSumReadResponse(resp, int(count), requests)
 	}
 	if !isSumCommandUnsupportedError(err) {
 		return nil, fmt.Errorf("SumRead failed: %w", err)
 	}
-	conn.logger.Warn("SumReadEx not supported, using individual reads", "error", err)
+	c.logger.Warn("SumReadEx not supported, using individual reads", "error", err)
 
 	// No sum read support
-	conn.capabilities.SumReadCmdStore(1)
-	return conn.sumReadFallback(requests)
+	c.capabilities.SumReadCmdStore(1)
+	return c.sumReadFallback(requests)
 }
 
 // sumReadExec performs a sum read with a known-good command.
-func (conn *Connection) sumReadExec(group Group, count uint32, readLen uint32, writeData []byte, requests []SumReadRequest) ([]SumReadResult, error) {
-	resp, err := conn.WriteRead(uint32(group), count, readLen, writeData)
+func (c *Client) sumReadExec(group Group, count uint32, readLen uint32, writeData []byte, requests []SumReadRequest) ([]SumReadResult, error) {
+	resp, err := c.WriteRead(uint32(group), count, readLen, writeData)
 	if err != nil {
 		return nil, fmt.Errorf("SumRead failed: %w", err)
 	}
-	return conn.parseSumReadResponse(resp, int(count), requests)
+	return c.parseSumReadResponse(resp, int(count), requests)
 }
 
 // parseSumReadResponse parses the [N × (error, length)][data] response format
@@ -182,7 +182,7 @@ func (conn *Connection) sumReadExec(group Group, count uint32, readLen uint32, w
 // Note: The official Beckhoff PDF shows 0xF083 with a separate error array (like 0xF080),
 // but empirical testing on both TwinCAT 2 and TwinCAT 3 confirms 0xF083 returns the
 // interleaved format identical to 0xF084. See PROTOCOL.md for details.
-func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumReadRequest) ([]SumReadResult, error) {
+func (c *Client) parseSumReadResponse(resp []byte, n int, requests []SumReadRequest) ([]SumReadResult, error) {
 	if len(resp) < n*8 {
 		return nil, fmt.Errorf("SumRead response too short: got %d bytes, expected at least %d", len(resp), n*8)
 	}
@@ -203,7 +203,7 @@ func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumR
 		if results[i].Error != ReturnCodeNoErrors {
 			remaining := uint32(len(resp) - dataOffset)
 			if lengths[i] > remaining {
-				conn.logger.Error("SumRead errored-item declared length exceeds remaining bytes — protocol drift",
+				c.logger.Error("SumRead errored-item declared length exceeds remaining bytes — protocol drift",
 					"item_index", i,
 					"declared_length", lengths[i],
 					"bytes_remaining", remaining,
@@ -220,7 +220,7 @@ func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumR
 		// returns exactly requests[i].Length bytes. Anything shorter shifts
 		// subsequent offsets in the data section.
 		if lengths[i] < requests[i].Length {
-			conn.logger.Error("SumRead per-item undersize — protocol drift",
+			c.logger.Error("SumRead per-item undersize — protocol drift",
 				"item_index", i,
 				"declared_length", lengths[i],
 				"requested_length", requests[i].Length)
@@ -233,7 +233,7 @@ func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumR
 		// requested would shift all subsequent items' offsets even if total
 		// bytes fit in the response. Reject and break (cascade marks remaining).
 		if lengths[i] > requests[i].Length {
-			conn.logger.Error("SumRead per-item oversize — protocol drift or wire corruption",
+			c.logger.Error("SumRead per-item oversize — protocol drift or wire corruption",
 				"item_index", i,
 				"declared_length", lengths[i],
 				"requested_length", requests[i].Length)
@@ -250,7 +250,7 @@ func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumR
 			// Data section is position-dependent: each item's offset depends on
 			// the cumulative lengths of all preceding items. Once one item is
 			// truncated, all subsequent offsets are wrong and unrecoverable.
-			conn.logger.Error("SumRead truncated — likely protocol corruption",
+			c.logger.Error("SumRead truncated — likely protocol corruption",
 				"items_lost", n-i,
 				"declared_length", lengths[i],
 				"bytes_remaining", remaining,
@@ -270,13 +270,13 @@ func (conn *Connection) parseSumReadResponse(resp []byte, n int, requests []SumR
 }
 
 // sumReadFallback performs individual reads when no sum read command is supported.
-func (conn *Connection) sumReadFallback(requests []SumReadRequest) ([]SumReadResult, error) {
+func (c *Client) sumReadFallback(requests []SumReadRequest) ([]SumReadResult, error) {
 	results := make([]SumReadResult, len(requests))
 	for i, req := range requests {
-		data, err := conn.Read(req.Group, req.Offset, req.Length)
+		data, err := c.Read(req.Group, req.Offset, req.Length)
 		if err != nil {
 			results[i].Error = ReturnCodeDeviceError
-			conn.logger.Warn("individual read failed in SumRead fallback", "error", err, "index", i)
+			c.logger.Warn("individual read failed in SumRead fallback", "error", err, "index", i)
 		} else {
 			results[i].Error = ReturnCodeNoErrors
 			results[i].Data = data
@@ -305,14 +305,14 @@ type SumWriteResult struct {
 // has a header section (Group+Offset+Length per item) followed by a concatenated
 // data section (variable-size Data bytes per item). The generic helper's fixed
 // itemWriteSize cannot represent this. Custom orchestration is required.
-func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, error) {
+func (c *Client) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, error) {
 	if len(requests) == 0 {
 		return nil, nil
 	}
 
 	// Skip SumWrite if we already know it's not supported.
-	if conn.capabilities.SumWriteStateLoad() == 2 {
-		return conn.sumWriteFallback(requests)
+	if c.capabilities.SumWriteStateLoad() == 2 {
+		return c.sumWriteFallback(requests)
 	}
 
 	n := len(requests)
@@ -338,19 +338,19 @@ func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, 
 	// Response: N × 4 bytes (one uint32 error code per item)
 	readLen := uint32(n * 4)
 
-	resp, err := conn.WriteRead(uint32(GroupSumupWrite), uint32(n), readLen, writeData)
+	resp, err := c.WriteRead(uint32(GroupSumupWrite), uint32(n), readLen, writeData)
 	if err != nil {
 		if isSumCommandUnsupportedError(err) {
-			conn.capabilities.SumWriteStateCAS(0, 2) // atomic: only first prober sets
-			conn.logger.Warn("SumWrite not supported by PLC, using individual writes", "error", err)
-			return conn.sumWriteFallback(requests)
+			c.capabilities.SumWriteStateCAS(0, 2) // atomic: only first prober sets
+			c.logger.Warn("SumWrite not supported by PLC, using individual writes", "error", err)
+			return c.sumWriteFallback(requests)
 		}
 		// Don't fall back for transient errors — writes are not idempotent
 		// and the PLC may have partially applied the batch
 		return nil, fmt.Errorf("SumWrite failed: %w", err)
 	}
 
-	conn.capabilities.SumWriteStateCAS(0, 1) // atomic: only first prober sets
+	c.capabilities.SumWriteStateCAS(0, 1) // atomic: only first prober sets
 
 	if len(resp) < n*4 {
 		return nil, fmt.Errorf("SumWrite response too short: got %d bytes, expected %d", len(resp), n*4)
@@ -365,13 +365,13 @@ func (conn *Connection) SumWrite(requests []SumWriteRequest) ([]SumWriteResult, 
 }
 
 // sumWriteFallback performs individual writes when sum write is not supported.
-func (conn *Connection) sumWriteFallback(requests []SumWriteRequest) ([]SumWriteResult, error) {
+func (c *Client) sumWriteFallback(requests []SumWriteRequest) ([]SumWriteResult, error) {
 	results := make([]SumWriteResult, len(requests))
 	for i, req := range requests {
-		err := conn.Write(req.Group, req.Offset, req.Data)
+		err := c.Write(req.Group, req.Offset, req.Data)
 		if err != nil {
 			results[i].Error = ReturnCodeDeviceError
-			conn.logger.Warn("individual write failed in SumWrite fallback", "error", err, "index", i)
+			c.logger.Warn("individual write failed in SumWrite fallback", "error", err, "index", i)
 		} else {
 			results[i].Error = ReturnCodeNoErrors
 		}
@@ -403,11 +403,11 @@ type SumNotificationResult struct {
 // SumAddDeviceNotification adds multiple device notifications in a single ADS
 // round-trip using GroupSumupAddDeviceNotification (0xF085). Falls back to
 // individual AddDeviceNotification calls on older PLCs.
-func (conn *Connection) SumAddDeviceNotification(requests []SumNotificationRequest) ([]SumNotificationResult, error) {
+func (c *Client) SumAddDeviceNotification(requests []SumNotificationRequest) ([]SumNotificationResult, error) {
 	spec := sumCmdSpec[SumNotificationRequest, SumNotificationResult]{
-		stateLoad:             conn.capabilities.SumAddNotifStateLoad,
-		stateCASToSupported:   func() bool { return conn.capabilities.SumAddNotifStateCAS(0, 1) },
-		stateCASToUnsupported: func() bool { return conn.capabilities.SumAddNotifStateCAS(0, 2) },
+		stateLoad:             c.capabilities.SumAddNotifStateLoad,
+		stateCASToSupported:   func() bool { return c.capabilities.SumAddNotifStateCAS(0, 1) },
+		stateCASToUnsupported: func() bool { return c.capabilities.SumAddNotifStateCAS(0, 2) },
 		group:                 GroupSumupAddDeviceNotification,
 		itemWriteSize:         40, // Group + Offset + Length + TransMode + MaxDelay + CycleTime + 16 reserved
 		itemReadSize:          8,  // error(4) + handle(4)
@@ -428,19 +428,23 @@ func (conn *Connection) SumAddDeviceNotification(requests []SumNotificationReque
 			}
 			return items, nil
 		},
-		fallback: conn.sumAddNotificationFallback,
+		fallback: c.sumAddNotificationFallback,
 	}
-	return executeSumCommand(conn, spec, requests)
+	return executeSumCommand(c, spec, requests)
 }
 
 // SumDeleteDeviceNotification deletes multiple device notifications by handle
 // in a single ADS round-trip using GroupSumupDeleteDeviceNotification (0xF086).
 // Falls back to individual DeleteDeviceNotification calls on older PLCs.
-func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error) {
+//
+// Returns the per-handle ReturnCode slice from the PLC. Persistent
+// activeNotifications cleanup is the caller's responsibility; Session
+// wraps this with its notifications.lock cleanup in Session.SumDeleteDeviceNotification.
+func (c *Client) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error) {
 	spec := sumCmdSpec[uint32, ReturnCode]{
-		stateLoad:             conn.capabilities.SumDeleteNotifStateLoad,
-		stateCASToSupported:   func() bool { return conn.capabilities.SumDeleteNotifStateCAS(0, 1) },
-		stateCASToUnsupported: func() bool { return conn.capabilities.SumDeleteNotifStateCAS(0, 2) },
+		stateLoad:             c.capabilities.SumDeleteNotifStateLoad,
+		stateCASToSupported:   func() bool { return c.capabilities.SumDeleteNotifStateCAS(0, 1) },
+		stateCASToUnsupported: func() bool { return c.capabilities.SumDeleteNotifStateCAS(0, 2) },
 		group:                 GroupSumupDeleteDeviceNotification,
 		itemWriteSize:         4, // handle
 		itemReadSize:          4, // error
@@ -454,54 +458,28 @@ func (conn *Connection) SumDeleteDeviceNotification(handles []uint32) ([]ReturnC
 			}
 			return out, nil
 		},
-		fallback: conn.sumDeleteNotificationFallback,
+		fallback: c.sumDeleteNotificationFallback,
 	}
-	errors, err := executeSumCommand(conn, spec, handles)
-	if err != nil {
-		return nil, err
-	}
-	if len(errors) == 0 {
-		return errors, nil
-	}
-
-	// cleanup: remove activeNotifications entries for successful or
-	// handle-invalid deletes. handle-invalid is success-equivalent — PLC
-	// already considers the handle gone.
-	conn.notifs.lock.Lock()
-	for i, h := range handles {
-		if errors[i] == ReturnCodeNoErrors || errors[i] == ReturnCodeDeviceNotifyHandleInvalid {
-			if sym := conn.notifs.activeNotifications[h]; sym != nil {
-				conn.removeNotificationConfig(sym.FullName)
-			}
-			delete(conn.notifs.activeNotifications, h)
-			conn.logger.Info("batch deleted notification handle", "handle", h, "errorCode", uint32(errors[i]))
-		}
-	}
-	if len(conn.notifs.activeNotifications) == 0 {
-		conn.notifs.notificationChannel = nil
-	}
-	conn.notifs.lock.Unlock()
-
-	return errors, nil
+	return executeSumCommand(c, spec, handles)
 }
 
 // sumAddNotificationFallback adds notifications individually when sum commands are not supported.
 // It also downgrades v2 transmission modes to v1 equivalents since older PLCs silently ignore v2 modes.
-func (conn *Connection) sumAddNotificationFallback(requests []SumNotificationRequest) ([]SumNotificationResult, error) {
+func (c *Client) sumAddNotificationFallback(requests []SumNotificationRequest) ([]SumNotificationResult, error) {
 	results := make([]SumNotificationResult, len(requests))
 	for i, req := range requests {
 		// Downgrade v2 modes for older PLCs that don't support them
 		transMode := downgradeTransMode(req.TransmissionMode)
 		if transMode != req.TransmissionMode {
-			conn.logger.Info("downgraded transmission mode for older PLC",
+			c.logger.Info("downgraded transmission mode for older PLC",
 				"from", req.TransmissionMode.String(),
 				"to", transMode.String(),
 				"index", i)
 		}
-		h, err := conn.AddDeviceNotification(req.Group, req.Offset, req.Length, transMode, req.MaxDelay, req.CycleTime)
+		h, err := c.AddDeviceNotification(req.Group, req.Offset, req.Length, transMode, req.MaxDelay, req.CycleTime)
 		if err != nil {
 			results[i].Error = ReturnCodeDeviceError
-			conn.logger.Warn("individual AddDeviceNotification failed in fallback", "error", err, "index", i)
+			c.logger.Warn("individual AddDeviceNotification failed in fallback", "error", err, "index", i)
 		} else {
 			results[i].Handle = h
 		}
@@ -510,18 +488,22 @@ func (conn *Connection) sumAddNotificationFallback(requests []SumNotificationReq
 }
 
 // bestEffortDeleteNotifications attempts to delete the given handles via
-// SumDeleteDeviceNotification. Errors are logged but never returned — this is
-// for cleanup paths where the caller cannot meaningfully react to a failure
-// (e.g. PLC unreachable during a reconnect retry). Returns the count of
-// successfully deleted handles for logging. Treats ReturnCodeDeviceNotifyHandleInvalid
+// SumDeleteDeviceNotification (Session wrapper, so notifications cleanup also
+// fires). Errors are logged but never returned — this is for cleanup
+// paths where the caller cannot meaningfully react to a failure (e.g.
+// PLC unreachable during a reconnect retry). Returns the count of
+// successfully deleted handles. Treats ReturnCodeDeviceNotifyHandleInvalid
 // as success-equivalent (handle already gone PLC-side).
-func (conn *Connection) bestEffortDeleteNotifications(handles []uint32) int {
+//
+// Lives on *Session because it routes through Session.SumDeleteDeviceNotification
+// to keep activeNotifications consistent with the PLC.
+func (sess *Session) bestEffortDeleteNotifications(handles []uint32) int {
 	if len(handles) == 0 {
 		return 0
 	}
-	errors, err := conn.SumDeleteDeviceNotification(handles)
+	errors, err := sess.SumDeleteDeviceNotification(handles)
 	if err != nil {
-		conn.logger.Warn("bestEffortDelete: SumDeleteDeviceNotification failed",
+		sess.logger.Warn("bestEffortDelete: SumDeleteDeviceNotification failed",
 			"error", err,
 			"handles", len(handles))
 		return 0
@@ -533,7 +515,7 @@ func (conn *Connection) bestEffortDeleteNotifications(handles []uint32) int {
 		}
 	}
 	if deleted < len(handles) {
-		conn.logger.Warn("bestEffortDelete: some handles not cleaned up",
+		sess.logger.Warn("bestEffortDelete: some handles not cleaned up",
 			"deleted", deleted,
 			"requested", len(handles))
 	}
@@ -541,13 +523,13 @@ func (conn *Connection) bestEffortDeleteNotifications(handles []uint32) int {
 }
 
 // sumDeleteNotificationFallback deletes notifications individually when sum commands are not supported.
-func (conn *Connection) sumDeleteNotificationFallback(handles []uint32) ([]ReturnCode, error) {
+func (c *Client) sumDeleteNotificationFallback(handles []uint32) ([]ReturnCode, error) {
 	errors := make([]ReturnCode, len(handles))
 	for i, h := range handles {
-		err := conn.DeleteDeviceNotification(h)
+		err := c.DeleteDeviceNotification(h)
 		if err != nil {
 			errors[i] = ReturnCodeDeviceError
-			conn.logger.Warn("individual DeleteDeviceNotification failed in fallback", "error", err, "handle", h)
+			c.logger.Warn("individual DeleteDeviceNotification failed in fallback", "error", err, "handle", h)
 		} else {
 			errors[i] = ReturnCodeNoErrors
 		}

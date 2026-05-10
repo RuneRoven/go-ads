@@ -17,6 +17,8 @@ import (
 // Run for each PLC:
 //
 //	set -a && source .env.integration && set +a && go test -tags integration -run TestBrowseAllSymbols -v -timeout 60s
+//
+// Validates: R-CACHE-001, R-VIEW-005.
 func TestBrowseAllSymbols(t *testing.T) {
 	conn := browseSetupConnection(t)
 
@@ -39,7 +41,7 @@ func TestBrowseAllSymbols(t *testing.T) {
 	t.Logf("Loaded %d symbols from %s", len(symbols), ip)
 
 	// Get device info for the header.
-	info, err := conn.ReadDeviceInfo()
+	info, err := conn.client.ReadDeviceInfo()
 	if err != nil {
 		t.Fatalf("ReadDeviceInfo failed: %v", err)
 	}
@@ -82,7 +84,7 @@ func TestBrowseAllSymbols(t *testing.T) {
 	t.Logf("Wrote %s (%d symbols)", filename, len(symbols))
 }
 
-func browseSetupConnection(t *testing.T) *Connection {
+func browseSetupConnection(t *testing.T) *Session {
 	t.Helper()
 	return setupConnectionWithDefaults(t, connDefaults{
 		ip:        "192.168.0.1",

@@ -8,12 +8,17 @@ import (
 	"time"
 )
 
-// Single-symbol device-notification commands: AddDeviceNotification,
-// DeleteDeviceNotification. The dispatcher for incoming notification packets
-// (handleNotification + deliverNotification) lives here too because it shares
-// the Update / handle bookkeeping defined by these commands.
+// Single-symbol device-notification raw RPCs on *Client:
+// AddDeviceNotification, DeleteDeviceNotification. Notifs persistence
+// + activeNotifications cleanup is the Session's wrapper concern (see
+// Session.DeleteDeviceNotification below). The cache-aware
+// handleNotification dispatcher (installed via Client.SetNotificationHandler)
+// also lives in this file because it shares Update / handle bookkeeping.
 
-func (conn *Connection) AddDeviceNotification(
+// AddDeviceNotification registers a device notification with the PLC and
+// returns the PLC-assigned handle. Raw RPC: no Session-side persistence.
+// Callers wanting auto-resubscribe-on-reconnect use Session.AddSymbolNotification.
+func (c *Client) AddDeviceNotification(
 	group uint32,
 	offset uint32,
 	length uint32,
@@ -31,7 +36,6 @@ func (conn *Connection) AddDeviceNotification(
 		CycleTime        uint32
 		Reserved         [16]byte
 	}
-
 	content := addDeviceNotificationCommandPacket{
 		group,
 		offset,
@@ -48,67 +52,103 @@ func (conn *Connection) AddDeviceNotification(
 		Error  ReturnCode
 		Handle uint32
 	}
-	// Try to send the request
-	resp, err := conn.sendRequest(CommandIDAddDeviceNotification, request.Bytes())
+	resp, err := c.sendRequest(CommandIDAddDeviceNotification, request.Bytes())
 	if err != nil {
 		return
 	}
 	respBuffer := bytes.NewBuffer(resp)
 	notificationResponse := addDeviceNotificationResponse{}
-	err = binary.Read(respBuffer, binary.LittleEndian, &notificationResponse)
-	if err != nil {
-		conn.logger.Error("failed to parse notification response", "error", err)
+	if err = binary.Read(respBuffer, binary.LittleEndian, &notificationResponse); err != nil {
+		c.logger.Error("failed to parse notification response", "error", err)
 		return 0, err
 	}
 	if notificationResponse.Error != 0 {
-		conn.logger.Error("failed to add notification handler", "errorCode", uint32(notificationResponse.Error))
+		c.logger.Error("failed to add notification handler", "errorCode", uint32(notificationResponse.Error))
 		return 0, fmt.Errorf("unable to create notification: %w", notificationResponse.Error)
 	}
-	conn.logger.Log(context.Background(), LevelTrace, "added notification handler", "handle", notificationResponse.Handle)
-
+	c.logger.Log(context.Background(), LevelTrace, "added notification handler", "handle", notificationResponse.Handle)
 	return notificationResponse.Handle, nil
 }
 
-// DeleteDeviceNotification deletes a device notification by handle.
-func (conn *Connection) DeleteDeviceNotification(handle uint32) error {
+// DeleteDeviceNotification deletes a device notification by handle. Raw RPC:
+// returns the wire-level success/error. Callers that maintain
+// activeNotifications must clean up themselves (Session does this in its
+// wrapper Session.DeleteDeviceNotification below).
+func (c *Client) DeleteDeviceNotification(handle uint32) error {
 	request := &bytes.Buffer{}
 	type deleteNotificationCommandPacket struct {
 		Handle uint32
 	}
-	content := deleteNotificationCommandPacket{
-		handle,
-	}
+	content := deleteNotificationCommandPacket{handle}
 	if err := binary.Write(request, binary.LittleEndian, content); err != nil {
 		return fmt.Errorf("binary.Write failed: %w", err)
 	}
-	// Try to send the request
-	resp, err := conn.sendRequest(CommandIDDeleteDeviceNotification, request.Bytes())
+	resp, err := c.sendRequest(CommandIDDeleteDeviceNotification, request.Bytes())
 	if err != nil {
-		conn.logger.Warn("error deleting handle", "handle", handle, "error", err)
+		c.logger.Warn("error deleting handle", "handle", handle, "error", err)
 		return err
 	}
-
-	// Check the result error code
 	respBuffer := bytes.NewBuffer(resp)
 	var adsError ReturnCode
 	if err = binary.Read(respBuffer, binary.LittleEndian, &adsError); err != nil {
 		return fmt.Errorf("failed to parse DeleteDeviceNotification response: %w", err)
 	}
 	if adsError > 0 {
-		conn.logger.Warn("error deleting handle", "handle", handle, "errorCode", uint32(adsError))
+		c.logger.Warn("error deleting handle", "handle", handle, "errorCode", uint32(adsError))
 		return fmt.Errorf("ADS error in DeleteDeviceNotification: %w", adsError)
 	}
-	conn.notifs.lock.Lock()
-	if sym := conn.notifs.activeNotifications[handle]; sym != nil {
-		conn.removeNotificationConfig(sym.FullName)
-	}
-	delete(conn.notifs.activeNotifications, handle)
-	if len(conn.notifs.activeNotifications) == 0 {
-		conn.notifs.notificationChannel = nil
-	}
-	conn.notifs.lock.Unlock()
-	conn.logger.Info("deleted handle", "handle", handle)
+	c.logger.Info("deleted handle", "handle", handle)
 	return nil
+}
+
+// DeleteDeviceNotification on Session wraps the raw Client RPC with
+// notifications.lock cleanup: removes the entry from activeNotifications, drops
+// the cached notificationConfig, and clears notificationChannel when the
+// last subscription dies. Callers that want raw delete behavior use
+// the Client method directly.
+func (sess *Session) DeleteDeviceNotification(handle uint32) error {
+	if err := sess.client.DeleteDeviceNotification(handle); err != nil {
+		return err
+	}
+	sess.notifications.lock.Lock()
+	if sym := sess.notifications.activeNotifications[handle]; sym != nil {
+		sess.removeNotificationConfig(sym.FullName)
+	}
+	delete(sess.notifications.activeNotifications, handle)
+	if len(sess.notifications.activeNotifications) == 0 {
+		sess.notifications.notificationChannel = nil
+	}
+	sess.notifications.lock.Unlock()
+	return nil
+}
+
+// SumDeleteDeviceNotification on Session wraps the raw Client RPC with
+// notifications.lock cleanup. Returns the per-handle ReturnCode slice from the
+// PLC. Successfully deleted handles (or handle-invalid, treated as
+// success-equivalent) are removed from activeNotifications.
+func (sess *Session) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error) {
+	errors, err := sess.client.SumDeleteDeviceNotification(handles)
+	if err != nil {
+		return nil, err
+	}
+	if len(errors) == 0 {
+		return errors, nil
+	}
+	sess.notifications.lock.Lock()
+	for i, h := range handles {
+		if errors[i] == ReturnCodeNoErrors || errors[i] == ReturnCodeDeviceNotifyHandleInvalid {
+			if sym := sess.notifications.activeNotifications[h]; sym != nil {
+				sess.removeNotificationConfig(sym.FullName)
+			}
+			delete(sess.notifications.activeNotifications, h)
+			sess.logger.Info("batch deleted notification handle", "handle", h, "errorCode", uint32(errors[i]))
+		}
+	}
+	if len(sess.notifications.activeNotifications) == 0 {
+		sess.notifications.notificationChannel = nil
+	}
+	sess.notifications.lock.Unlock()
+	return errors, nil
 }
 
 const (
@@ -129,54 +169,17 @@ type NotificationSample struct {
 	Size   uint32
 }
 
-// DeviceNotification - ADS command id: 8
-func (conn *Connection) DeviceNotification(ctx context.Context, in []byte) error {
-	var stream NotificationStream
-	var header StampHeader
-	var sample NotificationSample
-	var content []byte
+// DeviceNotification (ADS cmd 8) packet decoder lives on *Client — see
+// Client.deviceNotification. Session.handleNotification below is the
+// cache-aware handler installed via Client.SetNotificationHandler from
+// Session.Connect.
 
-	data := bytes.NewBuffer(in)
-
-	// Read stream header
-
-	err := binary.Read(data, binary.LittleEndian, &stream)
-	if err != nil {
-		return fmt.Errorf("unable to read notification: %w", err)
-	}
-	for i := uint32(0); i < stream.Stamps; i++ {
-		// Read stamp header
-		if err = binary.Read(data, binary.LittleEndian, &header); err != nil {
-			return fmt.Errorf("error reading stamp header: %w", err)
-		}
-
-		for j := uint32(0); j < header.Samples; j++ {
-			if err = binary.Read(data, binary.LittleEndian, &sample); err != nil {
-				return fmt.Errorf("error reading notification sample: %w", err)
-			}
-			if sample.Size > uint32(data.Len()) {
-				return fmt.Errorf("notification sample size %d exceeds remaining data %d", sample.Size, data.Len())
-			}
-			content = make([]byte, sample.Size)
-			n, err := data.Read(content)
-			if err != nil {
-				return fmt.Errorf("error reading notification content: %w", err)
-			}
-			if n != int(sample.Size) {
-				return fmt.Errorf("short read on notification content: got %d of %d bytes", n, sample.Size)
-			}
-			conn.handleNotification(ctx, sample.Handle, header.Timestamp, content)
-		}
-	}
-	return nil
-}
-
-func (conn *Connection) handleNotification(ctx context.Context, handle uint32, timestamp uint64, content []byte) {
-	// Phase 1: notifs.lock for handle lookup + symbol pointer/field snapshot.
-	conn.notifs.lock.Lock()
-	symbol, ok := conn.notifs.activeNotifications[handle]
+func (sess *Session) handleNotification(ctx context.Context, handle uint32, timestamp uint64, content []byte) {
+	// notifications.lock: handle lookup + symbol pointer/field snapshot.
+	sess.notifications.lock.Lock()
+	symbol, ok := sess.notifications.activeNotifications[handle]
 	if !ok {
-		conn.notifs.lock.Unlock()
+		sess.notifications.lock.Unlock()
 		// Stale notifications are expected during:
 		// - Close(): handles deleted from activeNotifications while listen() still drains
 		// - Reconnect: activeNotifications cleared (connection.go:575) before new subscriptions
@@ -186,18 +189,18 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 		//   the most recent successful subscribe.
 		const subscribeRaceWindowNs = int64(100 * time.Millisecond)
 		switch {
-		case conn.lifecycle.closed.Load() || conn.lifecycle.reconnecting.Load():
-			conn.logger.Debug("received notification for deleted handle (expected during close/reconnect)", "handle", handle)
-		case time.Now().UnixNano()-conn.notifs.lastSubscribeNs.Load() < subscribeRaceWindowNs:
-			conn.logger.Debug("received notification for unknown handle (likely first-sample race)", "handle", handle)
+		case sess.isClosed() || sess.isReconnecting():
+			sess.logger.Debug("received notification for deleted handle (expected during close/reconnect)", "handle", handle)
+		case time.Now().UnixNano()-sess.notifications.lastSubscribeNs.Load() < subscribeRaceWindowNs:
+			sess.logger.Debug("received notification for unknown handle (likely first-sample race)", "handle", handle)
 		default:
-			conn.logger.Warn("received notification for unknown handle", "handle", handle)
+			sess.logger.Warn("received notification for unknown handle", "handle", handle)
 		}
 		return
 	}
 	notification := symbol.Notification
 	fullName := symbol.FullName
-	conn.notifs.lock.Unlock()
+	sess.notifications.lock.Unlock()
 
 	var notificationTime time.Time
 	if timestamp == 0 {
@@ -206,38 +209,59 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 		timeStamp := int64(timestamp)/windowsTick - secToUnixEpoch
 		notificationTime = time.Unix(timeStamp, int64(timestamp)%(windowsTick)*100)
 	}
-	// Phase 2: cache.lock for parse() — Symbol fields live in cache.symbols
-	// and parse mutates Value/Changed/Valid. Lock ordering: cache after notifs
-	// release (never both held).
+	// cache.lock for parse() — Symbol fields live in cache.symbols and parse
+	// mutates Value/Valid. Lock ordering: cache after notifications release
+	// (never both held).
 	// Re-resolve via cache.symbols[FullName]: the symbol fetched from
 	// activeNotifications may be stranded post-reload (loadSymbols swapped
 	// the cache between subscribe and now), in which case parse with the
 	// FRESH cache.datatypes against the OLD symbol's DataType key may
 	// mismatch. If the symbol is gone from the live cache, log + skip.
-	conn.cache.lock.Lock()
-	live := conn.cache.symbols[symbolKey(fullName)]
+	sess.cache.lock.Lock()
+	live := sess.cache.symbols[symbolKey(fullName)]
 	if live == nil {
-		conn.cache.lock.Unlock()
-		conn.logger.Warn("notification target symbol no longer in cache; skipping parse",
+		sess.cache.lock.Unlock()
+		sess.logger.Warn("notification target symbol no longer in cache; skipping parse",
 			"handle", handle, "symbol", fullName)
 		return
 	}
-	value, err := live.parse(content, 0, conn.cache.datatypes)
+	// R-CACHE-009 supplementary detection: 0-byte terminal sample =
+	// symbol gone post-online-change. TwinCAT drops the old handle
+	// silently after the symbol is deleted and emits one final 0-byte
+	// sample on the now-dead handle. Intercept BEFORE the parse path so
+	// the configured strategy fires (Ignore: log + callback; Close:
+	// terminate; AutoReload: re-discover) and no spurious Update is
+	// delivered for the dead handle.
+	if len(content) == 0 && live.Length > 0 {
+		dataType := live.DataType
+		length := live.Length
+		sess.cache.lock.Unlock()
+		sess.logger.Debug("notification terminal 0-byte sample (symbol removed post-online-change)",
+			"handle", handle, "symbol", fullName, "dataType", dataType, "expectedLength", length)
+		sess.handleStaleDetection(ReturnCodeDeviceSymbolNoFound)
+		return
+	}
+	value, err := live.parse(content, 0, sess.cache.datatypes)
 	if err != nil {
-		conn.cache.lock.Unlock()
-		conn.logger.Error("error during parse of notification",
+		sess.cache.lock.Unlock()
+		sess.logger.Error("error during parse of notification",
 			"handle", handle, "symbol", fullName, "dataType", live.DataType, "error", err)
 		return
 	}
-	conn.cache.lock.Unlock()
+	sess.cache.lock.Unlock()
 
-	conn.logger.Log(context.Background(), LevelTrace, "update received", "update", value)
+	sess.logger.Log(context.Background(), LevelTrace, "update received", "update", value)
 	updateStruct := &Update{
 		Variable:  fullName,
 		Value:     value,
 		TimeStamp: notificationTime,
 	}
-	conn.deliverNotification(ctx, notification, updateStruct, handle, fullName)
+	// One-shot Stale flag (R-NOT-017): consume on first delivered sample.
+	if reason, ok := sess.consumeStaleFlag(handle); ok {
+		updateStruct.Stale = true
+		updateStruct.Reason = reason
+	}
+	sess.deliverNotification(ctx, notification, updateStruct, handle, fullName)
 }
 
 // deliverNotification performs a non-blocking send on the caller-owned channel.
@@ -247,10 +271,10 @@ func (conn *Connection) handleNotification(ctx context.Context, handle uint32, t
 //
 // Caller must NOT close the update channel while subscriptions exist on this
 // connection; see AddSymbolNotification(s) godoc for the ownership rule.
-func (conn *Connection) deliverNotification(ctx context.Context, ch chan<- *Update, update *Update, handle uint32, fullName string) {
+func (sess *Session) deliverNotification(ctx context.Context, ch chan<- *Update, update *Update, handle uint32, fullName string) {
 	defer func() {
 		if r := recover(); r != nil {
-			conn.logger.Error("notification send panicked — caller closed the update channel?",
+			sess.logger.Error("notification send panicked — caller closed the update channel?",
 				"handle", handle,
 				"symbol", fullName,
 				"panic", r)
@@ -263,9 +287,9 @@ func (conn *Connection) deliverNotification(ctx context.Context, ch chan<- *Upda
 	select {
 	case <-ctx.Done():
 	case ch <- update:
-		conn.logger.Debug("Successfully delivered notification", "handle", handle)
+		sess.logger.Debug("Successfully delivered notification", "handle", handle)
 	default:
-		conn.logger.Warn("notification dropped (channel full, receiver too slow)",
+		sess.logger.Warn("notification dropped (channel full, receiver too slow)",
 			"handle", handle,
 			"symbol", fullName)
 	}

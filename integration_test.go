@@ -84,7 +84,7 @@ func pickParseableSymbols(symbols map[string]SymbolView, n int) []string {
 	return names
 }
 
-func setupConnection(t *testing.T) *Connection {
+func setupConnection(t *testing.T) *Session {
 	t.Helper()
 	return setupConnectionWithDefaults(t, connDefaults{
 		ip:        "192.168.3.224",
@@ -102,7 +102,7 @@ func TestIntegrationConnect(t *testing.T) {
 
 func TestIntegrationReadDeviceInfo(t *testing.T) {
 	conn := setupConnection(t)
-	info, err := conn.ReadDeviceInfo()
+	info, err := conn.client.ReadDeviceInfo()
 	if err != nil {
 		t.Fatalf("ReadDeviceInfo failed: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestIntegrationReadDeviceInfo(t *testing.T) {
 
 func TestIntegrationReadState(t *testing.T) {
 	conn := setupConnection(t)
-	state, err := conn.ReadState()
+	state, err := conn.client.ReadState()
 	if err != nil {
 		t.Fatalf("ReadState failed: %v", err)
 	}
@@ -392,9 +392,9 @@ func TestIntegrationNotification(t *testing.T) {
 	}
 
 	// Verify no active notifications before subscribe
-	conn.notifs.lock.Lock()
-	beforeCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	beforeCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if beforeCount != 0 {
 		t.Fatalf("expected 0 active notifications before subscribe, got %d", beforeCount)
 	}
@@ -407,10 +407,10 @@ func TestIntegrationNotification(t *testing.T) {
 	t.Logf("notification handle: %d", handle)
 
 	// Verify handle is tracked
-	conn.notifs.lock.Lock()
-	afterCount := len(conn.notifs.activeNotifications)
-	_, tracked := conn.notifs.activeNotifications[handle]
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	afterCount := len(conn.notifications.activeNotifications)
+	_, tracked := conn.notifications.activeNotifications[handle]
+	conn.notifications.lock.Unlock()
 	if afterCount != 1 {
 		t.Errorf("expected 1 active notification after subscribe, got %d", afterCount)
 	}
@@ -430,9 +430,9 @@ func TestIntegrationNotification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteDeviceNotification(%d) failed: %v", handle, err)
 	}
-	conn.notifs.lock.Lock()
-	cleanupCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	cleanupCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if cleanupCount != 0 {
 		t.Errorf("expected 0 active notifications after delete, got %d", cleanupCount)
 	}
@@ -457,11 +457,11 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 	ch := make(chan *Update, 10)
 
 	// Verify clean state
-	conn.notifs.lock.Lock()
-	if len(conn.notifs.activeNotifications) != 0 {
-		t.Fatalf("expected 0 active notifications at start, got %d", len(conn.notifs.activeNotifications))
+	conn.notifications.lock.Lock()
+	if len(conn.notifications.activeNotifications) != 0 {
+		t.Fatalf("expected 0 active notifications at start, got %d", len(conn.notifications.activeNotifications))
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 
 	// Subscribe
 	handle, err := conn.AddSymbolNotification(symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch)
@@ -471,11 +471,11 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 	t.Logf("subscribed to %s (handle=%d)", symbolName, handle)
 
 	// Verify handle is tracked
-	conn.notifs.lock.Lock()
-	if _, ok := conn.notifs.activeNotifications[handle]; !ok {
+	conn.notifications.lock.Lock()
+	if _, ok := conn.notifications.activeNotifications[handle]; !ok {
 		t.Errorf("handle %d not tracked in activeNotifications after subscribe", handle)
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 
 	// Wait briefly for a notification
 	select {
@@ -493,14 +493,14 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 	t.Logf("unsubscribed handle %d", handle)
 
 	// Verify handle removed from tracking
-	conn.notifs.lock.Lock()
-	if _, ok := conn.notifs.activeNotifications[handle]; ok {
+	conn.notifications.lock.Lock()
+	if _, ok := conn.notifications.activeNotifications[handle]; ok {
 		t.Errorf("handle %d still in activeNotifications after DeleteDeviceNotification", handle)
 	}
-	if len(conn.notifs.activeNotifications) != 0 {
-		t.Errorf("expected 0 active notifications after unsubscribe, got %d", len(conn.notifs.activeNotifications))
+	if len(conn.notifications.activeNotifications) != 0 {
+		t.Errorf("expected 0 active notifications after unsubscribe, got %d", len(conn.notifications.activeNotifications))
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 
 	// Verify no more notifications arrive after unsubscribe
 	select {
@@ -529,9 +529,9 @@ func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
 	ch := make(chan *Update, 100)
 
 	// Verify clean state
-	conn.notifs.lock.Lock()
-	startCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	startCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if startCount != 0 {
 		t.Fatalf("expected 0 active notifications at start, got %d", startCount)
 	}
@@ -548,9 +548,9 @@ func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
 	}
 
 	// Verify all handles are tracked
-	conn.notifs.lock.Lock()
-	activeCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	activeCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if activeCount != len(handles) {
 		t.Errorf("expected %d active notifications, got %d", len(handles), activeCount)
 	}
@@ -561,9 +561,9 @@ func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DeleteDeviceNotification(%d) failed: %v", handle, err)
 		}
-		conn.notifs.lock.Lock()
-		remaining := len(conn.notifs.activeNotifications)
-		conn.notifs.lock.Unlock()
+		conn.notifications.lock.Lock()
+		remaining := len(conn.notifications.activeNotifications)
+		conn.notifications.lock.Unlock()
 		expected := len(handles) - i - 1
 		if remaining != expected {
 			t.Errorf("after deleting handle %d: expected %d active, got %d", handle, expected, remaining)
@@ -571,9 +571,9 @@ func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
 	}
 
 	// Final check: zero handles remaining
-	conn.notifs.lock.Lock()
-	finalCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	finalCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if finalCount != 0 {
 		t.Errorf("expected 0 active notifications after deleting all, got %d", finalCount)
 	}
@@ -592,7 +592,7 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	}
 	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
 
-	conn, err := NewConnection(ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second)
+	conn, err := NewSession(ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second)
 	if err != nil {
 		t.Fatalf("NewConnection failed: %v", err)
 	}
@@ -628,9 +628,9 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	}
 
 	// Verify handles are active
-	conn.notifs.lock.Lock()
-	activeBeforeClose := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	activeBeforeClose := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if activeBeforeClose != len(handles) {
 		t.Errorf("expected %d active notifications before Close, got %d", len(handles), activeBeforeClose)
 	}
@@ -642,7 +642,7 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	// Reconnect and verify no stale handles exist by subscribing to the same
 	// symbols again — if Close() didn't release, the PLC would eventually
 	// run out of handles.
-	conn2, err := NewConnection(ip, 48898, targetAMS, targetPort, localAMS, 10501, 5*time.Second)
+	conn2, err := NewSession(ip, 48898, targetAMS, targetPort, localAMS, 10501, 5*time.Second)
 	if err != nil {
 		t.Fatalf("second NewConnection failed: %v", err)
 	}
@@ -659,9 +659,9 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 
 	// If old handles leaked, subscribing again would still work (PLC allows many),
 	// but we verify no tracking leaks on our side
-	conn2.notifs.lock.Lock()
-	freshCount := len(conn2.notifs.activeNotifications)
-	conn2.notifs.lock.Unlock()
+	conn2.notifications.lock.Lock()
+	freshCount := len(conn2.notifications.activeNotifications)
+	conn2.notifications.lock.Unlock()
 	if freshCount != 0 {
 		t.Errorf("fresh connection should have 0 active notifications, got %d", freshCount)
 	}
@@ -677,9 +677,9 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 		}
 	}
 
-	conn2.notifs.lock.Lock()
-	resubCount := len(conn2.notifs.activeNotifications)
-	conn2.notifs.lock.Unlock()
+	conn2.notifications.lock.Lock()
+	resubCount := len(conn2.notifications.activeNotifications)
+	conn2.notifications.lock.Unlock()
 	if resubCount != len(symbolNames) {
 		t.Errorf("expected %d active notifications after re-subscribe, got %d", len(symbolNames), resubCount)
 	}
@@ -1076,14 +1076,16 @@ func TestIntegrationReadProcessData(t *testing.T) {
 // waitForReconnect waits for the full reconnect cycle: first waits for the
 // connection to become disconnected (confirming the error was detected), then
 // waits for reconnect to fully complete (disconnected=false AND reconnecting=false).
-func waitForReconnect(t *testing.T, conn *Connection, timeout time.Duration) {
+func waitForReconnect(t *testing.T, conn *Session, timeout time.Duration) {
 	t.Helper()
 	deadline := time.After(timeout)
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 
-	// Phase 1: wait for disconnect to be detected
-	for !conn.IsDisconnected() && !conn.lifecycle.reconnecting.Load() {
+	// Phase 1: wait for disconnect to be detected. IsDisconnected() is FSM-
+	// based and true in {Disconnected, Reconnecting} — both indicate the
+	// drop was observed.
+	for !conn.IsDisconnected() {
 		select {
 		case <-deadline:
 			t.Fatal("reconnect was never triggered within timeout")
@@ -1091,12 +1093,13 @@ func waitForReconnect(t *testing.T, conn *Connection, timeout time.Duration) {
 		}
 	}
 
-	// Phase 2: wait for reconnect to fully complete
-	for conn.IsDisconnected() || conn.lifecycle.reconnecting.Load() {
+	// Phase 2: wait for reconnect to fully complete. IsDisconnected() returns
+	// false only after state transitions back to Connected.
+	for conn.IsDisconnected() {
 		select {
 		case <-deadline:
-			t.Fatalf("reconnect did not complete within timeout (disconnected=%v, reconnecting=%v)",
-				conn.IsDisconnected(), conn.lifecycle.reconnecting.Load())
+			t.Fatalf("reconnect did not complete within timeout (state=%v)",
+				conn.lifecycle.state.load())
 		case <-tick.C:
 		}
 	}
@@ -1292,9 +1295,9 @@ func TestIntegrationBatchNotification(t *testing.T) {
 	}
 
 	// Verify all handles tracked
-	conn.notifs.lock.Lock()
-	activeCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	activeCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if activeCount != len(names) {
 		t.Errorf("expected %d active notifications, got %d", len(names), activeCount)
 	}
@@ -1309,12 +1312,12 @@ func TestIntegrationBatchNotification(t *testing.T) {
 	}
 
 	// Batch delete via SumDeleteDeviceNotification
-	conn.notifs.lock.Lock()
+	conn.notifications.lock.Lock()
 	var handles []uint32
-	for h := range conn.notifs.activeNotifications {
+	for h := range conn.notifications.activeNotifications {
 		handles = append(handles, h)
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 
 	codes, err := conn.SumDeleteDeviceNotification(handles)
 	if err != nil {
@@ -1326,9 +1329,9 @@ func TestIntegrationBatchNotification(t *testing.T) {
 		}
 	}
 
-	conn.notifs.lock.Lock()
-	finalCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	finalCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if finalCount != 0 {
 		t.Errorf("expected 0 active notifications after batch delete, got %d", finalCount)
 	}
@@ -1400,7 +1403,7 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 			readLen = uint32(n*8) + totalLen // [n*(error,length)][data]
 		}
 
-		resp, err := conn.WriteRead(uint32(cmd.group), uint32(n), readLen, writeData)
+		resp, err := conn.client.WriteRead(uint32(cmd.group), uint32(n), readLen, writeData)
 		if err != nil {
 			t.Logf("%s: NOT SUPPORTED (error: %v)", cmd.name, err)
 			continue
@@ -1458,7 +1461,7 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 	binary.LittleEndian.PutUint32(notifWriteData[16:], 1000000) // maxDelay 100ms in 100ns units
 	binary.LittleEndian.PutUint32(notifWriteData[20:], 1000000) // cycleTime 100ms in 100ns units
 
-	resp, err := conn.WriteRead(uint32(GroupSumupAddDeviceNotification), 1, 8, notifWriteData)
+	resp, err := conn.client.WriteRead(uint32(GroupSumupAddDeviceNotification), 1, 8, notifWriteData)
 	if err != nil {
 		t.Logf("SumAddDeviceNotification (0xF085): NOT SUPPORTED (error: %v)", err)
 	} else {
@@ -1491,7 +1494,7 @@ func TestIntegrationSumReadFallbackForced(t *testing.T) {
 	}
 
 	// Force fallback: mark sum read as unsupported
-	conn.capabilities.SumReadCmdStore(1)
+	conn.client.capabilities.SumReadCmdStore(1)
 
 	values, err := conn.ReadMultipleSymbols(names)
 	if err != nil {
@@ -1544,7 +1547,7 @@ func TestIntegrationSumWriteFallbackForced(t *testing.T) {
 	}
 
 	// Force fallback
-	conn.capabilities.SumWriteStateStore(2) // 2 = checked + unsupported (forces fallback)
+	conn.client.capabilities.SumWriteStateStore(2) // 2 = checked + unsupported (forces fallback)
 
 	// Save originals
 	originals := make(map[string]string)
@@ -1601,7 +1604,7 @@ func TestIntegrationSumNotifFallbackForced(t *testing.T) {
 	}
 
 	// Force fallback
-	conn.capabilities.SumAddNotifStateStore(2) // 2 = checked + unsupported (forces fallback)
+	conn.client.capabilities.SumAddNotifStateStore(2) // 2 = checked + unsupported (forces fallback)
 
 	ch := make(chan *Update, 50)
 	var configs []NotificationConfig
@@ -1620,13 +1623,13 @@ func TestIntegrationSumNotifFallbackForced(t *testing.T) {
 	}
 
 	// Verify handles tracked
-	conn.notifs.lock.Lock()
-	activeCount := len(conn.notifs.activeNotifications)
+	conn.notifications.lock.Lock()
+	activeCount := len(conn.notifications.activeNotifications)
 	var handles []uint32
-	for h := range conn.notifs.activeNotifications {
+	for h := range conn.notifications.activeNotifications {
 		handles = append(handles, h)
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 
 	if activeCount != len(names) {
 		t.Errorf("expected %d active notifications, got %d", len(names), activeCount)
@@ -1673,7 +1676,7 @@ func TestIntegrationSumNotifFallbackDowngrade(t *testing.T) {
 	t.Logf("symbol %q: ContextMask=%d flags=0x%04X (fallback test)", symbolName, sym.ContextMask, uint32(sym.Flags))
 
 	// Force notification fallback — v2 modes should be downgraded to v1
-	conn.capabilities.SumAddNotifStateStore(2) // 2 = checked + unsupported (forces fallback)
+	conn.client.capabilities.SumAddNotifStateStore(2) // 2 = checked + unsupported (forces fallback)
 
 	ch := make(chan *Update, 20)
 	configs := []NotificationConfig{{
@@ -1709,12 +1712,12 @@ done:
 	}
 
 	// Cleanup: copy handles first to avoid mutating map during iteration
-	conn.notifs.lock.Lock()
-	handles := make([]uint32, 0, len(conn.notifs.activeNotifications))
-	for h := range conn.notifs.activeNotifications {
+	conn.notifications.lock.Lock()
+	handles := make([]uint32, 0, len(conn.notifications.activeNotifications))
+	for h := range conn.notifications.activeNotifications {
 		handles = append(handles, h)
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 	for _, h := range handles {
 		_ = conn.DeleteDeviceNotification(h)
 	}
@@ -1746,7 +1749,7 @@ func TestIntegrationSumReadPartialFailure(t *testing.T) {
 		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Length: 4},               // bogus
 	}
 
-	results, err := conn.SumRead(requests)
+	results, err := conn.client.SumRead(requests)
 	if err != nil {
 		t.Fatalf("SumRead failed: %v", err)
 	}
@@ -1825,7 +1828,7 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Data: []byte{0, 0}},   // bogus
 	}
 
-	results, err := conn.SumWrite(requests)
+	results, err := conn.client.SumWrite(requests)
 	if err != nil {
 		t.Fatalf("SumWrite (mixed) failed: %v", err)
 	}
@@ -1856,7 +1859,6 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 // ============================================================
 // SumWrite raw debug diagnostic
 // ============================================================
-
 
 // ============================================================
 // SumRead/SumWrite functional verification
@@ -2490,12 +2492,12 @@ done:
 	t.Logf("total: %d notifications across %d symbols", totalSeen, len(seen))
 
 	// Cleanup
-	conn.notifs.lock.Lock()
+	conn.notifications.lock.Lock()
 	var handles []uint32
-	for h := range conn.notifs.activeNotifications {
+	for h := range conn.notifications.activeNotifications {
 		handles = append(handles, h)
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 	_, _ = conn.SumDeleteDeviceNotification(handles)
 }
 
@@ -2589,9 +2591,9 @@ func TestIntegrationLargeBatchNotification(t *testing.T) {
 	}
 
 	// Verify all tracked
-	conn.notifs.lock.Lock()
-	activeCount := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	activeCount := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if activeCount != len(names) {
 		t.Errorf("expected %d active notifications, got %d", len(names), activeCount)
 	}
@@ -2614,12 +2616,12 @@ done:
 	}
 
 	// Bulk cleanup
-	conn.notifs.lock.Lock()
+	conn.notifications.lock.Lock()
 	var handles []uint32
-	for h := range conn.notifs.activeNotifications {
+	for h := range conn.notifications.activeNotifications {
 		handles = append(handles, h)
 	}
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Unlock()
 	_, _ = conn.SumDeleteDeviceNotification(handles)
 }
 
@@ -2796,7 +2798,6 @@ func TestIntegrationReadAllParseableTypes(t *testing.T) {
 	}
 }
 
-
 // TestIntegrationRapidSubscribeUnsubscribe subscribes and unsubscribes quickly
 // in a loop to verify handle management under rapid lifecycle churn.
 func TestIntegrationRapidSubscribeUnsubscribe(t *testing.T) {
@@ -2824,9 +2825,9 @@ func TestIntegrationRapidSubscribeUnsubscribe(t *testing.T) {
 	}
 
 	// Verify clean state after rapid churn
-	conn.notifs.lock.Lock()
-	remaining := len(conn.notifs.activeNotifications)
-	conn.notifs.lock.Unlock()
+	conn.notifications.lock.Lock()
+	remaining := len(conn.notifications.activeNotifications)
+	conn.notifications.lock.Unlock()
 	if remaining != 0 {
 		t.Errorf("expected 0 active notifications after %d cycles, got %d", iterations, remaining)
 	}
@@ -2851,7 +2852,7 @@ func TestIntegrationDockerRoute(t *testing.T) {
 	}
 
 	// Verify connection works (proves route is valid)
-	info, err := conn.ReadDeviceInfo()
+	info, err := conn.client.ReadDeviceInfo()
 	if err != nil {
 		t.Fatalf("ReadDeviceInfo failed: %v", err)
 	}
@@ -2958,7 +2959,7 @@ func TestIntegrationBitSymbol(t *testing.T) {
 func TestIntegrationReadProcessInputSize(t *testing.T) {
 	conn := setupConnection(t)
 
-	size, err := conn.ReadProcessInputSize()
+	size, err := conn.client.ReadProcessInputSize()
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -2975,7 +2976,7 @@ func TestIntegrationReadProcessInput(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Read first 4 bytes of input image
-	data, err := conn.ReadProcessInput(0, 4)
+	data, err := conn.client.ReadProcessInput(0, 4)
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -2992,7 +2993,7 @@ func TestIntegrationReadProcessOutput(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Read first 4 bytes of output image
-	data, err := conn.ReadProcessOutput(0, 4)
+	data, err := conn.client.ReadProcessOutput(0, 4)
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -3009,7 +3010,7 @@ func TestIntegrationReadProcessInputBit(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Read bit 0 of first input byte
-	val, err := conn.ReadProcessInputBit(0, 0)
+	val, err := conn.client.ReadProcessInputBit(0, 0)
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -3017,4 +3018,170 @@ func TestIntegrationReadProcessInputBit(t *testing.T) {
 		t.Fatalf("ReadProcessInputBit failed: %v", err)
 	}
 	t.Logf("input bit 0.0 = %v", val)
+}
+
+// TestIntegrationDP3HandleLeak validates R-CACHE-016: eager LoadSymbols after
+// on-demand GetSymbol replaces the table. Open question per spec is whether
+// PLC-side handles acquired during on-demand resolve are released or leaked
+// when the cache is replaced. Approach: run 20 cycles of GetSymbol followed
+// by LoadSymbols, log the handle values, and let the caller inspect for
+// strict monotonic growth (= leak signal). 20 cycles is a balance — enough
+// to expose a per-cycle leak, gentle enough to avoid PLC strain.
+func TestIntegrationDP3HandleLeak(t *testing.T) {
+	conn := setupConnection(t)
+
+	if err := conn.LoadSymbols(); err != nil {
+		t.Fatalf("initial LoadSymbols failed: %v", err)
+	}
+	symbols, err := conn.ListSymbols()
+	if err != nil {
+		t.Fatalf("ListSymbols failed: %v", err)
+	}
+	picks := pickParseableSymbols(symbols, 2)
+	if len(picks) < 2 {
+		t.Skip("need at least 2 parseable symbols on PLC")
+	}
+	t.Logf("probing handles for %v", picks)
+
+	type sample struct {
+		cycle   int
+		handles []uint32
+	}
+	const cycles = 20
+	samples := make([]sample, 0, cycles)
+
+	for i := 0; i < cycles; i++ {
+		hs := make([]uint32, 0, len(picks))
+		for _, name := range picks {
+			view, gerr := conn.GetSymbol(name)
+			if gerr != nil {
+				t.Fatalf("cycle %d GetSymbol(%q): %v", i, name, gerr)
+			}
+			hs = append(hs, view.Handle)
+		}
+		if lerr := conn.LoadSymbols(); lerr != nil {
+			t.Fatalf("cycle %d LoadSymbols: %v", i, lerr)
+		}
+		samples = append(samples, sample{cycle: i, handles: hs})
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	for _, s := range samples {
+		t.Logf("cycle %2d  handles=%v", s.cycle, s.handles)
+	}
+
+	// Heuristic: if first symbol's handle is strictly monotonic across all
+	// cycles, that is a strong leak signal (PLC handle table never reuses).
+	// If it cycles or stays bounded, the leak is non-existent or tolerable.
+	leak := true
+	for i := 1; i < len(samples); i++ {
+		if samples[i].handles[0] <= samples[i-1].handles[0] {
+			leak = false
+			break
+		}
+	}
+	if leak {
+		t.Logf("WARNING: first-symbol handle is strictly monotonic across %d cycles — possible PLC-side handle leak", cycles)
+	} else {
+		t.Logf("first-symbol handle is NOT strictly monotonic — no obvious leak from %d cycles", cycles)
+	}
+}
+
+// TestIntegrationDP3LoadOrderEquivalence validates R-CACHE-015: LoadSymbolList
+// and LoadDataTypes are commutative — calling one then the other yields the
+// same Symbol.Children tree as the reverse order. Compares structural fields
+// (Name, DataType, Length) recursively; Value is excluded because live PLC
+// values change between the two connections.
+func TestIntegrationDP3LoadOrderEquivalence(t *testing.T) {
+	probeSym := os.Getenv("ADS_READ_STRUCT")
+	if probeSym == "" {
+		// fall back to first available top-level symbol with children
+		conn := setupConnection(t)
+		if err := conn.LoadSymbols(); err != nil {
+			t.Fatalf("LoadSymbols failed: %v", err)
+		}
+		symbols, err := conn.ListSymbols()
+		if err != nil {
+			t.Fatalf("ListSymbols failed: %v", err)
+		}
+		for name, sv := range symbols {
+			if strings.Contains(name, ".") {
+				continue
+			}
+			if len(sv.Children()) > 0 {
+				probeSym = name
+				break
+			}
+		}
+		conn.Close()
+	}
+	if probeSym == "" {
+		t.Skip("no struct symbol available to probe")
+	}
+	t.Logf("probe symbol: %q", probeSym)
+
+	collect := func(sv SymbolView) []string {
+		var out []string
+		var walk func(v SymbolView, path string)
+		walk = func(v SymbolView, path string) {
+			out = append(out, path+":"+v.DataType+"/"+strconv.FormatUint(uint64(v.Length), 10))
+			for cname, cv := range v.Children() {
+				walk(cv, path+"."+cname)
+			}
+		}
+		walk(sv, sv.FullName)
+		// Order-independent comparison: sort.
+		sortable := append([]string(nil), out...)
+		// stable sort via slices.Sort would need import; use bubble for tiny size
+		for i := 0; i < len(sortable); i++ {
+			for j := i + 1; j < len(sortable); j++ {
+				if sortable[j] < sortable[i] {
+					sortable[i], sortable[j] = sortable[j], sortable[i]
+				}
+			}
+		}
+		return sortable
+	}
+
+	// Order A: LoadSymbolList → LoadDataTypes
+	connA := setupConnection(t)
+	if err := connA.LoadSymbolList(SlowDiscoveryConfig{}); err != nil {
+		t.Fatalf("A LoadSymbolList: %v", err)
+	}
+	if err := connA.LoadDataTypes(SlowDiscoveryConfig{}); err != nil {
+		t.Fatalf("A LoadDataTypes: %v", err)
+	}
+	viewA, err := connA.GetSymbol(probeSym)
+	if err != nil {
+		t.Fatalf("A GetSymbol(%q): %v", probeSym, err)
+	}
+	treeA := collect(viewA)
+	connA.Close()
+
+	// Order B: LoadDataTypes → LoadSymbolList
+	connB := setupConnection(t)
+	if err := connB.LoadDataTypes(SlowDiscoveryConfig{}); err != nil {
+		t.Fatalf("B LoadDataTypes: %v", err)
+	}
+	if err := connB.LoadSymbolList(SlowDiscoveryConfig{}); err != nil {
+		t.Fatalf("B LoadSymbolList: %v", err)
+	}
+	viewB, err := connB.GetSymbol(probeSym)
+	if err != nil {
+		t.Fatalf("B GetSymbol(%q): %v", probeSym, err)
+	}
+	treeB := collect(viewB)
+	connB.Close()
+
+	if len(treeA) != len(treeB) {
+		t.Fatalf("tree size differs: A=%d B=%d\nA=%v\nB=%v", len(treeA), len(treeB), treeA, treeB)
+	}
+	for i := range treeA {
+		if treeA[i] != treeB[i] {
+			t.Errorf("tree[%d] differs: A=%q B=%q", i, treeA[i], treeB[i])
+		}
+	}
+	if !t.Failed() {
+		t.Logf("OK — both orders produce %d-node identical tree", len(treeA))
+	}
 }

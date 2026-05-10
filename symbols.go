@@ -8,8 +8,43 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// symbolCache owns the connection-level symbol metadata: the symbol map,
+// the data-type table, the PLC's reported symbol version (for change
+// detection), and discovery-mode flags that track which load function was
+// used (LoadSymbols, LoadSymbolsSlow, LoadSymbolList, LoadDataTypes).
+//
+// Lock also covers Symbol mutation during parse() — Symbol objects live
+// in the cache.symbols map and parse() rewrites their Value/Valid
+// fields. Lock ordering: NEVER hold both cache.lock and notifications.lock at
+// the same time. Paths that need both must release one before acquiring
+// the other.
+//
+// Generation tracking lives on sessionFSM.epoch. Cache.symbols swaps
+// (loadSymbols, LoadSymbolList, LoadDataTypes, on-demand reset in
+// reloadSymbols) call Session.bumpEpoch() under this lock. Simple insert
+// (on-demand getSymbol) does NOT bump — existing pointers stay valid
+// across an insert.
+//
+// Callers that need to publish a *Symbol pointer they obtained pre-roundtrip
+// into another data structure (e.g. notifications.activeNotifications) MUST capture
+// the epoch before resolve and recheck before commit; if the value changed,
+// the pointer is stranded and must be discarded. Closes the residual race
+// window between cache.lock release and notifications.lock acquire that the
+// simple re-fetch pattern leaves open.
+type symbolCache struct {
+	lock               sync.Mutex
+	symbols            map[string]*Symbol
+	datatypes          map[string]SymbolUploadDataType
+	symbolVersion      uint8
+	onDemandSymbols    map[string]bool
+	symbolListLoaded   bool
+	symbolsFullyLoaded bool
+	datatypesLoaded    bool
+}
 
 // symbolKey normalizes a symbol name for use as an internal map key.
 // TwinCAT treats symbol names case-insensitively (IEC 61131-3).
@@ -103,8 +138,8 @@ type SymbolUploadInfo struct {
 //     FullName, Name, DataType, Comment, Group, Offset, Length, BaseType,
 //     Flags, ContextMask, MinUpdateInterval, Parent, Children.
 //
-//   - Guarded by Connection.cache.lock (mutated by parse/Read/Write/loadSymbols):
-//     Value, Valid, ValueParsed, Changed, LastUpdateTime.
+//   - Guarded by Session.cache.lock (mutated by parse/Read/Write/loadSymbols):
+//     Value, Valid, ValueParsed, LastUpdateTime.
 //
 //   - Handle: write-once during getSymbol resolve under cache.lock, then
 //     stable until loadSymbols zeroes the old map (also under cache.lock).
@@ -113,7 +148,7 @@ type SymbolUploadInfo struct {
 //     fails the next PLC operation (ReturnCodeDeviceNotifyHandleInvalid),
 //     prompting re-resolve via GetSymbol.
 //
-//   - Guarded by Connection.notifs.lock (mutated by AddSymbolNotification(s)
+//   - Guarded by Session.notifications.lock (mutated by AddSymbolNotification(s)
 //     and DeleteDeviceNotification):
 //     Notification.
 //
@@ -134,7 +169,6 @@ type Symbol struct {
 	BaseType          uint32 // ADST_ numeric type code from protocol (e.g., ADSTReal32=4 for REAL)
 	Flags             SymbolFlag
 	ContextMask       uint8 // PLC task context (bits 8-11 of Flags); 0 = no task binding
-	Changed           bool
 
 	Value       string
 	Valid       bool
@@ -148,7 +182,7 @@ type Symbol struct {
 
 // SymbolView is a read-only snapshot of a symbol's metadata and current
 // cached value, captured atomically under cache.lock at view creation.
-// All fields - including Value and Valid - reflect the cache state at the
+// All fields - including Value and Parsed - reflect the cache state at the
 // instant GetSymbol/ListSymbols returned. The view does NOT track later
 // updates; for fresh data, call GetSymbol again or subscribe via
 // AddSymbolNotification.
@@ -156,14 +190,14 @@ type Symbol struct {
 // Trade-offs of the snapshot model:
 //   - Read-only ergonomics: every field access is a cheap struct read, no
 //     locks, no allocation, no deadlock risk.
-//   - Internally consistent: Valid and Value were captured together, so
-//     callers cannot observe a "Valid=true, Value=empty" tear.
+//   - Internally consistent: Parsed and Value were captured together, so
+//     callers cannot observe a "Parsed=true, Value=empty" tear.
 //   - Stale after concurrent loadSymbols / online-change: if the cache is
 //     swapped after the view is built, the view shows the prior state.
 //
 // IsValid() returns false for the zero-value SymbolView. Children() and
 // ChildrenWalk() collect snapshots under cache.lock and release before
-// invoking the caller's iterator - safe to call any Connection method
+// invoking the caller's iterator - safe to call any Session method
 // from within a walk.
 type SymbolView struct {
 	Name        string
@@ -177,11 +211,11 @@ type SymbolView struct {
 	BaseType    uint32 // ADST_ numeric type code from protocol
 	Flags       SymbolFlag
 	ContextMask uint8 // PLC task context (bits 8-11 of Flags); 0 = no task binding
-	Valid       bool  // true if Value has been parsed at least once at snapshot time
+	Parsed      bool  // true if Value has been parsed at least once at snapshot time
 	IsRoot      bool  // true if this symbol has no parent (top-level program/global var)
 	Value       string
 
-	conn *Connection
+	conn *Session
 }
 
 // IsValid reports whether the view is backed by a live connection. Zero-value
@@ -196,7 +230,7 @@ func (v SymbolView) IsValid() bool { return v.conn != nil && v.FullName != "" }
 //
 // Each child is a freshly-snapshotted SymbolView (lookups walk the cache
 // under cache.lock once per call, then release). Caller code in a walk loop
-// is free to call any Connection method - no lock held.
+// is free to call any Session method - no lock held.
 func (v SymbolView) Children() map[string]SymbolView {
 	if v.conn == nil {
 		return nil
@@ -221,7 +255,7 @@ func (v SymbolView) Children() map[string]SymbolView {
 // ChildrenWalk visits every symbol in the subtree rooted at this view in
 // depth-first order. Snapshots the entire subtree under cache.lock once,
 // releases the lock, then invokes fn for each entry. fn is free to call
-// any Connection method (Value field reads are lock-free, GetSymbol etc.
+// any Session method (Value field reads are lock-free, GetSymbol etc.
 // take their own locks - no deadlock risk).
 //
 // Walk terminates early if fn returns false.
@@ -249,14 +283,14 @@ func (v SymbolView) ChildrenWalk(fn func(SymbolView) bool) {
 
 // collectSubtreeMaxDepth caps recursion depth as defense against malformed
 // data forming a Children cycle. Real PLC struct nesting is at most a few
-// dozen levels; matches parentChangedMaxDepth in readWriter.go.
+// dozen levels.
 const collectSubtreeMaxDepth = 256
 
-func collectSubtree(s *Symbol, conn *Connection, out *[]SymbolView) {
+func collectSubtree(s *Symbol, conn *Session, out *[]SymbolView) {
 	collectSubtreeDepth(s, conn, out, 0)
 }
 
-func collectSubtreeDepth(s *Symbol, conn *Connection, out *[]SymbolView, depth int) {
+func collectSubtreeDepth(s *Symbol, conn *Session, out *[]SymbolView, depth int) {
 	if depth >= collectSubtreeMaxDepth {
 		getDefaultLogger().Warn("collectSubtree hit depth cap; possible Children cycle or malformed Symbol tree",
 			"symbol", s.FullName,
@@ -274,7 +308,7 @@ func collectSubtreeDepth(s *Symbol, conn *Connection, out *[]SymbolView, depth i
 
 // view builds a SymbolView for s. Caller must hold cache.lock so the
 // snapshot of metadata + value is internally consistent. O(1).
-func (s *Symbol) view(conn *Connection) SymbolView {
+func (s *Symbol) view(conn *Session) SymbolView {
 	return SymbolView{
 		Name:        s.Name,
 		FullName:    s.FullName,
@@ -287,7 +321,7 @@ func (s *Symbol) view(conn *Connection) SymbolView {
 		BaseType:    s.BaseType,
 		Flags:       s.Flags,
 		ContextMask: s.ContextMask,
-		Valid:       s.Valid,
+		Parsed:      s.Valid,
 		IsRoot:      s.Parent == nil,
 		Value:       s.Value,
 		conn:        conn,
@@ -374,8 +408,25 @@ func addSymbol(symbol symbolUploadSymbol, datatypes map[string]SymbolUploadDataT
 	return sym
 }
 
+// addOffsetMaxDepth caps recursion depth in datatype tree expansion. Real
+// PLC nesting is at most a few dozen levels; the cap defends against a
+// malformed datatype table forming a self-cycle (forbidden by IEC 61131-3
+// but not enforced over the wire).
+const addOffsetMaxDepth = 256
+
 func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string]SymbolUploadDataType, group uint32) (children map[string]*Symbol) {
+	return data.addOffsetDepth(parent, datatypes, group, 0)
+}
+
+func (data *SymbolUploadDataType) addOffsetDepth(parent *Symbol, datatypes map[string]SymbolUploadDataType, group uint32, depth int) (children map[string]*Symbol) {
 	children = map[string]*Symbol{}
+	if depth >= addOffsetMaxDepth {
+		getDefaultLogger().Warn("addOffset hit depth cap; possible datatype self-cycle in PLC response",
+			"parent", parent.FullName,
+			"datatype", data.DataType,
+			"max_depth", addOffsetMaxDepth)
+		return
+	}
 
 	for key, segment := range data.Children {
 		var path string
@@ -406,7 +457,7 @@ func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string
 		// Enums have children (enum constants) but should be parsed as
 		// their base type (e.g. INT), not expanded as struct fields.
 		if dt, ok := datatypes[segment.DataType]; ok && !isEnumDataType(&dt) {
-			child.Children = dt.addOffset(&child, datatypes, child.Group)
+			child.Children = dt.addOffsetDepth(&child, datatypes, child.Group, depth+1)
 		}
 
 		children[key] = &child
@@ -590,9 +641,9 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (chil
 	return
 }
 
-// GetJSON (onlyChanged bool) string
-func (symbol *Symbol) GetJSON(onlyChanged bool) string {
-	data := symbol.parseSymbol(onlyChanged)
+// GetJSON returns symbol value as JSON string.
+func (symbol *Symbol) GetJSON() string {
+	data := symbol.parseSymbol()
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		getDefaultLogger().Warn("GetJSON marshal error", "symbol", symbol.Name, "error", err)
@@ -604,7 +655,7 @@ func (symbol *Symbol) GetJSON(onlyChanged bool) string {
 var stringsList = map[string]struct{}{"STRING": {}, "WSTRING": {}, "TIME": {}, "TOD": {}, "TIME_OF_DAY": {}, "DATE": {}, "DT": {}, "DATE_AND_TIME": {}}
 
 // parseSymbol returns JSON interface for symbol
-func (symbol *Symbol) parseSymbol(onlyChanged bool) (rData interface{}) {
+func (symbol *Symbol) parseSymbol() (rData interface{}) {
 	if len(symbol.Children) == 0 {
 		if symbol.DataType == "BOOL" {
 			v, err := strconv.ParseBool(symbol.Value)
@@ -628,9 +679,7 @@ func (symbol *Symbol) parseSymbol(onlyChanged bool) (rData interface{}) {
 		for _, child := range symbol.Children {
 			s := strings.ReplaceAll(child.Name, "[", `"[`)
 			s = strings.ReplaceAll(s, "]", `]"`)
-			if !onlyChanged || child.Changed {
-				localMap[s] = child.parseSymbol(onlyChanged)
-			}
+			localMap[s] = child.parseSymbol()
 		}
 		rData = localMap
 	}
