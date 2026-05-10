@@ -643,7 +643,11 @@ type SymbolVersionStrategy uint8
 const (
 	SymbolVersionAutoReload SymbolVersionStrategy = iota // default — full reload + resub
 	SymbolVersionClose                                   // terminate session on detection
-	SymbolVersionIgnore                                  // surface error + mark Stale
+	// SymbolVersionIgnore — surface PLC error to caller + mark surviving
+	// notification handles' next sample Stale=true (one-shot, R-NOT-017).
+	// Asymmetry: removed symbols' channels go silent (no terminal Update);
+	// use WithOnSymbolVersionChanged for the removal signal.
+	SymbolVersionIgnore
 )
 
 // String returns the human-readable name of the strategy.

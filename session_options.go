@@ -196,6 +196,11 @@ func WithSymbolVersionReloadWindow(d time.Duration) SessionOption {
 // R-CACHE-009 detection. The reason argument matches R-NOT-016 enumerated
 // values. Callback runs in its own goroutine (R-SES-007) — do NOT block.
 //
+// Under SymbolVersionIgnore strategy this callback is the load-bearing
+// signal for symbol-removed events: the dead handle's user channel goes
+// silent (no terminal Update). Surviving sibling handles still receive a
+// one-shot Stale=true Update; only the removed symbol's channel is mute.
+//
 // Validates: R-SES-011.
 func WithOnSymbolVersionChanged(fn func(reason string)) SessionOption {
 	return func(sess *Session) {
