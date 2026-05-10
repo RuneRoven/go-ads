@@ -39,7 +39,11 @@ func (sess *Session) BrowseSymbols(path string) ([]SymbolBrowseEntry, error) {
 // browseRoot returns unique root-level entries (first segment of each symbol name).
 // Must be called with cache.lock held.
 func (sess *Session) browseRoot() []SymbolBrowseEntry {
-	roots := make(map[string]bool)
+	// Two-pass to preserve original PLC casing for virtual groupings.
+	// symbolKey() lowercases for cache lookup, but Symbol.FullName retains
+	// original case — derive display from any child symbol's FullName.
+	// Map key = lowercased prefix, value = original-case prefix.
+	roots := make(map[string]string)
 	var entries []SymbolBrowseEntry
 
 	for name, sym := range sess.cache.symbols {
@@ -52,8 +56,8 @@ func (sess *Session) browseRoot() []SymbolBrowseEntry {
 		dot := strings.IndexByte(name, '.')
 		if dot < 0 {
 			// No dot — this is a root symbol itself
-			if !roots[name] {
-				roots[name] = true
+			if _, seen := roots[name]; !seen {
+				roots[name] = sym.FullName
 				entries = append(entries, SymbolBrowseEntry{
 					Name:        sym.Name,
 					FullName:    sym.FullName,
@@ -67,26 +71,34 @@ func (sess *Session) browseRoot() []SymbolBrowseEntry {
 		}
 
 		root := name[:dot]
-		if !roots[root] {
-			roots[root] = true
-			// Check if the root itself is a symbol
-			if rootSym, ok := sess.cache.symbols[symbolKey(root)]; ok {
-				entries = append(entries, SymbolBrowseEntry{
-					Name:        rootSym.Name,
-					FullName:    rootSym.FullName,
-					DataType:    rootSym.DataType,
-					Size:        rootSym.Length,
-					HasChildren: true, // has children since we found dotted names
-					Comment:     rootSym.Comment,
-				})
-			} else {
-				// Virtual grouping (e.g., "MAIN" prefix with no symbol for "MAIN" itself)
-				entries = append(entries, SymbolBrowseEntry{
-					Name:        root,
-					FullName:    root,
-					HasChildren: true,
-				})
-			}
+		if _, seen := roots[root]; seen {
+			continue
+		}
+		// Capture original-case prefix from this symbol's FullName.
+		// sym.FullName length >= dot since key is its lowercased form.
+		origRoot := root
+		if len(sym.FullName) >= dot {
+			origRoot = sym.FullName[:dot]
+		}
+		roots[root] = origRoot
+		// Check if the root itself is a symbol
+		if rootSym, ok := sess.cache.symbols[symbolKey(root)]; ok {
+			entries = append(entries, SymbolBrowseEntry{
+				Name:        rootSym.Name,
+				FullName:    rootSym.FullName,
+				DataType:    rootSym.DataType,
+				Size:        rootSym.Length,
+				HasChildren: true, // has children since we found dotted names
+				Comment:     rootSym.Comment,
+			})
+		} else {
+			// Virtual grouping (e.g., "MAIN" prefix with no symbol for "MAIN" itself).
+			// Use original case derived from child symbol's FullName.
+			entries = append(entries, SymbolBrowseEntry{
+				Name:        origRoot,
+				FullName:    origRoot,
+				HasChildren: true,
+			})
 		}
 	}
 
@@ -123,7 +135,7 @@ func (sess *Session) browseChildren(path string) []SymbolBrowseEntry {
 	seen := make(map[string]bool)
 	var entries []SymbolBrowseEntry
 
-	for name := range sess.cache.symbols {
+	for name, sym := range sess.cache.symbols {
 		if !strings.HasPrefix(name, prefix) {
 			continue
 		}
@@ -154,10 +166,19 @@ func (sess *Session) browseChildren(path string) []SymbolBrowseEntry {
 				Comment:     childSym.Comment,
 			})
 		} else {
-			// We know there are deeper symbols, so this is a grouping
+			// Virtual middle-grouping. Recover original case for the segment
+			// from the child symbol's FullName (cache key is lowercased, but
+			// Symbol.FullName retains PLC case). sym.FullName aligns with the
+			// lowercased key, so we slice at the same offsets.
+			origSegment := segment
+			origFullName := childFullName
+			if len(sym.FullName) >= len(prefix)+len(segment) {
+				origSegment = sym.FullName[len(prefix) : len(prefix)+len(segment)]
+				origFullName = sym.FullName[:len(prefix)+len(segment)]
+			}
 			entries = append(entries, SymbolBrowseEntry{
-				Name:        segment,
-				FullName:    childFullName,
+				Name:        origSegment,
+				FullName:    origFullName,
 				HasChildren: true,
 			})
 		}
