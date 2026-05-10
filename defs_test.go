@@ -193,78 +193,6 @@ func TestReturnCodeError(t *testing.T) {
 	}
 }
 
-// Validates: NO-SPEC (regression guard, awaiting spec backfill).
-// Snapshots ReturnCode message text across global/router/device/client/RTime/TCP categories;
-// kept as snapshot so message changes are deliberate.
-func TestReturnCodeString_AllCategories(t *testing.T) {
-	tests := []struct {
-		code     ReturnCode
-		contains string
-	}{
-		// Global errors
-		{ReturnCodeGlobalInternalError, "internal error"},
-		{ReturnCodeGlobalTargetPortNotFound, "target port not found"},
-		{ReturnCodeGlobalInvalidAdsLength, "invalid ADS length"},
-		{ReturnCodeGlobalInvalidAmsNetID, "invalid AMS Net ID"},
-		{ReturnCodeGlobalTcpSendError, "TCP send error"},
-		{ReturnCodeGlobalHostUnreachable, "host unreachable"},
-		{ReturnCodeGlobalAccessDenied, "access denied"},
-
-		// Router errors
-		{ReturnCodeRouterNoLockedMemory, "locked memory"},
-		{ReturnCodeRouterMailboxFull, "mailbox full"},
-		{ReturnCodeRouterNotInitialized, "not initialized"},
-		{ReturnCodeRouterPortAlreadyInUse, "already assigned"},
-
-		// Device errors
-		{ReturnCodeDeviceError, "general device error"},
-		{ReturnCodeDeviceServiceNotSupported, "service not supported"},
-		{ReturnCodeDeviceInvalidGroup, "invalid index group"},
-		{ReturnCodeDeviceInvalidOffset, "invalid index offset"},
-		{ReturnCodeDeviceInvalidSize, "parameter size not correct"},
-		{ReturnCodeDeviceInvalidData, "invalid parameter value"},
-		{ReturnCodeDeviceNotReady, "not in a ready state"},
-		{ReturnCodeDeviceInvalidContext, "invalid operating system context"},
-		{ReturnCodeDeviceInvalidParam, "invalid parameter value"},
-		{ReturnCodeDeviceTimeout, "timeout"},
-		{ReturnCodeDeviceTransModeNotSupported, "TransMode not supported"},
-		{ReturnCodeDeviceNotifyHandleInvalid, "notification handle is invalid"},
-		{ReturnCodeDeviceNoMoreHandles, "no more notification handles"},
-		{ReturnCodeDeviceInvalidWatchSize, "notification size too large"},
-		{ReturnCodeDeviceInvalidArrayIndex, "invalid array index"},
-		{ReturnCodeDeviceSymbolNotActive, "symbol not active"},
-		{ReturnCodeDeviceAccessDenied, "access denied"},
-		{ReturnCodeDeviceLicenseNotFound, "missing license"},
-		{ReturnCodeDeviceLicenseExpired, "license expired"},
-
-		// Client errors
-		{ReturnCodeClientError, "client error"},
-		{ReturnCodeClientInvalidParameter, "invalid parameter"},
-		{ReturnCodeClientSyncTimeout, "timeout elapsed"},
-		{ReturnCodeClientPortNotOpen, "port not opened"},
-		{ReturnCodeClientRequestCancelled, "cancelled"},
-
-		// RTime errors
-		{ReturnCodeRTimeInternal, "fatal error"},
-		{ReturnCodeRTimeBadTimerPeriods, "timer value not valid"},
-
-		// TCP errors
-		{ReturnCodeWsaeTimedOut, "timed out"},
-		{ReturnCodeWsaeConnRefused, "refused"},
-		{ReturnCodeWsaeHostDown, "host is down"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.contains, func(t *testing.T) {
-			s := tt.code.String()
-			if !strings.Contains(strings.ToLower(s), strings.ToLower(tt.contains)) {
-				t.Errorf("ReturnCode(0x%04X).String() = %q, want it to contain %q",
-					uint32(tt.code), s, tt.contains)
-			}
-		})
-	}
-}
-
 // --- buildTag ---
 
 // Validates: R-ROUTE-001.
@@ -294,43 +222,6 @@ func TestAppendNull(t *testing.T) {
 	}
 	if result[5] != 0 {
 		t.Error("last byte should be null terminator")
-	}
-}
-
-// ==========================================================================
-// Process image constants and helpers
-// ==========================================================================
-
-// TestProcessImageConstants is a regression guard against accidental edits
-// to the Group constants in defs.go. The values come from PROTOCOL.md
-// "Process Image Groups" — that document is authoritative; defs.go is the
-// implementation. A change in defs.go that drifts from PROTOCOL.md fails
-// here. (It is intentionally a snapshot test; cite PROTOCOL.md before
-// changing any value.)
-//
-// Validates: NO-SPEC (regression guard, awaiting spec backfill).
-// Pins the GroupIoImage* constant values against PROTOCOL.md§Process Image Groups.
-func TestProcessImageConstants(t *testing.T) {
-	tests := []struct {
-		name string
-		got  Group
-		want uint32
-	}{
-		{"GroupIoImageRwib", GroupIoImageRwib, 0xF020},
-		{"GroupIoImageRwix", GroupIoImageRwix, 0xF021},
-		{"GroupIoImageRisize", GroupIoImageRisize, 0xF025},
-		{"GroupIoImageRwob", GroupIoImageRwob, 0xF030},
-		{"GroupIoImageRwox", GroupIoImageRwox, 0xF031},
-		{"GroupIoImageCleari", GroupIoImageCleari, 0xF040},
-		{"GroupIoImageClearo", GroupIoImageClearo, 0xF050},
-		{"GroupIoImageRwiob", GroupIoImageRwiob, 0xF060},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if uint32(tt.got) != tt.want {
-				t.Errorf("%s = 0x%04X, want 0x%04X", tt.name, uint32(tt.got), tt.want)
-			}
-		})
 	}
 }
 

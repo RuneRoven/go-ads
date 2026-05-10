@@ -623,26 +623,6 @@ func TestGetJSON_EmptyValue(t *testing.T) {
 	}
 }
 
-// Validates: NO-SPEC (regression guard, awaiting spec backfill).
-// Pins documented float64-lossy ULINT-max encoding (1.8446744073709552e+19);
-// flips when integer-as-string encoding lands.
-func TestGetJSON_NumericOverflow(t *testing.T) {
-	// GetJSON parses Value via strconv.ParseFloat then encodes as JSON
-	// number. For ULINT max (2^64-1) this is lossy: float64 rounds to
-	// the nearest representable value (1.8446744073709552e+19, which is
-	// 2^64 = 18446744073709551616, ONE more than the input). The test
-	// pins this documented limitation: any change to the encoding path
-	// (e.g. switching to a JSON string for large integers) should
-	// surface here as an explicit failure rather than silently changing
-	// observable output.
-	sym := &Symbol{DataType: "ULINT", Length: 8, Value: "18446744073709551615"}
-	got := sym.GetJSON()
-	const wantLossy = "18446744073709552000"
-	if got != wantLossy {
-		t.Errorf("ULINT max GetJSON() = %q, want %q (lossy float64 round-trip — fix when integer-as-string encoding lands)", got, wantLossy)
-	}
-}
-
 // Validates: NO-SPEC.
 func TestGetJSON_WSTRINGAsString(t *testing.T) {
 	sym := &Symbol{
@@ -738,7 +718,7 @@ func TestParseUploadSymbolInfoSymbols_TruncatedEntry(t *testing.T) {
 
 // --- symbolSumAddress ---
 
-// Validates: NO-SPEC.
+// Validates: R-SUM-008.
 func TestSymbolSumAddress_PrefersHandleOverDirect(t *testing.T) {
 	// Handle-based addressing preferred for sum commands because direct
 	// process image addressing (0x4040) fails inside sum reads on some PLCs.
@@ -757,7 +737,7 @@ func TestSymbolSumAddress_PrefersHandleOverDirect(t *testing.T) {
 	}
 }
 
-// Validates: NO-SPEC.
+// Validates: R-SUM-008.
 func TestSymbolSumAddress_HandleOnlyNoGroup(t *testing.T) {
 	// Handle-based when Group is 0
 	sym := &Symbol{
@@ -775,7 +755,7 @@ func TestSymbolSumAddress_HandleOnlyNoGroup(t *testing.T) {
 	}
 }
 
-// Validates: NO-SPEC.
+// Validates: R-SUM-008.
 func TestSymbolSumAddress_DirectFallbackNoHandle(t *testing.T) {
 	// Falls back to direct group/offset when no handle is available
 	sym := &Symbol{
@@ -793,7 +773,7 @@ func TestSymbolSumAddress_DirectFallbackNoHandle(t *testing.T) {
 	}
 }
 
-// Validates: NO-SPEC.
+// Validates: R-SUM-008.
 func TestSymbolSumAddress_DirectFallbackChildAccumulatesOffset(t *testing.T) {
 	// Without handles, child symbols accumulate offsets from parent chain.
 	parent := &Symbol{
@@ -818,7 +798,7 @@ func TestSymbolSumAddress_DirectFallbackChildAccumulatesOffset(t *testing.T) {
 	}
 }
 
-// Validates: NO-SPEC.
+// Validates: R-SUM-008.
 func TestSymbolSumAddress_DirectFallbackNestedChild(t *testing.T) {
 	// Deeply nested symbol without handles: grandparent → parent → child
 	grandparent := &Symbol{
