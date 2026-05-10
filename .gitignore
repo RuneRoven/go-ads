@@ -11,5 +11,10 @@ logs/
 improvements.md
 docs/
 
+# Internal triage docs (work logs, snapshots-in-time — not for public commit)
+specs/07-bug-report.md
+specs/10-test-audit.md
+specs/11-spec-code-audit.md
+
 # Symbol-version hardware test logs
 symbol-version-run-*.log
