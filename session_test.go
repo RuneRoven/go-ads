@@ -460,6 +460,40 @@ func TestSession_TryRecordReloadAttempt_SlidingWindow(t *testing.T) {
 	}
 }
 
+// TestSession_MarkAllHandlesStale validates the helper used by both the
+// Ignore branch of handleStaleDetection and the AutoReload pre-reload
+// window: every active notification handle gets a one-shot Stale flag
+// with the supplied reason.
+//
+// Validates: R-NOT-017 (markAllHandlesStale fans the flag across handles).
+func TestSession_MarkAllHandlesStale(t *testing.T) {
+	sess := newTestConnection()
+	defer sess.lifecycle.shutdown()
+	sess.notifications.activeNotifications[42] = &Symbol{}
+	sess.notifications.activeNotifications[99] = &Symbol{}
+
+	sess.markAllHandlesStale(ReasonReloadInProgress)
+
+	if r, ok := sess.consumeStaleFlag(42); !ok || r != ReasonReloadInProgress {
+		t.Errorf("h=42: reason=%q ok=%v, want (%q, true)", r, ok, ReasonReloadInProgress)
+	}
+	if r, ok := sess.consumeStaleFlag(99); !ok || r != ReasonReloadInProgress {
+		t.Errorf("h=99: reason=%q ok=%v, want (%q, true)", r, ok, ReasonReloadInProgress)
+	}
+	// Idempotency check: second consume returns ok=false.
+	if _, ok := sess.consumeStaleFlag(42); ok {
+		t.Error("flag should be one-shot — second consume should return ok=false")
+	}
+}
+
+// TestSession_MarkAllHandlesStale_NilNotificationsSafe validates the
+// nil-guard for unit-test bare Session{} construction.
+func TestSession_MarkAllHandlesStale_NilNotificationsSafe(t *testing.T) {
+	sess := &Session{logger: getDefaultLogger()}
+	// Must not panic even without notifications manager.
+	sess.markAllHandlesStale(ReasonReloadInProgress)
+}
+
 // TestSession_AutoReload_BumpsEpoch validates that handleStaleDetection
 // under SymbolVersionAutoReload triggers autoReloadOnStaleDetection which
 // bumps the session epoch (R-CACHE-003) before attempting reload. The
