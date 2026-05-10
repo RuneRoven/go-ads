@@ -636,17 +636,30 @@ func isSumCommandUnsupportedError(err error) bool {
 		rc == ReturnCodeGlobalUnknownAdsCommand
 }
 
-// SymbolVersionStrategy selects online-change detection behavior.
-// Validates: R-SES-011.
+// SymbolVersionStrategy selects online-change handling behavior (R-SES-011).
 type SymbolVersionStrategy uint8
 
 const (
-	SymbolVersionAutoReload SymbolVersionStrategy = iota // default — full reload + resub
-	SymbolVersionClose                                   // terminate session on detection
-	// SymbolVersionIgnore — surface PLC error to caller + mark surviving
-	// notification handles' next sample Stale=true (one-shot, R-NOT-017).
-	// Asymmetry: removed symbols' channels go silent (no terminal Update);
-	// use WithOnSymbolVersionChanged for the removal signal.
+	// SymbolVersionAutoReload is the default. On detection of an online
+	// change, the Session re-runs symbol discovery and resubscribes
+	// notifications. Bounded by WithMaxSymbolVersionReloadAttempts within
+	// a sliding window (default 3 attempts / 60s).
+	SymbolVersionAutoReload SymbolVersionStrategy = iota
+
+	// SymbolVersionClose terminates the Session on detection. The
+	// OnDisconnect callback fires and Session.Close() is invoked. The
+	// caller decides reconnect timing.
+	SymbolVersionClose
+
+	// SymbolVersionIgnore surfaces the PLC error verbatim to the calling
+	// op (Read/Write/Sum*) and flags surviving notification handles' next
+	// sample with Update.Stale=true, Update.Reason=<detected reason>
+	// (one-shot — consumed on first delivery, subsequent samples are
+	// Stale=false again).
+	//
+	// Asymmetry: removed-symbol channels go SILENT — no terminal Update
+	// is delivered for the dead handle. Use WithOnSymbolVersionChanged to
+	// observe symbol-removal events.
 	SymbolVersionIgnore
 )
 
@@ -664,7 +677,10 @@ func (s SymbolVersionStrategy) String() string {
 	}
 }
 
-// Stale reasons per R-NOT-016. Used in Update.Reason field.
+// Reason values populate Update.Reason (R-NOT-016) and the
+// WithOnSymbolVersionChanged callback. These strings are STABLE — safe
+// for switch/case comparison by callers. New reasons may be added in
+// future versions; callers SHOULD have a default branch.
 const (
 	ReasonSymbolVersionInvalid = "symbol-version-invalid"
 	ReasonSymbolNotFound       = "symbol-not-found"
@@ -681,8 +697,6 @@ const (
 // staleness from a PLC online change; (false, "") otherwise.
 //
 // Detection codes verified against Beckhoff InfoSys (TC2 Utilities).
-//
-// Validates: R-CACHE-009.
 func detectStaleCache(rc ReturnCode) (stale bool, reason string) {
 	switch rc {
 	case ReturnCodeDeviceSymbolVersionInvalid: // 0x711 — Beckhoff: "online change. Create a new handle."
