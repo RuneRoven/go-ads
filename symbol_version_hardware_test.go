@@ -442,9 +442,26 @@ func TestSymbolVersionIgnore_StaleFlag(t *testing.T) {
 // TestSymbolVersionIgnore_RemovedSymbolStops — when symbol B is deleted, OLD handle
 // stops yielding samples but no error is raised (Ignore strategy).
 //
-// Validates: R-CACHE-012.
+// Listener-path detection (cmd_notification.go: 0-byte terminal sample
+// intercept) is asserted via the onSymbolVersionChanged callback firing
+// with reason="symbol-not-found". By design the terminal 0-byte sample
+// is consumed BEFORE delivery (no Update emitted for the dead handle —
+// see TestNotification_TerminalZeroByteSample_TriggersDetection), so
+// the assertion target is "callback fires" + "stream stops", NOT a
+// post-removal Stale Update on the channel.
+//
+// Validates: R-CACHE-009 (listener-path supplementary detection),
+// R-CACHE-012 (Ignore strategy), R-NOT-016 (callback delivery).
 func TestSymbolVersionIgnore_RemovedSymbolStops(t *testing.T) {
-	sess := symbolVersionSession(t, "ignore")
+	cbReason := make(chan string, 4)
+	sess := symbolVersionSession(t, "ignore",
+		WithOnSymbolVersionChanged(func(reason string) {
+			select {
+			case cbReason <- reason:
+			default:
+			}
+		}),
+	)
 	assertSymbolPresent(t, sess, symProbeB)
 
 	// ServerCycle so we get steady-state samples pre-deletion (proves
@@ -462,25 +479,35 @@ func TestSymbolVersionIgnore_RemovedSymbolStops(t *testing.T) {
 		t.Fatal("no pre samples — ServerCycle subscription not flowing")
 	}
 	t.Logf("pre samples: %d", len(pre))
-	col.reset()
 
 	waitForOperator(t, "delete MAIN_DP1.nProbeB declaration, then Activate")
 
-	time.Sleep(3 * time.Second)
+	// Wait up to 5s for the listener-path detection to surface via the
+	// callback (TC3 emits the 0-byte terminal sample whenever it gets
+	// around to it after Activate completes).
+	var detectionReason string
+	select {
+	case detectionReason = <-cbReason:
+		t.Logf("listener-path detection callback fired: reason=%s", detectionReason)
+	case <-time.After(5 * time.Second):
+		t.Fatal("onSymbolVersionChanged callback did not fire within 5s after symbol removal — listener-path detection did not trigger")
+	}
+	if detectionReason != ReasonSymbolNotFound {
+		t.Errorf("callback reason = %q, want %q", detectionReason, ReasonSymbolNotFound)
+	}
+
+	// Mark the post-detection boundary: any sample arriving AFTER the
+	// callback fires would have to come from the dead handle, which by
+	// design is suppressed (see godoc above). Reset the collector here
+	// to drop pre-deletion buffered samples and observe stream silence.
+	col.reset()
+	time.Sleep(2 * time.Second)
 	post := col.snapshot()
-	t.Logf("post-removal Ignore samples: %d (expect 0-1 stale terminal)", len(post))
+	t.Logf("post-detection Ignore samples: %d (expect 0 — terminal 0-byte intercepted)", len(post))
 	for i, u := range post {
 		t.Logf("  [%d] value=%v Stale=%v Reason=%q", i, u.Value, u.Stale, u.Reason)
 	}
-	// Hardware-only assertion: if a terminal sample arrives at all post-removal,
-	// it must carry Stale=true — proves listener-path detection (Task 8) +
-	// Ignore dispatch (Task 9) wires through real TC3 0x0703/0x710 surfacing.
-	// (Marker mechanics covered by TestNotification_StaleFlag_IgnoreMarksAllHandles
-	// — Task 9. Listener detection covered by Task 8 unit tests.)
-	if len(post) > 0 {
-		terminal := post[len(post)-1]
-		if !terminal.Stale {
-			t.Errorf("terminal post-removal sample: Stale=%v, want true", terminal.Stale)
-		}
+	if len(post) != 0 {
+		t.Errorf("post-detection samples = %d, want 0 (dead handle should be silent after listener intercepts terminal sample)", len(post))
 	}
 }

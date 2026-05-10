@@ -581,6 +581,99 @@ func TestNotification_StaleFlag_IgnoreMarksAllHandles(t *testing.T) {
 	}
 }
 
+// TestNotification_ListenerPathTriggersIgnoreMarksOtherHandles validates
+// the END-TO-END wire from listener-path 0-byte terminal detection through
+// the Ignore branch: a 0-byte terminal sample on handle Hdead must mark
+// every OTHER active handle stale so its next delivery carries Stale=true.
+//
+// Hardware regression target: TestSymbolVersionIgnore_RemovedSymbolStops
+// (symbol_version_hardware_test.go) couldn't observe Stale via the dead
+// handle (terminal sample is suppressed by design — see
+// TestNotification_TerminalZeroByteSample_TriggersDetection). This test
+// proves the marking still propagates to surviving subscriptions.
+//
+// Validates: R-CACHE-009 (listener-path detection) + R-CACHE-012 +
+// R-NOT-016 (callback) + R-NOT-017 (Ignore branch marks all handles).
+func TestNotification_ListenerPathTriggersIgnoreMarksOtherHandles(t *testing.T) {
+	conn := newTestConnection()
+	defer conn.lifecycle.shutdown()
+	conn.versionStrategy = SymbolVersionIgnore
+
+	cbReason := make(chan string, 1)
+	conn.versionCallback = func(r string) {
+		select {
+		case cbReason <- r:
+		default:
+		}
+	}
+
+	const hDead, hLive uint32 = 100, 200
+	chDead := make(chan *Update, 4)
+	chLive := make(chan *Update, 4)
+	symDead := &Symbol{FullName: "MAIN.dead", DataType: "DINT", Length: 4, Notification: chDead}
+	symLive := &Symbol{FullName: "MAIN.live", DataType: "INT", Length: 2, Notification: chLive}
+
+	conn.notifications.activeNotifications[hDead] = symDead
+	conn.notifications.activeNotifications[hLive] = symLive
+	conn.cache.symbols[symbolKey(symDead.FullName)] = symDead
+	conn.cache.symbols[symbolKey(symLive.FullName)] = symLive
+
+	// Inject 0-byte terminal sample on hDead — listener path fires
+	// handleStaleDetection(0x710), Ignore branch must mark BOTH handles.
+	terminal := buildNotificationPacket(hDead, 0, []byte{})
+	if err := conn.drivePacket(conn.lifecycle.ctx, terminal); err != nil {
+		t.Logf("drivePacket terminal err (acceptable): %v", err)
+	}
+
+	// Callback must fire with symbol-not-found.
+	select {
+	case r := <-cbReason:
+		if r != ReasonSymbolNotFound {
+			t.Errorf("callback reason = %q, want %q", r, ReasonSymbolNotFound)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback did not fire from listener-path detection")
+	}
+
+	// Dead handle: by design no Update emitted.
+	select {
+	case u := <-chDead:
+		t.Errorf("unexpected Update on dead handle: %+v", u)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Live handle: next normal sample must carry Stale=true,
+	// Reason=ReasonSymbolNotFound (Ignore branch marked it).
+	livePkt := buildNotificationPacket(hLive, 0, []byte{0x05, 0x00})
+	if err := conn.drivePacket(conn.lifecycle.ctx, livePkt); err != nil {
+		t.Fatalf("drivePacket live: %v", err)
+	}
+	select {
+	case u := <-chLive:
+		if !u.Stale || u.Reason != ReasonSymbolNotFound {
+			t.Errorf("live first post-detection sample: Stale=%v Reason=%q, want Stale=true Reason=%q",
+				u.Stale, u.Reason, ReasonSymbolNotFound)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no live sample after listener-path detection")
+	}
+
+	// Live handle: second sample must NOT be Stale (one-shot consumed).
+	livePkt2 := buildNotificationPacket(hLive, 0, []byte{0x06, 0x00})
+	if err := conn.drivePacket(conn.lifecycle.ctx, livePkt2); err != nil {
+		t.Fatalf("drivePacket live #2: %v", err)
+	}
+	select {
+	case u := <-chLive:
+		if u.Stale || u.Reason != "" {
+			t.Errorf("live second sample: Stale=%v Reason=%q, want Stale=false Reason=\"\"",
+				u.Stale, u.Reason)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no live sample #2")
+	}
+}
+
 // Validates: consumeStaleFlag idempotency.
 func TestSession_ConsumeStaleFlag_IdempotentSecondCallEmpty(t *testing.T) {
 	sess := &Session{}
