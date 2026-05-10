@@ -225,6 +225,22 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 			"handle", handle, "symbol", fullName)
 		return
 	}
+	// R-CACHE-009 supplementary detection: 0-byte terminal sample =
+	// symbol gone post-online-change. TwinCAT drops the old handle
+	// silently after the symbol is deleted and emits one final 0-byte
+	// sample on the now-dead handle. Intercept BEFORE the parse path so
+	// the configured strategy fires (Ignore: log + callback; Close:
+	// terminate; AutoReload: re-discover) and no spurious Update is
+	// delivered for the dead handle.
+	if len(content) == 0 && live.Length > 0 {
+		dataType := live.DataType
+		length := live.Length
+		sess.cache.lock.Unlock()
+		sess.logger.Debug("notification terminal 0-byte sample (symbol removed post-online-change)",
+			"handle", handle, "symbol", fullName, "dataType", dataType, "expectedLength", length)
+		sess.handleStaleDetection(ReturnCodeDeviceSymbolNoFound)
+		return
+	}
 	value, err := live.parse(content, 0, sess.cache.datatypes)
 	if err != nil {
 		sess.cache.lock.Unlock()

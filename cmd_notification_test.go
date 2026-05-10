@@ -432,3 +432,67 @@ func TestWindowsFiletimeConversion(t *testing.T) {
 		})
 	}
 }
+
+// TestNotification_TerminalZeroByteSample_TriggersDetection validates that
+// the notification listener intercepts a 0-byte terminal sample (TwinCAT
+// signal that the symbol is gone post-online-change) BEFORE the
+// parse-error log path executes, classifying it as a R-CACHE-009
+// supplementary signal and firing the configured online-change callback
+// with ReasonSymbolNotFound.
+//
+// Hardware finding (TC3 sweep): symbol deletion via online change → PLC
+// drops the old notification handle silently and emits one terminal
+// 0-byte sample on the now-dead handle. Without interception, the parser
+// errors with "symbol.Length 4 exceeds data buffer size 0" and the user
+// gets noise instead of a structured stale-cache signal.
+//
+// Validates: R-CACHE-009 supplementary detection + R-NOT-016 (callback
+// reason) + no Update delivered for the dead handle.
+func TestNotification_TerminalZeroByteSample_TriggersDetection(t *testing.T) {
+	conn := newTestConnection()
+	defer conn.lifecycle.shutdown()
+
+	cbReason := make(chan string, 1)
+	conn.versionStrategy = SymbolVersionIgnore
+	conn.versionCallback = func(r string) {
+		select {
+		case cbReason <- r:
+		default:
+		}
+	}
+
+	ch := make(chan *Update, 4)
+	sym := &Symbol{
+		FullName:     "MAIN.x",
+		DataType:     "DINT",
+		Length:       4,
+		Notification: ch,
+	}
+	conn.notifications.activeNotifications[42] = sym
+	conn.cache.symbols[symbolKey(sym.FullName)] = sym
+
+	// Inject 0-byte terminal sample. drivePacket may or may not return an
+	// error from the now-skipped parse path — what matters is the callback
+	// firing with ReasonSymbolNotFound BEFORE the (downgraded) parse log.
+	packet := buildNotificationPacket(42, 0, []byte{})
+	if err := conn.drivePacket(conn.lifecycle.ctx, packet); err != nil {
+		t.Logf("drivePacket err (acceptable, detection still must fire): %v", err)
+	}
+
+	select {
+	case r := <-cbReason:
+		if r != ReasonSymbolNotFound {
+			t.Errorf("callback reason = %q, want %q", r, ReasonSymbolNotFound)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("0-byte terminal sample did not trigger online-change callback")
+	}
+
+	// No Update delivered for dead handle — terminal sample, not a value.
+	select {
+	case u := <-ch:
+		t.Errorf("unexpected Update delivered for terminal 0-byte sample: %+v", u)
+	case <-time.After(50 * time.Millisecond):
+		// expected: nothing on the channel
+	}
+}
