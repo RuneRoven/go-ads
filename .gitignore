@@ -1,6 +1,3 @@
-/examples/simple/simple
-/examples/simple/go-ads-cli
-examples/simple/config-office.yaml
 /examples/cli/cli
 examples/cli/config*.yaml
 .env*
