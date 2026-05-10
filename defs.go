@@ -670,3 +670,26 @@ const (
 	ReasonReloadCapExhausted   = "reload-cap-exhausted"
 	ReasonReloadInProgress     = "reload-in-progress"
 )
+
+// detectStaleCache classifies a PLC return code against the R-CACHE-009
+// detection set. Returns (true, reason) for codes that signal cache
+// staleness from a PLC online change; (false, "") otherwise.
+//
+// Detection codes verified against Beckhoff InfoSys (TC2 Utilities).
+//
+// Validates: R-CACHE-009.
+func detectStaleCache(rc ReturnCode) (stale bool, reason string) {
+	switch rc {
+	case ReturnCodeDeviceSymbolVersionInvalid: // 0x711 — Beckhoff: "online change. Create a new handle."
+		return true, ReasonSymbolVersionInvalid
+	case ReturnCodeDeviceSymbolNoFound: // 0x710
+		return true, ReasonSymbolNotFound
+	case ReturnCodeDeviceInvalidOffset: // 0x703 — TC3 surfaces this on cached handle post-delete
+		return true, ReasonInvalidOffset
+	case ReturnCodeDeviceSymbolNotActive: // 0x722 — Beckhoff: "Release the handle and try again."
+		return true, ReasonSymbolNotActive
+	case ReturnCodeDeviceNotifyHandleInvalid: // 0x714
+		return true, ReasonNotifyHandleInvalid
+	}
+	return false, ""
+}

@@ -302,3 +302,30 @@ func TestStaleReasonConstants(t *testing.T) {
 		}
 	}
 }
+
+// Validates: R-CACHE-009 detection set + R-NOT-016 reason mapping.
+func TestDetectStaleCache(t *testing.T) {
+	tests := []struct {
+		rc        ReturnCode
+		wantStale bool
+		wantReas  string
+	}{
+		// 5 codes in detection set.
+		{ReturnCodeDeviceSymbolVersionInvalid, true, ReasonSymbolVersionInvalid}, // 0x711
+		{ReturnCodeDeviceSymbolNoFound, true, ReasonSymbolNotFound},              // 0x710
+		{ReturnCodeDeviceInvalidOffset, true, ReasonInvalidOffset},               // 0x703
+		{ReturnCodeDeviceSymbolNotActive, true, ReasonSymbolNotActive},           // 0x722
+		{ReturnCodeDeviceNotifyHandleInvalid, true, ReasonNotifyHandleInvalid},   // 0x714
+		// Negative cases — must NOT trigger.
+		{ReturnCodeNoErrors, false, ""},
+		{ReturnCodeDeviceTimeout, false, ""},
+		{ReturnCodeDeviceWarning, false, ""}, // 0x720 — explicitly NOT in set (Beckhoff: signal warning)
+	}
+	for _, tt := range tests {
+		stale, reason := detectStaleCache(tt.rc)
+		if stale != tt.wantStale || reason != tt.wantReas {
+			t.Errorf("detectStaleCache(0x%X) = (%v, %q), want (%v, %q)",
+				uint32(tt.rc), stale, reason, tt.wantStale, tt.wantReas)
+		}
+	}
+}
