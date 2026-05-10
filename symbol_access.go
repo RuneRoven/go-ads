@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+// WriteToSymbol writes a value to a PLC symbol by name (handle resolved
+// on-demand and cached).
 func (sess *Session) WriteToSymbol(symbolName string, value string) error {
 	return sess.writeToSymbolRetry(symbolName, value, 1)
 }
@@ -60,6 +62,8 @@ func (sess *Session) writeToSymbolRetry(symbolName string, value string, retries
 	return nil
 }
 
+// ReadFromSymbol reads a PLC symbol by name and returns its stringified
+// value (handle resolved on-demand and cached).
 func (sess *Session) ReadFromSymbol(symbolName string) (string, error) {
 	return sess.readFromSymbolRetry(symbolName, 1)
 }

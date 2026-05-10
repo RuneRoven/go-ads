@@ -199,6 +199,8 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 	return
 }
 
+// Connect dials the PLC and transitions the session to Connected.
+// local=true targets the in-process TwinCAT runtime (127.0.0.1).
 func (sess *Session) Connect(local bool) error {
 	sess.isLocal = local
 	sess.transitionState(SessionStateConnecting)

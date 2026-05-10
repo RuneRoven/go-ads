@@ -12,6 +12,7 @@ import (
 // Cache-aware Session methods (ReadFromSymbol etc.) in symbol_access.go
 // call s.client.Read/Write internally.
 
+// Read issues ADS Read (cmd 2) against the given index group/offset.
 func (c *Client) Read(group uint32, offset uint32, length uint32) (data []byte, err error) {
 	request := new(bytes.Buffer)
 	type readCommandPacket struct {
@@ -108,6 +109,8 @@ func (c *Client) Write(group uint32, offset uint32, data []byte) error {
 	return nil
 }
 
+// WriteRead issues ADS ReadWrite (cmd 9): writes send and reads back up to
+// readLength bytes in a single round-trip.
 func (c *Client) WriteRead(group uint32, offset uint32, readLength uint32, send []byte) (data []byte, err error) {
 	request := new(bytes.Buffer)
 	type writeReadCommandPacket struct {
@@ -168,6 +171,7 @@ type States struct {
 	DeviceState uint16
 }
 
+// ReadState issues ADS ReadState (cmd 4) and returns the PLC's ADS+device state.
 func (c *Client) ReadState() (response States, err error) {
 	// Try to send the request
 	resp, err := c.sendRequest(CommandIDReadState, []byte{})
@@ -203,6 +207,7 @@ type DeviceInfo struct {
 	DeviceName [16]byte
 }
 
+// ReadDeviceInfo issues ADS ReadDeviceInfo (cmd 1).
 func (c *Client) ReadDeviceInfo() (response DeviceInfo, err error) {
 	// Try to send the request
 	resp, err := c.sendRequest(CommandIDReadDeviceInfo, []byte{})
