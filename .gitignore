@@ -10,3 +10,6 @@ coverage.html
 logs/
 improvements.md
 docs/
+
+# Symbol-version hardware test logs
+symbol-version-run-*.log
