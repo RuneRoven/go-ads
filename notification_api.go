@@ -29,6 +29,11 @@ type Update struct {
 	Variable  string
 	Value     string
 	TimeStamp time.Time
+	// Stale signals the value MAY be from a pre-online-change cache state.
+	// Validates: R-NOT-016.
+	Stale bool
+	// Reason is non-empty when Stale=true. See R-NOT-016 for enumerated values.
+	Reason string
 }
 
 // NotificationConfig holds configuration for a symbol notification, used for batch add and reconnect re-subscribe.
