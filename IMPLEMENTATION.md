@@ -328,6 +328,7 @@ All options are composable — no mutual exclusions. If omitted, defaults apply.
 | `WithForceRouteRegistration()` | Probe first (try ADS command, register only on failure) | Always register route with credentials. **Requires `WithRoute`** — no-op without it |
 | `WithHostIP(ip)` | Derived from AMS NetID (first 4 bytes) | IP the PLC uses to reach this client (Docker/VPN/NAT). **Requires `WithRoute`** — only affects route registration |
 | `WithLogger(logger)` | `slog.Default()` | Custom `*slog.Logger` for structured logging |
+| `WithOnDrop(func())` (Client) | None | Callback fired on unexpected TCP transport drop. Construction-time form of `Client.SetOnDrop()`. Session installs its own internally — only relevant for raw `Client` consumers |
 
 ### Symbol Discovery
 

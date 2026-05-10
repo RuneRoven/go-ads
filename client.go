@@ -216,9 +216,16 @@ func (c *Client) SetNotificationHandler(fn notificationHandler) {
 	c.notifyMu.Unlock()
 }
 
-// SetOnDrop installs a callback fired once when listen or transmitWorker
-// observes a transport-level failure. Used by Session to invoke
-// triggerReconnect; raw Client consumers leave nil.
+// WithOnDrop registers a callback fired on unexpected transport drop.
+// See SetOnDrop for the runtime equivalent.
+func WithOnDrop(fn func()) ClientOption {
+	return func(c *Client) {
+		c.SetOnDrop(fn)
+	}
+}
+
+// SetOnDrop registers a callback fired on unexpected transport drop.
+// Prefer WithOnDrop at construction time.
 func (c *Client) SetOnDrop(fn func()) {
 	c.ondropMu.Lock()
 	c.ondrop = fn

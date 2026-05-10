@@ -1058,3 +1058,23 @@ func TestClient_OnDropFiresExactlyOnce(t *testing.T) {
 	}
 	_ = c.Close()
 }
+
+// TestWithOnDrop_RegistersCallback validates the WithOnDrop ClientOption:
+// applying the option to a bare Client must install the callback such that
+// callOnDrop invokes it. Mirrors the runtime SetOnDrop pathway without
+// dialing a transport.
+func TestWithOnDrop_RegistersCallback(t *testing.T) {
+	called := make(chan struct{}, 1)
+	opt := WithOnDrop(func() { called <- struct{}{} })
+
+	c := &Client{}
+	opt(c)
+
+	c.callOnDrop()
+
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("WithOnDrop callback did not fire via callOnDrop")
+	}
+}
