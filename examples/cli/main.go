@@ -1,26 +1,25 @@
 // Example CLI — selector for two demos:
 //
-//   1) Session demo: managed Session with cache, auto-reconnect,
-//      online-change handling, persistent notifications, Stale-flag
-//      observation.
+//  1. Session demo: interactive REPL over a managed Session — cache,
+//     auto-reconnect, online-change handling, persistent notifications,
+//     live Stale-flag observation.
 //
-//   2) Client demo: raw Client (no cache, no reconnect) — escape hatch
-//      for protocol-level inspection. Demonstrates ReadDeviceInfo,
-//      ReadState, GetSymbolInfoByName, raw Read by handle.
+//  2. Client demo: raw Client (no cache, no reconnect) — single-shot
+//     protocol-level inspection. Demonstrates ReadDeviceInfo, ReadState,
+//     GetSymbolInfoByName, raw Read by handle.
 //
 // Connection parameters are read from environment variables — same set
 // for both demos:
 //
-//   ADS_PLC_IP        target PLC IP (default: 192.168.1.100)
-//   ADS_TARGET_AMS    target AMS NetID (default: 5.1.2.3.1.1)
-//   ADS_TARGET_PORT   target AMS port (default: 851)
-//   ADS_LOCAL_AMS     local AMS NetID ("auto" = derive from local IP)
-//   ADS_LOCAL_PORT    local AMS port (default: 10500)
-//   ADS_SYMBOL_NAME   symbol used for read/write/notification demos
-//                     (default: MAIN.bCounter)
-//   ADS_ROUTE_USER    optional — register route on PLC if set
-//   ADS_ROUTE_PASS    optional — paired with ADS_ROUTE_USER
-//   ADS_ROUTE_NAME    optional — route display name (default: go-ads-example)
+//	ADS_PLC_IP        target PLC IP (default: 192.168.1.100)
+//	ADS_TARGET_AMS    target AMS NetID (default: 5.1.2.3.1.1)
+//	ADS_TARGET_PORT   target AMS port (default: 851)
+//	ADS_LOCAL_AMS     local AMS NetID ("auto" = derive from local IP)
+//	ADS_LOCAL_PORT    local AMS port (default: 10500)
+//	ADS_SYMBOL_NAME   symbol used for client demo (default: MAIN.bCounter)
+//	ADS_ROUTE_USER    optional — register route on PLC if set
+//	ADS_ROUTE_PASS    optional — paired with ADS_ROUTE_USER
+//	ADS_ROUTE_NAME    optional — route display name (default: go-ads-example)
 package main
 
 import (
@@ -31,6 +30,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -40,6 +40,12 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+// run holds the body of main so deferred cleanups (signal context cancel)
+// fire before exit — using os.Exit directly in main bypasses defers.
+func run() int {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	mode := selectMode()
@@ -51,14 +57,15 @@ func main() {
 	case "session":
 		if err := runSessionDemo(ctx, logger); err != nil {
 			logger.Error("session demo failed", "error", err)
-			os.Exit(1)
+			return 1
 		}
 	case "client":
 		if err := runClientDemo(logger); err != nil {
 			logger.Error("client demo failed", "error", err)
-			os.Exit(1)
+			return 1
 		}
 	}
+	return 0
 }
 
 // selectMode prompts the user to pick a demo. Honours ADS_DEMO=session|client
@@ -69,7 +76,7 @@ func selectMode() string {
 	}
 	fmt.Println("go-ads example CLI")
 	fmt.Println()
-	fmt.Println("  1) Session demo — managed wrapper (cache, auto-reconnect, notifications)")
+	fmt.Println("  1) Session demo — managed wrapper (cache, auto-reconnect, REPL)")
 	fmt.Println("  2) Client demo  — raw RPC (no cache, no reconnect)")
 	fmt.Println()
 	fmt.Print("Select [1/2]: ")
@@ -91,23 +98,35 @@ func selectMode() string {
 	}
 }
 
-// ----- Session demo ---------------------------------------------------------
+// ----- Session demo (interactive REPL) --------------------------------------
+
+// repl holds shared state for the REPL command loop.
+type repl struct {
+	sess    *ads.Session
+	logger  *slog.Logger
+	updates chan *ads.Update
+	subs    map[uint32]string // handle -> symbol name (for unsub + state output)
+}
 
 func runSessionDemo(ctx context.Context, logger *slog.Logger) error {
-	ip, targetAMS, targetPort, localAMS, localPort, symbolName, routeName, routeUser, routePass := readEnv()
+	ip, targetAMS, targetPort, localAMS, localPort, _, routeName, routeUser, routePass := readEnv()
+
+	// Buffer chosen large enough to absorb bursts when REPL is mid-input.
+	updates := make(chan *ads.Update, 128)
 
 	opts := []ads.SessionOption{
 		ads.WithLogger(logger),
 		ads.WithAutoReconnect(true),
 		ads.WithOnDisconnect(func() {
-			logger.Warn("session: transport dropped — auto-reconnect will retry")
+			fmt.Println("\n[session] transport dropped — auto-reconnect will retry")
 		}),
 		ads.WithOnReconnect(func() {
-			logger.Info("session: reconnected — cache + notifications restored")
+			fmt.Println("\n[session] reconnected — cache + notifications restored")
 		}),
 		ads.WithSymbolVersionStrategy(ads.SymbolVersionAutoReload),
 		ads.WithOnSymbolVersionChanged(func(reason string) {
-			logger.Info("session: symbol-version event", "reason", reason)
+			// Surface DP-1 events live so the user sees online-change detection.
+			fmt.Printf("\n[online-change] reason=%s\n", reason)
 		}),
 	}
 	if routeUser != "" {
@@ -121,67 +140,330 @@ func runSessionDemo(ctx context.Context, logger *slog.Logger) error {
 	defer sess.Close()
 
 	if err := sess.Connect(false); err != nil {
-		return fmt.Errorf("Connect: %w", err)
+		return fmt.Errorf("connect: %w", err)
 	}
-	logger.Info("session: connected", "plc", ip, "ams", targetAMS)
+	fmt.Printf("[session] connected plc=%s ams=%s\n", ip, targetAMS)
 
 	if err := sess.LoadSymbols(); err != nil {
-		return fmt.Errorf("LoadSymbols: %w", err)
-	}
-	logger.Info("session: symbol cache loaded")
-
-	// Read/write round-trip — uses the cache transparently.
-	val, err := sess.ReadFromSymbol(symbolName)
-	if err != nil {
-		logger.Warn("ReadFromSymbol failed", "symbol", symbolName, "error", err)
+		// Non-fatal: REPL can still operate via on-demand handle resolve.
+		fmt.Printf("[session] LoadSymbols failed: %v (continuing — on-demand resolve still works)\n", err)
 	} else {
-		logger.Info("session: read", "symbol", symbolName, "value", val)
+		syms, _ := sess.ListSymbols()
+		fmt.Printf("[session] symbol cache loaded (%d symbols)\n", len(syms))
 	}
 
-	// Persistent notification: re-subscribed automatically across reconnect.
-	updates := make(chan *ads.Update, 32)
-	handle, err := sess.AddSymbolNotification(
-		symbolName,
-		100*time.Millisecond,    // maxDelay
-		100*time.Millisecond,    // cycleTime
-		ads.TransModeServerOnChange,
-		updates,
-	)
-	if err != nil {
-		logger.Warn("AddSymbolNotification failed", "symbol", symbolName, "error", err)
-	} else {
-		logger.Info("session: notification registered", "handle", handle, "symbol", symbolName)
+	r := &repl{
+		sess:    sess,
+		logger:  logger,
+		updates: updates,
+		subs:    make(map[uint32]string),
 	}
 
-	logger.Info("session: streaming notifications until SIGINT/SIGTERM")
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Info("session: shutdown signal received")
-			return nil
-		case u, ok := <-updates:
-			if !ok {
-				return nil
-			}
-			if u.Stale {
-				// One-shot Stale flag (R-NOT-016) — first sample after a
-				// transport recovery or symbol-version event.
-				logger.Warn("update STALE",
-					"symbol", u.Variable,
-					"value", u.Value,
-					"reason", u.Reason,
-					"ts", u.TimeStamp.Format(time.RFC3339Nano))
-			} else {
-				logger.Info("update",
-					"symbol", u.Variable,
-					"value", u.Value,
-					"ts", u.TimeStamp.Format(time.RFC3339Nano))
-			}
+	// Notification printer — single goroutine drains the shared channel and
+	// prints with a newline prefix to keep the prompt readable.
+	notifyDone := make(chan struct{})
+	go r.notifyLoop(notifyDone)
+
+	// Graceful shutdown on SIGINT/SIGTERM: close stdin to unblock ReadString.
+	go func() {
+		<-ctx.Done()
+		fmt.Println("\n[session] shutdown signal received")
+		_ = os.Stdin.Close()
+	}()
+
+	r.loop()
+
+	close(updates)
+	<-notifyDone
+	return nil
+}
+
+func (r *repl) notifyLoop(done chan struct{}) {
+	defer close(done)
+	for u := range r.updates {
+		if u.Stale {
+			fmt.Printf("\n[notify] *STALE* symbol=%s value=%s reason=%s ts=%s\n",
+				u.Variable, u.Value, u.Reason, u.TimeStamp.Format(time.RFC3339Nano))
+		} else {
+			fmt.Printf("\n[notify] %s = %s (ts=%s)\n",
+				u.Variable, u.Value, u.TimeStamp.Format("15:04:05.000"))
 		}
 	}
 }
 
-// ----- Client demo ----------------------------------------------------------
+func (r *repl) loop() {
+	in := bufio.NewReader(os.Stdin)
+	printHelp()
+	for {
+		fmt.Print("ads> ")
+		line, err := in.ReadString('\n')
+		if err != nil {
+			// EOF / stdin closed (SIGINT) → exit cleanly.
+			fmt.Println()
+			return
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		cmd := strings.ToLower(fields[0])
+		args := fields[1:]
+
+		switch cmd {
+		case "help", "?":
+			printHelp()
+		case "quit", "exit":
+			return
+		case "state":
+			r.cmdState()
+		case "list":
+			r.cmdList(args)
+		case "browse":
+			r.cmdBrowse(args)
+		case "read":
+			r.cmdRead(args)
+		case "write":
+			r.cmdWrite(args)
+		case "info":
+			r.cmdInfo(args)
+		case "sub":
+			r.cmdSub(args)
+		case "unsub":
+			r.cmdUnsub(args)
+		case "reload":
+			r.cmdReload()
+		default:
+			fmt.Printf("unknown command: %s (type 'help')\n", cmd)
+		}
+	}
+}
+
+func printHelp() {
+	fmt.Println("Commands:")
+	fmt.Println("  list [prefix]              List cached symbols (optionally filtered)")
+	fmt.Println("  browse [path]              Browse symbol hierarchy at path (default: root)")
+	fmt.Println("  read <symbol>              Read symbol value (cache-aware)")
+	fmt.Println("  write <symbol> <value>     Write value to symbol (library auto-parses)")
+	fmt.Println("  info <symbol>              Show DataType/Length/Group/Offset/Comment")
+	fmt.Println("  sub <symbol>               Subscribe to symbol on-change notifications")
+	fmt.Println("  unsub <handle>             Delete notification by handle")
+	fmt.Println("  reload                     RefreshSymbols (manual reload if version changed)")
+	fmt.Println("  state                      Show session state + cache + subscription counts")
+	fmt.Println("  help / ?                   Show this help")
+	fmt.Println("  quit / exit                Graceful shutdown")
+	fmt.Println()
+}
+
+func (r *repl) cmdState() {
+	syms, _ := r.sess.ListSymbols()
+	fmt.Printf("  IsClosed:       %v\n", r.sess.IsClosed())
+	fmt.Printf("  IsDisconnected: %v\n", r.sess.IsDisconnected())
+	fmt.Printf("  cached symbols: %d\n", len(syms))
+	fmt.Printf("  active subs:    %d\n", len(r.subs))
+	if len(r.subs) > 0 {
+		// Stable order for readable output.
+		handles := make([]uint32, 0, len(r.subs))
+		for h := range r.subs {
+			handles = append(handles, h)
+		}
+		sort.Slice(handles, func(i, j int) bool { return handles[i] < handles[j] })
+		for _, h := range handles {
+			fmt.Printf("    handle=%d symbol=%s\n", h, r.subs[h])
+		}
+	}
+}
+
+func (r *repl) cmdList(args []string) {
+	syms, err := r.sess.ListSymbols()
+	if err != nil {
+		fmt.Printf("  error: %v\n", err)
+		return
+	}
+	prefix := ""
+	if len(args) > 0 {
+		prefix = strings.ToLower(args[0])
+	}
+	names := make([]string, 0, len(syms))
+	for name := range syms {
+		if prefix == "" || strings.Contains(strings.ToLower(name), prefix) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	fmt.Printf("  symbols (%d shown / %d total):\n", len(names), len(syms))
+	for _, n := range names {
+		s := syms[n]
+		fmt.Printf("    %-50s type=%-20s size=%d\n", n, s.DataType, s.Length)
+	}
+}
+
+func (r *repl) cmdBrowse(args []string) {
+	path := ""
+	if len(args) > 0 {
+		path = args[0]
+	}
+	entries, err := r.sess.BrowseSymbols(path)
+	if err != nil {
+		fmt.Printf("  error: %v\n", err)
+		return
+	}
+	if path == "" {
+		fmt.Printf("  root (%d entries):\n", len(entries))
+	} else {
+		fmt.Printf("  children of %s (%d entries):\n", path, len(entries))
+	}
+	for _, e := range entries {
+		more := ""
+		if e.HasChildren {
+			more = " [+]"
+		}
+		fmt.Printf("    %-45s type=%-20s size=%d%s\n", e.FullName, e.DataType, e.Size, more)
+	}
+}
+
+func (r *repl) cmdRead(args []string) {
+	if len(args) < 1 {
+		fmt.Println("  usage: read <symbol>")
+		return
+	}
+	name := args[0]
+	v, err := r.sess.ReadFromSymbol(name)
+	if err != nil {
+		fmt.Printf("  error: %v\n", err)
+		return
+	}
+	fmt.Printf("  %s = %s\n", name, v)
+}
+
+func (r *repl) cmdWrite(args []string) {
+	if len(args) < 2 {
+		fmt.Println("  usage: write <symbol> <value>")
+		return
+	}
+	name := args[0]
+	// Re-join the rest so quoted strings with spaces survive (best-effort).
+	value := strings.Join(args[1:], " ")
+	if err := r.sess.WriteToSymbol(name, value); err != nil {
+		fmt.Printf("  error: %v\n", err)
+		return
+	}
+	fmt.Printf("  wrote %s = %s\n", name, value)
+	// Read-back confirms what the PLC observed (and exercises invalidation).
+	if back, err := r.sess.ReadFromSymbol(name); err == nil {
+		fmt.Printf("  confirmed: %s = %s\n", name, back)
+	}
+}
+
+func (r *repl) cmdInfo(args []string) {
+	if len(args) < 1 {
+		fmt.Println("  usage: info <symbol>")
+		return
+	}
+	name := args[0]
+	v, err := r.sess.GetSymbol(name)
+	if err != nil {
+		fmt.Printf("  error: %v\n", err)
+		return
+	}
+	fmt.Printf("  Name:     %s\n", v.FullName)
+	fmt.Printf("  DataType: %s\n", v.DataType)
+	fmt.Printf("  Length:   %d\n", v.Length)
+	fmt.Printf("  Group:    0x%X\n", v.Group)
+	fmt.Printf("  Offset:   0x%X\n", v.Offset)
+	fmt.Printf("  Handle:   %d\n", v.Handle)
+	fmt.Printf("  BaseType: %d (%s)\n", v.BaseType, baseTypeName(v.BaseType))
+	if v.Comment != "" {
+		fmt.Printf("  Comment:  %s\n", v.Comment)
+	}
+}
+
+func (r *repl) cmdSub(args []string) {
+	if len(args) < 1 {
+		fmt.Println("  usage: sub <symbol>")
+		return
+	}
+	name := args[0]
+	h, err := r.sess.AddSymbolNotification(
+		name,
+		100*time.Millisecond,
+		100*time.Millisecond,
+		ads.TransModeServerOnChange,
+		r.updates,
+	)
+	if err != nil {
+		fmt.Printf("  error: %v\n", err)
+		return
+	}
+	r.subs[h] = name
+	fmt.Printf("  subscribed: symbol=%s handle=%d\n", name, h)
+}
+
+func (r *repl) cmdUnsub(args []string) {
+	if len(args) < 1 {
+		fmt.Println("  usage: unsub <handle>")
+		return
+	}
+	h, err := strconv.ParseUint(args[0], 10, 32)
+	if err != nil {
+		fmt.Printf("  invalid handle: %v\n", err)
+		return
+	}
+	handle := uint32(h)
+	if err := r.sess.DeleteDeviceNotification(handle); err != nil {
+		fmt.Printf("  error: %v\n", err)
+		return
+	}
+	name := r.subs[handle]
+	delete(r.subs, handle)
+	fmt.Printf("  unsubscribed: handle=%d symbol=%s\n", handle, name)
+}
+
+func (r *repl) cmdReload() {
+	if err := r.sess.RefreshSymbols(); err != nil {
+		fmt.Printf("  error: %v\n", err)
+		return
+	}
+	syms, _ := r.sess.ListSymbols()
+	fmt.Printf("  reload complete (%d symbols)\n", len(syms))
+}
+
+// baseTypeName maps an ADST_ code to its IEC name for the info command.
+// Returns "" for composite/unknown — caller's printf hides the label cleanly.
+func baseTypeName(code uint32) string {
+	switch code {
+	case 33:
+		return "BOOL"
+	case 16:
+		return "SINT"
+	case 17:
+		return "USINT/BYTE"
+	case 2:
+		return "INT"
+	case 18:
+		return "UINT/WORD"
+	case 3:
+		return "DINT"
+	case 19:
+		return "UDINT/DWORD"
+	case 4:
+		return "REAL"
+	case 5:
+		return "LREAL"
+	case 20:
+		return "LINT"
+	case 21:
+		return "ULINT"
+	case 30:
+		return "STRING"
+	case 31:
+		return "WSTRING"
+	default:
+		return "composite/unknown"
+	}
+}
+
+// ----- Client demo (single-shot, unchanged) ---------------------------------
 
 func runClientDemo(logger *slog.Logger) error {
 	ip, targetAMS, targetPort, localAMS, localPort, symbolName, _, _, _ := readEnv()
@@ -203,12 +485,11 @@ func runClientDemo(logger *slog.Logger) error {
 		}),
 	)
 	if err != nil {
-		return fmt.Errorf("Dial: %w", err)
+		return fmt.Errorf("dial: %w", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	logger.Info("client: dialed", "plc", ip, "ams", targetAMS)
 
-	// PLC introspection — protocol-level, no cache.
 	if info, err := c.ReadDeviceInfo(); err != nil {
 		logger.Warn("ReadDeviceInfo failed", "error", err)
 	} else {
@@ -224,8 +505,6 @@ func runClientDemo(logger *slog.Logger) error {
 		logger.Info("client: ads state", "ads", state.ADSState, "device", state.DeviceState)
 	}
 
-	// Raw symbol resolution — no cache, no on-demand. Inspect what the PLC
-	// actually returned for this name.
 	sym, err := c.GetSymbolInfoByName(symbolName)
 	if err != nil {
 		logger.Warn("GetSymbolInfoByName failed", "symbol", symbolName, "error", err)
@@ -238,10 +517,6 @@ func runClientDemo(logger *slog.Logger) error {
 		"length", sym.Length,
 		"type", sym.DataType)
 
-	// Raw Read by index group/offset — the protocol-level escape hatch.
-	// GroupSymbolValueByName lets us read a value by writing the symbol
-	// name as the WriteRead payload; here we instead resolve a handle and
-	// Read by handle to mirror what the cache-aware Session does.
 	handleBytes, err := c.WriteRead(uint32(ads.GroupSymbolHandleByName), 0, 4, []byte(symbolName))
 	if err != nil {
 		logger.Warn("resolve handle failed", "symbol", symbolName, "error", err)

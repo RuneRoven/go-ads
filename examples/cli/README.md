@@ -6,19 +6,38 @@ prompt for scripted invocations.
 
 ## Demos
 
-### 1. Session demo (managed wrapper)
+### 1. Session demo (interactive REPL)
 
-Demonstrates the `ads.Session` API:
+Boots an `ads.Session` (cache, auto-reconnect, online-change handling,
+persistent notifications, route registration) and drops into a REPL.
 
-- `NewSession` + lifecycle callbacks (`WithOnDisconnect`, `WithOnReconnect`).
+Live event hooks while the REPL runs:
+
+- `WithOnDisconnect` / `WithOnReconnect` print transport state changes.
 - `WithSymbolVersionStrategy(SymbolVersionAutoReload)` +
-  `WithOnSymbolVersionChanged` for online-change handling.
-- Optional route registration via `WithRoute`.
-- `Connect(false)` + `LoadSymbols()`.
-- Cache-aware `ReadFromSymbol`.
-- Persistent `AddSymbolNotification` (auto-resubscribed across reconnect),
-  including `Update.Stale` flag observation.
-- Graceful shutdown on SIGINT/SIGTERM.
+  `WithOnSymbolVersionChanged` print `[online-change] reason=...` for DP-1
+  events.
+- Notification updates print on a background goroutine; `Update.Stale=true`
+  is rendered prominently as `[notify] *STALE* ...`.
+
+REPL commands:
+
+| Command | Action |
+|---|---|
+| `list [prefix]` | List cached symbols, optionally filtered |
+| `browse [path]` | `Session.BrowseSymbols` at path (default root) |
+| `read <symbol>` | `Session.ReadFromSymbol` |
+| `write <symbol> <value>` | `Session.WriteToSymbol` (library auto-parses value) |
+| `info <symbol>` | `Session.GetSymbol` — DataType, Length, Group, Offset, Comment |
+| `sub <symbol>` | `AddSymbolNotification` (background prints updates) |
+| `unsub <handle>` | `DeleteDeviceNotification` |
+| `reload` | `Session.RefreshSymbols` (manual reload) |
+| `state` | `IsClosed`, `IsDisconnected`, cache count, active subs |
+| `help` / `?` | Command list |
+| `quit` / `exit` | Graceful shutdown |
+
+`SIGINT` / `SIGTERM` close stdin and trigger graceful shutdown
+(`Session.Close` runs from a `defer`).
 
 ### 2. Client demo (raw RPC)
 
@@ -40,7 +59,7 @@ Demonstrates the `ads.Client` escape hatch — no cache, no reconnect:
 | `ADS_TARGET_PORT` | `851` | Target AMS port |
 | `ADS_LOCAL_AMS` | `auto` | Local AMS NetID (`auto` derives from local IP) |
 | `ADS_LOCAL_PORT` | `10500` | Local AMS source port |
-| `ADS_SYMBOL_NAME` | `MAIN.bCounter` | Symbol used for read/notification demo |
+| `ADS_SYMBOL_NAME` | `MAIN.bCounter` | Symbol used by the client demo (session REPL accepts any) |
 | `ADS_ROUTE_USER` | _(unset)_ | If set, register an AMS route on the PLC |
 | `ADS_ROUTE_PASS` | _(unset)_ | Paired with `ADS_ROUTE_USER` |
 | `ADS_ROUTE_NAME` | `go-ads-example` | Route display name on PLC |
@@ -59,7 +78,8 @@ go run .
 ## Choosing a demo
 
 - **Session** — almost everything. Handles reconnect, online-change, symbol
-  cache, persistent notifications. Default for production use.
+  cache, persistent notifications. Default for production use. Use the REPL
+  for ad-hoc browsing, reads, writes, and notification testing.
 - **Client** — raw protocol inspection, custom transport tooling, or anywhere
   you need to bypass the cache (e.g. ADS browser, debugger, transient one-shot
-  CLI tooling).
+  CLI tooling). Single-shot.
