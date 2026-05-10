@@ -2,6 +2,7 @@ package ads
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -34,6 +35,12 @@ func (sess *Session) writeToSymbolRetry(symbolName string, value string, retries
 	// Network I/O without lock
 	err = sess.client.Write(uint32(GroupSymbolValueByHandle), handle, data)
 	if err != nil {
+		// R-CACHE-009: classify ReturnCode-typed errors and dispatch the
+		// configured online-change strategy before surfacing to caller.
+		var rc ReturnCode
+		if errors.As(err, &rc) {
+			sess.handleStaleDetection(rc)
+		}
 		// If a reconnect happened during our operation, retry once with fresh handles
 		sess.waitForReconnect()
 		if retriesLeft > 0 && sess.epoch() != gen {
@@ -82,6 +89,12 @@ func (sess *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (st
 	// Network I/O without lock
 	data, err := sess.client.Read(uint32(GroupSymbolValueByHandle), handle, length)
 	if err != nil {
+		// R-CACHE-009: classify ReturnCode-typed errors and dispatch the
+		// configured online-change strategy before surfacing to caller.
+		var rc ReturnCode
+		if errors.As(err, &rc) {
+			sess.handleStaleDetection(rc)
+		}
 		// If a reconnect happened during our operation, retry once with fresh handles
 		sess.waitForReconnect()
 		if retriesLeft > 0 && sess.epoch() != gen {

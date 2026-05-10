@@ -311,3 +311,62 @@ func TestSession_OnDisconnectFiresOnceOnConcurrentTrigger(t *testing.T) {
 		t.Errorf("onDisconnect fired %d times, want exactly 1", got)
 	}
 }
+
+// TestSession_HandleStaleDetection_NoMatch validates that non-stale
+// ReturnCodes are a no-op for the dispatcher.
+//
+// Validates: R-CACHE-009 dispatch (negative path).
+func TestSession_HandleStaleDetection_NoMatch(t *testing.T) {
+	sess := &Session{
+		versionStrategy: SymbolVersionIgnore,
+		logger:          getDefaultLogger(),
+	}
+	stale, reason := sess.handleStaleDetection(ReturnCodeNoErrors)
+	if stale || reason != "" {
+		t.Errorf("got (%v, %q), want (false, \"\")", stale, reason)
+	}
+}
+
+// TestSession_HandleStaleDetection_Ignore_FiresCallback validates that the
+// Ignore strategy fires the callback in a goroutine and returns the
+// expected reason without altering Session state.
+//
+// Validates: R-CACHE-012 (Ignore) + R-NOT-016 (callback reason).
+func TestSession_HandleStaleDetection_Ignore_FiresCallback(t *testing.T) {
+	cbReason := make(chan string, 1)
+	sess := &Session{
+		versionStrategy: SymbolVersionIgnore,
+		versionCallback: func(r string) { cbReason <- r },
+		logger:          getDefaultLogger(),
+	}
+
+	stale, reason := sess.handleStaleDetection(ReturnCodeDeviceSymbolVersionInvalid)
+	if !stale || reason != ReasonSymbolVersionInvalid {
+		t.Errorf("got (%v, %q), want (true, %q)", stale, reason, ReasonSymbolVersionInvalid)
+	}
+	select {
+	case r := <-cbReason:
+		if r != ReasonSymbolVersionInvalid {
+			t.Errorf("callback got %q, want %q", r, ReasonSymbolVersionInvalid)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback not invoked")
+	}
+}
+
+// TestSession_HandleStaleDetection_NilCallbackOK validates R-SES-011: when
+// no callback is configured, the dispatcher must still classify the code
+// without panicking.
+//
+// Validates: R-SES-011 (nil-callback safety).
+func TestSession_HandleStaleDetection_NilCallbackOK(t *testing.T) {
+	sess := &Session{
+		versionStrategy: SymbolVersionIgnore,
+		versionCallback: nil,
+		logger:          getDefaultLogger(),
+	}
+	stale, _ := sess.handleStaleDetection(ReturnCodeDeviceSymbolVersionInvalid)
+	if !stale {
+		t.Error("expected stale=true")
+	}
+}

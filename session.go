@@ -399,6 +399,63 @@ func (sess *Session) ensureRouteOnConnect() (registered bool, err error) {
 	return true, nil
 }
 
+// handleStaleDetection runs the configured online-change strategy when a
+// PLC return code from the R-CACHE-009 detection set surfaces. It returns
+// (true, reason) when the code triggered stale-cache handling and
+// (false, "") for unrelated codes (no-op).
+//
+// The user-supplied callback fires in its own goroutine to honor R-SES-007:
+// callers MUST NOT block in the callback.
+//
+// Strategy dispatch:
+//   - SymbolVersionIgnore: surface the error unchanged. Subsequent
+//     notification samples are flagged Stale by R-NOT-017 (Task 9).
+//   - SymbolVersionClose: terminate the session asynchronously
+//     (R-CACHE-011).
+//   - SymbolVersionAutoReload: trigger full reload + resub (R-CACHE-010).
+//     Placeholder until Task 7 fills it in.
+//
+// Validates: R-CACHE-009 dispatch.
+func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason string) {
+	stale, reason = detectStaleCache(rc)
+	if !stale {
+		return false, ""
+	}
+	sess.logger.Warn("stale-cache detection",
+		"code", rc, "reason", reason, "strategy", sess.versionStrategy)
+	if sess.versionCallback != nil {
+		go sess.versionCallback(reason)
+	}
+	switch sess.versionStrategy {
+	case SymbolVersionIgnore:
+		// Surface unchanged. Notification listener marks subsequent samples
+		// Stale per R-NOT-017 (wired in Task 9).
+	case SymbolVersionClose:
+		go sess.closeOnStaleDetection(reason)
+	case SymbolVersionAutoReload:
+		go sess.autoReloadOnStaleDetection(reason)
+	}
+	return true, reason
+}
+
+// closeOnStaleDetection terminates the session under SymbolVersionClose.
+// Runs in its own goroutine to keep the calling Read/Write path
+// non-blocking.
+//
+// Validates: R-CACHE-011.
+func (sess *Session) closeOnStaleDetection(reason string) {
+	sess.logger.Info("Close strategy fired on stale-cache detection", "reason", reason)
+	sess.Close()
+}
+
+// autoReloadOnStaleDetection is the SymbolVersionAutoReload entry point.
+// Placeholder — Task 7 fills in the rate-limited reload + resub logic.
+//
+// Validates: R-CACHE-010 (TODO).
+func (sess *Session) autoReloadOnStaleDetection(reason string) {
+	sess.logger.Warn("auto-reload not yet implemented", "reason", reason)
+}
+
 // Close closes connection and waits for completion
 func (sess *Session) Close() {
 	// Capture transport-disconnected state BEFORE the FSM transitions into
