@@ -83,3 +83,33 @@ client, _ := ads.Dial(ip, 48898, target, source, 5*time.Second,
 defer client.Close()
 info, _ := client.ReadDeviceInfo()
 ```
+
+### Online-change handling (DP-1)
+
+- Detection of PLC online-change via the six R-CACHE-009 return codes
+  (`0x711` `DeviceSymbolVersionInvalid`, `0x710` `DeviceSymbolNoFound`,
+  `0x703` `DeviceInvalidOffset`, `0x722` `DeviceSymbolNotActive`, `0x714`
+  `DeviceNotifyHandleInvalid`, `0x705` `DeviceInvalidSize`).
+- Three strategies via `WithSymbolVersionStrategy`:
+  - `SymbolVersionAutoReload` (default) — re-discover symbols + resubscribe
+    notifications on detection.
+  - `SymbolVersionClose` — terminate the session on detection (fires
+    `OnDisconnect`, then `Close()`).
+  - `SymbolVersionIgnore` — surface the PLC error to the calling op and
+    flag surviving notification handles' next sample with `Update.Stale=true`
+    (one-shot, consumed on first delivery).
+- New `Update` fields `Stale bool` + `Reason string` (R-NOT-016). Reason
+  values are stable strings exported as `Reason*` constants.
+- Optional callback via `WithOnSymbolVersionChanged(fn func(reason string))`
+  fires once per detection. Required signal under `SymbolVersionIgnore` to
+  observe symbol-removal events (the dead handle's user channel goes silent
+  — no terminal Update is delivered).
+- Reload cap: `WithMaxSymbolVersionReloadAttempts` (default 3) within
+  `WithSymbolVersionReloadWindow` (default 60s) prevents runaway reload
+  loops under recurring online-change conditions (R-CACHE-013). On cap
+  exhaustion the strategy degrades to Ignore for that detection and the
+  callback fires with `ReasonReloadCapExhausted`.
+- Hardware-validated against TwinCAT 3 v3.1.4024.
+- Migration: the `Update` struct gained two trailing fields. Field-named
+  struct literals are unaffected; positional literals (rare) require an
+  update.

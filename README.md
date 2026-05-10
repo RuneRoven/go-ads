@@ -180,6 +180,10 @@ sess, _ := ads.NewSession(ip, 48898, netid, 851, "auto", 10500, 5*time.Second,
 | `WithForceRouteRegistration()` | Probe first | Always register route with credentials (skip probe). Requires `WithRoute` |
 | `WithHostIP(ip)` | Derived from AMS NetID | IP the PLC uses to reach this client (Docker/VPN/NAT). Requires `WithRoute` |
 | `WithLogger(logger)` | `slog.Default()` | Custom structured logger |
+| `WithSymbolVersionStrategy(s)` | `SymbolVersionAutoReload` | Online-change handling strategy (`AutoReload` / `Close` / `Ignore`) |
+| `WithMaxSymbolVersionReloadAttempts(n)` | `3` | Cap reload attempts within the sliding window (AutoReload only) |
+| `WithSymbolVersionReloadWindow(d)` | `60s` | Sliding window length for the reload-attempt cap |
+| `WithOnSymbolVersionChanged(fn)` | None | Callback fired once per online-change detection (`reason` from R-NOT-016) |
 
 ### Combining options
 
