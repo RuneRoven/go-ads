@@ -115,10 +115,6 @@ type Session struct {
 	onReconnect  func()
 
 	// Online-change handling (R-SES-011, R-CACHE-013).
-	// reloadAttempts/reloadMu/staleHandles/staleHandlesMu reserved for Tasks
-	// 5+ (handleStaleDetection / next-sample stale flag wiring); declaring
-	// them now keeps the Session struct shape stable across the staged
-	// online-change rollout.
 	versionStrategy   SymbolVersionStrategy
 	versionCallback   func(reason string)
 	maxReloadAttempts int
@@ -170,9 +166,7 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 		logger: slog.Default(),
 	}
 	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(context.Background()) //nolint:gosec // cancel stored in lifecycle.shutdown, called from Close
-	// FSM Phase 1 (shadow): explicit Constructed entry. Idempotent — state
-	// zero value already maps to SessionStateConstructed. Real transitions
-	// land in subsequent commits as readers/writers swap over.
+	// idempotent: zero state is Constructed already
 	sess.lifecycle.state.transitionTo(SessionStateConstructed)
 	// Online-change defaults (R-SES-011, R-CACHE-013). Applied before opts so
 	// callers can override. versionStrategy zero-value = SymbolVersionAutoReload
@@ -289,11 +283,10 @@ func (sess *Session) Connect(local bool) error {
 	sess.logger.Log(context.Background(), LevelTrace, "connected")
 	// Allocate the underlying Client and start its workers. Session and
 	// Client share the *transport pointer (no re-dial); the Client owns
-	// the listen / transmit / recvWorker goroutines from Phase 5.a-dial
-	// onward. handleNotification is installed via callback so cache-aware
-	// dispatch fires for inbound DeviceNotification packets, and
-	// triggerReconnect is installed as the on-drop hook so transport-down
-	// signals enter Session's reconnect FSM.
+	// the listen / transmit / recvWorker goroutines. handleNotification is
+	// installed via callback so cache-aware dispatch fires for inbound
+	// DeviceNotification packets, and triggerReconnect is installed as the
+	// on-drop hook so transport-down signals enter Session's reconnect FSM.
 	sess.client = &Client{
 		ip:             sess.ip,
 		port:           sess.port,
@@ -409,13 +402,10 @@ func (sess *Session) ensureRouteOnConnect() (registered bool, err error) {
 //
 // Strategy dispatch:
 //   - SymbolVersionIgnore: surface the error unchanged. Subsequent
-//     notification samples are flagged Stale by R-NOT-017 (Task 9).
+//     notification samples are flagged Stale by R-NOT-017.
 //   - SymbolVersionClose: terminate the session asynchronously
 //     (R-CACHE-011).
 //   - SymbolVersionAutoReload: trigger full reload + resub (R-CACHE-010).
-//     Placeholder until Task 7 fills it in.
-//
-// Validates: R-CACHE-009 dispatch.
 func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason string) {
 	stale, reason = detectStaleCache(rc)
 	if !stale {
@@ -429,20 +419,10 @@ func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason str
 	switch sess.versionStrategy {
 	case SymbolVersionIgnore:
 		// Mark all active notification handles stale — next sample for each
-		// handle will carry Update.Stale=true with this reason. Strategy
-		// surfaces the original error to the calling op via the existing
-		// errors.As intercept (Task 5).
-		// Lock order: notifications.lock → staleHandlesMu (acquired inside
-		// markSymbolStale). Never acquires cache.lock here (R-CACHE-008).
-		// Nil-guard: bare Session{} unit tests may construct without the
-		// notification manager; production NewConnection always sets it.
-		if sess.notifications != nil {
-			sess.notifications.lock.Lock()
-			for h := range sess.notifications.activeNotifications {
-				sess.markSymbolStale(h, reason)
-			}
-			sess.notifications.lock.Unlock()
-		}
+		// handle will carry Update.Stale=true with this reason. The original
+		// error surfaces to the calling op via the existing errors.As
+		// intercept.
+		sess.markAllHandlesStale(reason)
 	case SymbolVersionClose:
 		go sess.closeOnStaleDetection(reason)
 	case SymbolVersionAutoReload:
@@ -453,9 +433,7 @@ func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason str
 
 // markSymbolStale flags the next notification sample for handle h to be
 // delivered with Update.Stale=true and Update.Reason=reason. One-shot —
-// consumed on first delivery via consumeStaleFlag.
-//
-// Validates: R-NOT-017 (Ignore branch).
+// consumed on first delivery via consumeStaleFlag (R-NOT-017).
 func (sess *Session) markSymbolStale(handle uint32, reason string) {
 	sess.staleHandlesMu.Lock()
 	defer sess.staleHandlesMu.Unlock()
@@ -466,9 +444,7 @@ func (sess *Session) markSymbolStale(handle uint32, reason string) {
 }
 
 // consumeStaleFlag returns the pending stale reason for handle h and
-// clears the entry. Returns ("", false) if no pending flag.
-//
-// Validates: R-NOT-017.
+// clears the entry. Returns ("", false) if no pending flag (R-NOT-017).
 func (sess *Session) consumeStaleFlag(handle uint32) (string, bool) {
 	sess.staleHandlesMu.Lock()
 	defer sess.staleHandlesMu.Unlock()
@@ -479,16 +455,35 @@ func (sess *Session) consumeStaleFlag(handle uint32) (string, bool) {
 	return r, ok
 }
 
-// closeOnStaleDetection terminates the session under SymbolVersionClose.
-// Runs in its own goroutine to keep the calling Read/Write path
-// non-blocking.
+// markAllHandlesStale flags every active notification handle's next sample
+// with reason. Lock order: notifications.lock → staleHandlesMu (acquired
+// inside markSymbolStale). Never acquires cache.lock here (R-CACHE-008).
+//
+// Nil-guard: bare Session{} unit tests may construct without the
+// notification manager; production NewSession always sets it.
+func (sess *Session) markAllHandlesStale(reason string) {
+	if sess.notifications == nil {
+		return
+	}
+	sess.notifications.lock.Lock()
+	handles := make([]uint32, 0, len(sess.notifications.activeNotifications))
+	for h := range sess.notifications.activeNotifications {
+		handles = append(handles, h)
+	}
+	sess.notifications.lock.Unlock()
+	for _, h := range handles {
+		sess.markSymbolStale(h, reason)
+	}
+}
+
+// closeOnStaleDetection terminates the session under SymbolVersionClose
+// (R-CACHE-011). Runs in its own goroutine to keep the calling Read/Write
+// path non-blocking.
 //
 // Fires onDisconnect (in its own goroutine, per R-SES-007 non-blocking
 // contract) before Close() so observers see the lifecycle event even
-// though the termination is locally initiated. Skipped if the session
-// is already Closed (idempotent re-entry).
-//
-// Validates: R-CACHE-011.
+// though the termination is locally initiated. Skipped if the session is
+// already Closed (idempotent re-entry).
 func (sess *Session) closeOnStaleDetection(reason string) {
 	sess.logger.Info("Close strategy fired on stale-cache detection", "reason", reason)
 	if sess.onDisconnect != nil && !sess.isClosed() {
@@ -499,9 +494,8 @@ func (sess *Session) closeOnStaleDetection(reason string) {
 
 // tryRecordReloadAttempt prunes attempts outside the sliding window then
 // records a new attempt and returns true. Returns false when the cap is
-// exhausted within the window — caller MUST then degrade to Ignore.
-//
-// Validates: R-CACHE-013.
+// exhausted within the window — caller MUST then degrade to Ignore
+// (R-CACHE-013).
 func (sess *Session) tryRecordReloadAttempt() bool {
 	sess.reloadMu.Lock()
 	defer sess.reloadMu.Unlock()
@@ -522,15 +516,14 @@ func (sess *Session) tryRecordReloadAttempt() bool {
 }
 
 // autoReloadOnStaleDetection runs full re-discovery + resubscribe under
-// SymbolVersionAutoReload. Capped by R-CACHE-013 — on cap exhaustion, logs
-// WARN, fires callback with ReasonReloadCapExhausted, and degrades to
-// Ignore semantics for this call (no further reload attempts until window
-// slides out).
+// SymbolVersionAutoReload (R-CACHE-010). Capped by R-CACHE-013 — on cap
+// exhaustion, logs WARN, fires callback with ReasonReloadCapExhausted,
+// and degrades to Ignore semantics for this call (no further reload
+// attempts until window slides out).
 //
-// Sequence (R-CACHE-010): bumpEpoch → zero old handles → LoadSymbols →
-// resubscribeNotifications → fire onReconnect.
-//
-// Validates: R-CACHE-010.
+// Sequence: markAllHandlesStale(ReasonReloadInProgress) → bumpEpoch →
+// zero old handles → LoadSymbols → resubscribeNotifications →
+// fire onReconnect.
 func (sess *Session) autoReloadOnStaleDetection(reason string) {
 	if !sess.tryRecordReloadAttempt() {
 		sess.logger.Warn("reload cap exhausted - degrading to Ignore",
@@ -545,6 +538,12 @@ func (sess *Session) autoReloadOnStaleDetection(reason string) {
 		sess.logger.Debug("auto-reload skipped - session closed", "reason", reason)
 		return
 	}
+
+	// Mark surviving handles Stale during reload window — any sample that
+	// sneaks through the old handle pre-resubscribe carries
+	// Reason=ReasonReloadInProgress so consumers can distinguish in-flight
+	// from post-reload data.
+	sess.markAllHandlesStale(ReasonReloadInProgress)
 
 	sess.logger.Info("auto-reload starting", "reason", reason)
 	// Bump epoch first so any in-flight retry helpers observing epoch
@@ -786,9 +785,7 @@ func (sess *Session) Reconnect() error {
 
 	sess.logger.Info("attempting reconnect")
 	sess.tx.disconnected.Store(true)
-	// State is already Reconnecting (transitionToOnce above). The redundant
-	// transitionState call removed — Phase 1.1 wired it before the gate
-	// existed.
+	// State is already Reconnecting (transitionToOnce above).
 
 	// Clear active notifications (old handles invalid after reconnect).
 	sess.notifications.lock.Lock()
