@@ -118,14 +118,16 @@ for update := range ch {
 
 ## Example CLI
 
-A ready-to-run example is included:
+A ready-to-run example is included with two demo modes (Session-managed and
+raw Client). Selection is interactive by default, or via `ADS_DEMO`:
 
 ```bash
-cd examples/simple
-go run . -ip 192.168.1.100 -netid 5.1.2.3.1.1 -list
+cd examples/cli
+ADS_PLC_IP=192.168.1.100 ADS_TARGET_AMS=5.1.2.3.1.1 \
+ADS_SYMBOL_NAME=MAIN.bCounter ADS_DEMO=session go run .
 ```
 
-See `examples/simple/main.go` for all available flags.
+See `examples/cli/README.md` for the full env-var reference.
 
 ## Connection options
 
