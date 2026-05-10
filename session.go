@@ -125,8 +125,8 @@ type Session struct {
 	reloadWindow      time.Duration
 	reloadAttempts    []time.Time
 	reloadMu          sync.Mutex
-	staleHandles      map[uint32]string //nolint:unused // wired in Task 9
-	staleHandlesMu    sync.Mutex        //nolint:unused // wired in Task 9
+	staleHandles      map[uint32]string
+	staleHandlesMu    sync.Mutex
 
 	// Route registration config (populated by WithRoute / WithForceRouteRegistration).
 	route *routeManager
@@ -428,14 +428,55 @@ func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason str
 	}
 	switch sess.versionStrategy {
 	case SymbolVersionIgnore:
-		// Surface unchanged. Notification listener marks subsequent samples
-		// Stale per R-NOT-017 (wired in Task 9).
+		// Mark all active notification handles stale — next sample for each
+		// handle will carry Update.Stale=true with this reason. Strategy
+		// surfaces the original error to the calling op via the existing
+		// errors.As intercept (Task 5).
+		// Lock order: notifications.lock → staleHandlesMu (acquired inside
+		// markSymbolStale). Never acquires cache.lock here (R-CACHE-008).
+		// Nil-guard: bare Session{} unit tests may construct without the
+		// notification manager; production NewConnection always sets it.
+		if sess.notifications != nil {
+			sess.notifications.lock.Lock()
+			for h := range sess.notifications.activeNotifications {
+				sess.markSymbolStale(h, reason)
+			}
+			sess.notifications.lock.Unlock()
+		}
 	case SymbolVersionClose:
 		go sess.closeOnStaleDetection(reason)
 	case SymbolVersionAutoReload:
 		go sess.autoReloadOnStaleDetection(reason)
 	}
 	return true, reason
+}
+
+// markSymbolStale flags the next notification sample for handle h to be
+// delivered with Update.Stale=true and Update.Reason=reason. One-shot —
+// consumed on first delivery via consumeStaleFlag.
+//
+// Validates: R-NOT-017 (Ignore branch).
+func (sess *Session) markSymbolStale(handle uint32, reason string) {
+	sess.staleHandlesMu.Lock()
+	defer sess.staleHandlesMu.Unlock()
+	if sess.staleHandles == nil {
+		sess.staleHandles = map[uint32]string{}
+	}
+	sess.staleHandles[handle] = reason
+}
+
+// consumeStaleFlag returns the pending stale reason for handle h and
+// clears the entry. Returns ("", false) if no pending flag.
+//
+// Validates: R-NOT-017.
+func (sess *Session) consumeStaleFlag(handle uint32) (string, bool) {
+	sess.staleHandlesMu.Lock()
+	defer sess.staleHandlesMu.Unlock()
+	r, ok := sess.staleHandles[handle]
+	if ok {
+		delete(sess.staleHandles, handle)
+	}
+	return r, ok
 }
 
 // closeOnStaleDetection terminates the session under SymbolVersionClose.

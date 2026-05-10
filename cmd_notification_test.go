@@ -496,3 +496,101 @@ func TestNotification_TerminalZeroByteSample_TriggersDetection(t *testing.T) {
 		// expected: nothing on the channel
 	}
 }
+
+// Validates: R-NOT-016 + R-NOT-017 — Ignore strategy flags next sample
+// Stale=true, Reason=detected reason; flag is one-shot.
+func TestNotification_StaleFlag_OneShotAfterDetection(t *testing.T) {
+	sess := newTestConnection()
+	defer sess.lifecycle.shutdown()
+
+	ch := make(chan *Update, 4)
+	sym := &Symbol{
+		FullName: "MAIN.x", DataType: "INT", Length: 2, Notification: ch,
+	}
+	const handle uint32 = 7
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[handle] = sym
+	sess.notifications.lock.Unlock()
+	sess.cache.lock.Lock()
+	sess.cache.symbols[symbolKey(sym.FullName)] = sym
+	sess.cache.lock.Unlock()
+
+	// Mark stale (simulates prior R-CACHE-009 detection under Ignore).
+	sess.markSymbolStale(handle, ReasonSymbolVersionInvalid)
+
+	// First sample: must carry Stale=true.
+	pkt := buildNotificationPacket(handle, 0, []byte{0x01, 0x00})
+	if err := sess.drivePacket(sess.lifecycle.ctx, pkt); err != nil {
+		t.Fatalf("drivePacket #1: %v", err)
+	}
+	select {
+	case u := <-ch:
+		if !u.Stale || u.Reason != ReasonSymbolVersionInvalid {
+			t.Errorf("first sample: got Stale=%v Reason=%q, want Stale=true Reason=%q",
+				u.Stale, u.Reason, ReasonSymbolVersionInvalid)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no first sample")
+	}
+
+	// Second sample: flag consumed, must NOT be Stale.
+	pkt2 := buildNotificationPacket(handle, 0, []byte{0x02, 0x00})
+	if err := sess.drivePacket(sess.lifecycle.ctx, pkt2); err != nil {
+		t.Fatalf("drivePacket #2: %v", err)
+	}
+	select {
+	case u := <-ch:
+		if u.Stale || u.Reason != "" {
+			t.Errorf("second sample: got Stale=%v Reason=%q, want Stale=false Reason=\"\"",
+				u.Stale, u.Reason)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no second sample")
+	}
+}
+
+// Validates: R-CACHE-012 + R-NOT-017 — Ignore strategy detection marks ALL
+// active handles, not just the one that triggered detection.
+func TestNotification_StaleFlag_IgnoreMarksAllHandles(t *testing.T) {
+	sess := newTestConnection()
+	defer sess.lifecycle.shutdown()
+	sess.versionStrategy = SymbolVersionIgnore
+
+	const h1, h2 uint32 = 11, 22
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[h1] = &Symbol{FullName: "a"}
+	sess.notifications.activeNotifications[h2] = &Symbol{FullName: "b"}
+	sess.notifications.lock.Unlock()
+
+	// Trigger detection through the strategy dispatcher.
+	stale, reason := sess.handleStaleDetection(ReturnCodeDeviceSymbolVersionInvalid)
+	if !stale {
+		t.Fatal("expected stale=true")
+	}
+	if reason != ReasonSymbolVersionInvalid {
+		t.Fatalf("reason = %q, want %q", reason, ReasonSymbolVersionInvalid)
+	}
+
+	r1, ok1 := sess.consumeStaleFlag(h1)
+	r2, ok2 := sess.consumeStaleFlag(h2)
+	if !ok1 || r1 != ReasonSymbolVersionInvalid {
+		t.Errorf("h1: ok=%v reason=%q", ok1, r1)
+	}
+	if !ok2 || r2 != ReasonSymbolVersionInvalid {
+		t.Errorf("h2: ok=%v reason=%q", ok2, r2)
+	}
+}
+
+// Validates: consumeStaleFlag idempotency.
+func TestSession_ConsumeStaleFlag_IdempotentSecondCallEmpty(t *testing.T) {
+	sess := &Session{}
+	sess.markSymbolStale(99, ReasonSymbolNotFound)
+	r, ok := sess.consumeStaleFlag(99)
+	if !ok || r != ReasonSymbolNotFound {
+		t.Errorf("first consume: ok=%v r=%q", ok, r)
+	}
+	r2, ok2 := sess.consumeStaleFlag(99)
+	if ok2 || r2 != "" {
+		t.Errorf("second consume: ok=%v r=%q, want (false, \"\")", ok2, r2)
+	}
+}

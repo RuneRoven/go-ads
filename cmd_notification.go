@@ -256,6 +256,13 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 		Value:     value,
 		TimeStamp: notificationTime,
 	}
+	// R-NOT-016 / R-NOT-017: under SymbolVersionIgnore, R-CACHE-009 detection
+	// stamps all active handles into staleHandles. Consume the flag here —
+	// one-shot per handle, cleared on first delivered sample.
+	if reason, ok := sess.consumeStaleFlag(handle); ok {
+		updateStruct.Stale = true
+		updateStruct.Reason = reason
+	}
 	sess.deliverNotification(ctx, notification, updateStruct, handle, fullName)
 }
 
