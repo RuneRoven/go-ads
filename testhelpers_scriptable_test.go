@@ -2,6 +2,7 @@ package ads
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -480,8 +481,14 @@ func TestScriptableServer_Smoke(t *testing.T) {
 // to srv. The FSM is transitioned to Connected so isClosed/isReconnecting
 // short-circuits behave like a live session.
 //
+// Optional SessionOptions are applied after construction so tests can
+// override defaults (e.g. WithSymbolVersionStrategy, WithOnDisconnect).
+// lifecycle.ctx + lifecycle.shutdown are pre-initialised so sess.Close()
+// is safe to call from tests; autoReconnect defaults to false to avoid
+// spawning the Reconnect goroutine on disconnect.
+//
 // Caller is responsible for c.Close() at end of test (typically via t.Cleanup).
-func newWiredTestSession(t *testing.T, srv *scriptableServer) (*Session, *Client) {
+func newWiredTestSession(t *testing.T, srv *scriptableServer, opts ...SessionOption) (*Session, *Client) {
 	t.Helper()
 	c, err := Dial(srv.host, srv.port, AMSAddress{}, AMSAddress{}, 5*time.Second)
 	if err != nil {
@@ -497,9 +504,15 @@ func newWiredTestSession(t *testing.T, srv *scriptableServer) (*Session, *Client
 		lifecycle:     &sessionLifecycle{closedCh: make(chan struct{})},
 		logger:        getDefaultLogger(),
 	}
+	// Pre-init ctx/shutdown so sess.Close() is safe in test paths that
+	// exercise the close lifecycle (e.g. SymbolVersionClose strategy).
+	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(context.Background())
 	// Walk the FSM through Connecting → Connected so isClosed/isReconnecting
 	// readers see a live session. Direct atomic store keeps the test helper
 	// simple — production transitions go through transitionTo.
 	sess.lifecycle.state.value.Store(uint32(SessionStateConnected))
+	for _, opt := range opts {
+		opt(sess)
+	}
 	return sess, c
 }

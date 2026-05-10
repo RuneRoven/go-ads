@@ -370,3 +370,49 @@ func TestSession_HandleStaleDetection_NilCallbackOK(t *testing.T) {
 		t.Error("expected stale=true")
 	}
 }
+
+// TestSession_HandleStaleDetection_Close exercises the SymbolVersionClose
+// strategy end-to-end against a scriptable PLC stub: handleStaleDetection
+// must spawn closeOnStaleDetection in a goroutine, which fires the
+// onDisconnect callback and drives the FSM to Closed.
+//
+// Validates: R-CACHE-011 (Close strategy terminates session +
+// surfaces lifecycle event to observers).
+func TestSession_HandleStaleDetection_Close(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	disconnected := make(chan struct{})
+	sess, _ := newWiredTestSession(t, srv,
+		WithSymbolVersionStrategy(SymbolVersionClose),
+		WithOnDisconnect(func() { close(disconnected) }),
+	)
+
+	// Trigger detection synthetically. Close strategy fires
+	// closeOnStaleDetection in a goroutine, so the test must wait for the
+	// disconnect signal rather than asserting immediately.
+	stale, reason := sess.handleStaleDetection(ReturnCodeDeviceSymbolVersionInvalid)
+	if !stale || reason != ReasonSymbolVersionInvalid {
+		t.Errorf("handleStaleDetection = (%v, %q), want (true, %q)",
+			stale, reason, ReasonSymbolVersionInvalid)
+	}
+
+	select {
+	case <-disconnected:
+		// pass
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close strategy did not fire onDisconnect within 3s")
+	}
+
+	// closeOnStaleDetection invokes sess.Close() in the same goroutine as
+	// the onDisconnect callback. Close() runs synchronously, so once the
+	// callback has fired and Close() returns, isClosed() must report true.
+	// Allow a short grace window for the goroutine to finish Close().
+	deadline := time.Now().Add(2 * time.Second)
+	for !sess.isClosed() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !sess.isClosed() {
+		t.Error("session not in Closed state after Close strategy")
+	}
+}
