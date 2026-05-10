@@ -31,7 +31,8 @@ REPL commands:
 | `info <symbol>` | `Session.GetSymbol` — DataType, Length, Group, Offset, Comment |
 | `sub <symbol>` | `AddSymbolNotification` (background prints updates) |
 | `unsub <handle>` | `DeleteDeviceNotification` |
-| `reload` | `Session.RefreshSymbols` (manual reload) |
+| `reload` | `Session.RefreshSymbols` — fast single-shot reload (default `LoadSymbols`) |
+| `slow-load [chunk] [delay]` | `Session.LoadSymbolsSlow` — chunked download for large/slow PLCs (defaults: 4096 bytes, 100ms) |
 | `state` | `IsClosed`, `IsDisconnected`, cache count, active subs |
 | `help` / `?` | Command list |
 | `quit` / `exit` | Graceful shutdown |

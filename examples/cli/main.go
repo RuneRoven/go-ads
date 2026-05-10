@@ -233,6 +233,8 @@ func (r *repl) loop() {
 			r.cmdUnsub(args)
 		case "reload":
 			r.cmdReload()
+		case "slow-load":
+			r.cmdSlowLoad(args)
 		default:
 			fmt.Printf("unknown command: %s (type 'help')\n", cmd)
 		}
@@ -249,6 +251,7 @@ func printHelp() {
 	fmt.Println("  sub <symbol>               Subscribe to symbol on-change notifications")
 	fmt.Println("  unsub <handle>             Delete notification by handle")
 	fmt.Println("  reload                     RefreshSymbols (manual reload if version changed)")
+	fmt.Println("  slow-load [chunk] [delay]  Reload via chunked download (default: 4096 bytes, 100ms)")
 	fmt.Println("  state                      Show session state + cache + subscription counts")
 	fmt.Println("  help / ?                   Show this help")
 	fmt.Println("  quit / exit                Graceful shutdown")
@@ -426,6 +429,43 @@ func (r *repl) cmdReload() {
 	}
 	syms, _ := r.sess.ListSymbols()
 	fmt.Printf("  reload complete (%d symbols)\n", len(syms))
+}
+
+// cmdSlowLoad invokes Session.LoadSymbolsSlow for chunked symbol download.
+// Useful for large symbol tables on slow PLCs where single-shot LoadSymbols
+// times out or disrupts the real-time task.
+//
+// Usage: slow-load [chunkSize] [delayMs]
+//
+// Defaults: 4096 bytes per chunk, 100ms between chunks.
+func (r *repl) cmdSlowLoad(args []string) {
+	cfg := ads.SlowDiscoveryConfig{
+		ChunkSize:  4096,
+		ChunkDelay: 100 * time.Millisecond,
+	}
+	if len(args) >= 1 {
+		if v, err := strconv.ParseUint(args[0], 10, 32); err == nil {
+			cfg.ChunkSize = uint32(v)
+		} else {
+			fmt.Printf("  invalid chunkSize %q: %v\n", args[0], err)
+			return
+		}
+	}
+	if len(args) >= 2 {
+		if v, err := strconv.Atoi(args[1]); err == nil {
+			cfg.ChunkDelay = time.Duration(v) * time.Millisecond
+		} else {
+			fmt.Printf("  invalid delayMs %q: %v\n", args[1], err)
+			return
+		}
+	}
+	fmt.Printf("  loading symbols (chunkSize=%d, delay=%s)...\n", cfg.ChunkSize, cfg.ChunkDelay)
+	if err := r.sess.LoadSymbolsSlow(cfg); err != nil {
+		fmt.Printf("  slow-load failed: %v\n", err)
+		return
+	}
+	syms, _ := r.sess.ListSymbols()
+	fmt.Printf("  slow-load complete (%d symbols)\n", len(syms))
 }
 
 // baseTypeName maps an ADST_ code to its IEC name for the info command.
