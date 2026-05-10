@@ -156,23 +156,39 @@ func WithOnReconnect(fn func()) SessionOption {
 }
 
 // WithSymbolVersionStrategy selects the online-change handling strategy.
-// Default: SymbolVersionAutoReload. Values outside the enumeration are
-// rejected at Connect-time per R-SES-006.
+// Default: SymbolVersionAutoReload (zero-value, applies if option not set).
 //
-// Validates: R-SES-011.
+// Values outside the SymbolVersionAutoReload/Close/Ignore enumeration are
+// rejected at option-application time: a warning is logged and the strategy
+// falls back to AutoReload (R-SES-011).
 func WithSymbolVersionStrategy(s SymbolVersionStrategy) SessionOption {
 	return func(sess *Session) {
-		sess.versionStrategy = s
+		switch s {
+		case SymbolVersionAutoReload, SymbolVersionClose, SymbolVersionIgnore:
+			sess.versionStrategy = s
+		default:
+			if sess.logger != nil {
+				sess.logger.Warn("invalid SymbolVersionStrategy, using AutoReload",
+					"got", uint8(s))
+			}
+			sess.versionStrategy = SymbolVersionAutoReload
+		}
 	}
 }
 
 // WithMaxSymbolVersionReloadAttempts caps reload attempts under
-// SymbolVersionAutoReload within a sliding window. Default: 3. n<1 rejected.
+// SymbolVersionAutoReload within a sliding window. Default: 3. n<1 is
+// rejected (logged Warn, default kept).
 //
-// Validates: R-CACHE-013.
+// Note: unlike WithMaxReconnectAttempts (where n=0 means infinite), reload
+// attempts are intentionally bounded — runaway reload loops would hammer
+// the PLC under recurring online-change conditions (R-CACHE-013).
 func WithMaxSymbolVersionReloadAttempts(n int) SessionOption {
 	return func(sess *Session) {
 		if n < 1 {
+			if sess.logger != nil {
+				sess.logger.Warn("WithMaxSymbolVersionReloadAttempts: n<1 rejected, keeping current value", "n", n)
+			}
 			return
 		}
 		sess.maxReloadAttempts = n
@@ -180,12 +196,14 @@ func WithMaxSymbolVersionReloadAttempts(n int) SessionOption {
 }
 
 // WithSymbolVersionReloadWindow sets the sliding window for reload-attempt
-// counting. Default: 60s. d<=0 rejected.
-//
-// Validates: R-CACHE-013.
+// counting. Default: 60s. d<=0 is rejected (logged Warn, default kept)
+// (R-CACHE-013).
 func WithSymbolVersionReloadWindow(d time.Duration) SessionOption {
 	return func(sess *Session) {
 		if d <= 0 {
+			if sess.logger != nil {
+				sess.logger.Warn("WithSymbolVersionReloadWindow: d<=0 rejected, keeping current value", "d", d)
+			}
 			return
 		}
 		sess.reloadWindow = d
@@ -200,8 +218,6 @@ func WithSymbolVersionReloadWindow(d time.Duration) SessionOption {
 // signal for symbol-removed events: the dead handle's user channel goes
 // silent (no terminal Update). Surviving sibling handles still receive a
 // one-shot Stale=true Update; only the removed symbol's channel is mute.
-//
-// Validates: R-SES-011.
 func WithOnSymbolVersionChanged(fn func(reason string)) SessionOption {
 	return func(sess *Session) {
 		sess.versionCallback = fn

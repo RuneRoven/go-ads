@@ -1,6 +1,9 @@
 package ads
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -63,6 +66,30 @@ func TestWithSymbolVersionReloadWindow_RejectsZeroAndNeg(t *testing.T) {
 	WithSymbolVersionReloadWindow(-time.Second)(s)
 	if s.reloadWindow != 5*time.Second {
 		t.Errorf("d<0 should be rejected, got window = %v", s.reloadWindow)
+	}
+}
+
+// Validates: R-SES-011 — invalid strategy values fall back to AutoReload + log Warn.
+func TestWithSymbolVersionStrategy_InvalidFallsBack(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	s := &Session{logger: logger}
+	WithSymbolVersionStrategy(SymbolVersionStrategy(99))(s)
+	if s.versionStrategy != SymbolVersionAutoReload {
+		t.Errorf("strategy = %v, want fallback AutoReload", s.versionStrategy)
+	}
+	if !strings.Contains(buf.String(), "invalid SymbolVersionStrategy") {
+		t.Errorf("expected Warn log; got %q", buf.String())
+	}
+}
+
+// Validates: R-SES-011 — invalid strategy on bare Session{} (nil logger) is
+// the unit-test-friendly path: fallback applies, no panic.
+func TestWithSymbolVersionStrategy_InvalidNoLoggerNoPanic(t *testing.T) {
+	s := &Session{}
+	WithSymbolVersionStrategy(SymbolVersionStrategy(42))(s)
+	if s.versionStrategy != SymbolVersionAutoReload {
+		t.Errorf("strategy = %v, want fallback AutoReload", s.versionStrategy)
 	}
 }
 
