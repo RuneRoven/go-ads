@@ -12,6 +12,7 @@ import (
 // Verify that sending to a closed user channel does NOT panic the listen goroutine.
 // Go runtime panics on send-to-closed-channel regardless of select default,
 // so deliverNotification must guard with defer recover().
+// Validates: R-NOT-006.
 func TestDeliverNotification_ClosedChannelDoesNotPanic(t *testing.T) {
 	ch := make(chan *Update, 1)
 	close(ch)
@@ -30,6 +31,7 @@ func TestDeliverNotification_ClosedChannelDoesNotPanic(t *testing.T) {
 }
 
 // Verify normal happy-path delivery on an open buffered channel.
+// Validates: R-NOT-006.
 func TestDeliverNotification_DeliversOnOpenChannel(t *testing.T) {
 	ch := make(chan *Update, 1)
 	conn := &Session{logger: getDefaultLogger()}
@@ -49,6 +51,7 @@ func TestDeliverNotification_DeliversOnOpenChannel(t *testing.T) {
 }
 
 // Verify drop on full buffered channel (default branch of select fires).
+// Validates: R-NOT-006.
 func TestDeliverNotification_DropsWhenChannelFull(t *testing.T) {
 	ch := make(chan *Update, 1)
 	ch <- &Update{Variable: "filler"} // fill buffer
@@ -74,6 +77,7 @@ func TestDeliverNotification_DropsWhenChannelFull(t *testing.T) {
 // DeviceNotification parsing — binary packet tests
 // ==========================================================================
 
+// Validates: R-NOT-005, R-NOT-012.
 func TestDeviceNotification_SingleSample(t *testing.T) {
 	conn := newTestConnection()
 	defer conn.lifecycle.shutdown()
@@ -122,6 +126,7 @@ func TestDeviceNotification_SingleSample(t *testing.T) {
 	}
 }
 
+// Validates: R-NOT-007 (partial).
 func TestDeviceNotification_UnknownHandle(t *testing.T) {
 	conn := newTestConnection()
 	defer conn.lifecycle.shutdown()
@@ -138,6 +143,7 @@ func TestDeviceNotification_UnknownHandle(t *testing.T) {
 	}
 }
 
+// Validates: R-NOT-007.
 func TestDeviceNotification_UnknownHandleDuringClose(t *testing.T) {
 	handler := &testLogHandler{}
 	conn := newTestConnection()
@@ -168,6 +174,7 @@ func TestDeviceNotification_UnknownHandleDuringClose(t *testing.T) {
 	}
 }
 
+// Validates: R-NOT-007.
 func TestDeviceNotification_UnknownHandleNormalCondition(t *testing.T) {
 	handler := &testLogHandler{}
 	conn := newTestConnection()
@@ -193,6 +200,7 @@ func TestDeviceNotification_UnknownHandleNormalCondition(t *testing.T) {
 	}
 }
 
+// Validates: R-NOT-005 (partial).
 func TestDeviceNotification_MultipleStampsAndSamples(t *testing.T) {
 	conn := newTestConnection()
 	defer conn.lifecycle.shutdown()
@@ -254,6 +262,7 @@ func TestDeviceNotification_MultipleStampsAndSamples(t *testing.T) {
 	}
 }
 
+// Validates: R-CMD-007.
 func TestDeviceNotification_EmptyPacket(t *testing.T) {
 	conn := newTestConnection()
 	defer conn.lifecycle.shutdown()
@@ -265,6 +274,7 @@ func TestDeviceNotification_EmptyPacket(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestDeviceNotification_ZeroStamps(t *testing.T) {
 	conn := newTestConnection()
 	defer conn.lifecycle.shutdown()
@@ -280,6 +290,7 @@ func TestDeviceNotification_ZeroStamps(t *testing.T) {
 	}
 }
 
+// Validates: R-CMD-007 (sum-up).
 func TestDeviceNotification_SampleSizeExceedsData(t *testing.T) {
 	conn := newTestConnection()
 	defer conn.lifecycle.shutdown()
@@ -298,6 +309,7 @@ func TestDeviceNotification_SampleSizeExceedsData(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007 (BOOL).
 func TestDeviceNotification_BoolType(t *testing.T) {
 	conn := newTestConnection()
 	defer conn.lifecycle.shutdown()
@@ -323,6 +335,7 @@ func TestDeviceNotification_BoolType(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-005 + R-PARSE-007 (STRING).
 func TestDeviceNotification_StringType(t *testing.T) {
 	conn := newTestConnection()
 	defer conn.lifecycle.shutdown()

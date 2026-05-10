@@ -27,6 +27,7 @@ func craftSumReadResponse(errs []ReturnCode, dataLengths []uint32, data []byte) 
 // F-09: a malicious / buggy PLC sending lengths[i] = 0xFFFFFFFE must not cause
 // a negative int cast (32-bit Go) or huge make() allocation.
 // On 64-bit Go this is defense-in-depth; on 32-bit it is a real bug.
+// Validates: R-SUM-006.
 func TestParseSumReadResponse_LengthOverflow(t *testing.T) {
 	conn := &Session{logger: getDefaultLogger()}
 	conn.client = &Client{logger: conn.logger}
@@ -52,6 +53,7 @@ func TestParseSumReadResponse_LengthOverflow(t *testing.T) {
 
 // F-10: truncated response must emit an Error log so wire corruption is
 // distinguishable from genuine PLC errors.
+// Validates: R-SUM-006.
 func TestParseSumReadResponse_TruncationLogsError(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -87,6 +89,7 @@ func TestParseSumReadResponse_TruncationLogsError(t *testing.T) {
 // F-11: PLC oversizing one item's response shifts later items' offsets.
 // Defense: reject when lengths[i] > requests[i].Length even if total bytes
 // fit in the response.
+// Validates: R-SUM-006.
 func TestParseSumReadResponse_PerItemOversize(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -122,6 +125,7 @@ func TestParseSumReadResponse_PerItemOversize(t *testing.T) {
 
 // bestEffortDeleteNotifications returns 0 for an empty input slice and never
 // touches the network.
+// Validates: R-NOT-015.
 func TestBestEffortDeleteNotifications_Empty(t *testing.T) {
 	conn := &Session{logger: getDefaultLogger()}
 	conn.client = &Client{logger: conn.logger}
@@ -174,6 +178,7 @@ func TestSumReadOverflowGuard(t *testing.T) {
 
 // --- isSumCommandUnsupportedError ---
 
+// Validates: R-SUM-001/R-SUM-002 (partial).
 func TestIsSumCommandUnsupportedError(t *testing.T) {
 	tests := []struct {
 		err  error
@@ -197,6 +202,7 @@ func TestIsSumCommandUnsupportedError(t *testing.T) {
 
 // --- Sum probe state CAS ---
 
+// Validates: R-SUM-003.
 func TestSumProbeStateTransitions(t *testing.T) {
 	// Verify CAS 0→1 and 0→2 work, and second CAS is rejected
 	conn := Session{client: &Client{}}
@@ -232,6 +238,7 @@ func TestSumProbeStateTransitions(t *testing.T) {
 	}
 }
 
+// Validates: R-SUM-003 / R-LOCK-003.
 func TestSumProbeStateConcurrent(t *testing.T) {
 	// Concurrent CAS: only one goroutine should win
 	conn := Session{client: &Client{}}

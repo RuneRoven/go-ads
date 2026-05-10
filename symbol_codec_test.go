@@ -11,6 +11,7 @@ import (
 
 // F-16: int(symbol.Length) wraps on 32-bit Go. Validate symbol.Length against
 // data buffer size before arithmetic to prevent negative slice / huge alloc.
+// Validates: R-PARSE-006.
 func TestParse_RejectsOversizedSymbolLength(t *testing.T) {
 	data := make([]byte, 16)
 	sym := &Symbol{
@@ -28,6 +29,7 @@ func TestParse_RejectsOversizedSymbolLength(t *testing.T) {
 }
 
 // Happy path: an INT symbol with Length=2 parses normally.
+// Validates: R-PARSE-007.
 func TestParse_HappyPath_INT(t *testing.T) {
 	data := []byte{0x01, 0x00} // little-endian 1
 	sym := &Symbol{
@@ -46,6 +48,7 @@ func TestParse_HappyPath_INT(t *testing.T) {
 
 // F-17: STRING write with symbol.Length=0 must error rather than silently
 // produce a 0-byte payload to the PLC.
+// Validates: NO-SPEC strict.
 func TestWriteToNode_STRING_RejectsZeroLength(t *testing.T) {
 	sym := &Symbol{
 		Name:     "s",
@@ -60,6 +63,7 @@ func TestWriteToNode_STRING_RejectsZeroLength(t *testing.T) {
 
 // F-17: WSTRING write with symbol.Length<2 must error (need 2 bytes minimum
 // for the null terminator).
+// Validates: NO-SPEC strict.
 func TestWriteToNode_WSTRING_RejectsTooShort(t *testing.T) {
 	cases := []uint32{0, 1}
 	for _, length := range cases {
@@ -79,6 +83,7 @@ func TestWriteToNode_WSTRING_RejectsTooShort(t *testing.T) {
 // inferBaseType for unknown types, write must accept the same input and
 // round-trip it. Currently write errors on unknown types even when size
 // matches a known integer width.
+// Validates: NO-SPEC.
 func TestWriteToNode_FallsBackToInferredType(t *testing.T) {
 	// Unknown type with size=4 — read would fall back to DINT.
 	sym := &Symbol{
@@ -101,6 +106,7 @@ func TestWriteToNode_FallsBackToInferredType(t *testing.T) {
 
 // F-18: write must still error for sizes that don't match a known integer
 // width (no inference possible).
+// Validates: NO-SPEC.
 func TestWriteToNode_RejectsUnknownTypeWithUninferableSize(t *testing.T) {
 	sym := &Symbol{
 		Name:     "x",
@@ -114,6 +120,7 @@ func TestWriteToNode_RejectsUnknownTypeWithUninferableSize(t *testing.T) {
 }
 
 // Happy path: STRING with Length=10 truncates "hello world" to fit.
+// Validates: R-PARSE-003.
 func TestWriteToNode_STRING_HappyPath(t *testing.T) {
 	sym := &Symbol{
 		Name:     "s",
@@ -140,6 +147,7 @@ func TestWriteToNode_STRING_HappyPath(t *testing.T) {
 // Symbol.parse — basic types
 // ============================================================
 
+// Validates: R-PARSE-007.
 func TestSymbolParseBasicTypes(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -174,6 +182,7 @@ func TestSymbolParseBasicTypes(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007.
 func TestSymbolParseLREAL(t *testing.T) {
 	sym := &Symbol{DataType: "LREAL", Length: 8}
 	val, err := sym.parse(leF64(3.141592653589793), 0, nil)
@@ -182,6 +191,7 @@ func TestSymbolParseLREAL(t *testing.T) {
 	assertFloatApprox(t, f, 3.141592653589793, toleranceFloat64)
 }
 
+// Validates: NO-SPEC.
 func TestSymbolParseUnknownType(t *testing.T) {
 	// Use size 3 which doesn't match any standard integer size,
 	// so inferBaseType won't resolve it
@@ -196,6 +206,7 @@ func TestSymbolParseUnknownType(t *testing.T) {
 // writeToNode round-trip tests
 // ============================================================
 
+// Validates: R-PARSE-007 (write/read symmetry).
 func TestWriteToNodeRoundTrip(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -256,6 +267,7 @@ func TestWriteToNodeRoundTrip(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007.
 func TestWriteToNodeRoundTripFloat(t *testing.T) {
 	t.Run("REAL/3.14", func(t *testing.T) {
 		sym := &Symbol{DataType: "REAL", Length: 4}
@@ -276,6 +288,7 @@ func TestWriteToNodeRoundTripFloat(t *testing.T) {
 	})
 }
 
+// Validates: R-PARSE-001.
 func TestWriteToNodeStruct(t *testing.T) {
 	child1 := &Symbol{
 		Name:     "field1",
@@ -329,6 +342,7 @@ func TestWriteToNodeStruct(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-001.
 func TestWriteToNodeStructPartialFields(t *testing.T) {
 	child1 := &Symbol{Name: "x", FullName: "s.x", DataType: "BYTE", Length: 1, Offset: 0}
 	child2 := &Symbol{Name: "y", FullName: "s.y", DataType: "BYTE", Length: 1, Offset: 1}
@@ -350,6 +364,7 @@ func TestWriteToNodeStructPartialFields(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestWriteToNodeAliasResolution(t *testing.T) {
 	datatypes := map[string]SymbolUploadDataType{
 		"MyInt": {DataType: "INT"},
@@ -368,6 +383,7 @@ func TestWriteToNodeAliasResolution(t *testing.T) {
 // Post-F-18: write falls back to inferBaseType for unknown types when size
 // matches a known integer width (1/2/4/8). To keep error-path coverage on
 // unknown types, use a non-inferable size (3) so the fallback also rejects.
+// Validates: NO-SPEC.
 func TestWriteToNodeAliasWithoutDatatypes(t *testing.T) {
 	sym := &Symbol{DataType: "MyCustomType", Length: 3}
 	_, err := sym.writeToNode("42", nil)
@@ -376,6 +392,7 @@ func TestWriteToNodeAliasWithoutDatatypes(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestWriteToNodeUnknownType(t *testing.T) {
 	sym := &Symbol{DataType: "UNKNOWN_XYZ", Length: 3}
 	_, err := sym.writeToNode("42", map[string]SymbolUploadDataType{})
@@ -386,6 +403,7 @@ func TestWriteToNodeUnknownType(t *testing.T) {
 
 // --- parse error paths ---
 
+// Validates: R-PARSE-006.
 func TestSymbolParseDataTooShort(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -418,6 +436,7 @@ func TestSymbolParseDataTooShort(t *testing.T) {
 	}
 }
 
+// Validates: R-SYM-003 (partial).
 func TestSymbolParseSizeWrong(t *testing.T) {
 	// BOOL with 2 bytes should fail (size mismatch)
 	sym := &Symbol{DataType: "BOOL", Length: 2}
@@ -427,6 +446,7 @@ func TestSymbolParseSizeWrong(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestSymbolParseAliasResolution(t *testing.T) {
 	datatypes := map[string]SymbolUploadDataType{
 		"MyAlias": {DataType: "INT"},
@@ -448,6 +468,7 @@ func TestSymbolParseAliasResolution(t *testing.T) {
 
 // --- writeToNode error paths ---
 
+// Validates: NO-SPEC.
 func TestWriteToNodeInvalidValues(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -481,6 +502,7 @@ func TestWriteToNodeInvalidValues(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestWriteToNodeStructInvalidJSON(t *testing.T) {
 	parent := &Symbol{
 		Name: "s", FullName: "s", DataType: "ST_S", Length: 2,
@@ -498,6 +520,7 @@ func TestWriteToNodeStructInvalidJSON(t *testing.T) {
 // STRING edge cases
 // ==========================================================================
 
+// Validates: R-PARSE-005.
 func TestSymbolParseSTRING_NoNullTerminator(t *testing.T) {
 	// STRING buffer full with no null byte — should return entire buffer
 	sym := &Symbol{DataType: "STRING", Length: 5}
@@ -511,6 +534,7 @@ func TestSymbolParseSTRING_NoNullTerminator(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-005.
 func TestSymbolParseSTRING_Empty(t *testing.T) {
 	// Null byte at start — empty string
 	sym := &Symbol{DataType: "STRING", Length: 10}
@@ -524,6 +548,7 @@ func TestSymbolParseSTRING_Empty(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-005.
 func TestSymbolParseSTRING_TrailingGarbage(t *testing.T) {
 	// Null byte in middle, garbage after — should stop at null
 	sym := &Symbol{DataType: "STRING", Length: 10}
@@ -537,6 +562,7 @@ func TestSymbolParseSTRING_TrailingGarbage(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-003.
 func TestWriteToNodeSTRING_PadsWithZeros(t *testing.T) {
 	sym := &Symbol{DataType: "STRING", Length: 10}
 	data, err := sym.writeToNode("Hi", nil)
@@ -557,6 +583,7 @@ func TestWriteToNodeSTRING_PadsWithZeros(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-003.
 func TestWriteToNodeSTRING_ExactLength(t *testing.T) {
 	// STRING(5) → Length=6 (5 chars + null). Writing exactly 5 chars should fit.
 	sym := &Symbol{DataType: "STRING", Length: 6}
@@ -572,6 +599,7 @@ func TestWriteToNodeSTRING_ExactLength(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-003.
 func TestWriteToNodeSTRING_Overflow(t *testing.T) {
 	// STRING(3) → Length=4 (3 chars + null). "Hello" truncated to 3 chars + null.
 	sym := &Symbol{DataType: "STRING", Length: 4}
@@ -590,6 +618,7 @@ func TestWriteToNodeSTRING_Overflow(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-005.
 func TestSymbolParseSTRING_SpecialChars(t *testing.T) {
 	sym := &Symbol{DataType: "STRING", Length: 20}
 	data := make([]byte, 20)
@@ -607,6 +636,7 @@ func TestSymbolParseSTRING_SpecialChars(t *testing.T) {
 // REAL/LREAL special values (NaN, Inf, -Inf, -0, subnormal)
 // ============================================================
 
+// Validates: R-PARSE-007.
 func TestSymbolParseFloatSpecial(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -649,6 +679,7 @@ func TestSymbolParseFloatSpecial(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007.
 func TestWriteToNodeFloatSpecial(t *testing.T) {
 	t.Run("REAL/NaN", func(t *testing.T) {
 		sym := &Symbol{DataType: "REAL", Length: 4}
@@ -685,6 +716,7 @@ func TestWriteToNodeFloatSpecial(t *testing.T) {
 // DATE/TIME boundary values and aliases
 // ============================================================
 
+// Validates: R-PARSE-007.
 func TestSymbolParseTemporalTypes(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -717,6 +749,7 @@ func TestSymbolParseTemporalTypes(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007.
 func TestWriteToNodeTemporalRoundTrip(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -735,6 +768,7 @@ func TestWriteToNodeTemporalRoundTrip(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007.
 func TestWriteToNodeTemporalAliases(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -762,6 +796,7 @@ func TestWriteToNodeTemporalAliases(t *testing.T) {
 // Deeply nested struct parsing
 // ==========================================================================
 
+// Validates: R-PARSE-001.
 func TestParseNestedStructThreeLevels(t *testing.T) {
 	// ST_Inner { value: INT }
 	// ST_Middle { inner: ST_Inner, count: BYTE }
@@ -816,6 +851,7 @@ func TestParseNestedStructThreeLevels(t *testing.T) {
 // Struct write with nested children
 // ==========================================================================
 
+// Validates: R-PARSE-001.
 func TestWriteToNodeNestedStruct(t *testing.T) {
 	innerChild := &Symbol{Name: "val", FullName: "s.inner.val", DataType: "INT", Length: 2, Offset: 0}
 	inner := &Symbol{
@@ -848,6 +884,7 @@ func TestWriteToNodeNestedStruct(t *testing.T) {
 // WSTRING (UTF-16LE) parse/write tests
 // ==========================================================================
 
+// Validates: R-PARSE-007 (WSTRING).
 func TestParseWSTRING_ASCII(t *testing.T) {
 	text := "Hello"
 	raw := encodeUTF16LE(text)
@@ -866,6 +903,7 @@ func TestParseWSTRING_ASCII(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007 (WSTRING).
 func TestParseWSTRING_Unicode(t *testing.T) {
 	text := "日本語"
 	raw := encodeUTF16LE(text)
@@ -882,6 +920,7 @@ func TestParseWSTRING_Unicode(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007 (WSTRING).
 func TestParseWSTRING_NullTerminated(t *testing.T) {
 	// "Hi" followed by null terminator then garbage
 	raw := encodeUTF16LE("Hi")
@@ -903,6 +942,7 @@ func TestParseWSTRING_NullTerminated(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007 (WSTRING).
 func TestParseWSTRING_NoNullTerminator(t *testing.T) {
 	// Fill entire buffer with UTF-16 chars, no null
 	text := "ABCDE"
@@ -917,6 +957,7 @@ func TestParseWSTRING_NoNullTerminator(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007 (WSTRING).
 func TestParseWSTRING_Empty(t *testing.T) {
 	// Just null terminator
 	data := make([]byte, 10)
@@ -930,6 +971,7 @@ func TestParseWSTRING_Empty(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007 (WSTRING).
 func TestParseWSTRING_SurrogatePair(t *testing.T) {
 	// U+1F600 (😀) requires surrogate pair in UTF-16
 	text := "😀"
@@ -950,6 +992,7 @@ func TestParseWSTRING_SurrogatePair(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-004 / R-PARSE-007.
 func TestWriteWSTRING_ASCII(t *testing.T) {
 	sym := &Symbol{DataType: "WSTRING", Length: 20}
 	data, err := sym.writeToNode("Hello", nil)
@@ -974,6 +1017,7 @@ func TestWriteWSTRING_ASCII(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-004.
 func TestWriteWSTRING_Unicode(t *testing.T) {
 	sym := &Symbol{DataType: "WSTRING", Length: 20}
 	text := "日本語"
@@ -989,6 +1033,7 @@ func TestWriteWSTRING_Unicode(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-004.
 func TestWriteWSTRING_Truncation(t *testing.T) {
 	// Length 6 = room for 2 chars + null terminator (each 2 bytes)
 	sym := &Symbol{DataType: "WSTRING", Length: 6}
@@ -1012,6 +1057,7 @@ func TestWriteWSTRING_Truncation(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-004.
 func TestWriteWSTRING_RoundTrip(t *testing.T) {
 	texts := []string{"Hello", "日本語", "😀", "a", ""}
 	for _, text := range texts {
@@ -1041,6 +1087,7 @@ func TestWriteWSTRING_RoundTrip(t *testing.T) {
 // reads return data matching the declared DataType. Tests verify that
 // BitValue flag does NOT interfere with normal type parsing.
 
+// Validates: R-PARSE-007.
 func TestParseBitSymbol_True(t *testing.T) {
 	// Real bit symbol: DataType=BOOL, BitValue flag set
 	sym := &Symbol{DataType: "BOOL", Length: 1, Flags: SymbolFlagBitValue}
@@ -1054,6 +1101,7 @@ func TestParseBitSymbol_True(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007.
 func TestParseBitSymbol_False(t *testing.T) {
 	sym := &Symbol{DataType: "BOOL", Length: 1, Flags: SymbolFlagBitValue}
 	data := []byte{0x00}
@@ -1066,6 +1114,7 @@ func TestParseBitSymbol_False(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007.
 func TestWriteBitSymbol_True(t *testing.T) {
 	sym := &Symbol{DataType: "BOOL", Length: 1, Flags: SymbolFlagBitValue}
 	data, err := sym.writeToNode("true", nil)
@@ -1077,6 +1126,7 @@ func TestWriteBitSymbol_True(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007.
 func TestWriteBitSymbol_False(t *testing.T) {
 	sym := &Symbol{DataType: "BOOL", Length: 1, Flags: SymbolFlagBitValue}
 	data, err := sym.writeToNode("false", nil)
@@ -1090,6 +1140,7 @@ func TestWriteBitSymbol_False(t *testing.T) {
 
 // BitValue flag must NOT override parsing of non-BOOL types.
 // TC2 can set flag 0x0002 on UDINT, LREAL, etc.
+// Validates: R-PARSE-007.
 func TestBitValueFlag_DoesNotOverrideUDINT(t *testing.T) {
 	sym := &Symbol{DataType: "UDINT", Length: 4, Flags: SymbolFlagBitValue}
 	data := make([]byte, 4)
@@ -1103,6 +1154,7 @@ func TestBitValueFlag_DoesNotOverrideUDINT(t *testing.T) {
 	}
 }
 
+// Validates: R-PARSE-007.
 func TestBitValueFlag_DoesNotOverrideLREAL(t *testing.T) {
 	sym := &Symbol{DataType: "LREAL", Length: 8, Flags: SymbolFlagBitValue}
 	data := make([]byte, 8)
@@ -1116,6 +1168,7 @@ func TestBitValueFlag_DoesNotOverrideLREAL(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestReadBit_Extract(t *testing.T) {
 	// 0xA5 = 10100101
 	data := []byte{0xA5}
@@ -1130,6 +1183,7 @@ func TestReadBit_Extract(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestReadBit_AllPositions(t *testing.T) {
 	// 0xA5 = 10100101
 	data := []byte{0xA5}
@@ -1144,6 +1198,7 @@ func TestReadBit_AllPositions(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestWriteBit_Set(t *testing.T) {
 	data := []byte{0x00}
 	WriteBit(data, 3, true)
@@ -1152,6 +1207,7 @@ func TestWriteBit_Set(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestWriteBit_Clear(t *testing.T) {
 	data := []byte{0xFF}
 	WriteBit(data, 3, false)
@@ -1160,6 +1216,7 @@ func TestWriteBit_Clear(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestWriteBit_PreservesOthers(t *testing.T) {
 	// 0xA5 = 10100101, set bit 2 (already set) → no change
 	data := []byte{0xA5}
@@ -1176,6 +1233,7 @@ func TestWriteBit_PreservesOthers(t *testing.T) {
 
 // --- ADST_ BaseType parse paths ---
 
+// Validates: R-SYM-004.
 func TestParseWithBaseType_REAL(t *testing.T) {
 	// Symbol with unknown DataType but BaseType=ADST_REAL32 should parse as float
 	sym := &Symbol{
@@ -1198,6 +1256,7 @@ func TestParseWithBaseType_REAL(t *testing.T) {
 	}
 }
 
+// Validates: R-SYM-004.
 func TestParseWithBaseType_UDINT(t *testing.T) {
 	// Symbol with BaseType=ADST_UINT32 should parse as unsigned, not signed
 	sym := &Symbol{
@@ -1219,6 +1278,7 @@ func TestParseWithBaseType_UDINT(t *testing.T) {
 	}
 }
 
+// Validates: R-SYM-004.
 func TestParseWithBaseType_FallbackToInfer(t *testing.T) {
 	// BaseType=0 (ADST_VOID) → falls through to inferBaseType
 	sym := &Symbol{

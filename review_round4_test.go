@@ -8,6 +8,7 @@ import (
 // TestAddOffsetDepthCap verifies the recursion cap defends against malformed
 // PLC datatype tables that form a self-cycle (forbidden by IEC 61131-3 but
 // not enforced over the wire).
+// Validates: R-SYM-002.
 func TestAddOffsetDepthCap(t *testing.T) {
 	// Build a self-cycle: type "MyStruct" has a child of type "MyStruct".
 	// Real PLCs reject this at compile time; the wire response could in
@@ -42,6 +43,7 @@ func TestAddOffsetDepthCap(t *testing.T) {
 
 // TestCollectSubtreeDepthCap verifies the recursion cap on Symbol.Children
 // walks defends against tree corruption (cycle in Children map).
+// Validates: R-VIEW-004.
 func TestCollectSubtreeDepthCap(t *testing.T) {
 	// Build a Symbol cycle: A -> B -> A. addOffset cannot produce this in
 	// real cache data, but defensively we should not stack-overflow.
@@ -66,6 +68,7 @@ func TestCollectSubtreeDepthCap(t *testing.T) {
 // TestWSTRINGSurrogatePairTruncation verifies that truncation of a WSTRING
 // write that lands on a UTF-16 high surrogate drops the unpaired surrogate
 // instead of writing a malformed sequence to the PLC.
+// Validates: R-PARSE-004.
 func TestWSTRINGSurrogatePairTruncation(t *testing.T) {
 	// String with one BMP char followed by a non-BMP char (encodes as 2
 	// UTF-16 code units forming a surrogate pair).

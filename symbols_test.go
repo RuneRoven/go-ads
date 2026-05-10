@@ -643,6 +643,7 @@ func TestGetJSON_NumericOverflow(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestGetJSON_WSTRINGAsString(t *testing.T) {
 	sym := &Symbol{
 		Name:     "MyWString",
@@ -658,6 +659,7 @@ func TestGetJSON_WSTRINGAsString(t *testing.T) {
 
 // --- parseUploadSymbolInfoSymbols with real data ---
 
+// Validates: R-CACHE-006 (case-insensitive key).
 func TestParseUploadSymbolInfoSymbols_SingleSymbol(t *testing.T) {
 	// Build a minimal symbol entry: header + name + null + type + null + comment + null
 	name := []byte("MAIN.test")
@@ -725,6 +727,7 @@ func TestParseUploadSymbolInfoSymbols_SingleSymbol(t *testing.T) {
 	}
 }
 
+// Validates: R-CMD-007.
 func TestParseUploadSymbolInfoSymbols_TruncatedEntry(t *testing.T) {
 	// Only 10 bytes — not enough for a symbolEntry header
 	_, err := parseUploadSymbolInfoSymbols([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, nil)
@@ -735,6 +738,7 @@ func TestParseUploadSymbolInfoSymbols_TruncatedEntry(t *testing.T) {
 
 // --- symbolSumAddress ---
 
+// Validates: NO-SPEC.
 func TestSymbolSumAddress_PrefersHandleOverDirect(t *testing.T) {
 	// Handle-based addressing preferred for sum commands because direct
 	// process image addressing (0x4040) fails inside sum reads on some PLCs.
@@ -753,6 +757,7 @@ func TestSymbolSumAddress_PrefersHandleOverDirect(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestSymbolSumAddress_HandleOnlyNoGroup(t *testing.T) {
 	// Handle-based when Group is 0
 	sym := &Symbol{
@@ -770,6 +775,7 @@ func TestSymbolSumAddress_HandleOnlyNoGroup(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestSymbolSumAddress_DirectFallbackNoHandle(t *testing.T) {
 	// Falls back to direct group/offset when no handle is available
 	sym := &Symbol{
@@ -787,6 +793,7 @@ func TestSymbolSumAddress_DirectFallbackNoHandle(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestSymbolSumAddress_DirectFallbackChildAccumulatesOffset(t *testing.T) {
 	// Without handles, child symbols accumulate offsets from parent chain.
 	parent := &Symbol{
@@ -811,6 +818,7 @@ func TestSymbolSumAddress_DirectFallbackChildAccumulatesOffset(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC.
 func TestSymbolSumAddress_DirectFallbackNestedChild(t *testing.T) {
 	// Deeply nested symbol without handles: grandparent → parent → child
 	grandparent := &Symbol{
