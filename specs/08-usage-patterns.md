@@ -265,7 +265,7 @@ Examples (initial audit):
 These are real PLC limits. Library SHALL NOT attempt to compensate when compensation is impossible.
 
 ### Constraint 1: TwinCAT 2 doesn't support all sumup commands
-- Source: hardware test on TC2 (192.168.3.70) — 0xF085/F086 return 0x701.
+- Source: hardware test on TC2 — 0xF085/F086 return 0x701.
 - Library response: probe-and-fallback. R-SUM-003.
 
 ### Constraint 2: Notification handles are ephemeral per Connection
