@@ -176,9 +176,7 @@ func newTestConnection() *Session {
 
 // drivePacket feeds a wire-format DeviceNotification packet into the
 // Client.deviceNotification decoder, which then dispatches to
-// Session.handleNotification via the installed callback. Replaces the old
-// `conn.drivePacket(ctx, packet)` call after Phase 5.a-dial moved
-// the decoder onto Client.
+// Session.handleNotification via the installed callback.
 func (conn *Session) drivePacket(ctx context.Context, packet []byte) error {
 	return conn.client.deviceNotification(ctx, packet)
 }

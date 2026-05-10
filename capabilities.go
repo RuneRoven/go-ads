@@ -63,6 +63,6 @@ func (c *capabilities) ChunkedDownloadSupportedStore(v bool) {
 	c.chunkedDownloadSupported.Store(v)
 }
 
-// Reset is implicit after Phase 5.b.2: capabilities lives on *Client and a
-// fresh Client is allocated on every Connect / dialAndStart, so the
-// per-attempt struct value starts zeroed.
+// Reset is implicit: capabilities lives on *Client and a fresh Client is
+// allocated on every Connect / dialAndStart, so the per-attempt struct
+// value starts zeroed.

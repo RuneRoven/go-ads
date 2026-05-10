@@ -42,8 +42,8 @@ func stringToNetID(source string) (result [6]byte, err error) {
 	return
 }
 
-// encode is on *Client (Phase 5.b.0). Session callers reach it via
-// s.client.encode at the rare sites still on Session.
+// encode lives on *Client. Session callers reach it via s.client.encode
+// at the rare sites still on Session.
 func (c *Client) encode(command CommandID, data []byte, invokeID uint32) ([]byte, error) {
 	// Snapshot source under lock to avoid race with Session writing c.source
 	// during reconnect's auto-derive path. target is set at construction

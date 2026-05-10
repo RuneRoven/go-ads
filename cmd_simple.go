@@ -7,10 +7,10 @@ import (
 	"fmt"
 )
 
-// Single-symbol ADS commands on *Client (Phase 5.b.1):
-// Read, Write, WriteRead, ReadState, ReadDeviceInfo. Beckhoff-equivalent
-// thin RPC surface. Cache-aware Session methods (ReadFromSymbol etc.)
-// in symbol_access.go call s.client.Read/Write internally.
+// Single-symbol ADS commands on *Client: Read, Write, WriteRead,
+// ReadState, ReadDeviceInfo. Beckhoff-equivalent thin RPC surface.
+// Cache-aware Session methods (ReadFromSymbol etc.) in symbol_access.go
+// call s.client.Read/Write internally.
 
 func (c *Client) Read(group uint32, offset uint32, length uint32) (data []byte, err error) {
 	request := new(bytes.Buffer)

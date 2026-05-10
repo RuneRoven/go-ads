@@ -75,9 +75,6 @@ type notificationHandler func(ctx context.Context, handle uint32, timestamp uint
 // Lifetime states are exactly two: alive (Dial succeeded, Close not yet
 // called, transport not yet observed as dropped) and closed. Once closed,
 // every public method returns ErrTransportClosed.
-//
-// Phase 5.a-types: struct fields declared. Methods (Dial/Close/Read/Write/
-// notification dispatch) land in subsequent commits.
 type Client struct {
 	ip   string
 	port int
@@ -90,7 +87,7 @@ type Client struct {
 
 	tx *transport
 
-	capabilities capabilities //nolint:unused // Phase 5.b.2 migrates capability state onto Client.
+	capabilities capabilities //nolint:unused // capability state lives here, accessed via Client methods.
 
 	// notify is invoked from recvWorker when a DeviceNotification packet
 	// arrives. nil means raw Client (no dispatch). Session installs a
@@ -116,12 +113,6 @@ type Client struct {
 // Dial opens one TCP connection to ip:port, configures TCP keepalive, and
 // spawns the listen / transmit / recvWorker goroutines. Returns a usable
 // Client. See specs/09-fsm-design.md "Layer 2: Client (raw RPC)".
-//
-// Phase 5.a-dial: workers run on *Client. RPC methods (Read/Write/etc) and
-// sendRequest still live on *Session in this commit; they migrate one
-// cluster at a time during Phase 5.b. A raw Client constructed here can
-// receive notifications via WithNotificationHandler but cannot yet send
-// RPCs until 5.b.1 completes.
 func Dial(
 	ip string,
 	port int,

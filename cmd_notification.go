@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Single-symbol device-notification raw RPCs on *Client (Phase 5.b.2/3):
+// Single-symbol device-notification raw RPCs on *Client:
 // AddDeviceNotification, DeleteDeviceNotification. Notifs persistence
 // + activeNotifications cleanup is the Session's wrapper concern (see
 // Session.DeleteDeviceNotification below). The cache-aware
@@ -169,13 +169,13 @@ type NotificationSample struct {
 	Size   uint32
 }
 
-// DeviceNotification (ADS cmd 8) packet decoder migrated to *Client in
-// Phase 5.a-dial — see Client.deviceNotification. Session.handleNotification
-// below is the cache-aware handler installed via Client.SetNotificationHandler
-// from Session.Connect.
+// DeviceNotification (ADS cmd 8) packet decoder lives on *Client — see
+// Client.deviceNotification. Session.handleNotification below is the
+// cache-aware handler installed via Client.SetNotificationHandler from
+// Session.Connect.
 
 func (sess *Session) handleNotification(ctx context.Context, handle uint32, timestamp uint64, content []byte) {
-	// Phase 1: notifications.lock for handle lookup + symbol pointer/field snapshot.
+	// notifications.lock: handle lookup + symbol pointer/field snapshot.
 	sess.notifications.lock.Lock()
 	symbol, ok := sess.notifications.activeNotifications[handle]
 	if !ok {
@@ -209,9 +209,9 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 		timeStamp := int64(timestamp)/windowsTick - secToUnixEpoch
 		notificationTime = time.Unix(timeStamp, int64(timestamp)%(windowsTick)*100)
 	}
-	// Phase 2: cache.lock for parse() — Symbol fields live in cache.symbols
-	// and parse mutates Value/Valid. Lock ordering: cache after notifications
-	// release (never both held).
+	// cache.lock for parse() — Symbol fields live in cache.symbols and parse
+	// mutates Value/Valid. Lock ordering: cache after notifications release
+	// (never both held).
 	// Re-resolve via cache.symbols[FullName]: the symbol fetched from
 	// activeNotifications may be stranded post-reload (loadSymbols swapped
 	// the cache between subscribe and now), in which case parse with the
@@ -256,9 +256,7 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 		Value:     value,
 		TimeStamp: notificationTime,
 	}
-	// R-NOT-016 / R-NOT-017: under SymbolVersionIgnore, R-CACHE-009 detection
-	// stamps all active handles into staleHandles. Consume the flag here —
-	// one-shot per handle, cleared on first delivered sample.
+	// One-shot Stale flag (R-NOT-017): consume on first delivered sample.
 	if reason, ok := sess.consumeStaleFlag(handle); ok {
 		updateStruct.Stale = true
 		updateStruct.Reason = reason
