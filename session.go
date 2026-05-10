@@ -442,9 +442,17 @@ func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason str
 // Runs in its own goroutine to keep the calling Read/Write path
 // non-blocking.
 //
+// Fires onDisconnect (in its own goroutine, per R-SES-007 non-blocking
+// contract) before Close() so observers see the lifecycle event even
+// though the termination is locally initiated. Skipped if the session
+// is already Closed (idempotent re-entry).
+//
 // Validates: R-CACHE-011.
 func (sess *Session) closeOnStaleDetection(reason string) {
 	sess.logger.Info("Close strategy fired on stale-cache detection", "reason", reason)
+	if sess.onDisconnect != nil && !sess.isClosed() {
+		go sess.onDisconnect()
+	}
 	sess.Close()
 }
 
