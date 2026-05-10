@@ -194,6 +194,20 @@ func (sess *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (
 		return nil, fmt.Errorf("batch read failed: %w", err)
 	}
 
+	// R-CACHE-009: fire online-change detection for first stale per-item code.
+	// Once-per-batch semantics avoid callback amplification when N items in
+	// the same response carry the same stale code (R-SES-011 "once per
+	// detection").
+	for _, r := range results {
+		if r.Error == ReturnCodeNoErrors {
+			continue
+		}
+		if stale, _ := detectStaleCache(r.Error); stale {
+			sess.handleStaleDetection(r.Error)
+			break
+		}
+	}
+
 	values := make(map[string]string, len(results))
 	sess.cache.lock.Lock()
 	defer sess.cache.lock.Unlock()
@@ -288,6 +302,18 @@ func (sess *Session) writeMultipleSymbolsRetry(values map[string]string, retries
 			return sess.writeMultipleSymbolsRetry(values, retriesLeft-1)
 		}
 		return nil, fmt.Errorf("batch write failed: %w", err)
+	}
+
+	// R-CACHE-009: fire online-change detection for first stale per-item code.
+	// Once-per-batch semantics — see readMultipleSymbolsRetry for rationale.
+	for _, r := range results {
+		if r.Error == ReturnCodeNoErrors {
+			continue
+		}
+		if stale, _ := detectStaleCache(r.Error); stale {
+			sess.handleStaleDetection(r.Error)
+			break
+		}
 	}
 
 	codes := make(map[string]ReturnCode, len(results))

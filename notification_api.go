@@ -294,6 +294,20 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 		return results, fmt.Errorf("batch add notification failed: %w", err)
 	}
 
+	// R-CACHE-009: fire online-change detection for first stale per-item code.
+	// Once-per-batch semantics avoid callback amplification when multiple
+	// items in the same response carry the same stale code (R-SES-011
+	// "once per detection").
+	for _, r := range subResults {
+		if r.Error == ReturnCodeNoErrors {
+			continue
+		}
+		if stale, _ := detectStaleCache(r.Error); stale {
+			sess.handleStaleDetection(r.Error)
+			break
+		}
+	}
+
 	// Re-fetch *Symbol pointers under cache.lock before commit. Defends
 	// against a concurrent loadSymbols / online-change reload that swapped
 	// cache.symbols while we did the PLC roundtrip - the originally-resolved

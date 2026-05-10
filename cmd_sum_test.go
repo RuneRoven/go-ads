@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // craftSumReadResponse builds a byte response in the [N×(error,length)][data] format.
@@ -268,5 +269,173 @@ func TestSumProbeStateConcurrent(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("expected exactly 1 CAS winner, got %d", count)
+	}
+}
+
+// seedSymbol installs a minimal cache symbol entry so getSymbol short-circuits.
+// Length=1 + DataType="BOOL" parses cleanly; Handle is non-zero so getSymbol
+// skips the PLC GetHandleByName roundtrip.
+func seedSymbol(sess *Session, name string, handle uint32) {
+	sym := &Symbol{
+		FullName: name,
+		Handle:   handle,
+		Length:   1,
+		DataType: "BOOL",
+	}
+	sess.cache.symbols[symbolKey(name)] = sym
+}
+
+// TestSession_ReadMultipleSymbols_StaleDetection validates R-CACHE-009
+// detection in the sum-batch decode path: a per-item ReturnCode in the
+// stale-cache set (e.g. 0x711 SymbolVersionInvalid) must trigger
+// handleStaleDetection through the configured strategy callback even when
+// the batched roundtrip itself succeeded.
+//
+// Validates: R-CACHE-009 (sum-batch per-item detection wiring).
+func TestSession_ReadMultipleSymbols_StaleDetection(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	cbReason := make(chan string, 1)
+	sess, _ := newWiredTestSession(t, srv,
+		WithSymbolVersionStrategy(SymbolVersionIgnore),
+		WithOnSymbolVersionChanged(func(r string) {
+			select {
+			case cbReason <- r:
+			default:
+			}
+		}),
+	)
+	seedSymbol(sess, "MAIN.a", 0x1001)
+	seedSymbol(sess, "MAIN.b", 0x1002)
+
+	// SumReadEx2 (0xF084) handler: respond with one stale code + one OK.
+	// Response shape: [N × (error(4), length(4))][data].
+	srv.onWriteRead(GroupSumupReadEx2, func(_ []byte) []byte {
+		resp := craftSumReadResponse(
+			[]ReturnCode{ReturnCodeDeviceSymbolVersionInvalid, ReturnCodeNoErrors},
+			[]uint32{0, 1},
+			[]byte{0x00},
+		)
+		return resp
+	})
+
+	_, err := sess.ReadMultipleSymbols([]string{"MAIN.a", "MAIN.b"})
+	if err != nil {
+		t.Fatalf("ReadMultipleSymbols: %v", err)
+	}
+
+	select {
+	case got := <-cbReason:
+		if got != ReasonSymbolVersionInvalid {
+			t.Errorf("callback reason = %q, want %q", got, ReasonSymbolVersionInvalid)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("strategy callback did not fire within 2s for sum-batch stale code")
+	}
+}
+
+// TestSession_ReadMultipleSymbols_FiresCallbackOncePerBatch validates that
+// when N>1 items in a single batched response carry stale codes, the
+// strategy callback fires exactly ONCE (R-SES-011 "once per detection").
+// Verified via a buffered channel of size 1 and a drain check after a
+// short settle window.
+//
+// Validates: R-CACHE-009 + R-SES-011 (no callback amplification on batched ops).
+func TestSession_ReadMultipleSymbols_FiresCallbackOncePerBatch(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	// Buffer of 4 so a buggy implementation (one callback per stale item)
+	// would visibly fill the channel; correct impl pushes exactly 1.
+	calls := make(chan string, 4)
+	sess, _ := newWiredTestSession(t, srv,
+		WithSymbolVersionStrategy(SymbolVersionIgnore),
+		WithOnSymbolVersionChanged(func(r string) { calls <- r }),
+	)
+	seedSymbol(sess, "MAIN.a", 0x2001)
+	seedSymbol(sess, "MAIN.b", 0x2002)
+	seedSymbol(sess, "MAIN.c", 0x2003)
+
+	// Three stale codes — implementation must break after first.
+	srv.onWriteRead(GroupSumupReadEx2, func(_ []byte) []byte {
+		return craftSumReadResponse(
+			[]ReturnCode{
+				ReturnCodeDeviceSymbolVersionInvalid,
+				ReturnCodeDeviceSymbolVersionInvalid,
+				ReturnCodeDeviceSymbolNoFound,
+			},
+			[]uint32{0, 0, 0},
+			nil,
+		)
+	})
+
+	_, err := sess.ReadMultipleSymbols([]string{"MAIN.a", "MAIN.b", "MAIN.c"})
+	if err != nil {
+		t.Fatalf("ReadMultipleSymbols: %v", err)
+	}
+
+	// Wait for first callback.
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback did not fire at all within 2s")
+	}
+
+	// Settle window: any extra (buggy-amplified) callbacks would surface here.
+	select {
+	case extra := <-calls:
+		t.Fatalf("callback fired more than once per batch (got extra %q)", extra)
+	case <-time.After(150 * time.Millisecond):
+		// pass — no amplification
+	}
+}
+
+// TestSession_WriteMultipleSymbols_StaleDetection validates R-CACHE-009
+// detection in the SumWrite batch decode: a stale per-item code triggers
+// the strategy callback. SumWrite response is [N × error(4)] with no data
+// section, so this also exercises the bare-error-array decode path.
+//
+// Validates: R-CACHE-009 (SumWrite batch wiring).
+func TestSession_WriteMultipleSymbols_StaleDetection(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	cbReason := make(chan string, 1)
+	sess, _ := newWiredTestSession(t, srv,
+		WithSymbolVersionStrategy(SymbolVersionIgnore),
+		WithOnSymbolVersionChanged(func(r string) {
+			select {
+			case cbReason <- r:
+			default:
+			}
+		}),
+	)
+	seedSymbol(sess, "MAIN.a", 0x3001)
+	seedSymbol(sess, "MAIN.b", 0x3002)
+
+	// SumWrite (0xF081) response: N × uint32 per-item error codes.
+	srv.onWriteRead(GroupSumupWrite, func(_ []byte) []byte {
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint32(buf[0:], uint32(ReturnCodeDeviceSymbolVersionInvalid))
+		binary.LittleEndian.PutUint32(buf[4:], uint32(ReturnCodeNoErrors))
+		return buf
+	})
+
+	_, err := sess.WriteMultipleSymbols(map[string]string{
+		"MAIN.a": "true",
+		"MAIN.b": "false",
+	})
+	if err != nil {
+		t.Fatalf("WriteMultipleSymbols: %v", err)
+	}
+
+	select {
+	case got := <-cbReason:
+		if got != ReasonSymbolVersionInvalid {
+			t.Errorf("callback reason = %q, want %q", got, ReasonSymbolVersionInvalid)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("strategy callback did not fire within 2s for SumWrite stale code")
 	}
 }
