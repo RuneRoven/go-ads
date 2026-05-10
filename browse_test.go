@@ -17,6 +17,8 @@ import (
 // Run for each PLC:
 //
 //	set -a && source .env.integration && set +a && go test -tags integration -run TestBrowseAllSymbols -v -timeout 60s
+//
+// Validates: R-CACHE-001, R-VIEW-005.
 func TestBrowseAllSymbols(t *testing.T) {
 	conn := browseSetupConnection(t)
 

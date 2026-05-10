@@ -11,6 +11,8 @@ import (
 
 // F-15: PLC-controlled Elements with no sanity cap allows DoS via huge map allocation.
 // Cap at 1M entries per level. Reject and return empty map.
+//
+// Validates: R-SYM-002.
 func TestMakeArrayChildren_CapsExcessiveElements(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 0, Elements: 10_000_000}} // 10M
 	got := makeArrayChildren(levels, "INT", 20_000_000)
@@ -23,6 +25,8 @@ func TestMakeArrayChildren_CapsExcessiveElements(t *testing.T) {
 }
 
 // F-15: LBound + Elements that overflows uint32 must be rejected.
+//
+// Validates: R-SYM-002.
 func TestMakeArrayChildren_RejectsOverflowBound(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 0xFFFFFFF0, Elements: 0x20}} // overflows
 	got := makeArrayChildren(levels, "INT", 64)
@@ -35,6 +39,9 @@ func TestMakeArrayChildren_RejectsOverflowBound(t *testing.T) {
 }
 
 // Happy path: small array of 4 elements still works after the cap is added.
+//
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins makeArrayChildren happy-path output keys ("[0]".."[3]") for a 4-element array.
 func TestMakeArrayChildren_HappyPath(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 0, Elements: 4}}
 	got := makeArrayChildren(levels, "INT", 8) // 8 bytes / 4 = 2 bytes each
@@ -51,6 +58,8 @@ func TestMakeArrayChildren_HappyPath(t *testing.T) {
 
 // --- parseUploadSymbolInfoDataTypes ---
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins empty-buffer parse → empty map, no error.
 func TestParseUploadSymbolInfoDataTypes_Empty(t *testing.T) {
 	datatypes, err := parseUploadSymbolInfoDataTypes([]byte{})
 	if err != nil {
@@ -63,6 +72,8 @@ func TestParseUploadSymbolInfoDataTypes_Empty(t *testing.T) {
 
 // --- parseUploadSymbolInfoSymbols ---
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins empty-buffer symbol-list parse → empty map, no error.
 func TestParseUploadSymbolInfoSymbols_Empty(t *testing.T) {
 	symbols, err := parseUploadSymbolInfoSymbols([]byte{}, nil)
 	if err != nil {
@@ -75,6 +86,7 @@ func TestParseUploadSymbolInfoSymbols_Empty(t *testing.T) {
 
 // --- addOffset / addChildren ---
 
+// Validates: R-SYM-007.
 func TestAddOffsetEmptySegmentName(t *testing.T) {
 	parent := &Symbol{Name: "parent", FullName: "MAIN.parent"}
 	dt := &SymbolUploadDataType{
@@ -89,6 +101,7 @@ func TestAddOffsetEmptySegmentName(t *testing.T) {
 	}
 }
 
+// Validates: R-SYM-007.
 func TestAddOffsetFullNameWithDot(t *testing.T) {
 	parent := &Symbol{Name: "motor", FullName: "MAIN.motor"}
 	dt := &SymbolUploadDataType{
@@ -106,6 +119,7 @@ func TestAddOffsetFullNameWithDot(t *testing.T) {
 	}
 }
 
+// Validates: R-SYM-007.
 func TestAddOffsetArrayFullName(t *testing.T) {
 	// Array children have names like "[0]", "[1]" — should use parent.FullName (F-05 fix)
 	parent := &Symbol{Name: "arr", FullName: "MAIN.arr"}
@@ -126,6 +140,7 @@ func TestAddOffsetArrayFullName(t *testing.T) {
 	}
 }
 
+// Validates: R-SYM-008.
 func TestParseEnumNestedInStruct(t *testing.T) {
 	// Non-strict enum: TwinCAT includes enum constants as sub-items.
 	// Without the isEnumDataType guard, addOffset would expand these
@@ -251,6 +266,7 @@ func TestParseEnumNestedInStruct(t *testing.T) {
 	})
 }
 
+// Validates: R-SYM-008.
 func TestParseEnumWithoutDatatypes(t *testing.T) {
 	// When datatypes table is nil (on-demand mode), enum types should still
 	// parse by inferring the base type from the symbol's byte size.
@@ -304,6 +320,7 @@ func TestParseEnumWithoutDatatypes(t *testing.T) {
 	})
 }
 
+// Validates: R-SYM-008.
 func TestArrayTypedefNotMistakenForEnum(t *testing.T) {
 	// A typedef array like "TYPE MyInts : ARRAY[0..2] OF INT;" has
 	// Children (array elements) and DataType="INT" — same as an enum.
@@ -378,6 +395,8 @@ func TestArrayTypedefNotMistakenForEnum(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins addChildren utility — child Symbol added to parent map under FullName key.
 func TestAddChildren(t *testing.T) {
 	child := &Symbol{Name: "x", FullName: "s.x", DataType: "INT", Length: 2}
 	parent := &Symbol{
@@ -391,6 +410,8 @@ func TestAddChildren(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins addChildren no-clobber: pre-existing entry under same key is preserved.
 func TestAddChildrenNoDuplicates(t *testing.T) {
 	child := &Symbol{Name: "x", FullName: "s.x", DataType: "INT", Length: 2}
 	parent := &Symbol{
@@ -408,6 +429,8 @@ func TestAddChildrenNoDuplicates(t *testing.T) {
 
 // --- makeArrayChildren ---
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins 1-D 3-element array child generation (keys "[0]".."[2]").
 func TestMakeArrayChildren(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 0, Elements: 3}}
 	children := makeArrayChildren(levels, "INT", 6)
@@ -430,6 +453,8 @@ func TestMakeArrayChildren(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins makeArrayChildren on nil levels → empty map.
 func TestMakeArrayChildrenEmpty(t *testing.T) {
 	children := makeArrayChildren(nil, "INT", 6)
 	if len(children) != 0 {
@@ -437,6 +462,8 @@ func TestMakeArrayChildrenEmpty(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins makeArrayChildren key indexing offset by LBound (LBound=5 → "[5]","[6]").
 func TestMakeArrayChildrenNonZeroLBound(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 5, Elements: 2}}
 	children := makeArrayChildren(levels, "BYTE", 2)
@@ -448,6 +475,8 @@ func TestMakeArrayChildrenNonZeroLBound(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins 2-D array hierarchical child generation (outer dim has 3 sub-children each).
 func TestMakeArrayChildren_2D(t *testing.T) {
 	// ARRAY[0..1, 0..2] OF INT — 2x3 = 6 elements, 12 bytes total
 	levels := []datatypeArrayInfo{
@@ -473,6 +502,8 @@ func TestMakeArrayChildren_2D(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins 3-D array nested child generation (2x2x2 leaf shape).
 func TestMakeArrayChildren_3D(t *testing.T) {
 	// ARRAY[0..1, 0..1, 0..1] OF BYTE — 2x2x2 = 8 elements
 	levels := []datatypeArrayInfo{
@@ -501,6 +532,8 @@ func TestMakeArrayChildren_3D(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins zero-length array → empty children map.
 func TestMakeArrayChildren_ZeroElements(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 0, Elements: 0}}
 	children := makeArrayChildren(levels, "INT", 0)
@@ -511,6 +544,8 @@ func TestMakeArrayChildren_ZeroElements(t *testing.T) {
 
 // --- inferBaseType ---
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins size→base-type mapping (1→SINT, 2→INT, 4→DINT, 8→LINT; non-standard → "").
 func TestInferBaseType(t *testing.T) {
 	tests := []struct {
 		size uint32
@@ -534,6 +569,8 @@ func TestInferBaseType(t *testing.T) {
 
 // --- GetJSON ---
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins Sym.GetJSON for plain INT scalar (raw numeric literal, no quoting).
 func TestGetJSON(t *testing.T) {
 	sym := &Symbol{DataType: "INT", Length: 2, Value: "42"}
 	json := sym.GetJSON()
@@ -542,6 +579,8 @@ func TestGetJSON(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins BOOL JSON encoding (raw "true"/"false", no quoting).
 func TestGetJSONBool(t *testing.T) {
 	sym := &Symbol{DataType: "BOOL", Length: 1, Value: "true"}
 	json := sym.GetJSON()
@@ -550,6 +589,8 @@ func TestGetJSONBool(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins STRING JSON quoting (value wrapped in double-quotes).
 func TestGetJSONString(t *testing.T) {
 	sym := &Symbol{DataType: "STRING", Length: 20, Value: "hello"}
 	json := sym.GetJSON()
@@ -558,6 +599,8 @@ func TestGetJSONString(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins struct JSON encoding via nested-children traversal.
 func TestGetJSONStruct(t *testing.T) {
 	child := &Symbol{Name: "x", FullName: "s.x", DataType: "INT", Length: 2, Value: "10"}
 	parent := &Symbol{
@@ -570,6 +613,8 @@ func TestGetJSONStruct(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins empty STRING value → JSON empty-quoted string `""`.
 func TestGetJSON_EmptyValue(t *testing.T) {
 	sym := &Symbol{DataType: "STRING", Length: 10, Value: ""}
 	json := sym.GetJSON()
@@ -578,6 +623,9 @@ func TestGetJSON_EmptyValue(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins documented float64-lossy ULINT-max encoding (1.8446744073709552e+19);
+// flips when integer-as-string encoding lands.
 func TestGetJSON_NumericOverflow(t *testing.T) {
 	// GetJSON parses Value via strconv.ParseFloat then encodes as JSON
 	// number. For ULINT max (2^64-1) this is lossy: float64 rounds to

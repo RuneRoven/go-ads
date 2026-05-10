@@ -8,6 +8,8 @@ import (
 
 // --- stringToNetID ---
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins NetID parser semantics: six dot-separated decimal octets → [6]byte.
 func TestStringToNetID(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -33,6 +35,8 @@ func TestStringToNetID(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins NetID parser error paths (wrong segment count, non-numeric, out-of-range).
 func TestStringToNetIDErrors(t *testing.T) {
 	tests := []struct {
 		input string
@@ -56,6 +60,7 @@ func TestStringToNetIDErrors(t *testing.T) {
 
 // --- downgradeTransMode ---
 
+// Validates: R-NOT-011.
 func TestDowngradeTransMode(t *testing.T) {
 	tests := []struct {
 		input    TransMode
@@ -81,6 +86,8 @@ func TestDowngradeTransMode(t *testing.T) {
 
 // --- TransMode.String ---
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins TransMode Stringer output (ServerOnChange, ServerCycle2/CyclicInContext, Unknown(N)).
 func TestTransModeString(t *testing.T) {
 	if s := TransModeServerOnChange.String(); s != "ServerOnChange" {
 		t.Errorf("got %q, want %q", s, "ServerOnChange")
@@ -95,6 +102,7 @@ func TestTransModeString(t *testing.T) {
 
 // --- SymbolFlag ---
 
+// Validates: R-SYM-005.
 func TestSymbolFlagContextMask(t *testing.T) {
 	tests := []struct {
 		flags   SymbolFlag
@@ -116,6 +124,8 @@ func TestSymbolFlagContextMask(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins SymbolFlag.Has helper bit-test against TypeGuid / Attributes / ExtendedFlags bits.
 func TestSymbolFlagHas(t *testing.T) {
 	f := SymbolFlag(0x1008) // TypeGuid + Attributes
 	if !f.Has(SymbolFlagTypeGuid) {
@@ -129,6 +139,8 @@ func TestSymbolFlagHas(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins SymbolFlagBitValue detection (set, unset, combined with other flags).
 func TestSymbolFlagBitValue_Detection(t *testing.T) {
 	flags := SymbolFlag(0x0002)
 	if !flags.Has(SymbolFlagBitValue) {
@@ -147,6 +159,8 @@ func TestSymbolFlagBitValue_Detection(t *testing.T) {
 
 // --- ReturnCode.String ---
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins ReturnCode Stringer messages for representative no-error/global/device/client codes.
 func TestReturnCodeString(t *testing.T) {
 	tests := []struct {
 		code     ReturnCode
@@ -169,6 +183,8 @@ func TestReturnCodeString(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins ReturnCode satisfying the error interface with a non-empty Error() string.
 func TestReturnCodeError(t *testing.T) {
 	rc := ReturnCodeDeviceBusy
 	var err error = rc
@@ -177,6 +193,9 @@ func TestReturnCodeError(t *testing.T) {
 	}
 }
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Snapshots ReturnCode message text across global/router/device/client/RTime/TCP categories;
+// kept as snapshot so message changes are deliberate.
 func TestReturnCodeString_AllCategories(t *testing.T) {
 	tests := []struct {
 		code     ReturnCode
@@ -248,6 +267,7 @@ func TestReturnCodeString_AllCategories(t *testing.T) {
 
 // --- buildTag ---
 
+// Validates: R-ROUTE-001.
 func TestBuildTag(t *testing.T) {
 	tag := buildTag(7, []byte{192, 168, 1, 1, 1, 1})
 	if len(tag) != 10 {
@@ -265,6 +285,8 @@ func TestBuildTag(t *testing.T) {
 
 // --- appendNull ---
 
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins null-terminator append helper used by route tag builders.
 func TestAppendNull(t *testing.T) {
 	result := appendNull([]byte("hello"))
 	if len(result) != 6 {
@@ -285,6 +307,9 @@ func TestAppendNull(t *testing.T) {
 // implementation. A change in defs.go that drifts from PROTOCOL.md fails
 // here. (It is intentionally a snapshot test; cite PROTOCOL.md before
 // changing any value.)
+//
+// Validates: NO-SPEC (regression guard, awaiting spec backfill).
+// Pins the GroupIoImage* constant values against PROTOCOL.md§Process Image Groups.
 func TestProcessImageConstants(t *testing.T) {
 	tests := []struct {
 		name string
@@ -311,6 +336,7 @@ func TestProcessImageConstants(t *testing.T) {
 
 // --- ADST_ type code tests ---
 
+// Validates: R-SYM-004.
 func TestADSTypeToString(t *testing.T) {
 	tests := []struct {
 		code uint32

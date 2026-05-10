@@ -10,6 +10,8 @@ import (
 
 // F-24: parseRouteResponse must reject a response whose invokeID does not
 // match the expected value. This is the spoof defense.
+//
+// Validates: R-CMD-008.
 func TestParseRouteResponse_RejectsInvokeIdMismatch(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	resp := make([]byte, 24)
@@ -27,6 +29,8 @@ func TestParseRouteResponse_RejectsInvokeIdMismatch(t *testing.T) {
 }
 
 // F-24: parseRouteResponse must accept a response whose invokeID matches.
+//
+// Validates: R-CMD-008.
 func TestParseRouteResponse_AcceptsMatchingInvokeId(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	resp := make([]byte, 24)
@@ -42,6 +46,8 @@ func TestParseRouteResponse_AcceptsMatchingInvokeId(t *testing.T) {
 }
 
 // F-24: buildRoutePacket must encode the provided invokeID at offset 4.
+//
+// Validates: R-CMD-008.
 func TestBuildRoutePacket_EncodesInvokeId(t *testing.T) {
 	netId := [6]byte{1, 2, 3, 4, 5, 6}
 	pkt := buildRoutePacket(netId, "route", "host", "admin", "pwd", 0xABCDEF12)
@@ -56,6 +62,7 @@ func TestBuildRoutePacket_EncodesInvokeId(t *testing.T) {
 
 // --- buildRoutePacket ---
 
+// Validates: R-ROUTE-001.
 func TestBuildRoutePacket(t *testing.T) {
 	netID := [6]byte{192, 168, 1, 100, 1, 1}
 	packet := buildRoutePacket(netID, "TestRoute", "192.168.1.100", "Admin", "secret", 0)
@@ -120,6 +127,7 @@ func TestBuildRoutePacket(t *testing.T) {
 
 // --- parseRouteResponse ---
 
+// Validates: R-ROUTE-001.
 func TestParseRouteResponse_Success(t *testing.T) {
 	// Build a successful route response:
 	// cookie(4) + invokeID(4) + serviceId(4) + AmsAddr(8) + tagCount(4) + error tag
@@ -140,6 +148,7 @@ func TestParseRouteResponse_Success(t *testing.T) {
 	}
 }
 
+// Validates: R-ROUTE-001.
 func TestParseRouteResponse_ErrorCode(t *testing.T) {
 	resp := make([]byte, 32)
 	binary.LittleEndian.PutUint32(resp[0:], routeCookie)
@@ -155,6 +164,7 @@ func TestParseRouteResponse_ErrorCode(t *testing.T) {
 	}
 }
 
+// Validates: R-ROUTE-001.
 func TestParseRouteResponse_TooShort(t *testing.T) {
 	err := parseRouteResponse(getDefaultLogger(), []byte{1, 2, 3}, 0)
 	if err == nil {
@@ -162,6 +172,7 @@ func TestParseRouteResponse_TooShort(t *testing.T) {
 	}
 }
 
+// Validates: R-ROUTE-001.
 func TestParseRouteResponse_WrongCookie(t *testing.T) {
 	resp := make([]byte, 24)
 	binary.LittleEndian.PutUint32(resp[0:], 0xDEADBEEF) // wrong cookie
@@ -173,6 +184,7 @@ func TestParseRouteResponse_WrongCookie(t *testing.T) {
 	}
 }
 
+// Validates: R-ROUTE-001.
 func TestParseRouteResponse_WrongServiceID(t *testing.T) {
 	resp := make([]byte, 24)
 	binary.LittleEndian.PutUint32(resp[0:], routeCookie)

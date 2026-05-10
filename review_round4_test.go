@@ -115,70 +115,102 @@ func TestWSTRINGSurrogatePairTruncation(t *testing.T) {
 	}
 }
 
-// TestSumNotificationResultTriState pins the documented classification
-// rules for SumNotificationResult against synthetic struct values. It does
-// NOT drive the production AddSymbolNotifications path — a real end-to-end
-// test that exercises the four scenarios (success / PLC error / library
-// skip / TOCTOU race) requires Session-level stubbing scaffolding that
-// arrives in Tier 3 of the test audit. Until then this test serves as a
-// contract-documentation snapshot: the docstring on SumNotificationResult
-// MUST match these classification rules.
+// TestSumNotificationResultTriState drives the production
+// Session.AddSymbolNotifications path through the scriptable PLC stub
+// and asserts the three+TOCTOU classification of the
+// SumNotificationResult struct returned to the caller:
 //
-// Validates: R-NOT-009 / R-SUM-004 (contract documentation only;
-// production-path coverage TODO).
+//  1. success — Handle != 0, Error == NoErrors, Skipped == nil.
+//  2. PLC error — Handle == 0, Error != NoErrors, Skipped == nil.
+//  3. library skip (duplicate name in batch) — Skipped != nil.
+//  4. TOCTOU loss (PLC accepted, library found stranded *Symbol
+//     post-roundtrip) — Skipped != nil, Handle may be non-zero so
+//     caller must release.
+//
+// Validates: R-NOT-009 (per-config result contract) / R-SUM-004
+// (sum-batch tri-state).
 func TestSumNotificationResultTriState(t *testing.T) {
-	cases := []struct {
-		name        string
-		result      SumNotificationResult
-		wantSkipped bool
-		wantPLCErr  bool
-		wantSuccess bool
-	}{
-		{
-			name:        "success",
-			result:      SumNotificationResult{Handle: 42, Error: ReturnCodeNoErrors, Skipped: nil},
-			wantSuccess: true,
-		},
-		{
-			name:       "PLC error",
-			result:     SumNotificationResult{Handle: 0, Error: ReturnCodeDeviceError, Skipped: nil},
-			wantPLCErr: true,
-		},
-		{
-			name:        "library skipped (duplicate)",
-			result:      SumNotificationResult{Handle: 0, Skipped: errSentinel("dup")},
-			wantSkipped: true,
-		},
-		{
-			name:        "library skipped + PLC handle (TOCTOU loss)",
-			result:      SumNotificationResult{Handle: 99, Skipped: errSentinel("race")},
-			wantSkipped: true,
-		},
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	sess, _ := newWiredTestSession(t, srv)
+
+	// Three symbols cached up-front: x, y, z.
+	for _, name := range []string{"MAIN.x", "MAIN.y", "MAIN.z"} {
+		sess.cache.symbols[symbolKey(name)] = &Symbol{
+			FullName:    name,
+			DataType:    "INT",
+			Length:      2,
+			Handle:      0xA1B2C3D4, // any non-zero handle so symbolSumAddress takes the handle path
+			ContextMask: 0,
+		}
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			isSkipped := tc.result.Skipped != nil
-			isPLCErr := tc.result.Skipped == nil && tc.result.Error != ReturnCodeNoErrors
-			isSuccess := tc.result.Skipped == nil && tc.result.Error == ReturnCodeNoErrors
-			if isSkipped != tc.wantSkipped {
-				t.Errorf("skipped: got %v, want %v", isSkipped, tc.wantSkipped)
-			}
-			if isPLCErr != tc.wantPLCErr {
-				t.Errorf("PLC error: got %v, want %v", isPLCErr, tc.wantPLCErr)
-			}
-			if isSuccess != tc.wantSuccess {
-				t.Errorf("success: got %v, want %v", isSuccess, tc.wantSuccess)
-			}
-			// TOCTOU-loss case: Skipped non-nil AND Handle non-zero means
-			// caller must release the PLC-side registration.
-			if isSkipped && tc.result.Handle != 0 {
-				t.Logf("caller would call DeleteDeviceNotification(%d) for cleanup", tc.result.Handle)
-			}
+
+	// Sum-add response: per-item shape based on inbound count. Item 0
+	// (x) succeeds with handle 0x1001. Item 1 (y) returns PLC error.
+	// Item 2 (z) succeeds with handle 0x1003 — but the test mutates
+	// the cache mid-handler so the post-roundtrip re-fetch finds the
+	// orphan and reports Skipped+Handle (TOCTOU race).
+	srv.onWriteRead(GroupSumupAddDeviceNotification, func(req []byte) []byte {
+		// Mid-roundtrip: delete z from the cache so the post-roundtrip
+		// re-resolve fails for that handle, triggering the TOCTOU branch.
+		sess.cache.lock.Lock()
+		delete(sess.cache.symbols, symbolKey("MAIN.z"))
+		sess.cache.lock.Unlock()
+		return buildSumAddNotifPayload([]sumNotifResponse{
+			{Handle: 0x1001, Error: ReturnCodeNoErrors},
+			{Handle: 0, Error: ReturnCodeDeviceInvalidParam},
+			{Handle: 0x1003, Error: ReturnCodeNoErrors},
 		})
+	})
+	// bestEffortDelete uses SumDelete for the orphan release.
+	srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(req []byte) []byte {
+		nItems := len(req) / 4
+		codes := make([]ReturnCode, nItems)
+		for i := range codes {
+			codes[i] = ReturnCodeNoErrors
+		}
+		return buildSumDeleteNotifPayload(codes)
+	})
+
+	ch := make(chan *Update, 4)
+	configs := []NotificationConfig{
+		{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange},
+		// Library-skip case: duplicate name within the batch.
+		{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange},
+		{SymbolName: "MAIN.y", TransmissionMode: TransModeServerOnChange},
+		{SymbolName: "MAIN.z", TransmissionMode: TransModeServerOnChange},
+	}
+
+	results, err := sess.AddSymbolNotifications(configs, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotifications: %v", err)
+	}
+	if len(results) != len(configs) {
+		t.Fatalf("got %d results, want %d", len(results), len(configs))
+	}
+
+	// Assert: configs[0] success
+	r0 := results[0]
+	if r0.Skipped != nil || r0.Error != ReturnCodeNoErrors || r0.Handle == 0 {
+		t.Errorf("config[0] (success): got Handle=%d Error=%v Skipped=%v",
+			r0.Handle, r0.Error, r0.Skipped)
+	}
+	// Assert: configs[1] library-skip duplicate (Skipped != nil)
+	r1 := results[1]
+	if r1.Skipped == nil {
+		t.Errorf("config[1] (duplicate): Skipped should be non-nil; got %+v", r1)
+	}
+	// Assert: configs[2] PLC error (Skipped nil, Error != NoErrors, Handle == 0)
+	r2 := results[2]
+	if r2.Skipped != nil || r2.Error == ReturnCodeNoErrors || r2.Handle != 0 {
+		t.Errorf("config[2] (PLC error): got Handle=%d Error=%v Skipped=%v",
+			r2.Handle, r2.Error, r2.Skipped)
+	}
+	// Assert: configs[3] TOCTOU loss (Skipped != nil, Handle non-zero from
+	// the PLC because the cache vanished mid-roundtrip — caller MUST
+	// release this handle on the PLC side via DeleteDeviceNotification).
+	r3 := results[3]
+	if r3.Skipped == nil {
+		t.Errorf("config[3] (TOCTOU): Skipped should be non-nil; got %+v", r3)
 	}
 }
-
-// errSentinel is a tiny helper to build named errors for table-driven tests.
-type errSentinel string
-
-func (e errSentinel) Error() string { return string(e) }
