@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -189,4 +190,71 @@ func TestReconnect_CloseDuringDial_NoWaitGroupMisuse(t *testing.T) {
 	}
 	// Wait the waitGroup — should be a no-op since we never Add'd.
 	sess.lifecycle.waitGroup.Wait()
+}
+
+// TestReconnectExhaustsMaxAttemptsTransitionsToClosed verifies that when
+// Reconnect() exhausts maxReconnectAttempts, the FSM transitions to Closed
+// rather than staying stuck in Reconnecting.
+//
+// A synthetic Session is used so no real TCP dial occurs. The session is
+// pre-wired with an unreachable ip/port so dialAndStart fails immediately,
+// and the lifecycle fields that tearDownAndReset needs are properly initialised.
+//
+// Validates: max-attempts exhaustion → FSM Closed (not stuck Reconnecting).
+func TestReconnectExhaustsMaxAttemptsTransitionsToClosed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	sess := &Session{
+		ip:   "127.0.0.1",
+		port: 1, // port 1 is always refused on loopback — instant TCP RST
+		tx: &transport{
+			sendChannel:    make(chan []byte),
+			systemResponse: make(chan []byte, 1),
+			recvQueue:      make(chan []byte, recvQueueSize),
+			activeRequests: map[uint32]chan []byte{},
+		},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
+		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
+		logger:        getDefaultLogger(),
+		lifecycle: &sessionLifecycle{
+			closedCh:             make(chan struct{}),
+			autoReconnect:        false,
+			maxReconnectAttempts: 1,
+			backoffConfig: BackoffConfig{
+				InitialInterval: 1 * time.Millisecond,
+				InitialAttempts: 10,
+				MidInterval:     1 * time.Millisecond,
+				MidAttempts:     10,
+				SlowInterval:    1 * time.Millisecond,
+				SlowAttempts:    10,
+				MaxInterval:     1 * time.Millisecond,
+			},
+			ctx:      ctx,
+			shutdown: cancel,
+		},
+		requestTimeout: 200 * time.Millisecond,
+	}
+	// Drive FSM to Disconnected so Reconnect() can transition to Reconnecting.
+	sess.lifecycle.state.transitionTo(SessionStateConstructed)
+	sess.lifecycle.state.transitionTo(SessionStateConnecting)
+	sess.lifecycle.state.transitionTo(SessionStateConnected)
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+
+	reconnErr := sess.Reconnect()
+	if reconnErr == nil {
+		t.Fatal("expected Reconnect() to return error after max attempts")
+	}
+
+	state := sess.lifecycle.state.load()
+	if state != SessionStateClosed {
+		t.Fatalf("FSM state = %v, want Closed after max attempts exhausted", state)
+	}
+
+	// closedCh must be closed (non-blocking receive succeeds).
+	select {
+	case <-sess.lifecycle.closedCh:
+		// expected
+	default:
+		t.Fatal("closedCh not closed after max attempts exhausted")
+	}
 }

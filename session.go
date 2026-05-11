@@ -804,6 +804,18 @@ func (sess *Session) Reconnect() error {
 		}
 		attempts++
 		if sess.lifecycle.maxReconnectAttempts > 0 && attempts > sess.lifecycle.maxReconnectAttempts {
+			sess.logger.Error("max reconnect attempts exhausted, closing session",
+				"maxAttempts", sess.lifecycle.maxReconnectAttempts, "error", lastErr)
+			// Transition FSM to Closed so future Reconnect() calls are rejected
+			// instead of silently no-op'ing on the stuck Reconnecting state.
+			// Use transitionToOnce so a concurrent Close() wins cleanly — if it
+			// already transitioned, closedCh is already closed and we must not
+			// close it again.
+			if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateClosed); ok {
+				// Close closedCh to unblock goroutines blocking on reconnectSleep
+				// or waitForReconnect. reconnectDone is closed by the defer above.
+				close(sess.lifecycle.closedCh)
+			}
 			return fmt.Errorf("reconnect failed after %d attempts: %w", sess.lifecycle.maxReconnectAttempts, lastErr)
 		}
 
