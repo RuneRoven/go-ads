@@ -153,7 +153,7 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 		},
 		tx: &transport{
 			sendChannel:    make(chan []byte),
-			systemResponse: make(chan []byte),
+			systemResponse: make(chan []byte, 1),
 			recvQueue:      make(chan []byte, recvQueueSize),
 			activeRequests: map[uint32]chan []byte{},
 		},
@@ -1044,7 +1044,7 @@ func (sess *Session) tearDownAndReset(resetFeatureFlags bool) {
 	sess.lifecycle.ctxMu.Unlock()
 	sess.tx.chanMu.Lock()
 	sess.tx.sendChannel = make(chan []byte)
-	sess.tx.systemResponse = make(chan []byte)
+	sess.tx.systemResponse = make(chan []byte, 1)
 	sess.tx.recvQueue = make(chan []byte, recvQueueSize)
 	sess.tx.chanMu.Unlock()
 	sess.tx.activeRequestLock.Lock()

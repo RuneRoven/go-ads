@@ -132,7 +132,7 @@ func Dial(
 		logger:         slog.Default(),
 		tx: &transport{
 			sendChannel:    make(chan []byte),
-			systemResponse: make(chan []byte),
+			systemResponse: make(chan []byte, 1),
 			recvQueue:      make(chan []byte, recvQueueSize),
 			activeRequests: map[uint32]chan []byte{},
 		},

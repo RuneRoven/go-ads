@@ -1078,3 +1078,27 @@ func TestWithOnDrop_RegistersCallback(t *testing.T) {
 		t.Fatal("WithOnDrop callback did not fire via callOnDrop")
 	}
 }
+
+func TestSystemResponseChannelIsBuffered(t *testing.T) {
+	// systemResponse must be buffered (cap >= 1) so a system packet arriving
+	// outside a send() window does not stall the listen worker (R-TX-007).
+	host, port, stop := startStubTCPServer(t)
+	defer stop()
+
+	target := AMSAddress{NetID: [6]byte{127, 0, 0, 1, 1, 1}, Port: 851}
+	source := AMSAddress{NetID: [6]byte{127, 0, 0, 1, 1, 1}, Port: 30000}
+
+	c, err := Dial(host, port, target, source, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close() //nolint:errcheck
+
+	c.tx.chanMu.Lock()
+	chanCap := cap(c.tx.systemResponse)
+	c.tx.chanMu.Unlock()
+
+	if chanCap < 1 {
+		t.Fatalf("systemResponse channel capacity = %d, want >= 1", chanCap)
+	}
+}
