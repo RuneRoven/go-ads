@@ -25,7 +25,7 @@ type sumCmdSpec[Req any, Res any] struct {
 	group                 Group
 	itemWriteSize         int
 	itemReadSize          int
-	encode                func(buf []byte, req Req)
+	encode                func(buf []byte, req Req) error
 	decode                func(resp []byte, n int) ([]Res, error)
 	fallback              func(requests []Req) ([]Res, error)
 }
@@ -47,7 +47,9 @@ func executeSumCommand[Req any, Res any](c *Client, spec sumCmdSpec[Req, Res], r
 	n := len(requests)
 	writeData := make([]byte, n*spec.itemWriteSize)
 	for i, req := range requests {
-		spec.encode(writeData[i*spec.itemWriteSize:(i+1)*spec.itemWriteSize], req)
+		if err := spec.encode(writeData[i*spec.itemWriteSize:(i+1)*spec.itemWriteSize], req); err != nil {
+			return nil, fmt.Errorf("encode item %d: %w", i, err)
+		}
 	}
 	readLen := uint32(n * spec.itemReadSize)
 	resp, err := c.WriteRead(uint32(spec.group), uint32(n), readLen, writeData)
@@ -411,14 +413,23 @@ func (c *Client) SumAddDeviceNotification(requests []SumNotificationRequest) ([]
 		group:                 GroupSumupAddDeviceNotification,
 		itemWriteSize:         40, // Group + Offset + Length + TransMode + MaxDelay + CycleTime + 16 reserved
 		itemReadSize:          8,  // error(4) + handle(4)
-		encode: func(buf []byte, req SumNotificationRequest) {
+		encode: func(buf []byte, req SumNotificationRequest) error {
+			maxDelayTicks, err := durationToADSTicks(req.MaxDelay, "MaxDelay")
+			if err != nil {
+				return err
+			}
+			cycleTimeTicks, err := durationToADSTicks(req.CycleTime, "CycleTime")
+			if err != nil {
+				return err
+			}
 			binary.LittleEndian.PutUint32(buf[0:], req.Group)
 			binary.LittleEndian.PutUint32(buf[4:], req.Offset)
 			binary.LittleEndian.PutUint32(buf[8:], req.Length)
 			binary.LittleEndian.PutUint32(buf[12:], uint32(req.TransmissionMode))
-			binary.LittleEndian.PutUint32(buf[16:], uint32(req.MaxDelay.Nanoseconds()/100))
-			binary.LittleEndian.PutUint32(buf[20:], uint32(req.CycleTime.Nanoseconds()/100))
+			binary.LittleEndian.PutUint32(buf[16:], maxDelayTicks)
+			binary.LittleEndian.PutUint32(buf[20:], cycleTimeTicks)
 			// bytes 24-39 reserved (already zero)
+			return nil
 		},
 		decode: func(resp []byte, n int) ([]SumNotificationResult, error) {
 			items := make([]SumNotificationResult, n)
@@ -448,8 +459,9 @@ func (c *Client) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, er
 		group:                 GroupSumupDeleteDeviceNotification,
 		itemWriteSize:         4, // handle
 		itemReadSize:          4, // error
-		encode: func(buf []byte, h uint32) {
+		encode: func(buf []byte, h uint32) error {
 			binary.LittleEndian.PutUint32(buf, h)
+			return nil
 		},
 		decode: func(resp []byte, n int) ([]ReturnCode, error) {
 			out := make([]ReturnCode, n)

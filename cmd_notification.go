@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -14,6 +15,19 @@ import (
 // Session.DeleteDeviceNotification below). The cache-aware
 // handleNotification dispatcher (installed via Client.SetNotificationHandler)
 // also lives in this file because it shares Update / handle bookkeeping.
+
+// durationToADSTicks converts a time.Duration to ADS 100ns tick units (uint32).
+// Returns an error if d is negative or exceeds the ADS 32-bit limit (~429.5 s).
+func durationToADSTicks(d time.Duration, name string) (uint32, error) {
+	if d < 0 {
+		return 0, fmt.Errorf("%s must be non-negative, got %v", name, d)
+	}
+	ticks := d.Nanoseconds() / 100
+	if ticks > math.MaxUint32 {
+		return 0, fmt.Errorf("%s exceeds ADS 32-bit 100ns limit (~429.5s), got %v", name, d)
+	}
+	return uint32(ticks), nil
+}
 
 // AddDeviceNotification registers a device notification with the PLC and
 // returns the PLC-assigned handle. Raw RPC: no Session-side persistence.
@@ -36,13 +50,21 @@ func (c *Client) AddDeviceNotification(
 		CycleTime        uint32
 		Reserved         [16]byte
 	}
+	maxDelayTicks, err := durationToADSTicks(maxDelay, "maxDelay")
+	if err != nil {
+		return 0, err
+	}
+	cycleTimeTicks, err := durationToADSTicks(cycleTime, "cycleTime")
+	if err != nil {
+		return 0, err
+	}
 	content := addDeviceNotificationCommandPacket{
 		group,
 		offset,
 		length,
 		uint32(transmissionMode),
-		uint32(maxDelay.Nanoseconds() / 100),  // ADS uses 100ns units (1ms = 10000)
-		uint32(cycleTime.Nanoseconds() / 100), // ADS uses 100ns units (1ms = 10000)
+		maxDelayTicks,
+		cycleTimeTicks,
 		[16]byte{},
 	}
 	if err = binary.Write(request, binary.LittleEndian, content); err != nil {
