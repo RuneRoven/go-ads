@@ -164,7 +164,6 @@ func (c *Client) WriteRead(group uint32, offset uint32, readLength uint32, send 
 	return respBuff.Next(int(response.Length)), nil
 }
 
-// ReadStateResponse - ADS command id: 4
 // States holds the ADS and device state returned by ReadState.
 type States struct {
 	ADSState    ADSState
@@ -187,7 +186,7 @@ func (c *Client) ReadState() (response States, err error) {
 	stateResponse := &readStateResponse{}
 	buff := bytes.NewBuffer(resp)
 	if err = binary.Read(buff, binary.LittleEndian, stateResponse); err != nil {
-		return response, err
+		return response, fmt.Errorf("failed to parse ReadState response: %w", err)
 	}
 	if stateResponse.Error > 0 {
 		return response, fmt.Errorf("ADS error in ReadState: %w", stateResponse.Error)
