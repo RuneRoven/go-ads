@@ -45,6 +45,9 @@ func AddRemoteRoute(remoteHost string, localNetID [6]byte, routeName string, com
 
 // AddRemoteRouteWithLogger is like AddRemoteRoute but accepts an explicit logger.
 func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
+	if logger == nil {
+		logger = getDefaultLogger()
+	}
 	logger.Info("registering route",
 		"remoteHost", remoteHost,
 		"localNetID", fmt.Sprintf("%d.%d.%d.%d.%d.%d", localNetID[0], localNetID[1], localNetID[2], localNetID[3], localNetID[4], localNetID[5]),

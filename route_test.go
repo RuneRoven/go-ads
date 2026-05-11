@@ -195,3 +195,16 @@ func TestParseRouteResponse_WrongServiceID(t *testing.T) {
 		t.Error("expected error for wrong serviceId")
 	}
 }
+
+// F-25: AddRemoteRouteWithLogger must not panic when logger is nil.
+// A nil logger must be replaced by getDefaultLogger() before first use.
+func TestAddRemoteRouteWithLoggerNilLogger(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panicked with nil logger: %v", r)
+		}
+	}()
+	// unreachable host → network error, not panic
+	err := AddRemoteRouteWithLogger(nil, "127.0.0.1", [6]byte{}, "route", "host", "user", "pass")
+	_ = err
+}
