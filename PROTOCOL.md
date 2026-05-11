@@ -1033,7 +1033,7 @@ important implications for containerized deployments.
 AMS NetID (`ADS_LOCAL_AMS`) are both optional.
 
 ```go
-conn, _ := NewConnection(ctx, plcIP, 48898, targetAMS, 851, "auto", 10500, 5*time.Second,
+conn, _ := NewSession(ctx, plcIP, 48898, targetAMS, 851, "auto", 10500, 5*time.Second,
     WithRoute("my-route", "Administrator", "password"),
 )
 conn.Connect(false)
