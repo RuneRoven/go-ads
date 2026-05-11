@@ -140,7 +140,7 @@ Per Beckhoff: try newest commands first, fall back on "not supported" errors. Th
 
 Each sum command category has its own `atomic.Uint32`:
 
-```
+```text
 0 = unchecked
 1 = supported (use the modern command)
 2 = unsupported (use the fallback path)
@@ -320,7 +320,7 @@ TCP keepalive: idle=3s, interval=2s, count=5 → detection within ~13 seconds.
 
 ### FSM transitions
 
-```
+```text
 Constructed → Connecting → Connected
                               │
                               ├──→ Reloading (online change AutoReload) ──┐
