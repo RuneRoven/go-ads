@@ -439,3 +439,39 @@ func TestSession_WriteMultipleSymbols_StaleDetection(t *testing.T) {
 		t.Fatal("strategy callback did not fire within 2s for SumWrite stale code")
 	}
 }
+
+// TestSumReadFallback_PreservesADSReturnCode validates that sumReadFallback
+// propagates the real ADS ReturnCode from c.Read rather than masking it
+// with ReturnCodeDeviceError. This is required so that
+// readMultipleSymbolsRetry can detect stale-cache codes (e.g.
+// ReturnCodeDeviceSymbolVersionInvalid) in per-item results.
+//
+// Validates: fallback error preservation (fix for sumReadFallback masking).
+func TestSumReadFallback_PreservesADSReturnCode(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	// Register a Read handler for an arbitrary group that returns the stale code.
+	const testGroup Group = 0xABCD1234
+	srv.onRead(testGroup, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeDeviceSymbolVersionInvalid, nil
+	})
+
+	c, err := Dial(srv.host, srv.port, AMSAddress{}, AMSAddress{}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	reqs := []SumReadRequest{{Group: uint32(testGroup), Offset: 0, Length: 4}}
+	results, err := c.sumReadFallback(reqs)
+	if err != nil {
+		t.Fatalf("sumReadFallback returned unexpected top-level error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].Error != ReturnCodeDeviceSymbolVersionInvalid {
+		t.Errorf("results[0].Error = %v, want ReturnCodeDeviceSymbolVersionInvalid", results[0].Error)
+	}
+}

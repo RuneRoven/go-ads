@@ -2,6 +2,7 @@ package ads
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -277,7 +278,12 @@ func (c *Client) sumReadFallback(requests []SumReadRequest) ([]SumReadResult, er
 	for i, req := range requests {
 		data, err := c.Read(req.Group, req.Offset, req.Length)
 		if err != nil {
-			results[i].Error = ReturnCodeDeviceError
+			var rc ReturnCode
+			if errors.As(err, &rc) {
+				results[i].Error = rc
+			} else {
+				results[i].Error = ReturnCodeDeviceError
+			}
 			c.logger.Warn("individual read failed in SumRead fallback", "error", err, "index", i)
 		} else {
 			results[i].Error = ReturnCodeNoErrors
