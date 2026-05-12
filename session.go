@@ -661,15 +661,9 @@ func (sess *Session) Close() {
 	sess.lifecycle.ctxMu.RLock()
 	sess.lifecycle.shutdown()
 	sess.lifecycle.ctxMu.RUnlock()
-	// Close the TCP connection to unblock listen() which may be stuck in ReadFull.
-	// SetLinger(0) causes the kernel to send RST instead of FIN, skipping
-	// TIME_WAIT on both sides. Safe here because all ADS cleanup commands have
-	// already been sent above; RST discards only the empty post-cleanup window.
+	// Close the TCP connection to unblock listen() which may be stuck in ReadFull
 	sess.tx.connMu.Lock()
 	if sess.tx.connection != nil {
-		if tc, ok := sess.tx.connection.(*net.TCPConn); ok {
-			_ = tc.SetLinger(0)
-		}
 		sess.tx.connection.Close()
 	}
 	sess.tx.connMu.Unlock()
@@ -1076,9 +1070,6 @@ func (sess *Session) tearDownAndReset(resetFeatureFlags bool) {
 	sess.lifecycle.ctxMu.RUnlock()
 	sess.tx.connMu.Lock()
 	if sess.tx.connection != nil {
-		if tc, ok := sess.tx.connection.(*net.TCPConn); ok {
-			_ = tc.SetLinger(0)
-		}
 		sess.tx.connection.Close()
 	}
 	sess.tx.connMu.Unlock()
