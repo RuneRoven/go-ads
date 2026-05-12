@@ -656,12 +656,13 @@ func TestParseUploadSymbolInfoSymbols_SingleSymbol(t *testing.T) {
 		TypeLength:    uint16(len(dt)),
 		CommentLength: uint16(len(comment)),
 	}
-	// EntryLength = sizeof(symbolEntry) + name + 1 + dt + 1 + comment + 1
-	entryLen := 26 + len(name) + 1 + len(dt) + 1 + len(comment) + 1
+	// EntryLength = sizeof(symbolEntry[binary]) + name + 1 + dt + 1 + comment + 1
+	// binary.Write packs symbolEntry to 30 bytes (6×uint32 + 3×uint16)
+	entryLen := 30 + len(name) + 1 + len(dt) + 1 + len(comment) + 1
 	entry.EntryLength = uint32(entryLen)
 
 	buf := make([]byte, 0, entryLen)
-	b := make([]byte, 26)
+	b := make([]byte, 30)
 	binary.LittleEndian.PutUint32(b[0:], entry.EntryLength)
 	binary.LittleEndian.PutUint32(b[4:], entry.IGroup)
 	binary.LittleEndian.PutUint32(b[8:], entry.IOffs)
@@ -865,4 +866,35 @@ func TestAddOffsetDepthCap(t *testing.T) {
 	}
 	// The cap fires partway down; depth 256 produces ~256 nested children
 	// before the warn-and-return. Sanity check we didn't blow the stack.
+}
+
+func TestParseUploadSymbolInfoSymbols_EntryLengthTooShort(t *testing.T) {
+	// Build a symbol entry where EntryLength is smaller than the actual
+	// bytes consumed by the fixed-size header + name/type/comment.
+	// symbolEntry is 30 bytes; NameLength=5, TypeLength=4, CommentLength=0.
+	// Actual consumed = 30 + 5+1 + 4+1 + 0+1 = 42 bytes.
+	// Set EntryLength = 10 (too short) to trigger skip < 0.
+	buf := new(bytes.Buffer)
+	entry := symbolEntry{
+		EntryLength:   10, // intentionally too small
+		IGroup:        0x4020,
+		IOffs:         0,
+		Size:          4,
+		DataType:      0,
+		Flags:         0,
+		NameLength:    5,
+		TypeLength:    4,
+		CommentLength: 0,
+	}
+	_ = binary.Write(buf, binary.LittleEndian, entry)
+	buf.WriteString("MyVar") // name (5 bytes)
+	buf.WriteByte(0)         // null terminator
+	buf.WriteString("DINT")  // type (4 bytes)
+	buf.WriteByte(0)         // null terminator
+	buf.WriteByte(0)         // comment null terminator
+
+	_, err := parseUploadSymbolInfoSymbols(buf.Bytes(), nil)
+	if err == nil {
+		t.Fatal("expected error for EntryLength shorter than bytes consumed, got nil")
+	}
 }

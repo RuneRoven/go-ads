@@ -367,6 +367,10 @@ func parseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUpload
 		addChildren(symbol, symbols)
 
 		skip := int(item.SymbolEntry.EntryLength) - (begBuff - endBuff)
+		if skip < 0 {
+			return nil, fmt.Errorf("symbol %q: EntryLength %d is smaller than bytes consumed %d",
+				item.Name, item.SymbolEntry.EntryLength, begBuff-endBuff)
+		}
 		if skip > 0 {
 			buff.Next(skip)
 		}
