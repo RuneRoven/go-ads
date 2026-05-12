@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"runtime"
 	"strconv"
@@ -1100,5 +1101,27 @@ func TestSystemResponseChannelIsBuffered(t *testing.T) {
 
 	if chanCap < 1 {
 		t.Fatalf("systemResponse channel capacity = %d, want >= 1", chanCap)
+	}
+}
+
+func TestReadProcessInputBit_ByteOffsetOverflow(t *testing.T) {
+	c := &Client{}
+	_, err := c.ReadProcessInputBit(math.MaxUint32, 0)
+	if err == nil {
+		t.Fatal("expected error for byteOffset that overflows uint32*8, got nil")
+	}
+	if !strings.Contains(err.Error(), "overflow") && !strings.Contains(err.Error(), "byteOffset") {
+		t.Errorf("expected overflow error mentioning overflow or byteOffset, got: %v", err)
+	}
+}
+
+func TestWriteProcessOutputBit_ByteOffsetOverflow(t *testing.T) {
+	c := &Client{}
+	err := c.WriteProcessOutputBit(math.MaxUint32, 0, true)
+	if err == nil {
+		t.Fatal("expected error for byteOffset that overflows uint32*8, got nil")
+	}
+	if !strings.Contains(err.Error(), "overflow") && !strings.Contains(err.Error(), "byteOffset") {
+		t.Errorf("expected overflow error mentioning overflow or byteOffset, got: %v", err)
 	}
 }

@@ -3,6 +3,7 @@ package ads
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 )
 
 // Process Image I/O
@@ -44,7 +45,11 @@ func (c *Client) ReadProcessInputBit(byteOffset uint32, bitIndex uint8) (bool, e
 	if bitIndex > 7 {
 		return false, fmt.Errorf("bitIndex must be 0-7, got %d", bitIndex)
 	}
-	data, err := c.Read(uint32(GroupIoImageRwix), byteOffset*8+uint32(bitIndex), 1)
+	bitOffset := uint64(byteOffset)*8 + uint64(bitIndex)
+	if bitOffset > math.MaxUint32 {
+		return false, fmt.Errorf("byteOffset %d overflow: bit address %d exceeds uint32 max", byteOffset, bitOffset)
+	}
+	data, err := c.Read(uint32(GroupIoImageRwix), uint32(bitOffset), 1)
 	if err != nil {
 		return false, err
 	}
@@ -64,7 +69,11 @@ func (c *Client) WriteProcessOutputBit(byteOffset uint32, bitIndex uint8, value 
 	if value {
 		v = 1
 	}
-	return c.Write(uint32(GroupIoImageRwox), byteOffset*8+uint32(bitIndex), []byte{v})
+	bitOffset := uint64(byteOffset)*8 + uint64(bitIndex)
+	if bitOffset > math.MaxUint32 {
+		return fmt.Errorf("byteOffset %d overflow: bit address %d exceeds uint32 max", byteOffset, bitOffset)
+	}
+	return c.Write(uint32(GroupIoImageRwox), uint32(bitOffset), []byte{v})
 }
 
 // ReadProcessInputSize returns the size of the input process image in bytes.
