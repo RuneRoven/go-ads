@@ -776,7 +776,23 @@ func (sess *Session) triggerReconnect() {
 // Uses configurable backoff (see WithBackoff) with fast initial retries and
 // progressive slowdown. Backoff resets on each successful reconnect.
 func (sess *Session) Reconnect() error {
+	// closeReconnectDone closes the reconnectDone channel if still open and
+	// nils it. Mutex + nil-check is safe against concurrent callers — only
+	// the first observer of a non-nil channel closes it.
+	closeReconnectDone := func() {
+		sess.lifecycle.reconnectMu.Lock()
+		if sess.lifecycle.reconnectDone != nil {
+			close(sess.lifecycle.reconnectDone)
+			sess.lifecycle.reconnectDone = nil
+		}
+		sess.lifecycle.reconnectMu.Unlock()
+	}
+
 	if sess.isClosed() {
+		// triggerReconnect may have created reconnectDone before Close ran.
+		// Close it so Session.Close()'s wait at session.go:686 unblocks
+		// instead of hanging forever.
+		closeReconnectDone()
 		return fmt.Errorf("connection closed")
 	}
 	// Prevent concurrent reconnect attempts. transitionToOnce returns
@@ -784,6 +800,13 @@ func (sess *Session) Reconnect() error {
 	// is exactly the single-flight gate we want.
 	if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateReconnecting); !ok {
 		sess.logger.Info("reconnect already in progress or not permitted from current state, skipping")
+		// If FSM rejected because state is terminal (Closed), close the
+		// orphan reconnectDone so Close() unblocks. The winning goroutine
+		// (if any) ran BEFORE state became Closed; we are running AFTER.
+		// Safe vs winner: closeReconnectDone is mutex-protected + nil-check.
+		if sess.isClosed() {
+			closeReconnectDone()
+		}
 		return nil
 	}
 
@@ -795,14 +818,7 @@ func (sess *Session) Reconnect() error {
 	}
 	sess.lifecycle.reconnectMu.Unlock()
 
-	defer func() {
-		sess.lifecycle.reconnectMu.Lock()
-		if sess.lifecycle.reconnectDone != nil {
-			close(sess.lifecycle.reconnectDone)
-			sess.lifecycle.reconnectDone = nil
-		}
-		sess.lifecycle.reconnectMu.Unlock()
-	}()
+	defer closeReconnectDone()
 
 	sess.logger.Info("attempting reconnect")
 	sess.tx.disconnected.Store(true)
