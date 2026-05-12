@@ -518,7 +518,8 @@ func (c *Client) sendRequest(command CommandID, data []byte) ([]byte, error) {
 	}
 	c.tx.activeRequestLock.Lock()
 	id := c.tx.currentRequest.Inc()
-	c.tx.activeRequests[id] = make(chan []byte, 1)
+	responseCh := make(chan []byte, 1)
+	c.tx.activeRequests[id] = responseCh
 	c.tx.activeRequestLock.Unlock()
 	defer func() {
 		c.tx.activeRequestLock.Lock()
@@ -548,9 +549,6 @@ func (c *Client) sendRequest(command CommandID, data []byte) ([]byte, error) {
 		return nil, ctx.Err()
 	case sendCh <- pack:
 	}
-	c.tx.activeRequestLock.Lock()
-	responseCh := c.tx.activeRequests[id]
-	c.tx.activeRequestLock.Unlock()
 	select {
 	case <-ctx.Done():
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
