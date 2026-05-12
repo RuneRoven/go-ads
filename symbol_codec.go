@@ -302,10 +302,11 @@ func (symbol *Symbol) writeToNode(value string, datatypes map[string]SymbolUploa
 			if err != nil {
 				return nil, fmt.Errorf("field %q: %w", name, err)
 			}
-			end := child.Offset + child.Length
-			if end > uint32(len(buf)) {
-				return nil, fmt.Errorf("field %q: offset+length %d exceeds struct size %d", name, end, len(buf))
+			end64 := uint64(child.Offset) + uint64(child.Length)
+			if end64 > uint64(len(buf)) {
+				return nil, fmt.Errorf("field %q: offset+length %d exceeds struct size %d", name, end64, len(buf))
 			}
+			end := uint32(end64)
 			copy(buf[child.Offset:end], childBytes)
 		}
 		return buf, nil

@@ -1352,3 +1352,27 @@ func TestWSTRINGSurrogatePairTruncation(t *testing.T) {
 		t.Errorf("expected high surrogate dropped (zero bytes 2-3 - either truncated or null), got 0x%02X 0x%02X", data[2], data[3])
 	}
 }
+
+// F-xx: child.Offset + child.Length overflows uint32 — must error, not panic.
+// Validates: R-WRITE-OVERFLOW-001.
+func TestWriteToNode_ChildOffsetOverflow(t *testing.T) {
+	// Offset = MaxUint32-1, Length = 4: sum overflows to 2, bypassing bounds check.
+	child := &Symbol{
+		Name:     "Field",
+		FullName: "Parent.Field",
+		DataType: "DINT",
+		Offset:   math.MaxUint32 - 1,
+		Length:   4,
+	}
+	parent := &Symbol{
+		Name:     "Parent",
+		FullName: "Parent",
+		DataType: "SomeStruct",
+		Length:   10,
+		Children: map[string]*Symbol{"Field": child},
+	}
+	_, err := parent.writeToNode(`{"Field": "42"}`, nil)
+	if err == nil {
+		t.Fatal("expected error for child Offset+Length overflow, got nil")
+	}
+}
