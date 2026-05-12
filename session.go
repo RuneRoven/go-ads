@@ -243,6 +243,14 @@ func (sess *Session) Connect(local bool) error {
 		}
 		ip := localAddr.IP.To4()
 		if ip != nil {
+			// If callbackIP is set (WithHostIP), use it for source NetID so that AMS
+			// packet headers match the route the PLC registered. On multi-homed machines
+			// the TCP source IP can differ from the IP used for route registration.
+			if sess.callbackIP != "" {
+				if cbIP := net.ParseIP(sess.callbackIP).To4(); cbIP != nil {
+					ip = cbIP
+				}
+			}
 			sess.source.NetID = [6]byte{ip[0], ip[1], ip[2], ip[3], 1, 1}
 			sess.logger.Info("auto-derived source AMS NetID from local IP",
 				"netid", fmt.Sprintf("%d.%d.%d.%d.1.1", ip[0], ip[1], ip[2], ip[3]))
