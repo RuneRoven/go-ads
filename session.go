@@ -46,7 +46,24 @@ type sessionLifecycle struct {
 	strictReconnect            bool
 	strictReconnectMaxAttempts int
 	strictReconnectFailures    int
+
+	// Flap detection: a successful Connect/Reconnect that drops again within
+	// flapWindow counts as a flap. flapCount increments per flap and feeds
+	// reconnectBackoff() so the existing BackoffConfig tiers also govern
+	// cross-cycle behaviour, not just within-one-Reconnect retries. Without
+	// this, a PLC that RSTs every connection produces "successful attempts=1"
+	// every few ms because each new Reconnect() starts with fresh local
+	// attempts=0 — burning ephemeral ports and hammering the PLC. flapCount
+	// resets after the connection stays up for flapResetWindow.
+	flapMu          sync.Mutex
+	lastConnectedAt time.Time
+	flapCount       int
 }
+
+const (
+	flapWindow      = 5 * time.Second
+	flapResetWindow = 60 * time.Second
+)
 
 // secret is an internal wrapper around password/credential strings that
 // implements String() and slog.LogValuer to return "[REDACTED]" instead
@@ -364,6 +381,9 @@ func (sess *Session) Connect(local bool) error {
 		sess.cache.lock.Unlock()
 	}
 	sess.transitionState(SessionStateConnected)
+	sess.lifecycle.flapMu.Lock()
+	sess.lifecycle.lastConnectedAt = time.Now()
+	sess.lifecycle.flapMu.Unlock()
 	return nil
 }
 
@@ -602,29 +622,31 @@ func (sess *Session) Close() {
 	close(sess.lifecycle.closedCh)
 	sess.logger.Info("Close called, shutting down")
 
-	// Skip handle cleanup if already disconnected — all commands would timeout
+	// Notification cleanup runs even when disconnected: PLC tracks subscriptions
+	// per source AMS NetID, so a session that closes without deleting its
+	// notification handles leaves the PLC delivering them to the next session
+	// that opens with the same NetID ("received notification for unknown handle"
+	// warnings + extra PLC load). bestEffortDelete logs failures but never
+	// returns an error, so the call is safe even with a dead transport — the
+	// underlying writes will fast-fail and we move on.
+	sess.notifications.lock.Lock()
+	handles := make([]uint32, 0, len(sess.notifications.activeNotifications))
+	for handle := range sess.notifications.activeNotifications {
+		handles = append(handles, handle)
+	}
+	sess.notifications.lock.Unlock()
+	if len(handles) > 0 {
+		deleted := sess.bestEffortDeleteNotifications(handles)
+		sess.logger.Info("close: best-effort notification cleanup",
+			"requested", len(handles), "deleted", deleted,
+			"wasDisconnected", wasDisconnected)
+	}
+
+	// Symbol handle release is skipped when disconnected — unlike notifications,
+	// stranded symbol handles do not generate side effects on subsequent
+	// sessions, so the cost of leaking them is just a small PLC-side handle
+	// table entry that the PLC reaps on route timeout.
 	if !wasDisconnected {
-		// Delete all active notifications (uses sum command with automatic fallback to individual)
-		sess.notifications.lock.Lock()
-		handles := make([]uint32, 0, len(sess.notifications.activeNotifications))
-		for handle := range sess.notifications.activeNotifications {
-			handles = append(handles, handle)
-		}
-		sess.notifications.lock.Unlock()
-		if len(handles) > 0 {
-			codes, err := sess.SumDeleteDeviceNotification(handles)
-			if err != nil {
-				sess.logger.Warn("failed to delete notification handles during close", "error", err)
-			} else {
-				for i, h := range handles {
-					if codes[i] != ReturnCodeNoErrors {
-						sess.logger.Warn("failed to delete notification handle", "handle", h, "error", uint32(codes[i]))
-					} else {
-						sess.logger.Info("removed notification handle", "handle", h)
-					}
-				}
-			}
-		}
 		// Collect symbol handles under lock, then release without holding the lock
 		sess.cache.lock.Lock()
 		var symHandles []uint32
@@ -814,6 +836,41 @@ func (sess *Session) Reconnect() error {
 
 	defer closeReconnectDone()
 
+	// Flap detection: a successful Connected → drop within flapWindow indicates
+	// the previous reconnect cycle didn't really stabilize (typical when the
+	// PLC RSTs every connection because its route table or connection-tracking
+	// is saturated). Increment flapCount and sleep reconnectBackoff(flapCount)
+	// before dialing so the existing stepped backoff also throttles cross-cycle
+	// reconnect storms — not just within-one-Reconnect retries. Reset when the
+	// last connection lived longer than flapResetWindow.
+	sess.lifecycle.flapMu.Lock()
+	lastConn := sess.lifecycle.lastConnectedAt
+	if !lastConn.IsZero() {
+		elapsed := time.Since(lastConn)
+		switch {
+		case elapsed < flapWindow:
+			sess.lifecycle.flapCount++
+		case elapsed > flapResetWindow:
+			sess.lifecycle.flapCount = 0
+		}
+	}
+	flapCount := sess.lifecycle.flapCount
+	sess.lifecycle.flapMu.Unlock()
+
+	if flapCount > 0 {
+		delay := sess.reconnectBackoff(flapCount)
+		sess.logger.Warn("connection flapping, applying cross-cycle cooldown before reconnect",
+			"flapCount", flapCount, "delay", delay,
+			"lastConnectedAgo", time.Since(lastConn))
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-sess.lifecycle.closedCh:
+			timer.Stop()
+			return fmt.Errorf("connection closed during flap cooldown")
+		}
+	}
+
 	sess.logger.Info("attempting reconnect")
 	sess.tx.disconnected.Store(true)
 	// State is already Reconnecting (transitionToOnce above).
@@ -909,7 +966,10 @@ func (sess *Session) Reconnect() error {
 		sess.lifecycle.strictReconnectFailures = 0 // reset on success
 		// epoch bumps inside the transition helper when target == Connected.
 		sess.transitionState(SessionStateConnected)
-		sess.logger.Info("reconnect successful", "attempts", attempts)
+		sess.lifecycle.flapMu.Lock()
+		sess.lifecycle.lastConnectedAt = time.Now()
+		sess.lifecycle.flapMu.Unlock()
+		sess.logger.Info("reconnect successful", "attempts", attempts, "flapCount", flapCount)
 
 		// Fire reconnect callback in goroutine (must not block).
 		// Callback must not call Session methods — connection may be closing.
