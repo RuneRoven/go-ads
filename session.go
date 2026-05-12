@@ -911,6 +911,22 @@ func (sess *Session) Reconnect() error {
 			continue
 		}
 
+		// Sanity probe: verify the PLC ADS layer actually responds before
+		// declaring success. ensureRoute may have registered the route via UDP
+		// while TCP-ADS is dead (PLC AMS router hung). reloadSymbols + resubscribe
+		// can both be no-ops if nothing was previously loaded. Without this
+		// probe, Reconnect would log "successful" on a dead connection and the
+		// next user RPC would trigger another reconnect cycle — infinite loop.
+		if _, err := sess.client.GetSymbolVersion(); err != nil {
+			lastErr = err
+			sess.logger.Warn("reconnect sanity probe failed, retrying", "error", err, "attempt", attempts)
+			sess.resetForRetry()
+			if err := sess.reconnectSleep(attempts); err != nil {
+				return err
+			}
+			continue
+		}
+
 		sess.tx.disconnected.Store(false)
 		sess.lifecycle.strictReconnectFailures = 0 // reset on success
 		// epoch bumps inside the transition helper when target == Connected.
