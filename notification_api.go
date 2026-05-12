@@ -4,9 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"go.uber.org/atomic"
 )
 
 // notificationManager owns the connection-level notification state:

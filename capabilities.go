@@ -1,7 +1,7 @@
 package ads
 
 import (
-	"go.uber.org/atomic"
+	"sync/atomic"
 )
 
 // capabilities consolidates feature-detection state for a single connection.

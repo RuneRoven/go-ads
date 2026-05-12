@@ -6,9 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"time"
-
-	"go.uber.org/atomic"
 )
 
 // UDP route registration constants

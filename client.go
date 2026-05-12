@@ -476,7 +476,7 @@ func (c *Client) ReleaseHandle(handle uint32) error {
 // it consumes from the shared systemResponse channel. Used by Session for
 // the local AMS handshake during Connect/Reconnect.
 func (c *Client) send(data []byte) ([]byte, error) {
-	c.tx.currentRequest.Inc()
+	c.tx.currentRequest.Add(1)
 	c.tx.chanMu.RLock()
 	sendCh := c.tx.sendChannel
 	sysCh := c.tx.systemResponse
@@ -517,7 +517,7 @@ func (c *Client) sendRequest(command CommandID, data []byte) ([]byte, error) {
 		return nil, ErrTransportClosed
 	}
 	c.tx.activeRequestLock.Lock()
-	id := c.tx.currentRequest.Inc()
+	id := c.tx.currentRequest.Add(1)
 	responseCh := make(chan []byte, 1)
 	c.tx.activeRequests[id] = responseCh
 	c.tx.activeRequestLock.Unlock()

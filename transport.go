@@ -3,8 +3,7 @@ package ads
 import (
 	"net"
 	"sync"
-
-	"go.uber.org/atomic"
+	"sync/atomic"
 )
 
 // transport owns the TCP socket, the per-invoke request multiplexing,

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -121,6 +122,7 @@ type Session struct {
 	reloadWindow      time.Duration
 	reloadAttempts    []time.Time
 	reloadMu          sync.Mutex
+	reloadInProgress  atomic.Bool
 	staleHandles      map[uint32]string
 	staleHandlesMu    sync.Mutex
 
@@ -385,7 +387,7 @@ func (sess *Session) ensureRouteOnConnect() (registered bool, err error) {
 	}
 
 	// Probe failed → register with credentials
-	sess.route.routeProbeFailures.Inc()
+	sess.route.routeProbeFailures.Add(1)
 	sess.logger.Info("route probe failed, registering route", "error", probeErr)
 	err = sess.AddRoute(sess.route.name, sess.route.username, string(sess.route.password))
 	if err != nil {
@@ -428,7 +430,9 @@ func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason str
 	case SymbolVersionClose:
 		go sess.closeOnStaleDetection(reason)
 	case SymbolVersionAutoReload:
-		go sess.autoReloadOnStaleDetection(reason)
+		if sess.reloadInProgress.CompareAndSwap(false, true) {
+			go sess.autoReloadOnStaleDetection(reason)
+		}
 	}
 	return true, reason
 }
@@ -527,6 +531,7 @@ func (sess *Session) tryRecordReloadAttempt() bool {
 // zero old handles → LoadSymbols → resubscribeNotifications →
 // fire onReconnect.
 func (sess *Session) autoReloadOnStaleDetection(reason string) {
+	defer sess.reloadInProgress.Store(false)
 	if !sess.tryRecordReloadAttempt() {
 		sess.logger.Warn("reload cap exhausted - degrading to Ignore",
 			"reason", reason, "max", sess.maxReloadAttempts, "window", sess.reloadWindow)
@@ -928,7 +933,7 @@ func (sess *Session) ensureRoute() error {
 	}
 
 	// Probe failed → register with credentials
-	failuresAfter := sess.route.routeProbeFailures.Inc()
+	failuresAfter := sess.route.routeProbeFailures.Add(1)
 	sess.logger.Info("route probe failed, registering route", "error", probeErr, "probeFailures", failuresAfter)
 	if err := sess.AddRoute(sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
 		return fmt.Errorf("route registration failed after probe: %w", err)

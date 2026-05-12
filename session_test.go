@@ -566,6 +566,56 @@ func TestSession_AutoReload_CapExhaustion_FiresCallback(t *testing.T) {
 	}
 }
 
+// TestSession_AutoReload_SingleFlight validates that when N stale events fire
+// concurrently under SymbolVersionAutoReload, only one reload goroutine runs
+// (R-CACHE-010). The single-flight guard (reloadInProgress CAS) must prevent
+// duplicate concurrent bumpEpoch calls.
+func TestSession_AutoReload_SingleFlight(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, _ := newWiredTestSession(t, srv,
+		WithSymbolVersionStrategy(SymbolVersionAutoReload),
+		WithMaxSymbolVersionReloadAttempts(10),
+		WithSymbolVersionReloadWindow(60*time.Second),
+	)
+
+	preEpoch := sess.epoch()
+
+	const N = 5
+	var wg sync.WaitGroup
+	for range N {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sess.handleStaleDetection(ReturnCodeDeviceSymbolVersionInvalid)
+		}()
+	}
+	wg.Wait()
+
+	// Give goroutines time to complete the reload path.
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("epoch never bumped within 3s")
+		default:
+		}
+		if sess.epoch() > preEpoch {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Allow the one in-flight goroutine to complete before sampling epoch.
+	time.Sleep(200 * time.Millisecond)
+
+	got := int(sess.epoch() - preEpoch)
+	if got > 1 {
+		t.Errorf("epoch bumped %d times, want 1 (single-flight guard failed)", got)
+	}
+}
+
 // TestSession_ReadFromSymbol_LengthMismatchTriggersDetection validates the
 // supplementary R-CACHE-009 detection path: when the PLC returns a payload
 // whose length disagrees with the cached symbol.Length (e.g. operator

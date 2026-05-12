@@ -4,8 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
-
-	"go.uber.org/atomic"
+	"sync/atomic"
 )
 
 // SessionState is the explicit FSM state for a Session. See
