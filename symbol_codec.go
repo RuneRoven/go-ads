@@ -196,13 +196,12 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 			return symbol.Value, nil
 		}
 		// Last resort: infer base type from symbol size when ADST_ code is
-		// unavailable (BaseType=0). Handles enums and simple type aliases
-		// whose underlying type matches a standard integer size.
-		// WARNING: always infers signed integer types — unsigned enums and
-		// REAL/LREAL types will be misinterpreted.
-		if inferred := inferBaseType(symbol.Length); inferred != "" {
-			getDefaultLogger().Warn("inferring base type from size (may be wrong for unsigned/float types)",
-				"symbol", symbol.DataType, "size", symbol.Length, "inferred", inferred)
+		// unavailable (BaseType=0 or BIGTYPE) and the datatype table didn't
+		// resolve. Only 1- and 2-byte widths are inferred — see
+		// inferBaseType doc for why 4/8 are refused.
+		if inferred := inferBaseType(symbol.Length, symbol.BaseType); inferred != "" {
+			getDefaultLogger().Warn("inferring base type from size (no datatype table loaded; LoadSymbols() recommended for user-defined types)",
+				"symbol", symbol.DataType, "size", symbol.Length, "baseType", symbol.BaseType, "inferred", inferred)
 			resolved := *symbol
 			resolved.DataType = inferred
 			val, err := resolved.parse(data, offset, nil)
@@ -257,20 +256,45 @@ var parseableTypes = []string{
 	"LWORD",
 }
 
-// inferBaseType guesses a parseable base type from a symbol's byte size.
-// Used as a last resort when the datatype table is unavailable (on-demand mode)
-// to parse enums and simple type aliases. Returns "" if no match.
-func inferBaseType(size uint32) string {
+// inferBaseType guesses a parseable base type from a symbol's byte size,
+// last-resort fallback when neither the protocol's ADST_ code nor the
+// uploaded datatype table can resolve the type (on-demand mode without
+// LoadSymbols / LoadDataTypes).
+//
+// At 4 and 8 byte widths the layout is genuinely ambiguous between integer
+// and IEEE-754 float (DINT/REAL share size, LINT/LREAL share size).
+// Interpreting a REAL as a DINT silently corrupts every parse — 1.5
+// (0x3FC00000) becomes 1069547520. Per the Beckhoff Information System,
+// the authoritative way to resolve user-defined types (BIGTYPE) is to
+// look up symDataType in the datatype table, not to infer from size:
+//
+//	"All PLC structures and arrays (user-defined data types) have the ADS
+//	 data type name: ADST_BIGTYPE and can not be identified through this
+//	 data type constant. In order to be able to identify the user-defined
+//	 data types, use the symDataType variable, or read the base type of the
+//	 individual variables in the structure."
+//
+// To prevent silent corruption, this fallback only handles 1- and 2-byte
+// widths where no IEEE-754 form exists and signed/unsigned only affects
+// rendering of the same bytes. 4 and 8 byte symbols without a table
+// loaded return "" so the caller surfaces a clear error and the user
+// resolves the type via LoadSymbols (Beckhoff-blessed path).
+//
+// baseType is accepted but not currently consulted — the parameter is kept
+// in the signature so callers thread the protocol code through to keep the
+// resolution chain explicit and to leave room for tightening (e.g. refusing
+// 1/2 byte inference when baseType is also clearly non-integer).
+func inferBaseType(size, baseType uint32) string {
+	_ = baseType
 	switch size {
 	case 1:
 		return "SINT"
 	case 2:
 		return "INT"
-	case 4:
-		return "DINT"
-	case 8:
-		return "LINT"
 	default:
+		// 4 and 8 deliberately omitted — DINT/REAL and LINT/LREAL share
+		// these widths and the byte layout cannot be disambiguated without
+		// the datatype table.
 		return ""
 	}
 }
@@ -327,17 +351,18 @@ func (symbol *Symbol) writeToNode(value string, datatypes map[string]SymbolUploa
 			}
 		}
 		// If still not parseable after table lookup, infer from byte size.
-		// Inference always returns a signed integer type; this may misinterpret
-		// unsigned enums or floats. The read path emits the same Warn log.
+		// Only 1/2 byte widths are inferred (signed-int) — see inferBaseType
+		// doc for why 4/8 are refused (REAL/LREAL ambiguity).
 		if !slices.Contains(parseableTypes, dt) {
-			if inferred := inferBaseType(symbol.Length); inferred != "" {
-				getDefaultLogger().Warn("inferring base type from size for write (may be wrong for unsigned/float types)",
+			if inferred := inferBaseType(symbol.Length, symbol.BaseType); inferred != "" {
+				getDefaultLogger().Warn("inferring base type from size for write (no datatype table loaded; LoadSymbols() recommended)",
 					"symbol", symbol.DataType,
 					"size", symbol.Length,
+					"baseType", symbol.BaseType,
 					"inferred", inferred)
 				dt = inferred
 			} else {
-				return nil, fmt.Errorf("data type %q not parseable and size %d not inferable (must be 1/2/4/8 bytes); call LoadSymbols() first or use a known type", symbol.DataType, symbol.Length)
+				return nil, fmt.Errorf("data type %q not parseable and size %d not inferable (only 1/2 byte sizes auto-inferred to avoid REAL/LREAL ambiguity); call LoadSymbols() first or use a known type", symbol.DataType, symbol.Length)
 			}
 		}
 	}

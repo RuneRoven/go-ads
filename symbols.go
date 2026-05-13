@@ -223,6 +223,43 @@ type SymbolView struct {
 // true (until the connection is closed).
 func (v SymbolView) IsValid() bool { return v.conn != nil && v.FullName != "" }
 
+// BaseTypeName returns the IEC 61131-3 primitive name underlying this symbol
+// (e.g. "DINT" for an INT-aliased enum, "REAL" for a REAL-aliased type).
+// Useful for downstream consumers that need the storage layout without
+// having to track user-defined type names.
+//
+// Resolution order:
+//  1. Protocol BaseType (ADST_ code) → adsTypeToString — authoritative when
+//     the PLC ships a primitive code (TC3 enums, simple primitives).
+//  2. Datatype table lookup by DataType name — required for user-defined
+//     types reported as ADST_BIGTYPE (TC2 enums, type aliases). Populated
+//     by LoadSymbols / LoadDataTypes.
+//  3. Size-based inference — last-resort fallback for on-demand mode when
+//     no table is loaded. Restricted to 1- and 2-byte widths (safe for
+//     TC2 enums); refuses 4 and 8 to avoid REAL/LREAL ambiguity, matching
+//     parse()'s fallback policy.
+//
+// Returns "" when none of the routes can resolve a primitive — callers
+// should treat that as "load symbols or inspect Children".
+func (v SymbolView) BaseTypeName() string {
+	if name := adsTypeToString(v.BaseType); name != "" {
+		return name
+	}
+	if v.conn != nil {
+		v.conn.cache.lock.Lock()
+		dts := v.conn.cache.datatypes
+		v.conn.cache.lock.Unlock()
+		if dts != nil {
+			if dt, ok := dts[v.DataType]; ok {
+				if name := dt.DataType; name != "" {
+					return name
+				}
+			}
+		}
+	}
+	return inferBaseType(v.Length, v.BaseType)
+}
+
 // Children returns SymbolViews for struct/array members captured at view
 // creation time. Returns nil for scalars and for symbols whose subtree has
 // not been populated by full discovery. The map is freshly allocated per

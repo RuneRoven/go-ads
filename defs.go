@@ -586,6 +586,14 @@ const (
 	ADSTString  uint32 = 30 // STRING
 	ADSTWString uint32 = 31 // WSTRING
 	ADSTBool    uint32 = 33 // BOOL
+	// ADSTBigType is the PLC's catch-all for composite/user-defined types:
+	// structs, enums, type aliases, arrays. PLC sends this when the leaf does
+	// not have a primitive ADST_ code (e.g. TC2 always reports enums this way;
+	// TC3 sometimes reports the underlying primitive but falls back to BIGTYPE
+	// for opaque types). Structs are caught earlier by the parse path's
+	// Children branch, so a symbol reaching inferBaseType with BIGTYPE + a
+	// 1/2/4/8 byte size is enum-like — safe to interpret as signed integer.
+	ADSTBigType uint32 = 65
 )
 
 // adsTypeToString maps an ADST_ numeric type code to the corresponding
