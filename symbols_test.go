@@ -580,8 +580,8 @@ func TestInferBaseType(t *testing.T) {
 	}{
 		{1, 0, "SINT"},
 		{2, 0, "INT"},
-		{4, 0, ""},        // refused: REAL/DINT ambiguity
-		{8, 0, ""},        // refused: LREAL/LINT ambiguity
+		{4, 0, ""},           // refused: REAL/DINT ambiguity
+		{8, 0, ""},           // refused: LREAL/LINT ambiguity
 		{4, ADSTBigType, ""}, // refused even for BIGTYPE — caller must LoadSymbols
 		{8, ADSTBigType, ""},
 		{3, 0, ""},
