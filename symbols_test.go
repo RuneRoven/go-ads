@@ -268,9 +268,13 @@ func TestParseEnumNestedInStruct(t *testing.T) {
 
 // Validates: R-SYM-008.
 func TestParseEnumWithoutDatatypes(t *testing.T) {
-	// When datatypes table is nil (on-demand mode), enum types should still
-	// parse by inferring the base type from the symbol's byte size.
-	tests := []struct {
+	// When datatypes table is nil (on-demand mode), enum types can be parsed
+	// by inferring the base type from the symbol's byte size — but only for
+	// 1- and 2-byte widths. REAL/LREAL share 4 and 8 byte widths with
+	// DINT/LINT so the byte layout is ambiguous; inferBaseType refuses those
+	// widths and the parser surfaces "unknown format" so the caller resolves
+	// the type via LoadSymbols.
+	successCases := []struct {
 		name     string
 		dataType string
 		size     uint32
@@ -279,16 +283,8 @@ func TestParseEnumWithoutDatatypes(t *testing.T) {
 	}{
 		{"1-byte enum", "E_SmallState", 1, []byte{42}, "42"},
 		{"2-byte enum", "E_WordState", 2, func() []byte { b := make([]byte, 2); binary.LittleEndian.PutUint16(b, 1500); return b }(), "1500"},
-		{"4-byte enum DINT", "E_MachineState", 4, func() []byte { b := make([]byte, 4); binary.LittleEndian.PutUint32(b, 2); return b }(), "2"},
-		{"4-byte enum negative", "E_MachineState", 4, func() []byte {
-			b := make([]byte, 4)
-			v := int32(-1)
-			binary.LittleEndian.PutUint32(b, uint32(v))
-			return b
-		}(), "-1"},
-		{"8-byte enum", "E_BigState", 8, func() []byte { b := make([]byte, 8); binary.LittleEndian.PutUint64(b, 99); return b }(), "99"},
 	}
-	for _, tt := range tests {
+	for _, tt := range successCases {
 		t.Run(tt.name, func(t *testing.T) {
 			sym := &Symbol{
 				Name:     "testEnum",
@@ -303,6 +299,32 @@ func TestParseEnumWithoutDatatypes(t *testing.T) {
 			}
 			if value != tt.want {
 				t.Errorf("got %q, want %q", value, tt.want)
+			}
+		})
+	}
+
+	// 4- and 8-byte unknown types must NOT be inferred — they could be a
+	// REAL/LREAL alias just as plausibly as a DINT/LINT enum. Parser must
+	// surface "unknown format" to push the caller to LoadSymbols.
+	refusedCases := []struct {
+		name     string
+		dataType string
+		size     uint32
+	}{
+		{"4-byte unknown refused (REAL/DINT ambiguity)", "E_MachineState", 4},
+		{"8-byte unknown refused (LREAL/LINT ambiguity)", "E_BigState", 8},
+	}
+	for _, tt := range refusedCases {
+		t.Run(tt.name, func(t *testing.T) {
+			sym := &Symbol{
+				Name:     "testEnum",
+				FullName: "MAIN.testEnum",
+				DataType: tt.dataType,
+				Length:   tt.size,
+			}
+			_, err := sym.parse(make([]byte, tt.size), 0, nil)
+			if err == nil {
+				t.Fatalf("expected parse to refuse %d-byte inference, got nil", tt.size)
 			}
 		})
 	}
@@ -545,24 +567,31 @@ func TestMakeArrayChildren_ZeroElements(t *testing.T) {
 // --- inferBaseType ---
 
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
-// Pins size→base-type mapping (1→SINT, 2→INT, 4→DINT, 8→LINT; non-standard → "").
+// Pins size→base-type mapping: only 1 (SINT) and 2 (INT) are inferred.
+// 4 and 8 are deliberately refused regardless of BaseType — REAL/LREAL
+// share those widths with DINT/LINT and the byte layout cannot be
+// disambiguated without a datatype table. baseType is accepted for
+// future use but currently does not affect the result.
 func TestInferBaseType(t *testing.T) {
 	tests := []struct {
-		size uint32
-		want string
+		size     uint32
+		baseType uint32
+		want     string
 	}{
-		{1, "SINT"},
-		{2, "INT"},
-		{4, "DINT"},
-		{8, "LINT"},
-		{3, ""},
-		{16, ""},
-		{0, ""},
+		{1, 0, "SINT"},
+		{2, 0, "INT"},
+		{4, 0, ""},        // refused: REAL/DINT ambiguity
+		{8, 0, ""},        // refused: LREAL/LINT ambiguity
+		{4, ADSTBigType, ""}, // refused even for BIGTYPE — caller must LoadSymbols
+		{8, ADSTBigType, ""},
+		{3, 0, ""},
+		{16, 0, ""},
+		{0, 0, ""},
 	}
 	for _, tt := range tests {
-		got := inferBaseType(tt.size)
+		got := inferBaseType(tt.size, tt.baseType)
 		if got != tt.want {
-			t.Errorf("inferBaseType(%d) = %q, want %q", tt.size, got, tt.want)
+			t.Errorf("inferBaseType(size=%d, baseType=%d) = %q, want %q", tt.size, tt.baseType, got, tt.want)
 		}
 	}
 }
