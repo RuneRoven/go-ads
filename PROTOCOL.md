@@ -1,39 +1,43 @@
-# ADS Protocol and Library Documentation
+# ADS/AMS Protocol Specification
+
+Reference documentation for the Beckhoff ADS (Automation Device Specification) protocol, based on the official Beckhoff TwinCAT 3 documentation and empirical testing against TwinCAT 2 and TwinCAT 3 PLCs.
 
 ## Table of Contents
 
-- [ADS Protocol Overview](#ads-protocol-overview)
-- [Protocol Architecture](#protocol-architecture)
-- [AMS/TCP Packet Structure](#amstcp-packet-structure)
+- [Overview](#overview)
+- [Protocol Stack](#protocol-stack)
+- [AMS/TCP Header (6 bytes)](#amstcp-header-6-bytes)
+- [AMS Header (32 bytes)](#ams-header-32-bytes)
 - [ADS Commands](#ads-commands)
-- [Addressing and Routing](#addressing-and-routing)
-- [Symbol System](#symbol-system)
-- [Library Architecture](#library-architecture)
-- [API Reference](#api-reference)
-- [Connection Lifecycle](#connection-lifecycle)
-- [Symbol Discovery Limitations](#symbol-discovery-limitations)
+- [Index Groups](#index-groups)
+- [Symbol Entry Structure](#symbol-entry-structure)
+- [Symbol Flags](#symbol-flags)
+- [Sum Commands (Batch Operations)](#sum-commands-batch-operations)
+- [Transmission Modes](#transmission-modes)
+- [ADS States](#ads-states)
+- [AMS Ports](#ams-ports)
+- [Return Codes](#return-codes)
+- [TwinCAT 2 vs TwinCAT 3 Differences](#twincat-2-vs-twincat-3-differences)
+- [Packet Walkthrough](#packet-walkthrough)
 - [Secure ADS (ADS over TLS)](#secure-ads-ads-over-tls)
-- [Data Types](#data-types)
+- [Limits and Recommendations](#limits-and-recommendations)
+- [References](#references)
 
 ---
 
-## ADS Protocol Overview
+## Overview
 
-ADS (Automation Device Specification) is a transport-independent protocol developed by Beckhoff for communicating with TwinCAT automation systems. It is the native communication protocol used by all TwinCAT PLCs and provides access to PLC variables, device information, and real-time notifications.
+ADS (Automation Device Specification) is a binary, little-endian protocol developed by Beckhoff for communicating with TwinCAT automation systems. It runs on top of AMS (Automation Message Specification), which handles device addressing and routing.
 
-ADS sits on top of AMS (Automation Message Specification), which handles addressing and routing between devices. In practice, AMS/ADS packets are transported over TCP on port **48898**.
-
-### Key Characteristics
-
-- **Binary protocol** — all data is encoded in little-endian byte order
-- **Request/response model** — each request gets a matching response identified by an invoke ID
-- **Asynchronous notifications** — the PLC can push data changes to clients without polling
-- **Symbol-based access** — variables can be read/written by name, not just raw memory addresses
-- **Transport-independent** — while TCP is most common, ADS can run over other transports
+- **Transport:** TCP port 48898 (standard), port 8016 (Secure ADS over TLS)
+- **Route management:** UDP port 48899
+- **Byte order:** Little-endian throughout
+- **Request/response model:** Each request has an invoke ID echoed in the response
+- **Asynchronous notifications:** The PLC pushes data changes to subscribed clients
 
 ---
 
-## Protocol Architecture
+## Protocol Stack
 
 ```text
 ┌─────────────────────────────────────┐
@@ -57,58 +61,77 @@ ADS sits on top of AMS (Automation Message Specification), which handles address
 
 ---
 
-## AMS/TCP Packet Structure
+## AMS/TCP Header (6 bytes)
 
-Every AMS/TCP packet consists of three parts: an AMS/TCP header, an AMS header, and command-specific data.
+| Offset | Size | Field    | Description                                         |
+|--------|------|----------|-----------------------------------------------------|
+| 0      | 1    | Reserved | Always 0 for normal ADS packets                     |
+| 1      | 1    | System   | 0 = normal ADS, non-zero = system/router message    |
+| 2      | 4    | Length   | Length of AMS header + ADS data (excludes this header) |
 
-### AMS/TCP Header (6 bytes)
+System messages (System > 0) are used for router-level operations such as requesting the local AMS NetID.
 
-| Offset | Size | Field    | Description                                    |
-|--------|------|----------|------------------------------------------------|
-| 0      | 1    | Reserved | Always 0 for normal ADS packets                |
-| 1      | 1    | System   | 0 = normal ADS, non-zero = system/router message |
-| 2      | 4    | Length   | Length of the AMS header + ADS data (excludes this 6-byte header) |
+---
 
-System messages (System > 0) are used for router-level operations such as requesting the local AMS NetID when connecting to a local TwinCAT runtime.
-
-### AMS Header (32 bytes)
+## AMS Header (32 bytes)
 
 | Offset | Size | Field      | Description                              |
 |--------|------|------------|------------------------------------------|
 | 0      | 8    | Target     | Target AMS address (6-byte NetID + 2-byte port) |
 | 8      | 8    | Source     | Source AMS address (6-byte NetID + 2-byte port) |
-| 16     | 2    | Command    | ADS command ID (see table below)         |
-| 18     | 2    | State      | State flags (4 = ADS request with response) |
-| 20     | 4    | Length     | Length of the ADS data following this header |
+| 16     | 2    | Command    | ADS command ID                           |
+| 18     | 2    | State      | State flags (4 = request, 5 = response)  |
+| 20     | 4    | Length     | Length of ADS data following this header  |
 | 24     | 4    | Error Code | AMS error code (0 = no error)            |
 | 28     | 4    | Invoke ID  | Unique ID to match responses to requests |
 
-The **Invoke ID** is a counter that increments with each request. The PLC echoes it back in the response, allowing the client to match responses to their original requests even when multiple requests are in flight.
+**State Flags (uint16):**
 
-### ADS Data
+| Value | Meaning                 |
+|-------|-------------------------|
+| 0x0004 | ADS request (expects response) |
+| 0x0005 | ADS response            |
 
-The ADS data section varies by command. Each command has its own request and response format, documented in the [ADS Commands](#ads-commands) section.
+### AMS Address (8 bytes)
+
+```text
+NetID (6 bytes) + Port (2 bytes)
+```
+
+The NetID is typically displayed as `x.x.x.x.x.x` (e.g., `192.168.1.100.1.1`). By convention, the first 4 bytes often match the device IP and the last 2 bytes are `1.1`.
 
 ---
 
 ## ADS Commands
 
-| ID | Command                      | Description                                       |
-|----|------------------------------|---------------------------------------------------|
-| 0  | Invalid                      | Invalid / not used                                |
-| 1  | ReadDeviceInfo               | Read device name and version                      |
-| 2  | Read                         | Read data by index group and offset               |
-| 3  | Write                        | Write data by index group and offset              |
-| 4  | ReadState                    | Read ADS and device state                         |
-| 5  | WriteControl                 | Change ADS/device state                           |
-| 6  | AddDeviceNotification        | Subscribe to data change notifications            |
-| 7  | DeleteDeviceNotification     | Unsubscribe from notifications                    |
-| 8  | DeviceNotification           | Notification data pushed from PLC to client       |
-| 9  | ReadWrite                    | Combined read and write in a single round-trip    |
+| ID | Hex    | Command                      | Description                                       |
+|----|--------|------------------------------|---------------------------------------------------|
+| 0  | 0x0000 | Invalid                      | Not used                                          |
+| 1  | 0x0001 | ReadDeviceInfo               | Read device name and version                      |
+| 2  | 0x0002 | Read                         | Read data by index group and offset               |
+| 3  | 0x0003 | Write                        | Write data by index group and offset              |
+| 4  | 0x0004 | ReadState                    | Read ADS and device state                         |
+| 5  | 0x0005 | WriteControl                 | Change ADS/device state                           |
+| 6  | 0x0006 | AddDeviceNotification        | Subscribe to data change notifications            |
+| 7  | 0x0007 | DeleteDeviceNotification     | Unsubscribe from notifications                    |
+| 8  | 0x0008 | DeviceNotification           | Notification data pushed from PLC to client       |
+| 9  | 0x0009 | ReadWrite                    | Combined read and write in a single round-trip    |
+
+### ReadDeviceInfo (Command 1)
+
+**Request:** No ADS payload.
+
+**Response:**
+
+| Size | Field | Description                  |
+|------|-------|------------------------------|
+| 4    | Error | ADS return code              |
+| 1    | Major | Major version number         |
+| 1    | Minor | Minor version number         |
+| 2    | Build | Build number                 |
+| 16   | Name  | Device name (null-terminated)|
 
 ### Read (Command 2)
-
-Reads data from the PLC at a given index group and offset.
 
 **Request:**
 
@@ -128,8 +151,6 @@ Reads data from the PLC at a given index group and offset.
 
 ### Write (Command 3)
 
-Writes data to the PLC at a given index group and offset.
-
 **Request:**
 
 | Size | Field  | Description              |
@@ -145,15 +166,96 @@ Writes data to the PLC at a given index group and offset.
 |------|--------|-----------------|
 | 4    | Result | ADS return code |
 
-The Write response contains **only a single 4-byte return code** — there is no separate success field and no data payload. A Result value of `0x0000` (`ReturnCodeNoErrors`) indicates success. Any non-zero value indicates an error. This is confirmed by the Beckhoff ADS specification and the reference C++ implementation (`AoEResponseHeader` contains only `leResult`).
+Only a 4-byte return code. No data payload.
 
-Note that errors can occur at two levels:
-- **AMS level** — the Error Code field in the 32-byte AMS header (e.g., routing failures, target not found)
-- **ADS level** — the Result field in the command response (e.g., invalid group, access denied, symbol not found)
+### ReadState (Command 4)
+
+**Request:** No ADS payload.
+
+**Response:**
+
+| Size | Field       | Description         |
+|------|-------------|---------------------|
+| 4    | Error       | ADS return code     |
+| 2    | AdsState    | Current ADS state   |
+| 2    | DeviceState | Current device state|
+
+### WriteControl (Command 5)
+
+**Request:**
+
+| Size | Field       | Description                  |
+|------|-------------|------------------------------|
+| 2    | AdsState    | Requested ADS state          |
+| 2    | DeviceState | Requested device state       |
+| 4    | Length      | Length of additional data     |
+| n    | Data        | Additional data (optional)   |
+
+**Response:**
+
+| Size | Field | Description     |
+|------|-------|-----------------|
+| 4    | Error | ADS return code |
+
+### AddDeviceNotification (Command 6)
+
+**Request (40 bytes):**
+
+| Size | Field            | Description                              |
+|------|------------------|------------------------------------------|
+| 4    | Group            | Index group                              |
+| 4    | Offset           | Index offset                             |
+| 4    | Length            | Data length to monitor                   |
+| 4    | TransmissionMode | When to send notifications               |
+| 4    | MaxDelay         | Maximum delay before sending (100ns units) |
+| 4    | CycleTime        | Check interval (100ns units)             |
+| 16   | Reserved         | Must be zero                             |
+
+**Response:**
+
+| Size | Field  | Description         |
+|------|--------|---------------------|
+| 4    | Error  | ADS return code     |
+| 4    | Handle | Notification handle |
+
+### DeleteDeviceNotification (Command 7)
+
+**Request:**
+
+| Size | Field  | Description         |
+|------|--------|---------------------|
+| 4    | Handle | Notification handle |
+
+**Response:**
+
+| Size | Field | Description     |
+|------|-------|-----------------|
+| 4    | Error | ADS return code |
+
+### DeviceNotification (Command 8)
+
+Pushed from PLC to client. Not a request/response — sent asynchronously.
+
+```text
+NotificationStream:
+  Length    (4 bytes) — total data length
+  Stamps   (4 bytes) — number of stamp headers
+
+For each stamp:
+  StampHeader:
+    Timestamp (8 bytes) — Windows FILETIME (100ns since 1601-01-01)
+    Samples   (4 bytes) — number of samples in this stamp
+
+  For each sample:
+    NotificationSample:
+      Handle (4 bytes) — notification handle
+      Size   (4 bytes) — data size
+      Data   (n bytes) — the notification payload
+```
+
+Timestamp conversion to Unix: `unixSeconds = (filetime / 10000000) - 11644473600`
 
 ### ReadWrite (Command 9)
-
-Sends write data and receives read data in a single round-trip. Used extensively for symbol handle operations and sum commands.
 
 **Request:**
 
@@ -173,614 +275,823 @@ Sends write data and receives read data in a single round-trip. Used extensively
 | 4    | Length | Actual bytes returned |
 | n    | Data   | The read data         |
 
-### AddDeviceNotification (Command 6)
+---
 
-Subscribes to change notifications for a data area. The PLC will send DeviceNotification messages when the data changes.
+## Index Groups
 
-**Request:**
+### Symbol System
 
-| Size | Field            | Description                            |
-|------|------------------|----------------------------------------|
-| 4    | Group            | Index group                            |
-| 4    | Offset           | Index offset                           |
-| 4    | Length            | Data length to monitor                 |
-| 4    | TransmissionMode | When to send notifications (see below) |
-| 4    | MaxDelay         | Maximum delay before sending (100ns units) |
-| 4    | CycleTime        | Check interval (100ns units)           |
-| 16   | Reserved         | Must be zero                           |
+| Group  | Name                    | Purpose                                       |
+|--------|-------------------------|-----------------------------------------------|
+| 0xF000 | SymbolTab               | Symbol table                                  |
+| 0xF001 | SymbolName              | Symbol by name                                |
+| 0xF002 | SymbolValue             | Symbol by value                               |
+| 0xF003 | SymbolHandleByName      | Get a handle for a symbol name                |
+| 0xF004 | SymbolValueByName       | Read symbol value by name (one-shot)          |
+| 0xF005 | SymbolValueByHandle     | Read/write symbol value using handle          |
+| 0xF006 | SymbolReleaseHandle     | Release a previously acquired handle          |
+| 0xF007 | SymbolInfoByName        | Get symbol metadata by name                   |
+| 0xF008 | SymbolVersion           | Read symbol version (changes on PLC download) |
+| 0xF009 | SymbolInfoByNameEx      | Get extended symbol info by name              |
+| 0xF00A | SymbolDownload          | Symbol download                               |
+| 0xF00B | SymbolUpload            | Download full symbol table from PLC           |
+| 0xF00C | SymbolUploadInfo        | Get symbol table size info                    |
+| 0xF00D | SymbolDownload2         | Symbol download v2                            |
+| 0xF00E | SymbolDataTypeUpload    | Download all datatype definitions             |
+| 0xF00F | SymbolUploadInfo2       | Extended symbol upload info (TC3 only)        |
+| 0xF010 | SymbolNotification      | Notification of named handle                  |
 
-**Transmission Modes:**
+### Symbol Entry Structure
 
-| Value | Mode               | Description                                        |
-|-------|--------------------|----------------------------------------------------|
-| 0     | NoTransmission     | No notifications                                   |
-| 1     | ClientCycle        | Client-side cyclic check (deprecated)              |
-| 2     | ClientOnChange     | Client-side on-change (deprecated)                 |
-| 3     | ServerCycle        | Server sends at fixed intervals                    |
-| 4     | ServerOnChange     | Server sends only when value changes               |
-| 5     | ServerCycle2       | ServerCycle with timestamp (TwinCAT 3 only)        |
-| 6     | ServerOnChange2    | ServerOnChange with timestamp (TwinCAT 3 only)     |
-| 10    | Client1Request     | Single notification then auto-delete               |
+The symbol entry (returned by SymbolUpload 0xF00B and SymbolInfoByNameEx 0xF009) has a fixed 30-byte header followed by variable-length strings and optional extended data.
 
-**Response:**
+**Header (30 bytes):**
 
-| Size | Field  | Description              |
-|------|--------|--------------------------|
-| 4    | Error  | ADS return code          |
-| 4    | Handle | Notification handle      |
+| Offset | Size | Field         | Description                          |
+|--------|------|---------------|--------------------------------------|
+| 0      | 4    | EntryLength   | Total entry length in bytes          |
+| 4      | 4    | IndexGroup    | Index group for read/write           |
+| 8      | 4    | IndexOffset   | Index offset for read/write          |
+| 12     | 4    | Size          | Data size in bytes                   |
+| 16     | 4    | DataType      | Data type ID                         |
+| 20     | 4    | Flags         | Symbol flags (see [Symbol Flags](#symbol-flags)) |
+| 24     | 2    | NameLength    | Length of symbol name (excl. null)   |
+| 26     | 2    | TypeLength    | Length of type name (excl. null)     |
+| 28     | 2    | CommentLength | Length of comment (excl. null)       |
 
-### DeviceNotification (Command 8)
-
-Pushed from the PLC to the client. Contains one or more timestamped data samples.
-
-**Structure:**
+**Strings (variable length):**
 
 ```text
-NotificationStream:
-  Length (4 bytes) — total data length
-  Stamps (4 bytes) — number of stamp headers
-
-For each stamp:
-  StampHeader:
-    Timestamp (8 bytes) — Windows FILETIME (100ns since 1601-01-01)
-    Samples   (4 bytes) — number of samples in this stamp
-
-  For each sample:
-    NotificationSample:
-      Handle (4 bytes) — notification handle (matches AddDeviceNotification response)
-      Size   (4 bytes) — data size
-      Data   (n bytes) — the notification payload
+Name (NameLength bytes) + \0
+Type (TypeLength bytes) + \0
+Comment (CommentLength bytes) + \0
 ```
 
-The timestamp uses Windows FILETIME format: 100-nanosecond intervals since January 1, 1601. To convert to Unix time: `unixSeconds = (filetime / 10000000) - 11644473600`.
+**Extended data (TC3 only, conditional on flags):**
+
+After the strings, additional data may follow based on which flags are set:
+
+1. If `TypeGuid` flag (0x0008) is set: 16-byte type GUID
+2. If `Attributes` flag (0x1000) is set: attribute key-value pairs
+3. If `ExtendedFlags` flag (0x8000) is set: additional extended flags
+
+TwinCAT 2 does not include extended data after the strings.
+
+### ADST_ Data Type IDs
+
+The `DataType` field (offset 16) in the symbol entry header contains a numeric type code from the ADSDATATYPEID enum. This identifies the base type of the variable and is authoritative — even for type aliases (e.g., a `MyFloat` alias of `REAL` will have DataType=4). These codes are defined in TC2_Utilities and work on both TwinCAT 2 and TwinCAT 3.
+
+| Code | Constant    | IEC 61131-3 Type    |
+|------|-------------|---------------------|
+| 0    | ADST_VOID   | (composite/struct)  |
+| 2    | ADST_INT16  | INT                 |
+| 3    | ADST_INT32  | DINT                |
+| 4    | ADST_REAL32 | REAL                |
+| 5    | ADST_REAL64 | LREAL               |
+| 16   | ADST_INT8   | SINT                |
+| 17   | ADST_UINT8  | USINT / BYTE        |
+| 18   | ADST_UINT16 | UINT / WORD         |
+| 19   | ADST_UINT32 | UDINT / DWORD       |
+| 20   | ADST_INT64  | LINT                |
+| 21   | ADST_UINT64 | ULINT / LWORD       |
+| 30   | ADST_STRING | STRING              |
+| 31   | ADST_WSTRING| WSTRING             |
+| 33   | ADST_BOOL   | BOOL                |
+
+Code 0 (ADST_VOID) indicates a composite type (struct, function block, array) — the variable has children and should not be parsed as a scalar. For type aliases and enums, the PLC sends the underlying base type code, not 0.
+
+### Symbol Flags
+
+The Flags field (offset 20) in the symbol entry is a bitfield:
+
+| Bit(s) | Mask   | Name          | Description                                  |
+|--------|--------|---------------|----------------------------------------------|
+| 0      | 0x0001 | Persistent    | Value survives PLC restarts                  |
+| 1      | 0x0002 | BitValue      | Symbol is a single bit within a byte         |
+| 2      | 0x0004 | ReferenceTo   | Symbol is a reference/pointer                |
+| 3      | 0x0008 | TypeGuid      | 16-byte type GUID follows after strings      |
+| 4      | 0x0010 | TComObj       | Symbol is a TcCOM object                     |
+| 5      | 0x0020 | ReadOnly      | Symbol is read-only                          |
+| 8-11   | 0x0F00 | ContextMask   | PLC task context index (0 = no task binding) |
+| 12     | 0x1000 | Attributes    | Attribute pairs follow after type GUID       |
+| 15     | 0x8000 | ExtendedFlags | Additional extended flags present            |
+
+**ContextMask (bits 8-11):**
+
+The ContextMask identifies which PLC task owns the variable. It corresponds to the task's index in the global TASKINFOARRAY. A value of 0 means the variable is not bound to any specific task.
+
+ContextMask is non-zero only when:
+- The PLC project has multiple tasks (Referenced Tasks)
+- The variable is local to a PROGRAM POU assigned to a single task
+
+GVL variables, single-task projects, and TwinCAT 2 always have ContextMask=0.
+
+**Observed flag distributions (empirical):**
+
+| Flags  | Meaning                          | Typical count |
+|--------|----------------------------------|---------------|
+| 0x0008 | TypeGuid only                    | Most symbols  |
+| 0x1008 | TypeGuid + Attributes            | Some symbols  |
+| 0x8008 | TypeGuid + ExtendedFlags         | Few symbols   |
+| 0x0000 | No extended info                 | TC2 symbols   |
+
+### I/O Image
+
+| Group  | Name           | Purpose                              |
+|--------|----------------|--------------------------------------|
+| 0xF020 | IoImageRwib    | Read/write input byte(s)            |
+| 0xF021 | IoImageRwix    | Read/write input bit                |
+| 0xF025 | IoImageRisize  | Read input size (in bytes)          |
+| 0xF030 | IoImageRwob    | Read/write output byte(s)           |
+| 0xF031 | IoImageRwox    | Read/write output bit               |
+| 0xF040 | IoImageCleari  | Write inputs to null                |
+| 0xF050 | IoImageClearo  | Write outputs to null               |
+| 0xF060 | IoImageRwiob   | Read input and write output byte(s) |
+
+### Sum Commands
+
+| Group  | Name                          | Purpose                              |
+|--------|-------------------------------|--------------------------------------|
+| 0xF080 | SumupRead                     | Batch read (basic)                   |
+| 0xF081 | SumupWrite                    | Batch write                          |
+| 0xF082 | SumupReadWrite                | Batch read+write                     |
+| 0xF083 | SumupReadEx                   | Batch read with per-item errors      |
+| 0xF084 | SumupReadEx2                  | Batch read v2 (TC3 only)            |
+| 0xF085 | SumupAddDeviceNotification    | Batch add notifications (TC3 only)  |
+| 0xF086 | SumupDeleteDeviceNotification | Batch delete notifications (TC3 only)|
+
+### Other
+
+| Group  | Name       | Purpose                    |
+|--------|------------|----------------------------|
+| 0xF100 | DeviceData | State, name, etc.          |
 
 ---
 
-## Addressing and Routing
+## Sum Commands (Batch Operations)
 
-### AMS NetID
+Sum commands combine multiple operations into a single ADS ReadWrite (Command 9) call. The index group identifies the sum command type. The offset field carries the sub-command count `N`.
 
-Every AMS device is identified by a 6-byte **AMS NetID**, typically displayed in dotted notation (e.g., `5.1.2.3.1.1`). By convention:
-- The first 4 bytes often match the device's IP address
-- The last 2 bytes are typically `1.1`
+### 0xF080 — SumRead (Basic)
 
-For example, a PLC at IP `192.168.1.100` might have AMS NetID `192.168.1.100.1.1`.
+**ReadWrite parameters:**
+- Group: `0xF080`, Offset: `N`
+- ReadLength: `N × 4 + sum(requested lengths)`
 
-### AMS Port
+**Write data:** `N × 12 bytes` — per item: IndexGroup(4) + IndexOffset(4) + ReadLength(4)
 
-Each service on a TwinCAT device listens on a specific AMS port:
+**Read data (response):**
+```text
+[N × Error(4)]  [Data(0) .. Data(N-1)]
+```
+
+No per-item read lengths in response. Client must use originally requested lengths to split data.
+
+### 0xF081 — SumWrite
+
+**ReadWrite parameters:**
+- Group: `0xF081`, Offset: `N`
+- ReadLength: `N × 4`
+
+**Write data:** Headers `N × 12 bytes` [IndexGroup(4) + IndexOffset(4) + WriteLength(4)] followed by concatenated write data.
+
+**Read data (response):**
+```text
+[N × Error(4)]
+```
+
+### 0xF082 — SumReadWrite
+
+**ReadWrite parameters:**
+- Group: `0xF082`, Offset: `N`
+- ReadLength: `N × 8 + sum(read lengths)`
+
+**Write data:** Headers `N × 16 bytes` [IndexGroup(4) + IndexOffset(4) + ReadLength(4) + WriteLength(4)] followed by concatenated write data.
+
+**Read data (response):**
+```text
+[N × (Error(4), ReadLength(4))]  [ReadData(0) .. ReadData(N-1)]
+```
+
+### 0xF083 — SumReadEx
+
+Extended batch read with per-item error codes and actual read lengths.
+
+**ReadWrite parameters:**
+- Group: `0xF083`, Offset: `N`
+- ReadLength: `N × 8 + sum(requested lengths)`
+
+**Write data:** `N × 12 bytes` — per item: IndexGroup(4) + IndexOffset(4) + ReadLength(4)
+
+**Read data (response):**
+```text
+[N × (Error(4), ReadLength(4))]  [Data(0) .. Data(N-1)]
+```
+
+> **Documentation note:** The official Beckhoff PDF (page 36) shows 0xF083 with the same response format as 0xF080 (separate error array, no per-item lengths). Empirical testing on both TwinCAT 2 and TwinCAT 3 confirms 0xF083 actually returns the interleaved `[N × (error, length)][data]` format, identical to 0xF084.
+
+### 0xF084 — SumReadEx2
+
+Same request and response format as 0xF083. The official documentation (page 39) explicitly shows the interleaved format for this command:
+
+```text
+Error(1), ReadLen(1), ..., Error(N), ReadLen(N), ReadData(1..N)
+```
+
+**TC3 only.** Returns `0x0701` (service not supported) on TwinCAT 2.
+
+### 0xF085 — SumAddDeviceNotification
+
+**ReadWrite parameters:**
+- Group: `0xF085`, Offset: `N`
+- ReadLength: `N × 8`
+
+**Write data:** `N × 40 bytes` per item — matches the full AddDeviceNotification request structure:
+
+| Size | Field            |
+|------|------------------|
+| 4    | IndexGroup       |
+| 4    | IndexOffset      |
+| 4    | Length           |
+| 4    | TransmissionMode |
+| 4    | MaxDelay (100ns) |
+| 4    | CycleTime (100ns)|
+| 16   | Reserved (zero)  |
+
+**Read data (response):**
+```text
+[N × (Error(4), Handle(4))]
+```
+
+**TC3 only.** Not supported on TwinCAT 2.
+
+### 0xF086 — SumDeleteDeviceNotification
+
+**ReadWrite parameters:**
+- Group: `0xF086`, Offset: `N`
+- ReadLength: `N × 4`
+
+**Write data:** `N × 4 bytes` — one Handle(4) per item.
+
+**Read data (response):**
+```text
+[N × Error(4)]
+```
+
+**TC3 only.** Not supported on TwinCAT 2.
+
+---
+
+## Transmission Modes
+
+Used in AddDeviceNotification (Command 6) and SumAddDeviceNotification (0xF085).
+
+| Value | Name             | Beckhoff .NET Name   | Description                                       |
+|-------|------------------|----------------------|---------------------------------------------------|
+| 0     | NoTransmission   | —                    | No notifications                                  |
+| 1     | ClientCycle      | —                    | Client-side cyclic check (deprecated)             |
+| 2     | ClientOnChange   | —                    | Client-side on-change (deprecated)                |
+| 3     | ServerCycle      | Cyclic               | Server sends at fixed intervals                   |
+| 4     | ServerOnChange   | OnChange             | Server sends only when value changes              |
+| 5     | ServerCycle2     | CyclicInContext      | Cyclic within PLC task cycle (requires ContextMask) |
+| 6     | ServerOnChange2  | OnChangeInContext    | OnChange within PLC task cycle (requires ContextMask) |
+| 10    | Client1Request   | —                    | Single notification then auto-delete              |
+
+### Standard Modes (3, 4)
+
+ServerCycle and ServerOnChange are the standard notification modes supported on both TwinCAT 2 and TwinCAT 3. The notification check runs in a dedicated ADS server thread, separate from the PLC task cycle.
+
+### InContext Modes (5, 6)
+
+ServerCycle2 (CyclicInContext) and ServerOnChange2 (OnChangeInContext) execute the notification value-check inside the PLC task cycle that owns the variable, giving deterministic timing synchronized with the control loop.
+
+**ContextMask requirement:** InContext modes require the target symbol to have a non-zero ContextMask (bits 8-11 of the symbol flags). The ContextMask identifies which PLC task owns the variable. See [Symbol Flags](#symbol-flags) for details.
+
+**Behavior when ContextMask is 0:**
+
+| Platform | Error returned | Behavior |
+|----------|---------------|----------|
+| TwinCAT 3 | `0x070B` (InvalidParam) | Request explicitly rejected |
+| TwinCAT 2 | None | Silently accepted but notifications never fire |
+
+**When to get non-zero ContextMask:**
+- PLC project must have **multiple tasks** (Referenced Tasks in TwinCAT Solution Explorer)
+- Variable must be **local to a PROGRAM POU** assigned to a single task
+- GVL (Global Variable List) variables always have ContextMask=0
+- Single-task projects (the default) always have ContextMask=0
+
+Most PLC projects use a single task, so ContextMask=0 is the common case. Clients should fall back to ServerCycle/ServerOnChange when ContextMask is 0.
+
+---
+
+## ADS States
+
+| Value | State        | Description               |
+|-------|-------------|---------------------------|
+| 0     | Invalid     | Invalid state             |
+| 1     | Idle        | Idle                      |
+| 2     | Reset       | Resetting                 |
+| 3     | Init        | Initializing              |
+| 4     | Start       | Starting                  |
+| 5     | Run         | Running (normal operation)|
+| 6     | Stop        | Stopped                   |
+| 7     | SaveCfg     | Saving configuration      |
+| 8     | LoadCfg     | Loading configuration     |
+| 9     | PowerFailure| Power failure detected    |
+| 10    | PowerGood   | Power restored            |
+| 11    | Error       | Error state               |
+| 12    | Shutdown    | Shutting down             |
+| 13    | Suspend     | Suspended                 |
+| 14    | Resume      | Resuming                  |
+| 15    | Config      | Config mode               |
+| 16    | Reconfig    | Restart in config mode    |
+
+---
+
+## AMS Ports
 
 | Port | Service                          |
 |------|----------------------------------|
 | 100  | Logger                           |
 | 200  | Real-time system                 |
+| 290  | Real-time trace                  |
 | 300  | I/O                              |
 | 400  | SPS (TwinCAT 2 legacy)          |
 | 500  | NC                               |
-| 801  | PLC Runtime 1 (TwinCAT 2 & 3)  |
+| 550  | ISG (Interpolation)             |
+| 600  | PCS                              |
+| 801  | PLC Runtime 1 (TC2 & TC3)       |
 | 811  | PLC Runtime 2                    |
 | 821  | PLC Runtime 3                    |
 | 831  | PLC Runtime 4                    |
-| 851  | PLC Runtime 1 (TwinCAT 3 preferred) |
+| 851  | PLC Runtime 1 (TC3 preferred)   |
 
-### Index Groups
-
-ADS uses **index group** and **index offset** pairs to address data. Several reserved index groups provide access to the symbol system:
-
-| Group    | Name                           | Purpose                                       |
-|----------|--------------------------------|-----------------------------------------------|
-| 0xF000   | SymbolTab                      | Symbol table                                  |
-| 0xF003   | SymbolHandleByName             | Get a handle for a symbol name                |
-| 0xF004   | SymbolValueByName              | Read symbol value by name (one-shot)          |
-| 0xF005   | SymbolValueByHandle            | Read/write symbol value using handle          |
-| 0xF006   | SymbolReleaseHandle            | Release a previously acquired handle          |
-| 0xF007   | SymbolInfoByName               | Get symbol metadata by name                   |
-| 0xF008   | SymbolVersion                  | Read symbol version (changes on PLC download) |
-| 0xF00B   | SymbolUpload                   | Download full symbol table from PLC           |
-| 0xF00C   | SymbolUploadInfo               | Get symbol table size info                    |
-| 0xF00E   | SymbolDataTypeUpload           | Download all datatype definitions             |
-| 0xF00F   | SymbolUploadInfo2              | Extended symbol upload info (TwinCAT 3)       |
-| 0xF080   | SumupRead                      | Batch read multiple values                    |
-| 0xF081   | SumupWrite                     | Batch write multiple values                   |
-| 0xF082   | SumupReadWrite                 | Batch read+write                              |
-| 0xF084   | SumupReadEx2                   | Batch read with per-item error codes          |
-| 0xF085   | SumupAddDeviceNotification     | Batch add notifications                       |
-| 0xF086   | SumupDeleteDeviceNotification  | Batch delete notifications                    |
-
-### Route Registration
-
-Before a remote client can communicate with a PLC, a **route** must exist on both sides. The PLC needs to know the client's AMS NetID and how to reach it (IP address).
-
-Routes can be added via the Beckhoff UDP discovery/route protocol on port **48899**. The packet format uses a tag-based structure:
-
-1. Header: cookie (magic number `0x71146603`) + invoke ID + service ID + AMS address + tag count
-2. Tags: NetID, password, computer name, route name, username
-
-The PLC responds with a success/error code. Once the route is registered, TCP-based ADS communication on port 48898 can proceed.
+TwinCAT 2 uses ports 801-831. TwinCAT 3 introduced port 851+ but also supports the legacy range.
 
 ---
 
-## Symbol System
+## Return Codes
 
-TwinCAT PLCs expose their variables through a **symbol system**. Instead of requiring raw memory addresses, clients can reference variables by name (e.g., `MAIN.myVar`).
+Every ADS response includes a ReturnCode (UINT32). Value `0x0000` means success.
 
-### Symbol Discovery
+Errors can occur at two levels:
+- **AMS level** — the Error Code field in the AMS header (routing failures, target not found)
+- **ADS level** — the Result/Error field in the command response (invalid group, symbol not found)
 
-On connect, the library performs a full symbol discovery:
+### Global Errors (0x01 — 0x1E)
 
-1. **Read symbol version** — `GroupSymbolVersion` (0xF008) returns a version number that changes whenever the PLC program is downloaded. This allows detecting when symbols are stale.
+| Code   | Name                        | Description                                          |
+|--------|-----------------------------|------------------------------------------------------|
+| 0x0001 | InternalError               | Internal error                                       |
+| 0x0002 | NoRtime                     | No real-time                                         |
+| 0x0003 | AllocLockedMemError         | Allocation locked memory error                       |
+| 0x0004 | InsertMailboxError          | Mailbox full, ADS message could not be sent          |
+| 0x0005 | WrongReceiveHmsg           | Wrong receive HMSG                                   |
+| 0x0006 | TargetPortNotFound          | Target port not found, ADS server not started        |
+| 0x0007 | TargetNotFound              | Target machine not found, AMS route not found        |
+| 0x0008 | UnknownCommandID            | Unknown command ID                                   |
+| 0x0009 | BadTaskID                   | Invalid task ID                                      |
+| 0x000A | NoIO                        | No IO                                                |
+| 0x000B | UnknownAdsCommand           | Unknown ADS command                                  |
+| 0x000C | Win32Error                  | Win32 error                                          |
+| 0x000D | PortNotConnected            | Port not connected                                   |
+| 0x000E | InvalidAdsLength            | Invalid ADS length                                   |
+| 0x000F | InvalidAmsNetID             | Invalid AMS Net ID                                   |
+| 0x0010 | LowInstallLevel             | Installation level too low (TC2 license error)       |
+| 0x0011 | NoDebugAvailable            | No debugging available                               |
+| 0x0012 | PortDisabled                | Port disabled, system service not started            |
+| 0x0013 | PortAlreadyConnected        | Port already connected                               |
+| 0x0014 | AdsSyncW32Error             | ADS Sync Win32 error                                 |
+| 0x0015 | AdsSyncTimeout              | ADS Sync timeout                                     |
+| 0x0016 | AdsSyncAmsError             | ADS Sync AMS error                                   |
+| 0x0017 | AdsSyncNoIndexMap           | No index map for ADS Sync available                  |
+| 0x0018 | InvalidAdsPort              | Invalid ADS port                                     |
+| 0x0019 | NoMemory                    | No memory                                            |
+| 0x001A | TcpSendError                | TCP send error                                       |
+| 0x001B | HostUnreachable             | Host unreachable                                     |
+| 0x001C | InvalidAmsFragment          | Invalid AMS fragment                                 |
+| 0x001D | TlsSendError                | TLS send error, secure ADS connection failed         |
+| 0x001E | AccessDenied                | Access denied, secure ADS access denied              |
 
-2. **Read symbol upload info** — `GroupSymbolUploadInfo2` (0xF00F) or `GroupSymbolUploadInfo` (0xF00C) returns the total byte counts for symbols and datatypes.
+### Router Errors (0x0500 — 0x050D)
 
-3. **Download datatypes** — `GroupSymbolDataTypeUpload` (0xF00E) returns all datatype definitions. Each datatype entry contains:
-   - Name, type, comment
-   - Size, offset, flags
-   - Array dimensions and sub-items (for structs)
+| Code   | Name                  | Description                                    |
+|--------|-----------------------|------------------------------------------------|
+| 0x0500 | NoLockedMemory        | Locked memory cannot be allocated              |
+| 0x0501 | ResizeMemory          | Router memory size could not be changed        |
+| 0x0502 | MailboxFull           | Maximum number of messages reached             |
+| 0x0503 | DebugBoxFull          | Debug mailbox full                             |
+| 0x0504 | UnknownPortType       | Unknown port type                              |
+| 0x0505 | NotInitialized        | Router is not initialized                      |
+| 0x0506 | PortAlreadyInUse      | Port number is already assigned                |
+| 0x0507 | NotRegistered         | Port not registered                            |
+| 0x0508 | NoMoreQueues          | Maximum number of ports reached                |
+| 0x0509 | InvalidPort           | Invalid port                                   |
+| 0x050A | NotActivated          | TwinCAT router not active                      |
+| 0x050B | FragmentBoxFull       | Fragment mailbox full                          |
+| 0x050C | FragmentTimeout       | Fragment timeout                               |
+| 0x050D | ToBeRemoved           | Port is being removed                          |
 
-4. **Download symbols** — `GroupSymbolUpload` (0xF00B) returns all top-level symbols. Each symbol entry contains:
-   - Name (e.g., `MAIN.myVar`)
-   - Datatype name (e.g., `INT`, `REAL`, `MyStruct`)
-   - Index group, index offset, size
+### Device/ADS Errors (0x0700 — 0x0739)
 
-5. **Build symbol tree** — datatypes are used to expand structured symbols into a tree. For example, `MAIN.motor` of type `ST_Motor` with fields `speed` and `position` creates child symbols `MAIN.motor.speed` and `MAIN.motor.position`.
+| Code   | Name                       | Description                                    |
+|--------|----------------------------|------------------------------------------------|
+| 0x0700 | Error                      | General device error                           |
+| 0x0701 | ServiceNotSupported        | Service not supported by server                |
+| 0x0702 | InvalidGroup               | Invalid index group                            |
+| 0x0703 | InvalidOffset              | Invalid index offset                           |
+| 0x0704 | InvalidAccess              | Reading/writing not permitted                  |
+| 0x0705 | InvalidSize                | Parameter size not correct                     |
+| 0x0706 | InvalidData                | Invalid parameter value(s)                     |
+| 0x0707 | NotReady                   | Device is not in a ready state                 |
+| 0x0708 | Busy                       | Device is busy                                 |
+| 0x0709 | InvalidContext             | Invalid operating system context               |
+| 0x070A | NoMemory                   | Out of memory                                  |
+| 0x070B | InvalidParam               | Invalid parameter value(s)                     |
+| 0x070C | NotFound                   | Not found (files, ...)                         |
+| 0x070D | Syntax                     | Syntax error in command or file                |
+| 0x070E | Incompatible               | Objects do not match                           |
+| 0x070F | Exists                     | Object already exists                          |
+| 0x0710 | SymbolNotFound             | Symbol not found                               |
+| 0x0711 | SymbolVersionInvalid       | Symbol version invalid, reload symbols         |
+| 0x0712 | InvalidState               | Server is in invalid state                     |
+| 0x0713 | TransModeNotSupported      | ADS TransMode not supported                    |
+| 0x0714 | NotifyHandleInvalid        | Notification handle is invalid                 |
+| 0x0715 | ClientUnknown              | Notification client not registered             |
+| 0x0716 | NoMoreHandles              | No more notification handles available         |
+| 0x0717 | InvalidWatchSize           | Notification size too large                    |
+| 0x0718 | NotInitialized             | Device not initialized                         |
+| 0x0719 | Timeout                    | Device has a timeout                           |
+| 0x071A | NoInterface                | Query interface failed                         |
+| 0x071B | InvalidInterface           | Wrong interface required                       |
+| 0x071C | InvalidClsID               | Class ID is invalid                            |
+| 0x071D | InvalidObjID               | Object ID is invalid                           |
+| 0x071E | Pending                    | Request is pending                             |
+| 0x071F | Aborted                    | Request is aborted                             |
+| 0x0720 | Warning                    | Signal warning                                 |
+| 0x0721 | InvalidArrayIndex          | Invalid array index                            |
+| 0x0722 | SymbolNotActive            | Symbol not active, release handle and retry    |
+| 0x0723 | AccessDenied               | Access denied                                  |
+| 0x0724 | LicenseNotFound            | Missing license                                |
+| 0x0725 | LicenseExpired             | License expired                                |
+| 0x0726 | LicenseExceeded            | License exceeded                               |
+| 0x0727 | LicenseInvalid             | License invalid                                |
+| 0x0728 | LicenseSystemID            | License invalid system ID                      |
+| 0x0729 | LicenseNoTimeLimit         | License not limited in time                    |
+| 0x072A | LicenseFutureIssue         | License issue time in the future               |
+| 0x072B | LicenseTimeToLong          | License time period too long                   |
+| 0x072C | Exception                  | Exception at system startup                    |
+| 0x072D | LicenseDuplicated          | License file read twice                        |
+| 0x072E | SignatureInvalid           | Invalid signature                              |
+| 0x072F | CertificateInvalid         | Invalid public key certificate                 |
+| 0x0730 | LicenseOemNotFound         | Public key not known from OEM                  |
+| 0x0731 | LicenseRestricted          | License not valid for this system ID           |
+| 0x0732 | LicenseDemoDenied          | Demo license prohibited                        |
+| 0x0733 | InvalidFuncID              | Invalid function ID                            |
+| 0x0734 | OutOfRange                 | Outside the valid range                        |
+| 0x0735 | InvalidAlignment           | Invalid alignment                              |
+| 0x0736 | LicensePlatform            | Invalid platform level                         |
+| 0x0737 | ForwardPL                  | Context forward to passive level               |
+| 0x0738 | ForwardDL                  | Context forward to dispatch level              |
+| 0x0739 | ForwardRT                  | Context forward to real-time                   |
 
-> **Important:** Symbol discovery downloads the entire symbol and datatype tables in single ADS requests. See [Symbol Discovery Limitations](#symbol-discovery-limitations) for performance implications.
+### Client Errors (0x0740 — 0x0756)
 
-### Symbol Handles
+| Code   | Name                       | Description                                    |
+|--------|----------------------------|------------------------------------------------|
+| 0x0740 | Error                      | Client error                                   |
+| 0x0741 | InvalidParameter           | Invalid parameter at service call              |
+| 0x0742 | ListEmpty                  | Polling list is empty                          |
+| 0x0743 | VarUsed                    | Var connection already in use                  |
+| 0x0744 | DuplicateInvokeID          | Invoke ID already in use                       |
+| 0x0745 | SyncTimeout                | Timeout elapsed, remote not responding         |
+| 0x0746 | W32Error                   | Error in Win32 subsystem                       |
+| 0x0747 | TimeoutInvalid             | Invalid client timeout value                   |
+| 0x0748 | PortNotOpen                | ADS port not opened                            |
+| 0x0749 | NoAmsAddress               | No AMS address                                 |
+| 0x0750 | SyncInternal               | Internal error in ADS sync                     |
+| 0x0751 | AddHash                    | Hash table overflow                            |
+| 0x0752 | RemoveHash                 | Key not found in hash table                    |
+| 0x0753 | NoMoreSymbols              | No more symbols in cache                       |
+| 0x0754 | SyncResponseInvalid        | Invalid response received                      |
+| 0x0755 | SyncPortLocked             | Sync port is locked                            |
+| 0x0756 | RequestCancelled           | Request was cancelled                          |
 
-To read or write a symbol by name, you first acquire a **handle** (a uint32 identifier):
+### RTime Errors (0x1000 — 0x101A)
 
-1. **Get handle**: `WriteRead` with `GroupSymbolHandleByName` (0xF003), writing the symbol name
-2. **Use handle**: `Read`/`Write` with `GroupSymbolValueByHandle` (0xF005) using the handle as offset
-3. **Release handle**: `Write` with `GroupSymbolReleaseHandle` (0xF006) when done
+| Code   | Name                       | Description                                    |
+|--------|----------------------------|------------------------------------------------|
+| 0x1000 | Internal                   | Internal fatal error in real-time system       |
+| 0x1001 | BadTimerPeriods            | Timer value not valid                          |
+| 0x1002 | InvalidTaskPtr             | Task pointer has invalid value zero            |
+| 0x1003 | InvalidStackPtr            | Stack pointer has invalid value zero           |
+| 0x1004 | PrioExists                 | Requested task priority already assigned       |
+| 0x1005 | NoMoreTcb                  | No free TCB available (max 64)                 |
+| 0x1006 | NoMoreSemas                | No free semaphores available (max 64)          |
+| 0x1007 | NoMoreQueues               | No free queue available (max 64)               |
+| 0x100D | ExtIrqAlreadyDef           | External sync interrupt already applied        |
+| 0x100E | ExtIrqNotDef               | No external sync interrupt applied             |
+| 0x100F | ExtIrqInstallFailed        | External sync interrupt application failed     |
+| 0x1010 | IrqlNotLessOrEqual         | Service called in wrong context                |
+| 0x1017 | VmxNotSupported            | Intel VT-x extension not supported             |
+| 0x1018 | VmxDisabled                | Intel VT-x extension not enabled in BIOS       |
+| 0x1019 | VmxControlsMissing         | Missing feature in Intel VT-x extension        |
+| 0x101A | VmxEnableFails             | Enabling Intel VT-x failed                     |
 
-Handles are cached per symbol — the library acquires them lazily on first access and releases them all on disconnect.
+### TCP/Winsock Errors
 
-### Data Types
-
-The library can parse and serialize these PLC data types:
-
-| PLC Type       | Size    | Go Representation          |
-|----------------|---------|----------------------------|
-| BOOL           | 1 byte  | "true" / "false"           |
-| BYTE, USINT    | 1 byte  | Unsigned 0-255             |
-| SINT           | 1 byte  | Signed -128 to 127         |
-| UINT, WORD     | 2 bytes | Unsigned 0-65535           |
-| INT            | 2 bytes | Signed -32768 to 32767     |
-| UDINT, DWORD   | 4 bytes | Unsigned 32-bit            |
-| DINT           | 4 bytes | Signed 32-bit              |
-| REAL           | 4 bytes | 32-bit float               |
-| LREAL          | 8 bytes | 64-bit float               |
-| STRING         | varies  | Null-terminated string     |
-| TIME           | 4 bytes | Milliseconds, formatted as `HH:MM:SS.sss` |
-| TOD            | 4 bytes | Time of day, formatted as `HH:MM` |
-| DATE           | 4 bytes | Seconds since epoch, formatted as `YYYY-MM-DD` |
-| DT             | 4 bytes | Date+time, formatted as `YYYY-MM-DD HH:MM:SS` |
-
-Structured types (STRUCTs, FUNCTION_BLOCKs) and arrays are recursively expanded into child symbols and serialized as JSON.
+| Code   | Name            | Description                                  |
+|--------|-----------------|----------------------------------------------|
+| 0x274C | TimedOut        | Connection timed out, host unreachable       |
+| 0x274D | ConnRefused     | Connection refused, host not responding      |
+| 0x2751 | HostDown        | Host is down, connection actively refused    |
 
 ---
 
-## Library Architecture
+## TwinCAT 2 vs TwinCAT 3 Differences
+
+### Sum Command Support
+
+| Command                    | Group  | TC2 | TC3 |
+|----------------------------|--------|-----|-----|
+| SumRead (basic)            | 0xF080 | Yes | Yes |
+| SumWrite                   | 0xF081 | Yes | Yes |
+| SumReadWrite               | 0xF082 | Yes | Yes |
+| SumReadEx                  | 0xF083 | Yes | Yes |
+| SumReadEx2                 | 0xF084 | No  | Yes |
+| SumAddDeviceNotification   | 0xF085 | No  | Yes |
+| SumDeleteDeviceNotification| 0xF086 | No  | Yes |
+
+Unsupported commands return `0x0701` (service not supported).
+
+### Transmission Modes
+
+| Mode             | TC2                | TC3 (ContextMask=0) | TC3 (ContextMask>0) |
+|------------------|--------------------|----------------------|---------------------|
+| ServerCycle (3)  | Works              | Works                | Works               |
+| ServerOnChange (4)| Works             | Works                | Works               |
+| ServerCycle2 (5) | Silently ignored   | Rejected (0x070B)    | Works               |
+| ServerOnChange2 (6)| Silently ignored | Rejected (0x070B)    | Works               |
+
+TC2 does not return an error for v2 modes — notifications silently never fire. TC3 rejects v2 modes with `0x070B` (InvalidParam) when the symbol's ContextMask is 0. The `go-ads` library auto-falls back to modes 3/4 in both cases.
+
+### Symbol System
+
+| Feature                    | TC2               | TC3                  |
+|----------------------------|-------------------|----------------------|
+| SymbolUploadInfo2 (0xF00F) | Not available     | Available            |
+| SymbolUploadInfo (0xF00C)  | Available         | Available            |
+| Enum types                 | Flattened to base INT/DINT | Full enum metadata |
+| Chunked symbol download    | May not support   | Supported            |
+| Extended symbol data       | Not present       | TypeGuid, Attributes, ExtendedFlags |
+| ContextMask in flags       | Always 0          | 0 (single-task) or 1-15 (multi-task) |
+
+### Ports
+
+| Runtime   | TC2  | TC3           |
+|-----------|------|---------------|
+| PLC RT 1  | 801  | 851 (preferred), 801 also works |
+| PLC RT 2  | 811  | 811           |
+| PLC RT 3  | 821  | 821           |
+| PLC RT 4  | 831  | 831           |
+
+---
+
+## Packet Walkthrough
+
+This section shows a complete ADS Read request and response at the byte level, illustrating how a client reads 4 bytes from a PLC variable.
+
+### Scenario
+
+- Client IP: `192.168.1.10`, AMS NetID: `192.168.1.10.1.1`, AMS port: `10500`
+- PLC IP: `192.168.1.100`, AMS NetID: `192.168.1.100.1.1`, AMS port: `851`
+- Operation: Read 4 bytes from index group `0xF005` (SymbolValueByHandle), offset `0x0000002A` (handle 42)
+- Invoke ID: `1`
+
+### Step 1: TCP Connection
+
+Client opens a TCP connection to `192.168.1.100:48898`.
+
+> Before this, a route must exist on the PLC mapping the client's NetID to its IP. Routes can be pre-configured or added via UDP port 48899.
+
+### Step 2: ADS Read Request
+
+The client sends a single TCP packet containing the AMS/TCP header, AMS header, and ADS Read command data.
 
 ```text
-┌──────────────────────────────────────────────────┐
-│                   Application                     │
-│  ReadFromSymbol / WriteToSymbol / Notifications   │
-├──────────────────────────────────────────────────┤
-│                  ads.go / symbols.go              │
-│         Symbol resolution, caching, parsing       │
-├──────────────────────────────────────────────────┤
-│               command*.go files                   │
-│    Read, Write, ReadWrite, Notifications,         │
-│    SumRead, SumNotification, DeviceInfo, State    │
-├──────────────────────────────────────────────────┤
-│                    comm.go                        │
-│     sendRequest, listen, handleReceive,           │
-│     transmitWorker (goroutines)                   │
-├──────────────────────────────────────────────────┤
-│                    ams.go                         │
-│          AMS/TCP packet encoding                  │
-├──────────────────────────────────────────────────┤
-│                 connection.go                     │
-│    TCP dial, connect, reconnect, close            │
-├──────────────────────────────────────────────────┤
-│                  route.go                         │
-│        UDP route registration (port 48899)        │
-└──────────────────────────────────────────────────┘
+Complete packet (50 bytes):
+
+AMS/TCP Header (6 bytes):
+  00 00             Reserved + System (normal ADS packet)
+  2C 00 00 00       Length = 44 (32-byte AMS header + 12-byte ADS data)
+
+AMS Header (32 bytes):
+  C0 A8 01 64 01 01 Target NetID = 192.168.1.100.1.1
+  53 03             Target Port = 851 (0x0353)
+  C0 A8 01 0A 01 01 Source NetID = 192.168.1.10.1.1
+  14 29             Source Port = 10500 (0x2914)
+  02 00             Command = 2 (Read)
+  04 00             State = 4 (request)
+  0C 00 00 00       ADS Data Length = 12
+  00 00 00 00       Error Code = 0
+  01 00 00 00       Invoke ID = 1
+
+ADS Data — Read Request (12 bytes):
+  05 F0 00 00       Index Group = 0xF005 (SymbolValueByHandle)
+  2A 00 00 00       Index Offset = 42 (handle)
+  04 00 00 00       Read Length = 4
 ```
 
-### Concurrency Model
+### Step 3: ADS Read Response
 
-The library uses three goroutines per connection:
-
-1. **listen** — reads packets from TCP, parses AMS headers, and dispatches:
-   - Notification packets (Command 8) are handled directly
-   - Response packets are routed to the waiting request goroutine via a channel keyed by invoke ID
-
-2. **transmitWorker** — serializes outgoing packets onto the TCP connection from a send channel
-
-3. **handleReceive** — spawned per incoming response, delivers data to the correct request channel
-
-Requests use a `map[uint32]chan []byte` keyed by invoke ID. Each `sendRequest` call:
-1. Allocates a new invoke ID (atomic counter)
-2. Creates a response channel in the map
-3. Sends the encoded packet via the send channel
-4. Blocks waiting on the response channel (with timeout)
-5. Cleans up the map entry on return
-
-### Reconnection
-
-When TCP read errors are detected (including TCP keepalive failures), the library automatically:
-
-1. Closes the old TCP connection
-2. Stops listen and transmitWorker goroutines
-3. Retries TCP dial in a loop (configurable interval, default 5s)
-4. Re-loads symbols based on discovery mode:
-   - If `LoadSymbols()` was used: re-downloads the full symbol table
-   - If on-demand only: re-resolves only the specific symbols that were previously accessed
-   - If no symbols were loaded: reads symbol version only
-5. Re-subscribes to all previously registered notifications
-
-TCP keepalive is configured aggressively (idle=3s, interval=2s, count=5) so cable disconnections are detected within ~13 seconds.
-
----
-
-## API Reference
-
-### Connection Management
-
-#### `NewConnection(ctx, ip, port, netid, amsPort, localNetID, localPort, requestTimeout) (*Connection, error)`
-
-Creates a new ADS connection configuration. Does not connect yet.
-
-- `ip` — PLC IP address
-- `port` — TCP port (typically `48898`)
-- `netid` — Target PLC AMS NetID in dotted notation (e.g., `"5.1.2.3.1.1"`)
-- `amsPort` — Target AMS port (e.g., `851` for TwinCAT 3 Runtime 1)
-- `localNetID` — Source AMS NetID; use `"auto"` to derive from local IP
-- `localPort` — Source AMS port (e.g., `10500`)
-- `requestTimeout` — Timeout for individual ADS requests (0 defaults to 5000ms)
-
-#### `Connect(local bool) error`
-
-Establishes the TCP connection and starts background goroutines. Does **not** load the symbol table — symbols are resolved on-demand when first accessed, or you can call `LoadSymbols()` / `LoadSymbolsSlow()` explicitly.
-
-- `local` — set `true` when connecting to a TwinCAT runtime on the same machine (uses loopback and queries local NetID via system message)
-
-#### `Close()`
-
-Gracefully shuts down: deletes all notification handles, releases symbol handles, closes TCP, and waits for goroutines to finish.
-
-#### `Reconnect() error`
-
-Re-establishes the connection after a failure. Called automatically on TCP errors, but can also be called manually. If full discovery was performed, it re-loads the full symbol table. If only on-demand symbols were resolved, it re-resolves only those specific symbols.
-
-#### `IsDisconnected() bool`
-
-Returns whether the connection is currently in a disconnected state.
-
-### Symbol Discovery
-
-#### `LoadSymbols() error`
-
-Performs full symbol and datatype discovery from the PLC. Downloads the entire symbol table and datatype definitions in single requests. After calling this:
-- `ListSymbols()` returns all symbols
-- Struct/array children are available
-- Write operations with type aliases work
-
-**Warning:** This locks the PLC task during the download. For large programs, consider `LoadSymbolsSlow()`.
-
-#### `LoadSymbolsSlow(cfg SlowDiscoveryConfig) error`
-
-Downloads the full symbol table in chunks with configurable delays between chunks, to minimize disruption to the PLC's real-time task. Falls back to single-request downloads if the PLC does not support offset-based chunked reads.
-
-```go
-conn.LoadSymbolsSlow(ads.SlowDiscoveryConfig{
-    ChunkSize:  4096,            // bytes per chunk (default: 4096)
-    ChunkDelay: 100*time.Millisecond, // delay between chunks (default: 100ms)
-})
-```
-
-### Browse Mode (Partial Discovery)
-
-Browse mode allows lazy navigation of the PLC symbol hierarchy without downloading everything at once. It splits discovery into two independent downloads:
-
-| Mode | API | Downloads | Can List | Can Browse Children | Can Read Values |
-|------|-----|-----------|----------|--------------------|----|
-| None (default) | `Connect()` | Nothing | No | No | Yes (on-demand) |
-| Symbol list only | `LoadSymbolList()` | Symbol table (~small) | Top-level | Heuristic only | Yes (on-demand) |
-| Symbol list + types | `LoadSymbolList()` + `LoadDataTypes()` | Both tables | All | Yes (fully expanded) | Yes |
-| Full discovery | `LoadSymbols()` / `LoadSymbolsSlow()` | Both tables | All | Yes | Yes |
-
-#### `LoadSymbolList(cfg SlowDiscoveryConfig) error`
-
-Downloads only the symbol table (0xF00B) in chunks. This is the smaller of the two tables and enables browsing top-level symbol names via `BrowseSymbols()`. If `LoadDataTypes()` was already called, struct children are retroactively expanded.
-
-```go
-conn.LoadSymbolList(ads.SlowDiscoveryConfig{})
-entries, _ := conn.BrowseSymbols("") // list root entries
-```
-
-#### `LoadDataTypes(cfg SlowDiscoveryConfig) error`
-
-Downloads only the datatype table (0xF00E) in chunks. When combined with `LoadSymbolList()`, enables full struct/array child expansion. If the symbol list was already loaded, children are retroactively expanded.
-
-```go
-conn.LoadDataTypes(ads.SlowDiscoveryConfig{})
-entries, _ := conn.BrowseSymbols("MAIN.motor") // list struct children
-```
-
-#### `BrowseSymbols(path string) ([]SymbolBrowseEntry, error)`
-
-Returns browsable entries at the given path. If path is empty, returns root-level groupings. Requires `LoadSymbolList()` or `LoadSymbols()` to have been called first.
-
-Each `SymbolBrowseEntry` contains:
-- `Name` — short name (e.g., `"motor"`)
-- `FullName` — full path (e.g., `"MAIN.motor"`)
-- `DataType` — type name (e.g., `"ST_Motor"`, `"INT"`)
-- `Size` — byte size
-- `HasChildren` — true if the symbol has children (struct/array)
-- `Comment` — PLC comment
-
-### Reading and Writing
-
-#### `ReadFromSymbol(symbolName string) (string, error)`
-
-Reads a PLC variable by name and returns its parsed string value. If the symbol has not been discovered yet, it is resolved on-demand from the PLC (adds 2 ADS round-trips on first access, cached afterward). Includes a minimum update interval cache (50ms default) to avoid excessive reads.
-
-#### `WriteToSymbol(symbolName string, value string) error`
-
-Writes a value to a PLC variable by name. The string value is converted to the appropriate binary format based on the symbol's datatype. Symbols are resolved on-demand if not already loaded. Standard PLC types (BOOL, INT, REAL, STRING, etc.) work in on-demand mode. User-defined type aliases require `LoadSymbols()` first.
-
-#### `ReadMultipleSymbols(names []string) (map[string]string, error)`
-
-Reads multiple symbols in a single ADS round-trip using the SumRead command. Returns a map of symbol name to parsed value. Falls back to individual reads on older PLCs that don't support sum commands.
-
-### Symbol Information
-
-#### `ListSymbols() (map[string]*Symbol, error)`
-
-Returns the full symbol table. Requires `LoadSymbols()` or `LoadSymbolsSlow()` to have been called first — returns an error otherwise. Keys are fully qualified symbol names (e.g., `"MAIN.myVar"`, `"MAIN.motor.speed"`).
-
-#### `GetSymbol(symbolName string) (*Symbol, error)`
-
-Returns the Symbol struct for a given name, acquiring a handle from the PLC if needed.
-
-#### `RefreshSymbols() error`
-
-Checks if the PLC's symbol version has changed (e.g., after a new program download) and reloads the symbol table if so.
-
-#### `CheckSymbolVersion() (changed bool, err error)`
-
-Checks if the symbol version has changed without reloading.
-
-### Notifications
-
-#### `AddSymbolNotification(symbolName, maxDelay, cycleTime int, transMode TransMode, ch chan *Update) error`
-
-Subscribes to value changes on a single symbol. Updates are delivered to the provided channel.
-
-#### `AddSymbolNotifications(configs []NotificationConfig, ch chan *Update) error`
-
-Subscribes to multiple symbol notifications in a single ADS round-trip. All updates are delivered to the same channel. Notification configs are stored internally for automatic re-subscribe after reconnection.
-
-### Device Information
-
-#### `ReadDeviceInfo() (DeviceInfo, error)`
-
-Returns the device name and TwinCAT version (major, minor, build).
-
-#### `ReadState() (states, error)`
-
-Returns the current ADS state (Run, Stop, Config, etc.) and device state.
-
-### Route Management
-
-#### `AddRemoteRoute(remoteHost, localNetId, routeName, computerName, username, password string) error`
-
-Registers a route on the remote PLC via UDP (port 48899). This is needed before the PLC can send responses back to this client.
-
-### Low-Level Access
-
-#### `Read(group, offset, length uint32) ([]byte, error)`
-
-Raw ADS Read by index group and offset.
-
-#### `Write(group, offset uint32, data []byte) error`
-
-Raw ADS Write by index group and offset.
-
-#### `WriteRead(group, offset, readLength uint32, data []byte) ([]byte, error)`
-
-Raw ADS ReadWrite — sends data and reads a response in one round-trip.
-
-#### `SumRead(requests []SumReadRequest) ([]SumReadResult, error)`
-
-Batch read using `GroupSumupReadEx2`. Returns per-item results with error codes and data. Falls back to individual reads on older PLCs.
-
-#### `SumAddDeviceNotification(requests []SumNotificationRequest) (handles, errors, err)`
-
-Batch add notifications using `GroupSumupAddDeviceNotification`. Falls back to individual calls and automatically downgrades TwinCAT 3 transmission modes (v2) to v1 equivalents for older PLCs.
-
-#### `SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error)`
-
-Batch delete notifications using `GroupSumupDeleteDeviceNotification`.
-
----
-
-## Connection Lifecycle
+The PLC responds with the requested data. In this example, the variable holds the DINT value `1234` (0x000004D2).
 
 ```text
-1. NewConnection(...)          — configure target, source, timeouts
-       │
-2. [AddRemoteRoute(...)]       — optional: register route on PLC via UDP
-       │
-3. Connect(false)              — TCP dial → start goroutines (no symbol loading)
-       │
-4. [LoadSymbols()]             — optional: full discovery for ListSymbols/struct access
-   [LoadSymbolsSlow(cfg)]      — optional: chunked discovery (PLC-friendly)
-   [LoadSymbolList(cfg)]       — optional: browse mode (symbol names only)
-   [LoadDataTypes(cfg)]        — optional: add struct expansion to browse mode
-       │
-5. ReadFromSymbol(...)         — symbols resolved on-demand if not discovered
-   BrowseSymbols(path)         — navigate symbol hierarchy (requires step 4)
-   WriteToSymbol(...)
-   AddSymbolNotifications(...)
-       │
-   ┌───┴──── (TCP error detected) ────┐
-   │                                   │
-   │  Reconnect()                      │
-   │  - re-dial TCP                    │
-   │  - re-resolve symbols (mode-aware)│
-   │  - re-subscribe notifications     │
-   │                                   │
-   └───────────────────────────────────┘
-       │
-6. Close()                     — delete notifications → release handles → close TCP
+Complete packet (50 bytes):
+
+AMS/TCP Header (6 bytes):
+  00 00             Reserved + System
+  2C 00 00 00       Length = 44 (32-byte AMS header + 12-byte ADS data)
+
+AMS Header (32 bytes):
+  C0 A8 01 0A 01 01 Target NetID = 192.168.1.10.1.1  (swapped — response goes back)
+  14 29             Target Port = 10500
+  C0 A8 01 64 01 01 Source NetID = 192.168.1.100.1.1
+  53 03             Source Port = 851
+  02 00             Command = 2 (Read)
+  05 00             State = 5 (response)
+  0C 00 00 00       ADS Data Length = 12
+  00 00 00 00       Error Code = 0 (AMS-level OK)
+  01 00 00 00       Invoke ID = 1 (matches request)
+
+ADS Data — Read Response (12 bytes):
+  00 00 00 00       Result = 0x0000 (ADS-level OK)
+  04 00 00 00       Data Length = 4
+  D2 04 00 00       Data = 1234 (DINT, little-endian)
 ```
 
----
+### Step 4: Matching Request to Response
 
-## Symbol Discovery Limitations
+The client matches the response to the request using the **Invoke ID** (1). Multiple requests can be in flight simultaneously — each gets a unique Invoke ID. The response's State field changes from `0x0004` (request) to `0x0005` (response), and the Source/Target addresses are swapped.
 
-Full symbol discovery (triggered by calling `LoadSymbols()`) downloads the entire symbol table and all datatype definitions from the PLC in two large ADS Read requests. While convenient, this has important performance and sizing implications.
+### Error Levels
 
-### PLC Real-Time Impact
+Errors can occur at two independent levels:
 
-The PLC task is **locked for every ADS request**. While the PLC is assembling a response, it pauses its real-time cycle. For a small PLC program this is negligible, but for large programs with thousands of symbols, the symbol and datatype upload responses can be substantial and cause measurable **cycle jitter**.
+1. **AMS Error Code** (offset 24 in AMS header): Routing or transport failures. If non-zero, the ADS data may be absent or invalid.
+2. **ADS Result** (first 4 bytes of response data): Command-level errors like "symbol not found" or "invalid group". The AMS Error Code is 0 in this case — the packet was delivered, but the command failed.
 
-This means:
-- A full symbol discovery on a large PLC program will cause a brief real-time pause
-- The pause duration scales with symbol table size
-- Motion control or other time-critical applications may be affected
-- This typically only happens on connect/reconnect, not during normal operation
+### Full Session: Connect → Read Symbol → Disconnect
 
-### AMS Router Buffer Limit
+A typical session to read a PLC variable by name:
 
-The ADS response must pass through the AMS router, which has a **default buffer size of 2 MB** (2,097,152 bytes, configurable via `ADS.Config::RESPONSE_SIZE_LIMIT`). If the combined symbol table or datatype definitions exceed this limit, the upload will fail.
+```text
+1. TCP connect to PLC:48898
+        │
+2. ReadWrite (cmd 9) to 0xF003 (SymbolHandleByName)
+   Write: "MAIN.myVar\0" (symbol name, null-terminated)
+   Read:  4 bytes → handle (e.g., 42)
+        │
+3. Read (cmd 2) to 0xF005 (SymbolValueByHandle)
+   Group=0xF005, Offset=42 (handle), Length=4
+   Read:  4 bytes → raw value (e.g., 1234)
+        │
+4. Write (cmd 3) to 0xF006 (SymbolReleaseHandle)
+   Group=0xF006, Offset=0, Data=handle (42)
+   Response: 4-byte return code
+        │
+5. TCP close
+```
 
-PLC programs with very large numbers of symbols, deeply nested structs, or extensive arrays can exceed this limit. Symptoms include truncated responses or ADS errors during `Connect()`.
-
-### Sizing Guidelines
-
-| PLC Program Size | Typical Symbol Table | Impact            |
-|------------------|---------------------|-------------------|
-| Small (<100 symbols) | < 50 KB          | Negligible        |
-| Medium (100-1000)    | 50 KB - 500 KB   | Minor jitter      |
-| Large (1000-5000)    | 500 KB - 2 MB    | Noticeable jitter |
-| Very large (>5000)   | > 2 MB           | May exceed buffer |
-
-### Recommendations
-
-- **Small/medium PLC programs**: Full discovery (the default) is fine and the most convenient approach.
-- **Large PLC programs**: If real-time jitter during connect is a concern, consider increasing the PLC task cycle time temporarily during the connection phase, or schedule connects during non-critical periods.
-- **Very large PLC programs**: If the symbol table exceeds the 2 MB AMS router buffer, you have two options:
-  1. Increase the router buffer size on the PLC (`ADS.Config::RESPONSE_SIZE_LIMIT`)
-  2. Use selective symbol access instead — query individual symbols by name using `GroupSymbolInfoByNameEx` (0xF009) rather than downloading the entire table
-- **Sum commands**: Beckhoff recommends not exceeding **500 sub-commands** in a single sum request (SumRead, SumAddDeviceNotification, etc.) to avoid excessive real-time jitter.
-
-### Is Full Discovery Required?
-
-**No.** Full symbol discovery is a convenience, not a protocol requirement. The ADS protocol provides multiple ways to work with symbols without downloading the entire table:
-
-| Approach | Index Group | Description |
-|----------|------------|-------------|
-| Full upload | 0xF00B + 0xF00E | Download entire symbol + datatype tables. Convenient but heavy. |
-| Handle by name | 0xF003 | Get a handle for a single symbol by name. Lightweight. |
-| Value by name | 0xF004 | Read a symbol value directly by name in one shot. No handle needed. |
-| Info by name | 0xF009 | Get metadata (size, type, group, offset) for a single symbol. |
-| Direct access | Any group/offset | If you already know the index group and offset, no discovery needed at all. |
-
-For applications that only need a small subset of symbols, querying individual symbols by name (`GroupSymbolHandleByName` + `GroupSymbolValueByHandle`) avoids the cost of full discovery entirely. This is the recommended approach for large PLC programs where full discovery would cause unacceptable real-time jitter or exceed the AMS router buffer.
-
-The Beckhoff reference C++ ADS library supports both modes — it can download the full symbol table or resolve individual symbols on demand.
+Each step is one ADS request/response pair. Step 2 uses ReadWrite because it sends data (the name) and receives data (the handle) in one round-trip. Step 3 is a pure Read. Step 4 is a pure Write.
 
 ---
 
 ## Secure ADS (ADS over TLS)
 
-Secure ADS adds TLS encryption to the standard ADS protocol. It was introduced in **TwinCAT 3.1 Build 4024.0** and is included with TC1000 at no additional cost.
+Introduced in TwinCAT 3.1 Build 4024.0. Uses **TLS 1.2 with mutual authentication (mTLS)** on TCP port **8016**.
 
-> **Note:** This library does **not** currently implement Secure ADS. It uses plain TCP on port 48898. This section documents the protocol for reference.
+### Key Differences from Standard ADS
 
-### Overview
+- Uses port 8016 instead of 48898
+- **Omits the 6-byte AMS/TCP framing header** inside the TLS tunnel (TLS record layer provides framing)
+- Adds a TlsConnectInfo handshake after TLS establishment
 
-Secure ADS creates an encrypted tunnel for all AMS/ADS communication using **TLS 1.2 with mutual authentication (mTLS)** — both client and server present certificates. Programs using standard ADS do not need modification; Secure ADS is transparent at the TwinCAT router level.
+### Authentication Methods
 
-### Port
+1. **Self-Signed Certificates (SSC)** — auto-generated, TOFU with SHA-256 fingerprint pinning
+2. **Pre-Shared Keys (PSK)** — TLS-PSK, no certificates needed, no expiration
+3. **Customer CA Certificates** — shared CA trust, most flexible for large deployments
 
-Secure ADS uses **TCP port 8016** instead of the standard port 48898.
+### TLS Error Codes
 
-| Protocol     | TCP Port | UDP Port |
-|-------------|----------|----------|
-| Standard ADS | 48898    | 48899 (route management) |
-| Secure ADS   | 8016     | —        |
-
-### Connection Sequence
-
-```text
-1. TCP connect to port 8016
-2. TLS 1.2 handshake (mutual TLS — both sides authenticate)
-3. TlsConnectInfo request (64-512 bytes, inside TLS tunnel)
-4. TlsConnectInfo response (inside TLS tunnel)
-5. AMS/ADS frames (inside TLS tunnel)
-```
-
-### Key Protocol Difference
-
-Unlike standard ADS, Secure ADS **omits the 6-byte AMS/TCP framing header** inside the TLS tunnel. The TLS record layer provides framing instead, and the receiver determines frame boundaries from the AMS header's Length field.
-
-### Authentication Modes
-
-Secure ADS supports three certificate/authentication methods:
-
-#### 1. Self-Signed Certificates (SSC)
-
-- TwinCAT auto-generates a self-signed certificate on first startup
-- Trust is established via **TOFU (Trust On First Use)** with SHA-256 fingerprint pinning
-- Certificate validity: 1/1/2000 to 1/1/2061 (intentionally wide to avoid clock issues)
-- Simplest to set up; good for initial deployments and small systems
-
-#### 2. Pre-Shared Keys (PSK)
-
-- Uses TLS-PSK with identity and password-derived keys
-- No certificates required
-- Keys are stored in configuration files (not hashed — keep them secure)
-- PSKs have no expiration dates
-- Suitable for maintenance staff access and simple setups
-
-#### 3. Customer-Provided Certificates (Shared CA)
-
-- Both peers trust certificates issued by a shared Certificate Authority
-- Enables dynamic constellations — any device trusting the same CA can communicate without prior per-device configuration
-- Most flexible for large deployments
-- Requires proactive certificate renewal before expiration
-
-### Security Considerations
-
-- All methods require keeping secrets (private keys, PSKs) isolated and protected
-- If secrets are compromised, the entire system must be re-configured to restore integrity
-- Two ADS-specific TLS error codes exist:
-  - `0x1D` (`ReturnCodeGlobalTlsSendError`): "TLS send error — secure ADS connection failed"
-  - `0x1E` (`ReturnCodeGlobalAccessDenied`): "Access denied — secure ADS access denied"
-
-### References
-
-- [Beckhoff InfoSys: Secure ADS](https://infosys.beckhoff.com/content/1033/tc3_grundlagen/6798095243.html)
-- [Beckhoff Secure ADS Manual (PDF)](https://download.beckhoff.com/download/document/automation/twincat3/Secure_ADS_EN.pdf)
+- `0x001D` — TLS send error, secure ADS connection failed
+- `0x001E` — Access denied, secure ADS access denied
 
 ---
 
-### Error Handling
+## Limits and Recommendations
 
-All ADS responses include a `ReturnCode`. The library defines comprehensive return codes covering:
+| Limit | Value | Source |
+|-------|-------|--------|
+| Max sub-commands per sum request | 500 | Beckhoff documentation |
+| Max notifications per device | 550 | Beckhoff recommendation |
+| AMS router response buffer | 2 MB (default) | Configurable via `ADS.Config::RESPONSE_SIZE_LIMIT` |
+| AddDeviceNotification request size | 40 bytes | Fixed by protocol |
+| AMS/TCP header | 6 bytes | Fixed |
+| AMS header | 32 bytes | Fixed |
 
-- **Global errors** (0x01-0x1E) — internal errors, routing failures, timeouts
-- **Router errors** (0x500-0x50D) — port and memory allocation issues
-- **Device errors** (0x700-0x739) — symbol not found, invalid access, licensing
-- **Client errors** (0x740-0x756) — timeout, invalid parameters
-- **RTime errors** (0x1000-0x101A) — real-time system failures
-- **TCP errors** (0x274C-0x2751) — connection refused, timed out, host down
+### Network Ports
 
-Each `ReturnCode` implements both `String()` and `Error()`, providing human-readable descriptions like `"0x0710: symbol not found"`.
+| Port | Protocol | Purpose | Configurable |
+|------|----------|---------|--------------|
+| 48898 | TCP | ADS/AMS data channel — all ADS commands, responses, and notifications | Yes (TwinCAT System Manager) |
+| 48899 | UDP | AMS route registration — Beckhoff proprietary protocol | No (fixed by Beckhoff convention) |
+
+Both ports must be reachable from the client to the PLC. If UDP 48899 is blocked,
+route registration fails but ADS communication works if a route already exists on the PLC.
+
+### Route Registration
+
+UDP port 48899 is used for route management. Packet format:
+- Header: cookie `0x71146603` + invoke ID + service ID + AMS address + tag count
+- Tags: NetID, password, computer name, route name, username
+
+#### Route Registration Behavior (Observed)
+
+**PLC stores the UDP source IP, not the `computerName` tag.** When a route is registered
+from inside a Docker container (bridge mode), the PLC records:
+- **AMS NetID**: from the packet's NetID tag (e.g., `172.17.0.2.1.1` — the container IP)
+- **IP address**: from the UDP packet's source IP after NAT (e.g., `192.168.3.52` — the host IP)
+
+The `computerName` tag in the packet appears to be ignored for IP resolution. This has
+important implications for containerized deployments.
+
+#### Docker / Container Deployment
+
+**Minimum configuration**: only route credentials are needed. `WithHostIP` and explicit
+AMS NetID (`ADS_LOCAL_AMS`) are both optional.
+
+```go
+conn, _ := NewSession(ctx, plcIP, 48898, targetAMS, 851, "auto", 10500, 5*time.Second,
+    WithRoute("my-route", "Administrator", "password"),
+)
+conn.Connect(false)
+// Works from Docker, Kubernetes, VMs — no ADS_HOST_IP or ADS_LOCAL_AMS needed
+```
+
+**How it works:**
+1. TCP connects to PLC → auto-derive NetID from container IP (e.g., `172.17.0.2.1.1`)
+2. UDP route registration → PLC stores NetID + UDP source IP (post-NAT = host IP)
+3. TCP reconnects after route registration (PLC may reset pre-route connections)
+4. ADS commands use the auto-derived NetID → PLC matches route → accepts
+5. Notifications delivered over existing TCP → no reverse connection needed
+
+| Scenario | NetID | Route IP | Works? |
+|----------|-------|----------|--------|
+| Bare metal | Host IP-based (e.g., `192.168.3.52.1.1`) | Host IP | Yes |
+| Docker (auto-derived) | Container IP-based (e.g., `172.17.0.2.1.1`) | Host IP (via NAT) | Yes |
+| Docker (explicit AMS) | Any chosen NetID | Host IP (via NAT) | Yes |
+| Docker, no credentials | Any | No route created | **No** |
+| Docker, UDP port 48899 blocked | Any | Can't register | **No** |
+
+**Key findings from Docker bridge testing (Colima/macOS, April 2025):**
+1. Auto-derived NetID from container IP works — PLC accepts ADS commands
+   and sends notifications over the existing TCP connection
+2. `WithHostIP` / `ADS_HOST_IP` has no effect on route IP — PLC uses UDP source IP regardless
+3. Route credentials are **required** — without them, no route is created and the PLC
+   closes the TCP connection (EOF / connection reset) on the first ADS command
+4. `ADS_LOCAL_AMS` is **optional** — auto-derived NetID from container works fine
+5. UDP port 48899 must be open — route registration is UDP-based and cannot fall back to TCP
+6. TCP port 48898 is used for ADS data — must be open
+7. When the PLC has no route for a source NetID, it closes the TCP connection immediately.
+   The error appears as `EOF` or `connection reset by peer` — this typically means a
+   missing or expired AMS route, not a network issue
+
+**Note:** These observations are based on testing with TwinCAT 3 (TC3.1 build 4026) via
+Colima on macOS. More extensive testing across TwinCAT versions, native Linux Docker, and
+Kubernetes is needed to fully validate these findings. The `computerName` field may still
+be relevant for other route management scenarios (e.g., TwinCAT route manager UI display).
+
+#### Connect/Route Ordering
+
+Route registration must happen **before** any ADS commands. If no route exists when the
+first ADS command is sent, the PLC closes the TCP connection immediately (EOF or
+connection reset). A lightweight ADS command like `GetSymbolVersion` (index group 0xF008)
+can be used to probe whether a route already exists before attempting registration.
+
+Routes persist across PLC reboots in most configurations but may be lost in some environments
+(e.g., TwinCAT CE devices, certain VM configurations).
+
+See [IMPLEMENTATION.md](IMPLEMENTATION.md) for how go-ads handles route registration and reconnection.
+
+---
+
+## References
+
+- [Beckhoff InfoSys: ADS/AMS Specification](https://infosys.beckhoff.com/content/1033/tc3_ads_intro/index.html)
+- [Beckhoff InfoSys: TwinCAT 3 Basics](https://infosys.beckhoff.com/content/1033/tc3_grundlagen/index.html)
+- [Beckhoff TwinCAT 3 Basics PDF](https://download.beckhoff.com/download/document/automation/twincat3/TwinCAT_3_Basics_EN.pdf) — pages 34-39 cover sum commands
+- [Beckhoff InfoSys: ADS Return Codes](https://infosys.beckhoff.com/content/1033/tc3_ads_intro/374277003.html)
+- [Beckhoff InfoSys: Secure ADS](https://infosys.beckhoff.com/content/1033/tc3_grundlagen/6798095243.html)
+- [Beckhoff Secure ADS Manual (PDF)](https://download.beckhoff.com/download/document/automation/twincat3/Secure_ADS_EN.pdf)

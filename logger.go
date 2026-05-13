@@ -16,21 +16,8 @@ func hexAttr(key string, data []byte) slog.Attr {
 	return slog.String(key, hex.EncodeToString(data))
 }
 
-// ConnectionOption configures optional parameters for NewConnection.
-type ConnectionOption func(*Connection)
-
-// WithLogger sets the logger for the connection.
-// If not provided, slog.Default() is used.
-func WithLogger(logger *slog.Logger) ConnectionOption {
-	return func(c *Connection) {
-		if logger != nil {
-			c.logger = logger
-		}
-	}
-}
-
 // defaultLoggerPtr is used by package-level functions (e.g., AddRemoteRoute)
-// that are not associated with a Connection instance.
+// that are not associated with a Session instance.
 var defaultLoggerPtr atomic.Pointer[slog.Logger]
 
 func init() {

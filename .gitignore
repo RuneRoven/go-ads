@@ -1,7 +1,19 @@
-/examples/simple/simple
-/examples/simple/go-ads-cli
-examples/simple/config-office.yaml
+/examples/cli/cli
+examples/cli/config*.yaml
 .env*
 .DS_Store
 coverage.out
 coverage.html
+*.pdf
+*.var
+logs/
+improvements.md
+docs/
+
+# Internal triage docs (work logs, snapshots-in-time — not for public commit)
+specs/07-bug-report.md
+specs/10-test-audit.md
+specs/11-spec-code-audit.md
+
+# Symbol-version hardware test logs
+symbol-version-run-*.log

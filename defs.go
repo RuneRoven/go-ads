@@ -6,7 +6,7 @@ import (
 )
 
 // AMSAddress netid and port of device
-type AmsAddress struct {
+type AMSAddress struct {
 	NetID [6]byte
 	Port  uint16
 }
@@ -15,13 +15,30 @@ type AmsAddress struct {
 type TransMode uint32
 
 const (
-	TransModeNoTransmission  TransMode = 0
-	TransModeClientCycle     TransMode = 1
-	TransModeClientOnChange  TransMode = 2
-	TransModeServerCycle     TransMode = 3
-	TransModeServerOnChange  TransMode = 4
-	TransModeServerCycle2    TransMode = 5
-	TransModeServerOnChange2 TransMode = 6
+	TransModeNoTransmission TransMode = 0
+	TransModeClientCycle    TransMode = 1
+	TransModeClientOnChange TransMode = 2
+	TransModeServerCycle    TransMode = 3
+	TransModeServerOnChange TransMode = 4
+	// ServerCycle2 / ServerOnChange2 are the "InContext" variants (called CyclicInContext
+	// and OnChangeInContext in Beckhoff's .NET SDK). They execute the notification check
+	// within the PLC task cycle instead of a separate ADS server thread, giving more
+	// deterministic timing. Both modes are part of the same feature — if one is supported,
+	// the other is too.
+	//
+	// InContext modes require the target symbol to have a non-zero ContextMask (bits 8-11
+	// of the symbol flags). ContextMask indicates which PLC task owns the variable. If
+	// ContextMask is 0, the PLC rejects the request with 0x070B (invalid parameter) on TC3,
+	// or silently ignores it on TC2 (notifications never fire, no error).
+	//
+	// ContextMask is non-zero only for variables local to a PROGRAM POU assigned to a
+	// single task in a multi-task PLC project. GVL variables and single-task projects
+	// always have ContextMask=0. Most PLC projects are single-task.
+	//
+	// AddSymbolNotification and AddSymbolNotifications automatically fall back to
+	// ServerCycle/ServerOnChange when the symbol's ContextMask is 0.
+	TransModeServerCycle2    TransMode = 5 // CyclicInContext
+	TransModeServerOnChange2 TransMode = 6 // OnChangeInContext
 	TransModeClient1Request  TransMode = 10
 )
 
@@ -39,9 +56,9 @@ func (tm TransMode) String() string {
 	case TransModeServerOnChange:
 		return "ServerOnChange"
 	case TransModeServerCycle2:
-		return "ServerCycle2"
+		return "ServerCycle2/CyclicInContext"
 	case TransModeServerOnChange2:
-		return "ServerOnChange2"
+		return "ServerOnChange2/OnChangeInContext"
 	case TransModeClient1Request:
 		return "Client1Request"
 	default:
@@ -62,27 +79,75 @@ func downgradeTransMode(mode TransMode) TransMode {
 	}
 }
 
-type AdsState uint16
+// SymbolFlag represents bits in the symbol flags field returned by INFOBYNAMEEX (0xF009)
+// and the bulk symbol upload. These flags control how extended symbol info is parsed
+// and which notification modes are available.
+type SymbolFlag uint32
 
 const (
-	AdsStateInvalid      AdsState = 0
-	AdsStateIdle         AdsState = 1
-	AdsStateReset        AdsState = 2
-	AdsStateInit         AdsState = 3
-	AdsStateStart        AdsState = 4
-	AdsStateRun          AdsState = 5
-	AdsStateStop         AdsState = 6
-	AdsStateSaveCfg      AdsState = 7
-	AdsStateLoadCfg      AdsState = 8
-	AdsStatePowerFailure AdsState = 9
-	AdsStatePowerGood    AdsState = 10
-	AdsStateError        AdsState = 11
-	AdsStateShutdown     AdsState = 12
-	AdsStateSuspend      AdsState = 13
-	AdsStateResume       AdsState = 14
-	AdsStateConfig       AdsState = 15 // System Is In Config Mode
-	AdsStateReconfig     AdsState = 16 // System Should Restart In Config Mode
-	AdsStateMaxStates    AdsState = 255
+	// SymbolFlagPersistent indicates the symbol value survives PLC restarts.
+	SymbolFlagPersistent SymbolFlag = 0x0001
+	// SymbolFlagBitValue indicates the symbol is a single bit within a byte.
+	SymbolFlagBitValue SymbolFlag = 0x0002
+	// SymbolFlagReferenceTo indicates the symbol is a reference/pointer.
+	SymbolFlagReferenceTo SymbolFlag = 0x0004
+	// SymbolFlagTypeGuid indicates a 16-byte type GUID follows after the name/type/comment strings.
+	SymbolFlagTypeGuid SymbolFlag = 0x0008
+	// SymbolFlagTComObj indicates the symbol is a TcCOM object.
+	SymbolFlagTComObj SymbolFlag = 0x0010
+	// SymbolFlagReadOnly indicates the symbol is read-only.
+	SymbolFlagReadOnly SymbolFlag = 0x0020
+	// SymbolFlagContextMask extracts the PLC task context index from bits 8-11.
+	// Non-zero means the variable is bound to a specific PLC task, enabling
+	// InContext notification modes (TransMode 5/6). The value corresponds to the
+	// task's index in the global TASKINFOARRAY.
+	// Zero means no task binding — InContext modes will be rejected (0x070B on TC3)
+	// or silently ignored (TC2).
+	//
+	// ContextMask is non-zero only when:
+	//   - The PLC project has multiple tasks (Referenced Tasks in Solution Explorer)
+	//   - The variable is local to a PROGRAM POU assigned to a single task
+	// GVL (Global Variable List) variables always have ContextMask=0.
+	// Single-task projects (the default) always have ContextMask=0 for all symbols.
+	SymbolFlagContextMask SymbolFlag = 0x0F00
+	// SymbolFlagAttributes indicates attribute key-value pairs follow after the type GUID.
+	SymbolFlagAttributes SymbolFlag = 0x1000
+	// SymbolFlagExtendedFlags indicates additional extended flags are present.
+	SymbolFlagExtendedFlags SymbolFlag = 0x8000
+)
+
+// ContextMask extracts the PLC task context index from symbol flags (bits 8-11).
+// Returns 0 if the symbol is not bound to a specific task.
+func (f SymbolFlag) ContextMask() uint8 {
+	return uint8((f >> 8) & 0x0F)
+}
+
+// Has returns true if the flag set contains the given flag(s).
+func (f SymbolFlag) Has(flag SymbolFlag) bool {
+	return f&flag == flag
+}
+
+type ADSState uint16
+
+const (
+	ADSStateInvalid      ADSState = 0
+	ADSStateIdle         ADSState = 1
+	ADSStateReset        ADSState = 2
+	ADSStateInit         ADSState = 3
+	ADSStateStart        ADSState = 4
+	ADSStateRun          ADSState = 5
+	ADSStateStop         ADSState = 6
+	ADSStateSaveCfg      ADSState = 7
+	ADSStateLoadCfg      ADSState = 8
+	ADSStatePowerFailure ADSState = 9
+	ADSStatePowerGood    ADSState = 10
+	ADSStateError        ADSState = 11
+	ADSStateShutdown     ADSState = 12
+	ADSStateSuspend      ADSState = 13
+	ADSStateResume       ADSState = 14
+	ADSStateConfig       ADSState = 15 // System Is In Config Mode
+	ADSStateReconfig     ADSState = 16 // System Should Restart In Config Mode
+	ADSStateMaxStates    ADSState = 255
 )
 
 // Port default twincat ports
@@ -169,7 +234,7 @@ const (
 type Offset uint32
 
 const (
-	OffsetDeviceDataAdsState    Offset = 0x0000 // ads state of device
+	OffsetDeviceDataADSState    Offset = 0x0000 // ads state of device
 	OffsetDeviceDataDeviceState Offset = 0x0002 // device state
 )
 
@@ -300,7 +365,7 @@ const (
 	ReturnCodeClientW32Error            ReturnCode = (0x46 + ReturnCodeErrorOffset)
 	ReturnCodeClientTimeoutInvalid      ReturnCode = (0x47 + ReturnCodeErrorOffset)
 	ReturnCodeClientPortNotOpen         ReturnCode = (0x48 + ReturnCodeErrorOffset)
-	ReturnCodeClientNoAmsAddress        ReturnCode = (0x49 + ReturnCodeErrorOffset)
+	ReturnCodeClientNoAMSAddress        ReturnCode = (0x49 + ReturnCodeErrorOffset)
 	ReturnCodeClientSyncInternal        ReturnCode = (0x50 + ReturnCodeErrorOffset)
 	ReturnCodeClientAddHash             ReturnCode = (0x51 + ReturnCodeErrorOffset)
 	ReturnCodeClientRemoveHash          ReturnCode = (0x52 + ReturnCodeErrorOffset)
@@ -455,7 +520,7 @@ var returnCodeDescriptions = map[ReturnCode]string{
 	ReturnCodeClientW32Error:            "error in Win32 subsystem",
 	ReturnCodeClientTimeoutInvalid:      "invalid client timeout value",
 	ReturnCodeClientPortNotOpen:         "ADS port not opened",
-	ReturnCodeClientNoAmsAddress:        "no AMS address",
+	ReturnCodeClientNoAMSAddress:        "no AMS address",
 	ReturnCodeClientSyncInternal:        "internal error in ADS sync",
 	ReturnCodeClientAddHash:             "hash table overflow",
 	ReturnCodeClientRemoveHash:          "key not found in hash table",
@@ -502,6 +567,71 @@ func (rc ReturnCode) Error() string {
 	return rc.String()
 }
 
+// ADST_ data type IDs from the ADS protocol (ADSDATATYPEID enum).
+// The PLC sends these numeric codes in symbolEntry.DataType to identify
+// the base type of a variable. Works on both TwinCAT 2 and TwinCAT 3.
+// Source: Beckhoff TC2_Utilities ADSDATATYPEID
+const (
+	ADSTVoid    uint32 = 0
+	ADSTInt16   uint32 = 2  // INT
+	ADSTInt32   uint32 = 3  // DINT
+	ADSTReal32  uint32 = 4  // REAL
+	ADSTReal64  uint32 = 5  // LREAL
+	ADSTInt8    uint32 = 16 // SINT
+	ADSTUint8   uint32 = 17 // USINT/BYTE
+	ADSTUint16  uint32 = 18 // UINT/WORD
+	ADSTUint32  uint32 = 19 // UDINT/DWORD
+	ADSTInt64   uint32 = 20 // LINT
+	ADSTUint64  uint32 = 21 // ULINT/LWORD
+	ADSTString  uint32 = 30 // STRING
+	ADSTWString uint32 = 31 // WSTRING
+	ADSTBool    uint32 = 33 // BOOL
+	// ADSTBigType is the PLC's catch-all for composite/user-defined types:
+	// structs, enums, type aliases, arrays. PLC sends this when the leaf does
+	// not have a primitive ADST_ code (e.g. TC2 always reports enums this way;
+	// TC3 sometimes reports the underlying primitive but falls back to BIGTYPE
+	// for opaque types). Structs are caught earlier by the parse path's
+	// Children branch, so a symbol reaching inferBaseType with BIGTYPE + a
+	// 1/2/4/8 byte size is enum-like — safe to interpret as signed integer.
+	ADSTBigType uint32 = 65
+)
+
+// adsTypeToString maps an ADST_ numeric type code to the corresponding
+// IEC 61131-3 type name used in the parse switch statement.
+// Returns "" for unknown or composite types.
+func adsTypeToString(code uint32) string {
+	switch code {
+	case ADSTBool:
+		return "BOOL"
+	case ADSTInt8:
+		return "SINT"
+	case ADSTUint8:
+		return "USINT"
+	case ADSTInt16:
+		return "INT"
+	case ADSTUint16:
+		return "UINT"
+	case ADSTInt32:
+		return "DINT"
+	case ADSTUint32:
+		return "UDINT"
+	case ADSTReal32:
+		return "REAL"
+	case ADSTReal64:
+		return "LREAL"
+	case ADSTInt64:
+		return "LINT"
+	case ADSTUint64:
+		return "ULINT"
+	case ADSTString:
+		return "STRING"
+	case ADSTWString:
+		return "WSTRING"
+	default:
+		return ""
+	}
+}
+
 // isSumCommandUnsupportedError returns true if the error indicates the PLC does
 // not support sum/batch commands (as opposed to a transient network error).
 func isSumCommandUnsupportedError(err error) bool {
@@ -512,4 +642,83 @@ func isSumCommandUnsupportedError(err error) bool {
 	return rc == ReturnCodeDeviceServiceNotSupported ||
 		rc == ReturnCodeGlobalUnknownCommandID ||
 		rc == ReturnCodeGlobalUnknownAdsCommand
+}
+
+// SymbolVersionStrategy selects online-change handling behavior (R-SES-011).
+type SymbolVersionStrategy uint8
+
+const (
+	// SymbolVersionAutoReload is the default. On detection of an online
+	// change, the Session re-runs symbol discovery and resubscribes
+	// notifications. Bounded by WithMaxSymbolVersionReloadAttempts within
+	// a sliding window (default 3 attempts / 60s).
+	SymbolVersionAutoReload SymbolVersionStrategy = iota
+
+	// SymbolVersionClose terminates the Session on detection. The
+	// OnDisconnect callback fires and Session.Close() is invoked. The
+	// caller decides reconnect timing.
+	SymbolVersionClose
+
+	// SymbolVersionIgnore surfaces the PLC error verbatim to the calling
+	// op (Read/Write/Sum*) and flags surviving notification handles' next
+	// sample with Update.Stale=true, Update.Reason=<detected reason>
+	// (one-shot — consumed on first delivery, subsequent samples are
+	// Stale=false again).
+	//
+	// Asymmetry: removed-symbol channels go SILENT — no terminal Update
+	// is delivered for the dead handle. Use WithOnSymbolVersionChanged to
+	// observe symbol-removal events.
+	SymbolVersionIgnore
+)
+
+// String returns the human-readable name of the strategy.
+func (s SymbolVersionStrategy) String() string {
+	switch s {
+	case SymbolVersionAutoReload:
+		return "AutoReload"
+	case SymbolVersionClose:
+		return "Close"
+	case SymbolVersionIgnore:
+		return "Ignore"
+	default:
+		return "Unknown"
+	}
+}
+
+// Reason values populate Update.Reason (R-NOT-016) and the
+// WithOnSymbolVersionChanged callback. These strings are STABLE — safe
+// for switch/case comparison by callers. New reasons may be added in
+// future versions; callers SHOULD have a default branch.
+const (
+	ReasonSymbolVersionInvalid = "symbol-version-invalid"
+	ReasonSymbolNotFound       = "symbol-not-found"
+	ReasonInvalidOffset        = "invalid-offset"
+	ReasonSymbolNotActive      = "symbol-not-active"
+	ReasonNotifyHandleInvalid  = "notify-handle-invalid"
+	ReasonInvalidSize          = "invalid-size"
+	ReasonReloadCapExhausted   = "reload-cap-exhausted"
+	ReasonReloadInProgress     = "reload-in-progress"
+)
+
+// detectStaleCache classifies a PLC return code against the R-CACHE-009
+// detection set. Returns (true, reason) for codes that signal cache
+// staleness from a PLC online change; (false, "") otherwise.
+//
+// Detection codes verified against Beckhoff InfoSys (TC2 Utilities).
+func detectStaleCache(rc ReturnCode) (stale bool, reason string) {
+	switch rc {
+	case ReturnCodeDeviceSymbolVersionInvalid: // 0x711 — Beckhoff: "online change. Create a new handle."
+		return true, ReasonSymbolVersionInvalid
+	case ReturnCodeDeviceSymbolNoFound: // 0x710
+		return true, ReasonSymbolNotFound
+	case ReturnCodeDeviceInvalidOffset: // 0x703 — TC3 surfaces this on cached handle post-delete
+		return true, ReasonInvalidOffset
+	case ReturnCodeDeviceSymbolNotActive: // 0x722 — Beckhoff: "Release the handle and try again."
+		return true, ReasonSymbolNotActive
+	case ReturnCodeDeviceNotifyHandleInvalid: // 0x714
+		return true, ReasonNotifyHandleInvalid
+	case ReturnCodeDeviceInvalidSize: // 0x705 — surfaces when cached symbol.Length disagrees with PLC's new size post-online-change (e.g. operator toggle INT↔LREAL)
+		return true, ReasonInvalidSize
+	}
+	return false, ""
 }
