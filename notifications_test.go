@@ -798,3 +798,63 @@ func TestSumNotificationResultTriState(t *testing.T) {
 		t.Errorf("config[3] (TOCTOU): Skipped should be non-nil; got %+v", r3)
 	}
 }
+
+// TestResubscribeNotifications_RollbackOnError verifies that when
+// AddSymbolNotifications returns an outer error mid-resubscribe, the rollback
+// path restores notificationConfigs and notificationChannel from the
+// pre-call snapshot. Without rollback, the configs would be left empty
+// after a failed retry and subsequent reconnects would have nothing to
+// resubscribe (user notification subscriptions silently dropped).
+//
+// Drives the error by registering a SumAddDeviceNotification handler that
+// returns a too-short response so executeSumCommand's length validation
+// fails — surfaces as outer err to AddSymbolNotifications.
+//
+// Validates: resubscribeNotifications save/restore via resetConfigs.
+func TestResubscribeNotifications_RollbackOnError(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	// Truncated response: claims n=1 item but returns 0 bytes of item data.
+	// executeSumCommand asserts len(resp) >= n*itemReadSize (n*8 for Add).
+	srv.onWriteRead(GroupSumupAddDeviceNotification, func(_ []byte) []byte {
+		return []byte{} // too short — outer parse will fail
+	})
+
+	sess, _ := newWiredTestSession(t, srv)
+	preSeedSymbol(sess, "MAIN.x")
+	ch := make(chan *Update, 1)
+	saved := []NotificationConfig{
+		{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange, MaxDelay: 0, CycleTime: 0},
+	}
+
+	sess.notifications.lock.Lock()
+	sess.notifications.resetConfigs(saved)
+	sess.notifications.notificationChannel = ch
+	sess.notifications.lock.Unlock()
+
+	// resubscribeNotifications runs the AddSymbolNotifications path. With the
+	// truncated-response handler installed, the call errors out and rollback
+	// must restore both fields.
+	err := sess.resubscribeNotifications()
+
+	// Rollback restored — savedConfigs is back in place.
+	sess.notifications.lock.Lock()
+	got := sess.notifications.notificationConfigs
+	gotChannel := sess.notifications.notificationChannel
+	sess.notifications.lock.Unlock()
+
+	if len(got) != 1 || got[0].SymbolName != "MAIN.x" {
+		t.Errorf("notificationConfigs after rollback = %+v, want 1 entry for MAIN.x", got)
+	}
+	if gotChannel != ch {
+		t.Errorf("notificationChannel after rollback = %v, want %v (saved channel)", gotChannel, ch)
+	}
+	if !sess.notifications.hasConfig("MAIN.x") {
+		t.Errorf("configsByKey mirror not rebuilt by resetConfigs on rollback")
+	}
+	// AddSymbolNotifications may return err or nil depending on whether the
+	// SumAddNotifState CAS landed on unsupported (triggering fallback). Either
+	// is acceptable for the rollback contract — we care about the restoration.
+	_ = err
+}

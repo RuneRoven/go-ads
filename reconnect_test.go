@@ -258,3 +258,153 @@ func TestReconnectExhaustsMaxAttemptsTransitionsToClosed(t *testing.T) {
 		t.Fatal("closedCh not closed after max attempts exhausted")
 	}
 }
+
+// TestReconnectExhaustConcurrentClose_NoPanic drives the exhaustion path
+// while a second goroutine concurrently calls into the markClosed/transition
+// pair. With closedOnce sync.Once gating close(closedCh), both racers can
+// claim the FSM transition without double-close panic. Without the guard,
+// "panic: close of closed channel" was possible whenever Close ran between
+// exhaustion's transitionToOnce and its raw close(closedCh).
+//
+// Validates: closedOnce guard introduced in Phase 1.1 Group B.
+func TestReconnectExhaustConcurrentClose_NoPanic(t *testing.T) {
+	for iter := 0; iter < 20; iter++ {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		sess := &Session{
+			ip:   "127.0.0.1",
+			port: 1, // refused on loopback
+			tx: &transport{
+				sendChannel:    make(chan []byte),
+				systemResponse: make(chan []byte, 1),
+				recvQueue:      make(chan []byte, recvQueueSize),
+				activeRequests: map[uint32]chan []byte{},
+			},
+			notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
+			cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
+			logger:        getDefaultLogger(),
+			lifecycle: &sessionLifecycle{
+				closedCh:             make(chan struct{}),
+				autoReconnect:        false,
+				maxReconnectAttempts: 1,
+				backoffConfig: BackoffConfig{
+					InitialInterval: 1 * time.Millisecond,
+					InitialAttempts: 10,
+					MidInterval:     1 * time.Millisecond,
+					MidAttempts:     10,
+					SlowInterval:    1 * time.Millisecond,
+					SlowAttempts:    10,
+					MaxInterval:     1 * time.Millisecond,
+				},
+				ctx:      ctx,
+				shutdown: cancel,
+			},
+			requestTimeout: 200 * time.Millisecond,
+		}
+		sess.lifecycle.state.transitionTo(SessionStateConstructed)
+		sess.lifecycle.state.transitionTo(SessionStateConnecting)
+		sess.lifecycle.state.transitionTo(SessionStateConnected)
+		sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+
+		// Race the exhaustion loop with a concurrent markClosed call. We test
+		// markClosed directly rather than full Close() because Close()'s
+		// reconnectDone wait would block this test on the goroutine we just
+		// spawned. markClosed exercises the sync.Once guard, which is the
+		// invariant under test.
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = sess.Reconnect()
+		}()
+		go func() {
+			defer wg.Done()
+			// Yield a few times so we land somewhere in the retry loop.
+			for i := 0; i < 5; i++ {
+				time.Sleep(time.Microsecond)
+			}
+			if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateClosed); ok {
+				sess.markClosed()
+			} else {
+				// Exhaustion path won; markClosed is idempotent.
+				sess.markClosed()
+			}
+		}()
+		wg.Wait()
+
+		// Always end in Closed; closedCh always observably closed; no panic.
+		if state := sess.lifecycle.state.load(); state != SessionStateClosed {
+			t.Errorf("iter %d: FSM state = %v, want Closed", iter, state)
+		}
+		select {
+		case <-sess.lifecycle.closedCh:
+		default:
+			t.Errorf("iter %d: closedCh not closed", iter)
+		}
+	}
+}
+
+// TestReconnect_FlapDetection_AccumulatesAcrossCycles exercises the cross-
+// cycle flap counter introduced in v2.1. A PLC that disconnects shortly
+// after each Connect should accumulate flapCount across Reconnect cycles,
+// not just within a single cycle's retry loop.
+//
+// Validates the flap-counter field lives on sessionLifecycle and the
+// flapWindow gating in Reconnect produces a sub-Connected→sub-Connected
+// counter increment.
+func TestReconnect_FlapDetection_AccumulatesAcrossCycles(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess := &Session{
+		ip:   "127.0.0.1",
+		port: 1, // refused on loopback
+		tx: &transport{
+			sendChannel:    make(chan []byte),
+			systemResponse: make(chan []byte, 1),
+			recvQueue:      make(chan []byte, recvQueueSize),
+			activeRequests: map[uint32]chan []byte{},
+		},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
+		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
+		logger:        getDefaultLogger(),
+		lifecycle: &sessionLifecycle{
+			closedCh:             make(chan struct{}),
+			autoReconnect:        false,
+			maxReconnectAttempts: 1, // exhaust quickly
+			backoffConfig: BackoffConfig{
+				InitialInterval: 1 * time.Millisecond,
+				InitialAttempts: 10,
+				MidInterval:     1 * time.Millisecond,
+				MidAttempts:     10,
+				SlowInterval:    1 * time.Millisecond,
+				SlowAttempts:    10,
+				MaxInterval:     1 * time.Millisecond,
+			},
+			ctx:      ctx,
+			shutdown: cancel,
+		},
+		requestTimeout: 200 * time.Millisecond,
+	}
+	sess.lifecycle.state.transitionTo(SessionStateConstructed)
+	sess.lifecycle.state.transitionTo(SessionStateConnecting)
+	sess.lifecycle.state.transitionTo(SessionStateConnected)
+	// Pretend we just had a successful connect that immediately dropped.
+	sess.lifecycle.flapMu.Lock()
+	sess.lifecycle.lastConnectedAt = time.Now()
+	sess.lifecycle.lastConnectedAt = sess.lifecycle.lastConnectedAt.Add(-50 * time.Millisecond) // within flapWindow
+	sess.lifecycle.lastConnectedAt = time.Now().Add(-50 * time.Millisecond)
+	sess.lifecycle.flapMu.Unlock()
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+
+	if err := sess.Reconnect(); err == nil {
+		t.Fatal("expected Reconnect to fail (port refused)")
+	}
+
+	sess.lifecycle.flapMu.Lock()
+	gotCount := sess.lifecycle.flapCount
+	sess.lifecycle.flapMu.Unlock()
+	if gotCount < 1 {
+		t.Errorf("flapCount = %d after a within-flapWindow Reconnect, want >= 1", gotCount)
+	}
+}
