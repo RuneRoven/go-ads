@@ -17,3 +17,6 @@ specs/11-spec-code-audit.md
 
 # Symbol-version hardware test logs
 symbol-version-run-*.log
+
+# Self-review agent artifacts
+.self-review/

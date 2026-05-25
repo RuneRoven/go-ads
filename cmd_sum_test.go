@@ -31,7 +31,7 @@ func craftSumReadResponse(errs []ReturnCode, dataLengths []uint32, data []byte) 
 // Validates: R-SUM-006.
 func TestParseSumReadResponse_LengthOverflow(t *testing.T) {
 	conn := &Session{logger: getDefaultLogger()}
-	conn.client = &Client{logger: conn.logger}
+	conn.client.Store(&Client{logger: conn.logger})
 
 	resp := craftSumReadResponse(
 		[]ReturnCode{ReturnCodeNoErrors},
@@ -40,7 +40,7 @@ func TestParseSumReadResponse_LengthOverflow(t *testing.T) {
 	)
 	requests := []SumReadRequest{{Length: 4}}
 
-	results, err := conn.client.parseSumReadResponse(resp, 1, requests)
+	results, err := conn.client.Load().parseSumReadResponse(resp, 1, requests)
 	if err != nil {
 		t.Fatalf("unexpected outer error: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestParseSumReadResponse_TruncationLogsError(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	conn := &Session{logger: logger}
-	conn.client = &Client{logger: logger}
+	conn.client.Store(&Client{logger: logger})
 
 	// Two items: first declares length=8, second declares length=4. Data section
 	// has only 4 bytes total — first item alone exceeds remaining bytes.
@@ -70,7 +70,7 @@ func TestParseSumReadResponse_TruncationLogsError(t *testing.T) {
 	)
 	requests := []SumReadRequest{{Length: 8}, {Length: 4}}
 
-	results, err := conn.client.parseSumReadResponse(resp, 2, requests)
+	results, err := conn.client.Load().parseSumReadResponse(resp, 2, requests)
 	if err != nil {
 		t.Fatalf("unexpected outer error: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestParseSumReadResponse_PerItemOversize(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	conn := &Session{logger: logger}
-	conn.client = &Client{logger: logger}
+	conn.client.Store(&Client{logger: logger})
 
 	// Two items each requested as 4 bytes, but item 0 declares 8 bytes returned.
 	// Total response size accommodates 8+4=12 data bytes so the gross truncation
@@ -107,7 +107,7 @@ func TestParseSumReadResponse_PerItemOversize(t *testing.T) {
 	)
 	requests := []SumReadRequest{{Length: 4}, {Length: 4}}
 
-	results, err := conn.client.parseSumReadResponse(resp, 2, requests)
+	results, err := conn.client.Load().parseSumReadResponse(resp, 2, requests)
 	if err != nil {
 		t.Fatalf("unexpected outer error: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestParseSumReadResponse_PerItemOversize(t *testing.T) {
 // Validates: R-NOT-015.
 func TestBestEffortDeleteNotifications_Empty(t *testing.T) {
 	conn := &Session{logger: getDefaultLogger()}
-	conn.client = &Client{logger: conn.logger}
+	conn.client.Store(&Client{logger: conn.logger})
 	got := conn.bestEffortDeleteNotifications(nil)
 	if got != 0 {
 		t.Errorf("expected 0, got %d", got)
@@ -206,35 +206,36 @@ func TestIsSumCommandUnsupportedError(t *testing.T) {
 // Validates: R-SUM-003.
 func TestSumProbeStateTransitions(t *testing.T) {
 	// Verify CAS 0→1 and 0→2 work, and second CAS is rejected
-	conn := Session{client: &Client{}}
+	conn := Session{}
+	conn.client.Store(&Client{})
 
 	// sumWriteState: 0→1
-	if !conn.client.capabilities.SumWriteStateCAS(0, 1) {
+	if !conn.client.Load().capabilities.SumWriteStateCAS(0, 1) {
 		t.Error("CAS 0→1 should succeed")
 	}
-	if conn.client.capabilities.SumWriteStateLoad() != 1 {
+	if conn.client.Load().capabilities.SumWriteStateLoad() != 1 {
 		t.Error("state should be 1")
 	}
 	// Second goroutine trying 0→2 should fail
-	if conn.client.capabilities.SumWriteStateCAS(0, 2) {
+	if conn.client.Load().capabilities.SumWriteStateCAS(0, 2) {
 		t.Error("CAS 0→2 should fail when state is 1")
 	}
 
 	// sumAddNotifState: 0→2
-	if !conn.client.capabilities.SumAddNotifStateCAS(0, 2) {
+	if !conn.client.Load().capabilities.SumAddNotifStateCAS(0, 2) {
 		t.Error("CAS 0→2 should succeed")
 	}
-	if conn.client.capabilities.SumAddNotifStateLoad() != 2 {
+	if conn.client.Load().capabilities.SumAddNotifStateLoad() != 2 {
 		t.Error("state should be 2")
 	}
 	// sumDeleteNotifState independent of sumAddNotifState
-	if conn.client.capabilities.SumDeleteNotifStateLoad() != 0 {
+	if conn.client.Load().capabilities.SumDeleteNotifStateLoad() != 0 {
 		t.Error("delete state should still be 0 (independent of add)")
 	}
 
 	// Reset works
-	conn.client.capabilities.SumWriteStateStore(0)
-	if conn.client.capabilities.SumWriteStateLoad() != 0 {
+	conn.client.Load().capabilities.SumWriteStateStore(0)
+	if conn.client.Load().capabilities.SumWriteStateLoad() != 0 {
 		t.Error("reset should set state to 0")
 	}
 }
@@ -242,7 +243,8 @@ func TestSumProbeStateTransitions(t *testing.T) {
 // Validates: R-SUM-003 / R-LOCK-003.
 func TestSumProbeStateConcurrent(t *testing.T) {
 	// Concurrent CAS: only one goroutine should win
-	conn := Session{client: &Client{}}
+	conn := Session{}
+	conn.client.Store(&Client{})
 	const goroutines = 100
 	var wg sync.WaitGroup
 	wins := make(chan uint32, goroutines)
@@ -255,7 +257,7 @@ func TestSumProbeStateConcurrent(t *testing.T) {
 			if id%2 == 0 {
 				val = 2
 			}
-			if conn.client.capabilities.SumWriteStateCAS(0, val) {
+			if conn.client.Load().capabilities.SumWriteStateCAS(0, val) {
 				wins <- val
 			}
 		}(i)

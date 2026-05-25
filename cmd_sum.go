@@ -378,7 +378,12 @@ func (c *Client) sumWriteFallback(requests []SumWriteRequest) ([]SumWriteResult,
 	for i, req := range requests {
 		err := c.Write(req.Group, req.Offset, req.Data)
 		if err != nil {
-			results[i].Error = ReturnCodeDeviceError
+			var rc ReturnCode
+			if errors.As(err, &rc) {
+				results[i].Error = rc
+			} else {
+				results[i].Error = ReturnCodeDeviceError
+			}
 			c.logger.Warn("individual write failed in SumWrite fallback", "error", err, "index", i)
 		} else {
 			results[i].Error = ReturnCodeNoErrors
@@ -496,7 +501,12 @@ func (c *Client) sumAddNotificationFallback(requests []SumNotificationRequest) (
 		}
 		h, err := c.AddDeviceNotification(req.Group, req.Offset, req.Length, transMode, req.MaxDelay, req.CycleTime)
 		if err != nil {
-			results[i].Error = ReturnCodeDeviceError
+			var rc ReturnCode
+			if errors.As(err, &rc) {
+				results[i].Error = rc
+			} else {
+				results[i].Error = ReturnCodeDeviceError
+			}
 			c.logger.Warn("individual AddDeviceNotification failed in fallback", "error", err, "index", i)
 		} else {
 			results[i].Handle = h
@@ -542,15 +552,20 @@ func (sess *Session) bestEffortDeleteNotifications(handles []uint32) int {
 
 // sumDeleteNotificationFallback deletes notifications individually when sum commands are not supported.
 func (c *Client) sumDeleteNotificationFallback(handles []uint32) ([]ReturnCode, error) {
-	errors := make([]ReturnCode, len(handles))
+	codes := make([]ReturnCode, len(handles))
 	for i, h := range handles {
 		err := c.DeleteDeviceNotification(h)
 		if err != nil {
-			errors[i] = ReturnCodeDeviceError
+			var rc ReturnCode
+			if errors.As(err, &rc) {
+				codes[i] = rc
+			} else {
+				codes[i] = ReturnCodeDeviceError
+			}
 			c.logger.Warn("individual DeleteDeviceNotification failed in fallback", "error", err, "handle", h)
 		} else {
-			errors[i] = ReturnCodeNoErrors
+			codes[i] = ReturnCodeNoErrors
 		}
 	}
-	return errors, nil
+	return codes, nil
 }

@@ -102,7 +102,7 @@ func TestIntegrationConnect(t *testing.T) {
 
 func TestIntegrationReadDeviceInfo(t *testing.T) {
 	conn := setupConnection(t)
-	info, err := conn.client.ReadDeviceInfo()
+	info, err := conn.client.Load().ReadDeviceInfo()
 	if err != nil {
 		t.Fatalf("ReadDeviceInfo failed: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestIntegrationReadDeviceInfo(t *testing.T) {
 
 func TestIntegrationReadState(t *testing.T) {
 	conn := setupConnection(t)
-	state, err := conn.client.ReadState()
+	state, err := conn.client.Load().ReadState()
 	if err != nil {
 		t.Fatalf("ReadState failed: %v", err)
 	}
@@ -1403,7 +1403,7 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 			readLen = uint32(n*8) + totalLen // [n*(error,length)][data]
 		}
 
-		resp, err := conn.client.WriteRead(uint32(cmd.group), uint32(n), readLen, writeData)
+		resp, err := conn.client.Load().WriteRead(uint32(cmd.group), uint32(n), readLen, writeData)
 		if err != nil {
 			t.Logf("%s: NOT SUPPORTED (error: %v)", cmd.name, err)
 			continue
@@ -1461,7 +1461,7 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 	binary.LittleEndian.PutUint32(notifWriteData[16:], 1000000) // maxDelay 100ms in 100ns units
 	binary.LittleEndian.PutUint32(notifWriteData[20:], 1000000) // cycleTime 100ms in 100ns units
 
-	resp, err := conn.client.WriteRead(uint32(GroupSumupAddDeviceNotification), 1, 8, notifWriteData)
+	resp, err := conn.client.Load().WriteRead(uint32(GroupSumupAddDeviceNotification), 1, 8, notifWriteData)
 	if err != nil {
 		t.Logf("SumAddDeviceNotification (0xF085): NOT SUPPORTED (error: %v)", err)
 	} else {
@@ -1494,7 +1494,7 @@ func TestIntegrationSumReadFallbackForced(t *testing.T) {
 	}
 
 	// Force fallback: mark sum read as unsupported
-	conn.client.capabilities.SumReadCmdStore(1)
+	conn.client.Load().capabilities.SumReadCmdStore(1)
 
 	values, err := conn.ReadMultipleSymbols(names)
 	if err != nil {
@@ -1547,7 +1547,7 @@ func TestIntegrationSumWriteFallbackForced(t *testing.T) {
 	}
 
 	// Force fallback
-	conn.client.capabilities.SumWriteStateStore(2) // 2 = checked + unsupported (forces fallback)
+	conn.client.Load().capabilities.SumWriteStateStore(2) // 2 = checked + unsupported (forces fallback)
 
 	// Save originals
 	originals := make(map[string]string)
@@ -1604,7 +1604,7 @@ func TestIntegrationSumNotifFallbackForced(t *testing.T) {
 	}
 
 	// Force fallback
-	conn.client.capabilities.SumAddNotifStateStore(2) // 2 = checked + unsupported (forces fallback)
+	conn.client.Load().capabilities.SumAddNotifStateStore(2) // 2 = checked + unsupported (forces fallback)
 
 	ch := make(chan *Update, 50)
 	var configs []NotificationConfig
@@ -1676,7 +1676,7 @@ func TestIntegrationSumNotifFallbackDowngrade(t *testing.T) {
 	t.Logf("symbol %q: ContextMask=%d flags=0x%04X (fallback test)", symbolName, sym.ContextMask, uint32(sym.Flags))
 
 	// Force notification fallback — v2 modes should be downgraded to v1
-	conn.client.capabilities.SumAddNotifStateStore(2) // 2 = checked + unsupported (forces fallback)
+	conn.client.Load().capabilities.SumAddNotifStateStore(2) // 2 = checked + unsupported (forces fallback)
 
 	ch := make(chan *Update, 20)
 	configs := []NotificationConfig{{
@@ -1749,7 +1749,7 @@ func TestIntegrationSumReadPartialFailure(t *testing.T) {
 		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Length: 4},               // bogus
 	}
 
-	results, err := conn.client.SumRead(requests)
+	results, err := conn.client.Load().SumRead(requests)
 	if err != nil {
 		t.Fatalf("SumRead failed: %v", err)
 	}
@@ -1828,7 +1828,7 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Data: []byte{0, 0}},   // bogus
 	}
 
-	results, err := conn.client.SumWrite(requests)
+	results, err := conn.client.Load().SumWrite(requests)
 	if err != nil {
 		t.Fatalf("SumWrite (mixed) failed: %v", err)
 	}
@@ -2852,7 +2852,7 @@ func TestIntegrationDockerRoute(t *testing.T) {
 	}
 
 	// Verify connection works (proves route is valid)
-	info, err := conn.client.ReadDeviceInfo()
+	info, err := conn.client.Load().ReadDeviceInfo()
 	if err != nil {
 		t.Fatalf("ReadDeviceInfo failed: %v", err)
 	}
@@ -2959,7 +2959,7 @@ func TestIntegrationBitSymbol(t *testing.T) {
 func TestIntegrationReadProcessInputSize(t *testing.T) {
 	conn := setupConnection(t)
 
-	size, err := conn.client.ReadProcessInputSize()
+	size, err := conn.client.Load().ReadProcessInputSize()
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -2976,7 +2976,7 @@ func TestIntegrationReadProcessInput(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Read first 4 bytes of input image
-	data, err := conn.client.ReadProcessInput(0, 4)
+	data, err := conn.client.Load().ReadProcessInput(0, 4)
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -2993,7 +2993,7 @@ func TestIntegrationReadProcessOutput(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Read first 4 bytes of output image
-	data, err := conn.client.ReadProcessOutput(0, 4)
+	data, err := conn.client.Load().ReadProcessOutput(0, 4)
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -3010,7 +3010,7 @@ func TestIntegrationReadProcessInputBit(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Read bit 0 of first input byte
-	val, err := conn.client.ReadProcessInputBit(0, 0)
+	val, err := conn.client.Load().ReadProcessInputBit(0, 0)
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")

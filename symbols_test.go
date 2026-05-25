@@ -521,6 +521,18 @@ func TestMakeArrayChildren_2D(t *testing.T) {
 		if child.DatatypeEntry.Size != 6 { // 12/2 = 6 bytes per row
 			t.Errorf("child %s: size = %d, want 6", name, child.DatatypeEntry.Size)
 		}
+		// Inner-element Size must equal one INT (2 bytes), not the outer row size.
+		// Regression guard for makeArrayChildren passing full size to recursion.
+		for _, inner := range []string{"[0]", "[1]", "[2]"} {
+			leaf, ok := child.Children[inner]
+			if !ok {
+				t.Errorf("child %s missing inner %s", name, inner)
+				continue
+			}
+			if leaf.DatatypeEntry.Size != 2 {
+				t.Errorf("child %s inner %s: size = %d, want 2", name, inner, leaf.DatatypeEntry.Size)
+			}
+		}
 	}
 }
 
@@ -551,6 +563,15 @@ func TestMakeArrayChildren_3D(t *testing.T) {
 	}
 	if len(c00.Children) != 2 {
 		t.Fatalf("[0][0] expected 2 children, got %d", len(c00.Children))
+	}
+	// Leaf-element Size must equal one BYTE (1 byte), not the parent slab.
+	// Regression guard for makeArrayChildren passing full size to recursion.
+	c000 := c00.Children["[0]"]
+	if c000 == nil {
+		t.Fatal("missing [0][0][0]")
+	}
+	if c000.DatatypeEntry.Size != 1 {
+		t.Errorf("[0][0][0] size = %d, want 1", c000.DatatypeEntry.Size)
 	}
 }
 

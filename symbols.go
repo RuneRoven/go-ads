@@ -661,7 +661,9 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (chil
 	// subChildren is shared across all array elements at this level.
 	// This is intentional: children are read-only after symbol table construction,
 	// and deep-copying would be expensive for large arrays (e.g., ARRAY[0..999]).
-	subChildren := makeArrayChildren(levels[1:], dt, size)
+	// Recursion size shrinks by this level's element count so inner-dim
+	// elements compute correct per-element byte size, not the outer total.
+	subChildren := makeArrayChildren(levels[1:], dt, size/level.Elements)
 
 	var offset uint32
 

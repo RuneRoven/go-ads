@@ -35,7 +35,7 @@ func (sess *Session) writeToSymbolRetry(symbolName string, value string, retries
 	}
 
 	// Network I/O without lock
-	err = sess.client.Write(uint32(GroupSymbolValueByHandle), handle, data)
+	err = sess.client.Load().Write(uint32(GroupSymbolValueByHandle), handle, data)
 	if err != nil {
 		// Online-change detection (R-CACHE-009).
 		var rc ReturnCode
@@ -90,7 +90,7 @@ func (sess *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (st
 	sess.cache.lock.Unlock()
 
 	// Network I/O without lock
-	data, err := sess.client.Read(uint32(GroupSymbolValueByHandle), handle, length)
+	data, err := sess.client.Load().Read(uint32(GroupSymbolValueByHandle), handle, length)
 	if err != nil {
 		// Online-change detection (R-CACHE-009).
 		var rc ReturnCode
@@ -148,6 +148,9 @@ func (sess *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (st
 //
 // Falls back to direct group/offset with accumulated absolute offsets when no
 // handle is available (e.g. before handle acquisition).
+//
+// Caller MUST hold cache.lock: this reads sym.Handle which is written by
+// zeroOldSymbolHandles + handle-resolve paths under the same lock.
 func symbolSumAddress(sym *Symbol) (group, offset uint32) {
 	if sym.Handle != 0 {
 		return uint32(GroupSymbolValueByHandle), sym.Handle
@@ -191,16 +194,23 @@ func (sess *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (
 			sess.logger.Error("error getting symbol for batch read", "error", err, "symbol", name)
 			continue
 		}
-		infos = append(infos, symbolInfo{name: name, symbol: symbol})
+		// Snapshot Handle under cache.lock — autoReload's zeroOldSymbolHandles
+		// writes symbol.Handle under cache.lock, so racing reads here without
+		// the lock would trip -race and could see an in-flight zero. Length is
+		// write-once at construction; snapshot it together for symmetry.
+		sess.cache.lock.Lock()
 		group, offset := symbolSumAddress(symbol)
-		requests = append(requests, SumReadRequest{Group: group, Offset: offset, Length: symbol.Length})
+		length := symbol.Length
+		sess.cache.lock.Unlock()
+		infos = append(infos, symbolInfo{name: name, symbol: symbol})
+		requests = append(requests, SumReadRequest{Group: group, Offset: offset, Length: length})
 	}
 
 	if len(requests) == 0 {
 		return nil, fmt.Errorf("no valid symbols found for batch read")
 	}
 
-	results, err := sess.client.SumRead(requests)
+	results, err := sess.client.Load().SumRead(requests)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
 		sess.waitForReconnect()
@@ -299,7 +309,10 @@ func (sess *Session) writeMultipleSymbolsRetry(values map[string]string, retries
 			continue
 		}
 
+		// Snapshot Handle under cache.lock — see readMultipleSymbolsRetry for rationale.
+		sess.cache.lock.Lock()
 		group, offset := symbolSumAddress(symbol)
+		sess.cache.lock.Unlock()
 		req := SumWriteRequest{Group: group, Offset: offset, Data: data}
 
 		infos = append(infos, symbolInfo{name: name, symbol: symbol})
@@ -310,7 +323,7 @@ func (sess *Session) writeMultipleSymbolsRetry(values map[string]string, retries
 		return nil, fmt.Errorf("no valid symbols found for batch write")
 	}
 
-	results, err := sess.client.SumWrite(requests)
+	results, err := sess.client.Load().SumWrite(requests)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
 		sess.waitForReconnect()

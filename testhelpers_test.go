@@ -155,7 +155,7 @@ func buildNotificationPacketMultiSample(stamps []struct {
 
 // newTestConnection creates a minimal Session for unit testing notification parsing.
 // The Session has a synthetic *Client wired with its handleNotification installed
-// so packet-level tests can drive `conn.client.deviceNotification(ctx, packet)`
+// so packet-level tests can drive `conn.client.Load().deviceNotification(ctx, packet)`
 // and exercise the cache-aware handler.
 func newTestConnection() *Session {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -165,12 +165,12 @@ func newTestConnection() *Session {
 		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 	}
-	conn.client = &Client{
+	conn.client.Store(&Client{
 		logger: conn.logger,
 		ctx:    ctx,
 		cancel: cancel,
-	}
-	conn.client.SetNotificationHandler(conn.handleNotification)
+	})
+	conn.client.Load().SetNotificationHandler(conn.handleNotification)
 	return conn
 }
 
@@ -178,7 +178,7 @@ func newTestConnection() *Session {
 // Client.deviceNotification decoder, which then dispatches to
 // Session.handleNotification via the installed callback.
 func (conn *Session) drivePacket(ctx context.Context, packet []byte) error {
-	return conn.client.deviceNotification(ctx, packet)
+	return conn.client.Load().deviceNotification(ctx, packet)
 }
 
 // --- testLogHandler — captures slog records for assertions ---
