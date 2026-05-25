@@ -28,7 +28,7 @@ import (
 func newNotifTestSession() *Session {
 	return &Session{
 		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
 		lifecycle:     &sessionLifecycle{closedCh: make(chan struct{})},
 		logger:        getDefaultLogger(),
 	}
@@ -100,8 +100,7 @@ func TestAddSymbolNotifications_DuplicateRejected(t *testing.T) {
 		ch := make(chan *Update, 1)
 		// Pre-stage one config so the pre-check rejects on second batch.
 		sess.notifications.lock.Lock()
-		sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs,
-			NotificationConfig{SymbolName: "MAIN.x"})
+		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.x"})
 		sess.notifications.lock.Unlock()
 
 		results, err := sess.AddSymbolNotifications([]NotificationConfig{
@@ -131,8 +130,7 @@ func TestAddSymbolNotifications_DuplicateRejected(t *testing.T) {
 		// stays empty and SumAddDeviceNotification is not invoked
 		// (nil client would panic).
 		sess.notifications.lock.Lock()
-		sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs,
-			NotificationConfig{SymbolName: "MAIN.dup"})
+		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.dup"})
 		sess.notifications.lock.Unlock()
 
 		results, err := sess.AddSymbolNotifications([]NotificationConfig{
@@ -499,8 +497,7 @@ func TestNotificationChannel_SetOnFirstSuccess(t *testing.T) {
 		ch := make(chan *Update, 1)
 		// Pre-stage so every config is rejected as duplicate.
 		sess.notifications.lock.Lock()
-		sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs,
-			NotificationConfig{SymbolName: "MAIN.dup"})
+		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.dup"})
 		sess.notifications.lock.Unlock()
 
 		_, _ = sess.AddSymbolNotifications([]NotificationConfig{
@@ -529,8 +526,7 @@ func TestNotificationChannel_SetOnFirstSuccess(t *testing.T) {
 		ch := make(chan *Update, 1)
 		sess.notifications.lock.Lock()
 		sess.notifications.notificationChannel = ch
-		sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs,
-			NotificationConfig{SymbolName: "MAIN.x"})
+		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.x"})
 		sess.notifications.lock.Unlock()
 
 		var wg sync.WaitGroup
