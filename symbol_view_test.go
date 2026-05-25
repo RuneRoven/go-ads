@@ -20,7 +20,7 @@ import (
 func newViewTestSession() *Session {
 	return &Session{
 		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
 		lifecycle:     &sessionLifecycle{closedCh: make(chan struct{})},
 		logger:        getDefaultLogger(),
 	}

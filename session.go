@@ -30,7 +30,8 @@ type sessionLifecycle struct {
 	reconnectMu   sync.Mutex // protects reconnectDone
 	reconnectDone chan struct{}
 
-	closedCh chan struct{}
+	closedCh   chan struct{}
+	closedOnce sync.Once // guards close(closedCh) so Close() and Reconnect-exhaustion can both fire safely
 
 	// state is the explicit FSM state plus the unified epoch counter
 	// (specs/09-fsm-design.md). FSM is the source of truth for closed and
@@ -166,7 +167,7 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 		port:           port,
 		requestTimeout: requestTimeout,
 		route:          &routeManager{},
-		notifications:  &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
+		notifications:  &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
 		cache: &symbolCache{
 			symbols:         map[string]*Symbol{},
 			onDemandSymbols: map[string]bool{},
@@ -224,7 +225,7 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 // Not safe for concurrent invocation on the same Session — the FSM gate via
 // transitionToOnce(Connecting) serializes callers, but races on sess.tx /
 // sess.client publishing would still leak resources. Call once per Session.
-func (sess *Session) Connect(local bool) error {
+func (sess *Session) Connect(local bool) (retErr error) {
 	sess.isLocal = local
 	// transitionToOnce returns ok=false if another goroutine already won
 	// the Constructed→Connecting transition; reject concurrent calls rather
@@ -232,6 +233,15 @@ func (sess *Session) Connect(local bool) error {
 	if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateConnecting); !ok {
 		return fmt.Errorf("ads: Connect already in progress or session past Constructed state")
 	}
+	// Roll back Connecting→Disconnected on any error return so the caller
+	// can retry Connect via the Disconnected→Connecting edge. Without this,
+	// the FSM is stranded in Connecting and Reconnect (auto-path only) is
+	// the sole recovery, forcing callers to construct a new Session.
+	defer func() {
+		if retErr != nil && sess.lifecycle.state.load() == SessionStateConnecting {
+			sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+		}
+	}()
 	var err error
 	sess.logger.Debug("dialing", "ip", sess.ip, "port", sess.port)
 	if local {
@@ -369,7 +379,11 @@ func (sess *Session) Connect(local bool) error {
 	if sess.route.name != "" {
 		registered, err := sess.ensureRouteOnConnect()
 		if err != nil {
-			sess.logger.Warn("route registration failed during connect", "error", err)
+			// WithRoute is an explicit caller requirement — silently swallowing
+			// the error and continuing leads to every subsequent ADS command
+			// failing with ReturnCodeGlobalTargetNotFound, leaving the caller
+			// to debug a connection that "succeeded" but doesn't work.
+			return fmt.Errorf("route registration failed during connect: %w", err)
 		}
 		if registered {
 			// TCP reconnect — PLC may reset connections from previously-unknown NetIDs.
@@ -631,6 +645,77 @@ func (sess *Session) reloadSymbolsAndResubscribe() error {
 	return sess.resubscribeNotifications()
 }
 
+// markClosed closes the closedCh signal channel exactly once. Safe for
+// concurrent invocation from Close() and from Reconnect-exhaustion path.
+func (sess *Session) markClosed() {
+	sess.lifecycle.closedOnce.Do(func() {
+		close(sess.lifecycle.closedCh)
+	})
+}
+
+// releasePLCResources releases PLC-side notification subscriptions and (when
+// transport is still alive) PLC-side symbol handles. Both Close() and the
+// Reconnect-exhaustion path call this so PLC state isn't stranded when the
+// session terminates via either entry point.
+//
+// Notification cleanup runs even when disconnected: PLC tracks subscriptions
+// per source AMS NetID, so a session that closes without deleting its
+// notification handles leaves the PLC delivering them to the next session
+// that opens with the same NetID. bestEffortDelete logs failures but never
+// returns an error, so the call is safe even with a dead transport.
+//
+// Symbol handle release is skipped when disconnected — unlike notifications,
+// stranded symbol handles do not generate side effects on subsequent
+// sessions, so the cost of leaking them is just a small PLC-side handle
+// table entry that the PLC reaps on route timeout.
+func (sess *Session) releasePLCResources(wasDisconnected bool) {
+	sess.notifications.lock.Lock()
+	handles := make([]uint32, 0, len(sess.notifications.activeNotifications))
+	for handle := range sess.notifications.activeNotifications {
+		handles = append(handles, handle)
+	}
+	sess.notifications.lock.Unlock()
+	if len(handles) > 0 {
+		deleted := sess.bestEffortDeleteNotifications(handles)
+		sess.logger.Info("releasePLCResources: best-effort notification cleanup",
+			"requested", len(handles), "deleted", deleted,
+			"wasDisconnected", wasDisconnected)
+	}
+
+	if wasDisconnected {
+		sess.logger.Info("already disconnected, skipping handle cleanup")
+		return
+	}
+	// Collect symbol handles under lock, then release without holding the lock.
+	sess.cache.lock.Lock()
+	symHandles := make([]uint32, 0, len(sess.cache.symbols))
+	for _, symbol := range sess.cache.symbols {
+		if symbol.Handle != 0 {
+			symHandles = append(symHandles, symbol.Handle)
+		}
+	}
+	sess.cache.lock.Unlock()
+
+	// Release handles individually — ADS has no batch release command.
+	// Re-check disconnected each iteration so a mid-loop PLC failure
+	// doesn't force every remaining Write to time out.
+	for i, h := range symHandles {
+		if sess.isDisconnected() {
+			sess.logger.Info("releasePLCResources: disconnected during handle release, stopping cleanup",
+				"released", i,
+				"remaining", len(symHandles)-i)
+			break
+		}
+		handleBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(handleBytes, h)
+		if err := sess.client.Load().Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+			sess.logger.Warn("failed to release symbol handle", "error", err, "handle", h)
+		} else {
+			sess.logger.Info("handle deleted", "handle", h)
+		}
+	}
+}
+
 // Close closes connection and waits for completion
 func (sess *Session) Close() {
 	// Capture transport-disconnected state BEFORE the FSM transitions into
@@ -641,67 +726,10 @@ func (sess *Session) Close() {
 	if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateClosed); !ok {
 		return // already closed (or transition not permitted from current state)
 	}
-	close(sess.lifecycle.closedCh)
+	sess.markClosed()
 	sess.logger.Info("Close called, shutting down")
 
-	// Notification cleanup runs even when disconnected: PLC tracks subscriptions
-	// per source AMS NetID, so a session that closes without deleting its
-	// notification handles leaves the PLC delivering them to the next session
-	// that opens with the same NetID ("received notification for unknown handle"
-	// warnings + extra PLC load). bestEffortDelete logs failures but never
-	// returns an error, so the call is safe even with a dead transport — the
-	// underlying writes will fast-fail and we move on.
-	sess.notifications.lock.Lock()
-	handles := make([]uint32, 0, len(sess.notifications.activeNotifications))
-	for handle := range sess.notifications.activeNotifications {
-		handles = append(handles, handle)
-	}
-	sess.notifications.lock.Unlock()
-	if len(handles) > 0 {
-		deleted := sess.bestEffortDeleteNotifications(handles)
-		sess.logger.Info("close: best-effort notification cleanup",
-			"requested", len(handles), "deleted", deleted,
-			"wasDisconnected", wasDisconnected)
-	}
-
-	// Symbol handle release is skipped when disconnected — unlike notifications,
-	// stranded symbol handles do not generate side effects on subsequent
-	// sessions, so the cost of leaking them is just a small PLC-side handle
-	// table entry that the PLC reaps on route timeout.
-	if !wasDisconnected {
-		// Collect symbol handles under lock, then release without holding the lock
-		sess.cache.lock.Lock()
-		var symHandles []uint32
-		for _, symbol := range sess.cache.symbols {
-			if symbol.Handle != 0 {
-				symHandles = append(symHandles, symbol.Handle)
-			}
-		}
-		sess.cache.lock.Unlock()
-
-		// Release handles individually — ADS has no batch release command,
-		// and Close() is not performance-critical.
-		// re-check disconnected each iteration so a mid-loop PLC failure
-		// (listen detects EOF → triggerReconnect → disconnected=true) doesn't
-		// force every remaining Write to time out. Bail out early.
-		for i, h := range symHandles {
-			if sess.isDisconnected() {
-				sess.logger.Info("close: disconnected during handle release, stopping cleanup",
-					"released", i,
-					"remaining", len(symHandles)-i)
-				break
-			}
-			handleBytes := make([]byte, 4)
-			binary.LittleEndian.PutUint32(handleBytes, h)
-			if err := sess.client.Load().Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
-				sess.logger.Warn("failed to release symbol handle during close", "error", err, "handle", h)
-			} else {
-				sess.logger.Info("handle deleted", "handle", h)
-			}
-		}
-	} else {
-		sess.logger.Info("already disconnected, skipping handle cleanup")
-	}
+	sess.releasePLCResources(wasDisconnected)
 	// Capture cancel under RLock then release before invoking — see
 	// tearDownAndReset for the symmetric pattern. Holding RLock across the
 	// cancel() blocks tearDownAndReset's ctxMu.Lock replacement.
@@ -920,14 +948,17 @@ func (sess *Session) Reconnect() error {
 				"maxAttempts", sess.lifecycle.maxReconnectAttempts, "error", lastErr)
 			// Transition FSM to Closed so future Reconnect() calls are rejected
 			// instead of silently no-op'ing on the stuck Reconnecting state.
-			// Use transitionToOnce so a concurrent Close() wins cleanly — if it
-			// already transitioned, closedCh is already closed and we must not
-			// close it again.
+			// Use transitionToOnce so a concurrent Close() wins cleanly.
 			if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateClosed); ok {
-				// Close closedCh to unblock goroutines blocking on reconnectSleep
-				// or waitForReconnect. reconnectDone is closed by the defer above.
-				close(sess.lifecycle.closedCh)
+				// We won the transition: take ownership of PLC-side cleanup so
+				// notification + handle leaks don't strand on the PLC. A subsequent
+				// user Close() will short-circuit on transitionToOnce ok=false and
+				// would otherwise skip cleanup entirely.
+				sess.releasePLCResources(true) // transport already dead by exhaustion
 			}
+			// closedCh close is idempotent via closedOnce, safe whether Close()
+			// or this branch ran first. Unblocks reconnectSleep / waitForReconnect.
+			sess.markClosed()
 			return fmt.Errorf("reconnect failed after %d attempts: %w", sess.lifecycle.maxReconnectAttempts, lastErr)
 		}
 
@@ -1104,10 +1135,19 @@ func (sess *Session) reloadSymbols() error {
 		// On-demand mode: re-resolve only the symbols that were previously loaded.
 		// By default, missing symbols are skipped gracefully (PLC may have done
 		// an online change). With WithStrictReconnect, missing symbols cause failure.
+		//
+		// Snapshot the requested set BEFORE wiping cache.symbols; do NOT also
+		// wipe onDemandSymbols here. Failed resolutions leave their name in
+		// onDemandSymbols so the NEXT reconnect retry still sees the full
+		// requested set. Without this, partial-success on retry N silently
+		// drops the failed names from retry N+1's set, masking symbols that
+		// would have come back after a transient PLC condition cleared.
 		sess.cache.lock.Lock()
-		oldSymbols := sess.cache.onDemandSymbols
+		oldSymbols := make(map[string]bool, len(sess.cache.onDemandSymbols))
+		for k, v := range sess.cache.onDemandSymbols {
+			oldSymbols[k] = v
+		}
 		sess.cache.symbols = make(map[string]*Symbol)
-		sess.cache.onDemandSymbols = make(map[string]bool)
 		sess.bumpEpoch()
 		sess.cache.lock.Unlock()
 
@@ -1267,7 +1307,10 @@ func (sess *Session) resubscribeNotifications() error {
 	sess.notifications.lock.Lock()
 	savedConfigs := sess.notifications.notificationConfigs
 	savedChannel := sess.notifications.notificationChannel
-	sess.notifications.notificationConfigs = nil // Clear before re-adding to prevent duplicates
+	// Clear via resetConfigs so the key-index mirror is wiped in lockstep —
+	// AddSymbolNotifications dup-checks against the mirror and would reject
+	// every resubscribe if the old keys remained.
+	sess.notifications.resetConfigs(nil)
 	sess.notifications.lock.Unlock()
 	if len(savedConfigs) == 0 || savedChannel == nil {
 		return nil
@@ -1328,7 +1371,9 @@ func (sess *Session) resubscribeNotifications() error {
 	}
 	if len(retryConfigs) > 0 {
 		sess.notifications.lock.Lock()
-		sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs, retryConfigs...)
+		for _, cfg := range retryConfigs {
+			sess.notifications.addConfig(cfg)
+		}
 		sess.notifications.lock.Unlock()
 		sess.logger.Info("resubscribe: queued Skipped configs for next reconnect retry",
 			"retry_count", len(retryConfigs))
@@ -1351,7 +1396,8 @@ func (sess *Session) resubscribeNotifications() error {
 			}
 		}
 		// Restore configs so they can be retried by the next reconnect attempt.
-		sess.notifications.notificationConfigs = savedConfigs
+		// resetConfigs rebuilds the key-index mirror to match savedConfigs.
+		sess.notifications.resetConfigs(savedConfigs)
 		sess.notifications.notificationChannel = savedChannel
 		sess.notifications.lock.Unlock()
 		if len(newHandles) > 0 {

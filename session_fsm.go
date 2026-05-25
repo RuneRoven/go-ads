@@ -58,6 +58,11 @@ var allowedTransitions = map[SessionState]map[SessionState]struct{}{
 	SessionStateConnecting: {
 		SessionStateConnected:    {},
 		SessionStateReconnecting: {},
+		// Connecting -> Disconnected covers Connect-time failure rollback:
+		// dial error, route err, handshake err leave the FSM in a state
+		// the caller can recover from via Reconnect, instead of forcing a
+		// fresh NewSession.
+		SessionStateDisconnected: {},
 		SessionStateClosed:       {},
 	},
 	SessionStateConnected: {
@@ -76,7 +81,11 @@ var allowedTransitions = map[SessionState]map[SessionState]struct{}{
 	},
 	SessionStateDisconnected: {
 		SessionStateReconnecting: {},
-		SessionStateClosed:       {},
+		// Allow Connect retry after a Connecting-time rollback into
+		// Disconnected. Without this edge the recovered Session has only
+		// Reconnecting available, which is auto-path-only.
+		SessionStateConnecting: {},
+		SessionStateClosed:     {},
 	},
 	SessionStateReconnecting: {
 		SessionStateConnected:    {},

@@ -22,7 +22,7 @@ import (
 func newReconnectTestSession() *Session {
 	return &Session{
 		tx:            &transport{},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
 		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 		lifecycle: &sessionLifecycle{
@@ -213,7 +213,7 @@ func TestReconnectExhaustsMaxAttemptsTransitionsToClosed(t *testing.T) {
 			recvQueue:      make(chan []byte, recvQueueSize),
 			activeRequests: map[uint32]chan []byte{},
 		},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
 		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 		lifecycle: &sessionLifecycle{

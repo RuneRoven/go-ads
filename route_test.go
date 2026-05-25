@@ -28,20 +28,24 @@ func TestParseRouteResponse_RejectsInvokeIdMismatch(t *testing.T) {
 	}
 }
 
-// F-24: parseRouteResponse must accept a response whose invokeID matches.
+// parseRouteResponse with a matching invokeID but NO error tag must return an
+// error. Previously the absence of tagResponseError was treated as success,
+// which masked malformed/truncated PLC responses — caller would see Connect
+// succeed and every subsequent ADS command fail with TargetNotFound. Updated
+// per v2.2 to require the error tag explicitly.
 //
 // Validates: R-CMD-008.
-func TestParseRouteResponse_AcceptsMatchingInvokeId(t *testing.T) {
+func TestParseRouteResponse_NoErrorTagRejected(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	resp := make([]byte, 24)
 	binary.LittleEndian.PutUint32(resp[0:], routeCookie)
 	binary.LittleEndian.PutUint32(resp[4:], 0x12345678)
 	binary.LittleEndian.PutUint32(resp[8:], 0x80000000|routeServiceAdd)
-	// tagCount=0; no error tag → "no error tag found, assuming success"
+	// tagCount=0; no error tag → must surface as error now.
 
 	err := parseRouteResponse(logger, resp, 0x12345678)
-	if err != nil {
-		t.Errorf("expected nil error for matching invokeID, got: %v", err)
+	if err == nil {
+		t.Errorf("expected error for missing error tag, got nil")
 	}
 }
 

@@ -161,7 +161,7 @@ func newTestConnection() *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := &Session{
 		lifecycle:     &sessionLifecycle{ctx: ctx, shutdown: cancel},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
 		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 	}

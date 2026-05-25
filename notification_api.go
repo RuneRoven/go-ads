@@ -19,8 +19,38 @@ type notificationManager struct {
 	lock                sync.Mutex
 	activeNotifications map[uint32]*Symbol
 	notificationConfigs []NotificationConfig
+	// configsByKey mirrors notificationConfigs for O(1) duplicate-subscribe
+	// probes (R-NOT-013 hot path under bulk Add). Keys are lower-cased symbol
+	// names to match the EqualFold semantic used elsewhere. MUST be kept in
+	// lockstep with notificationConfigs — use addConfig / removeConfigByName /
+	// resetConfigs to mutate.
+	configsByKey        map[string]struct{}
 	notificationChannel chan *Update
 	lastSubscribeNs     atomic.Int64
+}
+
+// addConfig appends cfg to notificationConfigs and updates the key index.
+// Caller must hold lock.
+func (m *notificationManager) addConfig(cfg NotificationConfig) {
+	m.notificationConfigs = append(m.notificationConfigs, cfg)
+	m.configsByKey[symbolKey(cfg.SymbolName)] = struct{}{}
+}
+
+// hasConfig returns true if any existing config matches symbolName
+// (case-insensitive). Caller must hold lock.
+func (m *notificationManager) hasConfig(symbolName string) bool {
+	_, ok := m.configsByKey[symbolKey(symbolName)]
+	return ok
+}
+
+// resetConfigs swaps the entire slice and rebuilds the key index. Used by
+// resubscribeNotifications during the save/rollback dance. Caller must hold lock.
+func (m *notificationManager) resetConfigs(cfgs []NotificationConfig) {
+	m.notificationConfigs = cfgs
+	m.configsByKey = make(map[string]struct{}, len(cfgs))
+	for _, cfg := range cfgs {
+		m.configsByKey[symbolKey(cfg.SymbolName)] = struct{}{}
+	}
 }
 
 // Update is delivered to the user channel for each PLC notification sample.
@@ -76,11 +106,9 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 		sess.notifications.lock.Unlock()
 		return 0, fmt.Errorf("all symbol notifications on a connection must use the same updateReceiver channel")
 	}
-	for _, cfg := range sess.notifications.notificationConfigs {
-		if strings.EqualFold(cfg.SymbolName, symbolName) {
-			sess.notifications.lock.Unlock()
-			return 0, fmt.Errorf("symbol %q already has an active notification; delete it before re-subscribing", symbolName)
-		}
+	if sess.notifications.hasConfig(symbolName) {
+		sess.notifications.lock.Unlock()
+		return 0, fmt.Errorf("symbol %q already has an active notification; delete it before re-subscribing", symbolName)
 	}
 	sess.notifications.lock.Unlock()
 
@@ -162,22 +190,20 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 		}
 		return 0, fmt.Errorf("all symbol notifications on a connection must use the same updateReceiver channel")
 	}
-	for _, cfg := range sess.notifications.notificationConfigs {
-		if strings.EqualFold(cfg.SymbolName, symbolName) {
-			sess.notifications.lock.Unlock()
-			if delErr := sess.DeleteDeviceNotification(handle); delErr != nil {
-				sess.logger.Warn("failed to release PLC handle after duplicate-subscribe reject",
-					"handle", handle, "symbol", symbolName, "error", delErr)
-			}
-			return 0, fmt.Errorf("symbol %q already has an active notification; delete it before re-subscribing", symbolName)
+	if sess.notifications.hasConfig(symbolName) {
+		sess.notifications.lock.Unlock()
+		if delErr := sess.DeleteDeviceNotification(handle); delErr != nil {
+			sess.logger.Warn("failed to release PLC handle after duplicate-subscribe reject",
+				"handle", handle, "symbol", symbolName, "error", delErr)
 		}
+		return 0, fmt.Errorf("symbol %q already has an active notification; delete it before re-subscribing", symbolName)
 	}
 	defer sess.notifications.lock.Unlock()
 	fresh.Notification = updateReceiver
 	sess.notifications.activeNotifications[handle] = fresh
 
 	// Save config for reconnect re-subscribe
-	sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs, NotificationConfig{
+	sess.notifications.addConfig(NotificationConfig{
 		SymbolName:       symbolName,
 		MaxDelay:         maxDelay,
 		CycleTime:        cycleTime,
@@ -220,9 +246,12 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 		sess.notifications.lock.Unlock()
 		return nil, fmt.Errorf("all symbol notifications on a connection must use the same updateReceiver channel")
 	}
-	existing := make(map[string]struct{}, len(sess.notifications.notificationConfigs))
-	for _, cfg := range sess.notifications.notificationConfigs {
-		existing[symbolKey(cfg.SymbolName)] = struct{}{}
+	// Snapshot the configsByKey mirror so the dup-check inside the batch loop
+	// runs lock-free against a per-call copy (cheaper than re-acquiring the
+	// manager lock for each candidate).
+	existing := make(map[string]struct{}, len(sess.notifications.configsByKey))
+	for k := range sess.notifications.configsByKey {
+		existing[k] = struct{}{}
 	}
 	sess.notifications.lock.Unlock()
 
@@ -353,9 +382,9 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 	// TOCTOU re-check: another goroutine may have subscribed one of our names
 	// while we were doing the PLC roundtrip. Mark such items Skipped and
 	// surface handle so the caller can release the PLC-side registration.
-	postExisting := make(map[string]struct{}, len(sess.notifications.notificationConfigs))
-	for _, cfg := range sess.notifications.notificationConfigs {
-		postExisting[symbolKey(cfg.SymbolName)] = struct{}{}
+	postExisting := make(map[string]struct{}, len(sess.notifications.configsByKey))
+	for k := range sess.notifications.configsByKey {
+		postExisting[k] = struct{}{}
 	}
 
 	successes := 0
@@ -394,7 +423,7 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 		// no longer relevant.
 		commitCfg := info.config
 		commitCfg.resubscribeAttempts = 0
-		sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs, commitCfg)
+		sess.notifications.addConfig(commitCfg)
 		postExisting[key] = struct{}{}
 		successes++
 		sess.logger.Info("batch notification created",
@@ -412,6 +441,11 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 // removeNotificationConfig removes the first config matching symbolName.
 // Must be called with notifications.lock held.
 func (sess *Session) removeNotificationConfig(symbolName string) {
+	key := symbolKey(symbolName)
+	if _, ok := sess.notifications.configsByKey[key]; !ok {
+		return
+	}
+	delete(sess.notifications.configsByKey, key)
 	for i, cfg := range sess.notifications.notificationConfigs {
 		if strings.EqualFold(cfg.SymbolName, symbolName) {
 			sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs[:i], sess.notifications.notificationConfigs[i+1:]...)

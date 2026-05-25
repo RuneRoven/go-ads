@@ -129,12 +129,22 @@ func (c *Client) DeleteDeviceNotification(handle uint32) error {
 // last subscription dies. Callers that want raw delete behavior use
 // the Client method directly.
 func (sess *Session) DeleteDeviceNotification(handle uint32) error {
+	// Snapshot symbol name BEFORE PLC RPC so a concurrent Reconnect clearing
+	// activeNotifications mid-flight doesn't strand notificationConfigs (which
+	// would cause resubscribeNotifications to re-subscribe a deleted symbol).
+	sess.notifications.lock.Lock()
+	var symbolName string
+	if sym := sess.notifications.activeNotifications[handle]; sym != nil {
+		symbolName = sym.FullName
+	}
+	sess.notifications.lock.Unlock()
+
 	if err := sess.client.Load().DeleteDeviceNotification(handle); err != nil {
 		return err
 	}
 	sess.notifications.lock.Lock()
-	if sym := sess.notifications.activeNotifications[handle]; sym != nil {
-		sess.removeNotificationConfig(sym.FullName)
+	if symbolName != "" {
+		sess.removeNotificationConfig(symbolName)
 	}
 	delete(sess.notifications.activeNotifications, handle)
 	if len(sess.notifications.activeNotifications) == 0 {

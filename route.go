@@ -199,8 +199,12 @@ func parseRouteResponse(logger *slog.Logger, data []byte, expectedInvokeID uint3
 		offset += int(tlen)
 	}
 
-	logger.Info("route registration response received (no error tag found, assuming success)")
-	return nil
+	// No tagResponseError observed. Beckhoff's documented happy-path always
+	// includes the tag (errCode=0 on success). Treating its absence as
+	// success masked real failures where the PLC sent a malformed or truncated
+	// response — caller would observe Connect() succeed and then every
+	// subsequent ADS command fail with ReturnCodeGlobalTargetNotFound.
+	return fmt.Errorf("route registration response had no error tag (response truncated or malformed)")
 }
 
 // routeManager holds the credentials and policy state used for AMS route
