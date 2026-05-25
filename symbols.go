@@ -141,12 +141,12 @@ type SymbolUploadInfo struct {
 //   - Guarded by Session.cache.lock (mutated by parse/Read/Write/loadSymbols):
 //     Value, Valid, ValueParsed, LastUpdateTime.
 //
-//   - Handle: write-once during getSymbol resolve under cache.lock, then
-//     stable until loadSymbols zeroes the old map (also under cache.lock).
-//     Concurrent reads after resolve are safe lock-free — observed value is
-//     either the resolved handle or 0 (post-reload), and a 0 handle naturally
-//     fails the next PLC operation (ReturnCodeDeviceNotifyHandleInvalid),
-//     prompting re-resolve via GetSymbol.
+//   - Handle: written during getSymbol resolve and zeroed during
+//     zeroOldSymbolHandles on reload/refresh; all writes under cache.lock.
+//     Reads must also hold cache.lock — see symbolSumAddress and the
+//     readMultipleSymbolsRetry / writeMultipleSymbolsRetry call sites.
+//     An observed-zero Handle naturally fails the next PLC operation with
+//     ReturnCodeDeviceNotifyHandleInvalid, prompting re-resolve via GetSymbol.
 //
 //   - Guarded by Session.notifications.lock (mutated by AddSymbolNotification(s)
 //     and DeleteDeviceNotification):
@@ -306,11 +306,13 @@ func (v SymbolView) ChildrenWalk(fn func(SymbolView) bool) {
 		v.conn.cache.lock.Unlock()
 		return
 	}
-	// Phase 1: collect snapshots under lock.
+	// Snapshot the subtree under cache.lock so the slice is internally
+	// consistent, then release the lock BEFORE invoking the caller's fn —
+	// fn may call other Session methods that take their own locks, and the
+	// lock-ordering rule forbids holding cache.lock across user callbacks.
 	var snapshots []SymbolView
 	collectSubtree(root, v.conn, &snapshots)
 	v.conn.cache.lock.Unlock()
-	// Phase 2: invoke fn outside lock.
 	for _, view := range snapshots {
 		if !fn(view) {
 			return

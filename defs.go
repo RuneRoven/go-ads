@@ -5,13 +5,15 @@ import (
 	"fmt"
 )
 
-// AMSAddress netid and port of device
+// AMSAddress identifies an ADS endpoint by its 6-byte AMS NetID and 16-bit
+// AMS port.
 type AMSAddress struct {
 	NetID [6]byte
 	Port  uint16
 }
 
-// TransMode transmission mode for notifications
+// TransMode is the transmission mode for an ADS device notification — how the
+// PLC decides when to deliver a sample to the subscriber.
 type TransMode uint32
 
 const (
@@ -127,6 +129,8 @@ func (f SymbolFlag) Has(flag SymbolFlag) bool {
 	return f&flag == flag
 }
 
+// ADSState is the run-time state of an ADS device (typically the PLC runtime),
+// as reported by Client.ReadState.
 type ADSState uint16
 
 const (
@@ -150,7 +154,8 @@ const (
 	ADSStateMaxStates    ADSState = 255
 )
 
-// Port default twincat ports
+// Port is a well-known AMS port number for a TwinCAT service. PortR0PlcTc3
+// (851) is the typical PLC runtime port for TwinCAT 3.
 type Port uint32
 
 const (
@@ -170,7 +175,8 @@ const (
 	PortR0PlcTc3  Port = 851
 )
 
-// CommandID Ads Command IDS
+// CommandID is the ADS command opcode carried in the AMS header (see
+// Beckhoff ADS specification for the wire format).
 type CommandID uint16
 
 const (
@@ -186,7 +192,9 @@ const (
 	CommandIDReadWrite
 )
 
-// Group reserved index groups
+// Group is an ADS index group identifier. The high-byte hex values address
+// reserved system tables (symbol cache, process image, device data) per
+// Beckhoff's published index-group reservations.
 type Group uint32
 
 const (
@@ -209,7 +217,7 @@ const (
 	GroupSymbolDataTypeUpload Group = 0xF00E
 	GroupSymbolUploadInfo2    Group = 0xF00F
 
-	GroupSymbolNotification Group = 0xf010 // notification of named handle
+	GroupSymbolNotification Group = 0xF010 // notification of named handle
 
 	GroupSumupRead                     Group = 0xF080
 	GroupSumupWrite                    Group = 0xF081
@@ -231,6 +239,9 @@ const (
 	GroupDeviceData Group = 0xF100 // state, name, etc...
 )
 
+// Offset is the index-offset half of an ADS group/offset address; the
+// interpretation depends on the index group (symbol-relative byte offset,
+// process-image bit/byte index, device-data field, ...).
 type Offset uint32
 
 const (
@@ -238,7 +249,10 @@ const (
 	OffsetDeviceDataDeviceState Offset = 0x0002 // device state
 )
 
-// ReturnCode ADS Return codes
+// ReturnCode is an ADS return code reported by the PLC in command responses
+// and per-item sum-command results. The Error method on ReturnCode satisfies
+// the error interface so callers can use errors.As to extract the code from
+// wrapped errors.
 type ReturnCode uint32
 
 // ReturnCodeErrorOffset General ADS errors begin at this offset

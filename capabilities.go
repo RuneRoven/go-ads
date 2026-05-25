@@ -15,9 +15,9 @@ import (
 //   - chunkedDownloadSupported / chunkedDownloadChecked: pair tracks whether a chunked
 //     download probe has been done and whether it succeeded.
 //
-// reset() clears all fields; called during Reconnect because the PLC behind
-// the connection may have changed (firmware swap, hardware replacement) and
-// capabilities must be re-detected.
+// Reset is implicit: see the comment at the bottom of this file — a fresh
+// Client (allocated on every Connect / dialAndStart) starts zeroed, so no
+// explicit reset method is needed.
 type capabilities struct {
 	sumReadCmd               atomic.Uint32
 	sumWriteState            atomic.Uint32

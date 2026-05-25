@@ -10,11 +10,13 @@ import (
 )
 
 // Single-symbol device-notification raw RPCs on *Client:
-// AddDeviceNotification, DeleteDeviceNotification. Notifs persistence
-// + activeNotifications cleanup is the Session's wrapper concern (see
+// AddDeviceNotification, DeleteDeviceNotification. Notification persistence
+// and activeNotifications cleanup is the Session's wrapper concern (see
 // Session.DeleteDeviceNotification below). The cache-aware
-// handleNotification dispatcher (installed via Client.SetNotificationHandler)
-// also lives in this file because it shares Update / handle bookkeeping.
+// handleNotification dispatcher also lives in this file because it shares
+// Update / handle bookkeeping; it is wired into the Client via
+// Client.SetNotificationHandler at Session.Connect and Session.dialAndStart
+// (the two Client-allocation sites in session.go).
 
 // durationToADSTicks converts a time.Duration to ADS 100ns tick units (uint32).
 // Returns an error if d is negative or exceeds the ADS 32-bit limit (~429.5 s).
@@ -188,14 +190,25 @@ const (
 	secToUnixEpoch int64 = 11644473600
 )
 
+// NotificationStream is the outer header of an ADS DeviceNotification
+// payload: Length is the total payload length in bytes, Stamps is the
+// number of StampHeader records that follow.
 type NotificationStream struct {
 	Length uint32
 	Stamps uint32
 }
+
+// StampHeader prefixes the samples that share a single PLC sample
+// timestamp. Timestamp is in Windows FILETIME ticks (100 ns since 1601-01-01
+// UTC). Samples is the count of NotificationSample records that follow.
 type StampHeader struct {
 	Timestamp uint64
 	Samples   uint32
 }
+
+// NotificationSample is the per-handle prefix inside a stamp record:
+// Handle identifies the subscription that produced the value; Size is the
+// byte length of the value bytes that follow.
 type NotificationSample struct {
 	Handle uint32
 	Size   uint32
@@ -214,12 +227,13 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 		sess.notifications.lock.Unlock()
 		// Stale notifications are expected during:
 		// - Close(): handles deleted from activeNotifications while listen() still drains
-		// - Reconnect: activeNotifications cleared (connection.go:575) before new subscriptions
+		// - Reconnect: Session.Reconnect clears activeNotifications before new subscriptions
 		// - first-sample race — PLC fires the first notification before our
 		//   activeNotifications map insert completes (sub-millisecond window for
 		//   fast PLCs and zero-MaxDelay subscriptions). Suppress within ~100ms of
 		//   the most recent successful subscribe.
-		const subscribeRaceWindowNs = int64(100 * time.Millisecond)
+		const subscribeRaceWindow = 100 * time.Millisecond
+		subscribeRaceWindowNs := subscribeRaceWindow.Nanoseconds()
 		switch {
 		case sess.isClosed() || sess.isReconnecting():
 			sess.logger.Debug("received notification for deleted handle (expected during close/reconnect)", "handle", handle)

@@ -6,20 +6,20 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) a
 [go-semantic-release](https://github.com/go-semantic-release/semantic-release) for
 automated versioning and changelog generation.
 
-## v2.1.0 — Layered architecture (breaking)
+## v2.1.0: Layered architecture (breaking)
 
 The single `Connection` god-type is split into two distinct public types:
 
-- **`Client`** — thin Beckhoff-equivalent RPC layer. One TCP socket, raw AMS
+- **`Client`** - thin Beckhoff-equivalent RPC layer. One TCP socket, raw AMS
   framing, request multiplexing, no cache, no notification persistence, no
   reconnect. Constructed via `Dial`. Suitable for one-shot consumers (CLI
   tools, web ADS browsers).
-- **`Session`** — managed wrapper. Owns a `*Client` and adds the symbol
+- **`Session`** - managed wrapper. Owns a `*Client` and adds the symbol
   cache, name-based read/write, persistent notifications with auto-resubscribe,
   auto-reconnect with backoff, FSM-based lifecycle, and lifecycle callbacks.
   Constructed via `NewSession`.
 
-`Session` does NOT embed `Client` — there is no method promotion. Callers
+`Session` does NOT embed `Client` - there is no method promotion. Callers
 choose a layer at construction. This keeps the boundary explicit.
 
 ### Breaking changes
@@ -91,11 +91,11 @@ info, _ := client.ReadDeviceInfo()
   `0x703` `DeviceInvalidOffset`, `0x722` `DeviceSymbolNotActive`, `0x714`
   `DeviceNotifyHandleInvalid`, `0x705` `DeviceInvalidSize`).
 - Three strategies via `WithSymbolVersionStrategy`:
-  - `SymbolVersionAutoReload` (default) — re-discover symbols + resubscribe
+  - `SymbolVersionAutoReload` (default) - re-discover symbols + resubscribe
     notifications on detection.
-  - `SymbolVersionClose` — terminate the session on detection (fires
+  - `SymbolVersionClose` - terminate the session on detection (fires
     `OnDisconnect`, then `Close()`).
-  - `SymbolVersionIgnore` — surface the PLC error to the calling op and
+  - `SymbolVersionIgnore` - surface the PLC error to the calling op and
     flag surviving notification handles' next sample with `Update.Stale=true`
     (one-shot, consumed on first delivery).
 - New `Update` fields `Stale bool` + `Reason string` (R-NOT-016). Reason
@@ -103,7 +103,7 @@ info, _ := client.ReadDeviceInfo()
 - Optional callback via `WithOnSymbolVersionChanged(fn func(reason string))`
   fires once per detection. Required signal under `SymbolVersionIgnore` to
   observe symbol-removal events (the dead handle's user channel goes silent
-  — no terminal Update is delivered).
+  - no terminal Update is delivered).
 - Reload cap: `WithMaxSymbolVersionReloadAttempts` (default 3) within
   `WithSymbolVersionReloadWindow` (default 60s) prevents runaway reload
   loops under recurring online-change conditions (R-CACHE-013). On cap

@@ -11,7 +11,7 @@ import (
 // Batched ADS sum commands: SumRead, SumWrite, SumAddDeviceNotification,
 // SumDeleteDeviceNotification. Each falls back to individual commands when
 // the PLC does not support the sum variant. Capability state is tracked via
-// the capabilities type on Session.
+// the capabilities type on *Client (see capabilities.go).
 
 // sumCmdSpec describes a single sum-command's protocol contract for use
 // with executeSumCommand. SumAddDeviceNotification and SumDeleteDeviceNotification

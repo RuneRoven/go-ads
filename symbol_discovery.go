@@ -295,7 +295,7 @@ func (sess *Session) getSymbol(symbolName string) (*Symbol, error) {
 // GetSymbolInfoByName resolves a single symbol on the PLC and returns a
 // populated Symbol with Group, Offset, Length, DataType, etc. Does NOT
 // populate Children (struct / array children require full discovery via
-// LoadSymbols / LoadSymbolList + LoadDataTypes). Wire RPC; no cache.
+// LoadSymbols / LoadSymbolList + LoadDataTypes). This is a raw RPC and bypasses the symbol cache; the caller is responsible for decoding the response.
 func (c *Client) GetSymbolInfoByName(symbolName string) (*Symbol, error) {
 	resp, err := c.WriteRead(
 		uint32(GroupSymbolInfoByNameEx),
@@ -360,7 +360,7 @@ func (c *Client) GetHandleByName(symbolName string) (uint32, error) {
 // GetSymbolUploadInfo reads the symbol-table size header from the PLC.
 // Tries extended info (0xF00F, 24 bytes) first; falls back to basic info
 // (0xF00C, 16 bytes) for older PLCs. Used by LoadSymbols / LoadSymbolList /
-// LoadDataTypes to size the subsequent download. Wire RPC; no cache.
+// LoadDataTypes to size the subsequent download. This is a raw RPC and bypasses the symbol cache; the caller is responsible for decoding the response.
 func (c *Client) GetSymbolUploadInfo() (SymbolUploadInfo, error) {
 	var uploadInfo SymbolUploadInfo
 	res, err := c.Read(uint32(GroupSymbolUploadInfo2), 0, 24)
@@ -396,7 +396,7 @@ func (c *Client) GetSymbolUploadInfo() (SymbolUploadInfo, error) {
 }
 
 // DownloadSymbolList downloads the raw symbol-table bytes (group 0xF00B).
-// Caller decodes per parseUploadSymbolInfoSymbols. Wire RPC; no cache.
+// Caller decodes per parseUploadSymbolInfoSymbols. This is a raw RPC and bypasses the symbol cache; the caller is responsible for decoding the response.
 func (c *Client) DownloadSymbolList(length uint32) ([]byte, error) {
 	res, err := c.Read(uint32(GroupSymbolUpload), 0, length)
 	if err != nil {
@@ -406,7 +406,7 @@ func (c *Client) DownloadSymbolList(length uint32) ([]byte, error) {
 }
 
 // DownloadDataTypes downloads the raw datatype-table bytes (group 0xF00E).
-// Caller decodes via parseUploadSymbolInfoDataTypes. Wire RPC; no cache.
+// Caller decodes via parseUploadSymbolInfoDataTypes. This is a raw RPC and bypasses the symbol cache; the caller is responsible for decoding the response.
 func (c *Client) DownloadDataTypes(length uint32) ([]byte, error) {
 	res, err := c.Read(uint32(GroupSymbolDataTypeUpload), 0x0, length)
 	if err != nil {
@@ -416,7 +416,7 @@ func (c *Client) DownloadDataTypes(length uint32) ([]byte, error) {
 }
 
 // GetSymbolVersion reads the current PLC symbol version (single byte).
-// Increments on online-change or download. Wire RPC; no cache.
+// Increments on online-change or download. This is a raw RPC and bypasses the symbol cache; the caller is responsible for decoding the response.
 func (c *Client) GetSymbolVersion() (uint8, error) {
 	data, err := c.Read(uint32(GroupSymbolVersion), 0, 1)
 	if err != nil {
