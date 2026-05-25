@@ -14,7 +14,8 @@ docs/
 specs/07-bug-report.md
 specs/10-test-audit.md
 specs/11-spec-code-audit.md
-
+specs/12-v2.2-plan.md
+scripts/
 # Symbol-version hardware test logs
 symbol-version-run-*.log
 

@@ -102,6 +102,12 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 			"flags", fmt.Sprintf("0x%04X", uint32(symbol.Flags)))
 	}
 
+	// Record subscribe time BEFORE the RPC so any first-sample arriving in the
+	// race window between PLC handle return and our map insert sees a fresh
+	// timestamp in handleNotification's unknown-handle log-level decision. If
+	// stored after the RPC, the previous-subscribe timestamp would falsely
+	// elevate a legitimate first-sample to Warn.
+	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
 	handle, err := sess.client.Load().AddDeviceNotification(
 		uint32(GroupSymbolValueByHandle),
 		symbol.Handle,
@@ -178,11 +184,6 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 		TransmissionMode: transMode,
 	})
 	sess.notifications.notificationChannel = updateReceiver
-	// record subscribe time so handleNotification suppresses the
-	// "unknown handle" Warn for any notifications arriving in the small
-	// race window between PLC firing the first sample and the map insert
-	// completing here.
-	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
 
 	return handle, nil
 }
@@ -282,6 +283,10 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 		return results, nil
 	}
 
+	// Record subscribe time BEFORE the batch RPC so first-sample arrivals
+	// during PLC-roundtrip + map-insert race window log at Debug not Warn.
+	// See AddSymbolNotification for the same ordering rationale.
+	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
 	subResults, err := sess.client.Load().SumAddDeviceNotification(requests)
 	if err != nil {
 		// Transport-aborted batch: every entry that was about to be sent must
@@ -399,11 +404,6 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 
 	if successes > 0 {
 		sess.notifications.notificationChannel = ch
-		// record subscribe time so handleNotification suppresses the
-		// "unknown handle" Warn for any notifications arriving in the small
-		// race window between PLC firing the first sample and the map insert
-		// completing here.
-		sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
 	}
 
 	return results, nil

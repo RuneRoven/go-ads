@@ -46,6 +46,15 @@ func executeSumCommand[Req any, Res any](c *Client, spec sumCmdSpec[Req, Res], r
 		return spec.fallback(requests)
 	}
 	n := len(requests)
+	// Guard against uint32 overflow on response-size accounting. SumRead has the
+	// same check at SumRead:128-130; mirror here for the generic executor so
+	// SumAddDeviceNotification / SumDeleteDeviceNotification get the same defense.
+	if uint64(n)*uint64(spec.itemReadSize) > uint64(math.MaxUint32) {
+		return nil, fmt.Errorf("sum command (group 0x%X) response size overflow: %d items × %d bytes", uint32(spec.group), n, spec.itemReadSize)
+	}
+	if uint64(n)*uint64(spec.itemWriteSize) > uint64(math.MaxUint32) {
+		return nil, fmt.Errorf("sum command (group 0x%X) request size overflow: %d items × %d bytes", uint32(spec.group), n, spec.itemWriteSize)
+	}
 	writeData := make([]byte, n*spec.itemWriteSize)
 	for i, req := range requests {
 		if err := spec.encode(writeData[i*spec.itemWriteSize:(i+1)*spec.itemWriteSize], req); err != nil {
