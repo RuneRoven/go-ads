@@ -41,7 +41,7 @@ func TestBrowseAllSymbols(t *testing.T) {
 	t.Logf("Loaded %d symbols from %s", len(symbols), ip)
 
 	// Get device info for the header.
-	info, err := conn.client.ReadDeviceInfo()
+	info, err := conn.client.Load().ReadDeviceInfo()
 	if err != nil {
 		t.Fatalf("ReadDeviceInfo failed: %v", err)
 	}

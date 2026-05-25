@@ -218,14 +218,14 @@ func TestListen_TwoSequentialPackets(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn.lifecycle.ctx = ctx
 	conn.lifecycle.shutdown = cancel
-	conn.client = &Client{tx: conn.tx, logger: conn.logger, ctx: ctx}
-	conn.client.waitGroup.Add(1)
+	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
+	conn.client.Load().waitGroup.Add(1)
 
 	var listenDone sync.WaitGroup
 	listenDone.Add(1)
 	go func() {
 		defer listenDone.Done()
-		conn.client.listen()
+		conn.client.Load().listen()
 	}()
 
 	body1 := []byte{0xAA, 0xBB, 0xCC, 0xDD}
@@ -272,14 +272,14 @@ func TestListen_OversizePacketTriggersReconnect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn.lifecycle.ctx = ctx
 	conn.lifecycle.shutdown = cancel
-	conn.client = &Client{tx: conn.tx, logger: conn.logger, ctx: ctx}
-	conn.client.waitGroup.Add(1)
+	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
+	conn.client.Load().waitGroup.Add(1)
 
 	var listenDone sync.WaitGroup
 	listenDone.Add(1)
 	go func() {
 		defer listenDone.Done()
-		conn.client.listen()
+		conn.client.Load().listen()
 	}()
 
 	hdr := buildAmsTCPHeader(1, 8*1024*1024) // 8 MB exceeds 4 MB cap
@@ -357,10 +357,10 @@ func TestEncodePacket(t *testing.T) {
 			Port:  10500,
 		},
 	}
-	conn.client = &Client{tx: conn.tx, logger: conn.logger, target: conn.target, source: conn.source}
+	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, target: conn.target, source: conn.source})
 
 	data := []byte{0x01, 0x02, 0x03, 0x04}
-	packet, err := conn.client.encode(CommandIDRead, data, 7)
+	packet, err := conn.client.Load().encode(CommandIDRead, data, 7)
 	if err != nil {
 		t.Fatalf("encode error: %v", err)
 	}
@@ -436,9 +436,9 @@ func TestEncodePacket_EmptyData(t *testing.T) {
 		target:    AMSAddress{NetID: [6]byte{1, 2, 3, 4, 5, 6}, Port: 851},
 		source:    AMSAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 10500},
 	}
-	conn.client = &Client{tx: conn.tx, logger: conn.logger, target: conn.target, source: conn.source}
+	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, target: conn.target, source: conn.source})
 
-	packet, err := conn.client.encode(CommandIDReadDeviceInfo, nil, 0)
+	packet, err := conn.client.Load().encode(CommandIDReadDeviceInfo, nil, 0)
 	if err != nil {
 		t.Fatalf("encode error: %v", err)
 	}
@@ -474,7 +474,7 @@ func TestEncodePacket_AllCommands(t *testing.T) {
 		target:    target,
 		source:    source,
 	}
-	conn.client = &Client{tx: conn.tx, logger: conn.logger, target: target, source: source}
+	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, target: target, source: source})
 
 	commands := []CommandID{
 		CommandIDReadDeviceInfo,
@@ -491,7 +491,7 @@ func TestEncodePacket_AllCommands(t *testing.T) {
 		invokeID := uint32(100 + i) // distinct per command so we catch swapped fields
 		payload := []byte{0xDE, 0xAD, 0xBE, byte(cmd & 0xFF)}
 		t.Run(fmt.Sprintf("Command_%d", cmd), func(t *testing.T) {
-			packet, err := conn.client.encode(cmd, payload, invokeID)
+			packet, err := conn.client.Load().encode(cmd, payload, invokeID)
 			if err != nil {
 				t.Fatalf("encode: %v", err)
 			}
@@ -554,7 +554,7 @@ func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 		logger:    getDefaultLogger(),
 		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
 	}
-	conn.client = &Client{tx: conn.tx, logger: conn.logger, ctx: ctx}
+	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
 
 	// Register a response channel for invokeID 42
 	ch := make(chan []byte, 1)
@@ -576,7 +576,7 @@ func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 	binary.Write(buf, binary.LittleEndian, &header)
 	buf.Write([]byte{0xDE, 0xAD, 0xBE, 0xEF})
 
-	conn.client.handleReceive(ctx, buf.Bytes())
+	conn.client.Load().handleReceive(ctx, buf.Bytes())
 
 	select {
 	case resp := <-ch:
@@ -596,7 +596,7 @@ func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 		logger:    getDefaultLogger(),
 		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
 	}
-	conn.client = &Client{tx: conn.tx, logger: conn.logger, ctx: ctx}
+	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
 
 	// No registered channels — should not panic
 	header := amsHeader{
@@ -610,7 +610,7 @@ func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 	buf.Write([]byte{0x00, 0x00})
 
 	// Should not panic or error
-	conn.client.handleReceive(ctx, buf.Bytes())
+	conn.client.Load().handleReceive(ctx, buf.Bytes())
 }
 
 func TestHandleReceive_TooShort(t *testing.T) {
@@ -621,10 +621,10 @@ func TestHandleReceive_TooShort(t *testing.T) {
 		logger:    getDefaultLogger(),
 		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
 	}
-	conn.client = &Client{tx: conn.tx, logger: conn.logger, ctx: ctx}
+	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
 
 	// Less than 32 bytes — should return early
-	conn.client.handleReceive(ctx, []byte{1, 2, 3, 4, 5})
+	conn.client.Load().handleReceive(ctx, []byte{1, 2, 3, 4, 5})
 }
 
 // ==========================================================================

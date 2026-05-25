@@ -497,13 +497,13 @@ func newWiredTestSession(t *testing.T, srv *scriptableServer, opts ...SessionOpt
 	t.Cleanup(func() { _ = c.Close() })
 
 	sess := &Session{
-		client:        c,
 		tx:            c.tx,
 		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
 		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol)},
 		lifecycle:     &sessionLifecycle{closedCh: make(chan struct{})},
 		logger:        getDefaultLogger(),
 	}
+	sess.client.Store(c)
 	// Pre-init ctx/shutdown so sess.Close() is safe in test paths that
 	// exercise the close lifecycle (e.g. SymbolVersionClose strategy).
 	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(context.Background())

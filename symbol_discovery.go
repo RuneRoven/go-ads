@@ -74,7 +74,7 @@ func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Step 1: Read symbol version
-	version, err := sess.client.GetSymbolVersion()
+	version, err := sess.client.Load().GetSymbolVersion()
 	if err != nil {
 		sess.logger.Warn("failed to read symbol version during slow discovery", "error", err)
 	} else {
@@ -84,7 +84,7 @@ func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	}
 
 	// Step 2: Get upload info (small request)
-	uploadInfo, err := sess.client.GetSymbolUploadInfo()
+	uploadInfo, err := sess.client.Load().GetSymbolUploadInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
@@ -92,7 +92,7 @@ func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Step 3: Download datatypes in chunks
-	datatypesData, err := sess.client.DownloadInChunks(
+	datatypesData, err := sess.client.Load().DownloadInChunks(
 		uint32(GroupSymbolDataTypeUpload),
 		uploadInfo.DataTypeLength,
 		cfg.ChunkSize,
@@ -101,7 +101,7 @@ func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download datatypes in one request
 		sess.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
-		datatypesData, err = sess.client.DownloadDataTypes(uploadInfo.DataTypeLength)
+		datatypesData, err = sess.client.Load().DownloadDataTypes(uploadInfo.DataTypeLength)
 		if err != nil {
 			return fmt.Errorf("failed to download datatypes: %w", err)
 		}
@@ -114,7 +114,7 @@ func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Step 4: Download symbols in chunks
-	symbolsData, err := sess.client.DownloadInChunks(
+	symbolsData, err := sess.client.Load().DownloadInChunks(
 		uint32(GroupSymbolUpload),
 		uploadInfo.SymbolLength,
 		cfg.ChunkSize,
@@ -123,7 +123,7 @@ func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download symbols in one request
 		sess.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
-		symbolsData, err = sess.client.DownloadSymbolList(uploadInfo.SymbolLength)
+		symbolsData, err = sess.client.Load().DownloadSymbolList(uploadInfo.SymbolLength)
 		if err != nil {
 			return fmt.Errorf("failed to download symbols: %w", err)
 		}
@@ -230,7 +230,7 @@ func (sess *Session) getSymbol(symbolName string) (*Symbol, error) {
 		if needHandle {
 			// Network I/O must happen outside the lock to avoid deadlock
 			// with handleNotification which also acquires cache.lock.
-			handle, err := sess.client.GetHandleByName(symbolName)
+			handle, err := sess.client.Load().GetHandleByName(symbolName)
 			if err != nil {
 				return nil, err
 			}
@@ -240,7 +240,7 @@ func (sess *Session) getSymbol(symbolName string) (*Symbol, error) {
 				sess.cache.lock.Unlock()
 				handleBytes := make([]byte, 4)
 				binary.LittleEndian.PutUint32(handleBytes, handle)
-				if err := sess.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+				if err := sess.client.Load().Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 					sess.logger.Warn("failed to release duplicate symbol handle",
 						"symbol", symbolName, "handle", handle, "error", err)
 				}
@@ -254,12 +254,12 @@ func (sess *Session) getSymbol(symbolName string) (*Symbol, error) {
 	}
 
 	// On-demand resolution: query the PLC for this specific symbol
-	sym, err := sess.client.GetSymbolInfoByName(symbolName)
+	sym, err := sess.client.Load().GetSymbolInfoByName(symbolName)
 	if err != nil {
 		return nil, fmt.Errorf("symbol %q not found and on-demand lookup failed: %w", symbolName, err)
 	}
 
-	handle, err := sess.client.GetHandleByName(symbolName)
+	handle, err := sess.client.Load().GetHandleByName(symbolName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get handle for %q: %w", symbolName, err)
 	}
@@ -272,7 +272,7 @@ func (sess *Session) getSymbol(symbolName string) (*Symbol, error) {
 		// Release the handle we just acquired since another goroutine beat us
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, handle)
-		if err := sess.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+		if err := sess.client.Load().Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 			sess.logger.Warn("failed to release duplicate symbol handle",
 				"symbol", symbolName, "handle", handle, "error", err)
 		}
@@ -431,7 +431,7 @@ func (c *Client) GetSymbolVersion() (uint8, error) {
 // CheckSymbolVersion compares the current PLC symbol version against the stored version.
 // Returns true if the version has changed.
 func (sess *Session) CheckSymbolVersion() (changed bool, err error) {
-	version, err := sess.client.GetSymbolVersion()
+	version, err := sess.client.Load().GetSymbolVersion()
 	if err != nil {
 		return false, err
 	}
@@ -473,7 +473,7 @@ func (sess *Session) RefreshSymbols() error {
 	for _, h := range handleList {
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, h)
-		if err := sess.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+		if err := sess.client.Load().Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 			sess.logger.Warn("failed to release symbol handle", "error", err, "handle", h)
 		}
 	}
@@ -499,7 +499,7 @@ func (sess *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Read symbol version
-	version, err := sess.client.GetSymbolVersion()
+	version, err := sess.client.Load().GetSymbolVersion()
 	if err != nil {
 		sess.logger.Warn("failed to read symbol version during LoadSymbolList", "error", err)
 	} else {
@@ -509,7 +509,7 @@ func (sess *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	}
 
 	// Get upload info
-	uploadInfo, err := sess.client.GetSymbolUploadInfo()
+	uploadInfo, err := sess.client.Load().GetSymbolUploadInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
@@ -517,7 +517,7 @@ func (sess *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Download symbols in chunks
-	symbolsData, err := sess.client.DownloadInChunks(
+	symbolsData, err := sess.client.Load().DownloadInChunks(
 		uint32(GroupSymbolUpload),
 		uploadInfo.SymbolLength,
 		cfg.ChunkSize,
@@ -526,7 +526,7 @@ func (sess *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download symbols in one request
 		sess.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
-		symbolsData, err = sess.client.DownloadSymbolList(uploadInfo.SymbolLength)
+		symbolsData, err = sess.client.Load().DownloadSymbolList(uploadInfo.SymbolLength)
 		if err != nil {
 			return fmt.Errorf("failed to download symbols: %w", err)
 		}
@@ -563,7 +563,7 @@ func (sess *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Get upload info
-	uploadInfo, err := sess.client.GetSymbolUploadInfo()
+	uploadInfo, err := sess.client.Load().GetSymbolUploadInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
@@ -571,7 +571,7 @@ func (sess *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Download datatypes in chunks
-	datatypesData, err := sess.client.DownloadInChunks(
+	datatypesData, err := sess.client.Load().DownloadInChunks(
 		uint32(GroupSymbolDataTypeUpload),
 		uploadInfo.DataTypeLength,
 		cfg.ChunkSize,
@@ -580,7 +580,7 @@ func (sess *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download datatypes in one request
 		sess.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
-		datatypesData, err = sess.client.DownloadDataTypes(uploadInfo.DataTypeLength)
+		datatypesData, err = sess.client.Load().DownloadDataTypes(uploadInfo.DataTypeLength)
 		if err != nil {
 			return fmt.Errorf("failed to download datatypes: %w", err)
 		}

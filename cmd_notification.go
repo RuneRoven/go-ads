@@ -129,7 +129,7 @@ func (c *Client) DeleteDeviceNotification(handle uint32) error {
 // last subscription dies. Callers that want raw delete behavior use
 // the Client method directly.
 func (sess *Session) DeleteDeviceNotification(handle uint32) error {
-	if err := sess.client.DeleteDeviceNotification(handle); err != nil {
+	if err := sess.client.Load().DeleteDeviceNotification(handle); err != nil {
 		return err
 	}
 	sess.notifications.lock.Lock()
@@ -149,7 +149,7 @@ func (sess *Session) DeleteDeviceNotification(handle uint32) error {
 // PLC. Successfully deleted handles (or handle-invalid, treated as
 // success-equivalent) are removed from activeNotifications.
 func (sess *Session) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error) {
-	errors, err := sess.client.SumDeleteDeviceNotification(handles)
+	errors, err := sess.client.Load().SumDeleteDeviceNotification(handles)
 	if err != nil {
 		return nil, err
 	}

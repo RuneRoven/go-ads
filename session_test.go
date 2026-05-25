@@ -97,7 +97,7 @@ func TestNewSession_TotalConstruction(t *testing.T) {
 		t.Errorf("NewSession spawned goroutines: baseline=%d, after=%d", baseline, got)
 	}
 
-	if sess.client != nil {
+	if sess.client.Load() != nil {
 		t.Error("client should be nil before Connect()")
 	}
 	if sess.requestTimeout != 5*time.Second {
@@ -243,7 +243,7 @@ func TestSession_ConnectAfterCloseRejected(t *testing.T) {
 		t.Errorf("after Connect post-Close: state = %v, want Closed (no transition out of terminal)", state)
 	}
 	// Should not have spawned client workers.
-	if sess.client != nil && sess.client.tx != nil && sess.client.tx.connection != nil {
+	if c := sess.client.Load(); c != nil && c.tx != nil && c.tx.connection != nil {
 		t.Error("Connect post-Close created a live transport")
 	}
 	// Sanity: at least one of these must be true.

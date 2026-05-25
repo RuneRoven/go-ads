@@ -104,8 +104,9 @@ type Session struct {
 	port int
 
 	// Underlying RPC client. nil until Connect succeeds; replaced on
-	// Reconnect; shut down by Close.
-	client *Client
+	// Reconnect; shut down by Close. atomic.Pointer so concurrent reads on
+	// user RPC paths cannot race the publish in Connect / dialAndStart.
+	client atomic.Pointer[Client]
 
 	// TCP socket + request multiplexing + listen/transmit channels.
 	tx *transport
@@ -316,7 +317,7 @@ func (sess *Session) Connect(local bool) error {
 	// installed via callback so cache-aware dispatch fires for inbound
 	// DeviceNotification packets, and triggerReconnect is installed as the
 	// on-drop hook so transport-down signals enter Session's reconnect FSM.
-	sess.client = &Client{
+	newClient := &Client{
 		ip:             sess.ip,
 		port:           sess.port,
 		target:         sess.target,
@@ -327,11 +328,14 @@ func (sess *Session) Connect(local bool) error {
 		ctx:            sess.lifecycle.ctx,
 		cancel:         sess.lifecycle.shutdown,
 	}
-	sess.client.SetNotificationHandler(sess.handleNotification)
-	sess.client.SetOnDrop(sess.triggerReconnect)
-	sess.client.startWorkers()
+	newClient.SetNotificationHandler(sess.handleNotification)
+	newClient.SetOnDrop(sess.triggerReconnect)
+	newClient.startWorkers()
+	// Publish only after handlers + workers are wired so concurrent readers
+	// never observe a half-initialized Client.
+	sess.client.Store(newClient)
 	if local {
-		resp, err := sess.client.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
+		resp, err := newClient.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 		if err != nil {
 			sess.tearDownAndReset(false)
 			return fmt.Errorf("local mode handshake failed: %w", err)
@@ -372,7 +376,7 @@ func (sess *Session) Connect(local bool) error {
 	}
 
 	// Read symbol version for later change detection (best-effort, don't fail connect)
-	version, err := sess.client.GetSymbolVersion()
+	version, err := sess.client.Load().GetSymbolVersion()
 	if err != nil {
 		sess.logger.Debug("could not read symbol version during connect", "error", err)
 	} else {
@@ -403,7 +407,7 @@ func (sess *Session) ensureRouteOnConnect() (registered bool, err error) {
 	}
 
 	// Probe: try a lightweight ADS command to see if route exists
-	_, probeErr := sess.client.GetSymbolVersion()
+	_, probeErr := sess.client.Load().GetSymbolVersion()
 	if probeErr == nil {
 		sess.logger.Info("route already exists on PLC, skipping registration")
 		sess.route.routeProbeFailures.Store(0)
@@ -671,7 +675,7 @@ func (sess *Session) Close() {
 			}
 			handleBytes := make([]byte, 4)
 			binary.LittleEndian.PutUint32(handleBytes, h)
-			if err := sess.client.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+			if err := sess.client.Load().Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 				sess.logger.Warn("failed to release symbol handle during close", "error", err, "handle", h)
 			} else {
 				sess.logger.Info("handle deleted", "handle", h)
@@ -702,8 +706,8 @@ func (sess *Session) Close() {
 		<-ch
 	}
 	sess.logger.Info("Waiting for workers to close")
-	if sess.client != nil {
-		sess.client.waitGroup.Wait()
+	if c := sess.client.Load(); c != nil {
+		c.waitGroup.Wait()
 	}
 	sess.lifecycle.waitGroup.Wait()
 	sess.logger.Info("Close DONE")
@@ -1005,7 +1009,7 @@ func (sess *Session) ensureRoute() error {
 	}
 
 	// Probe: try a lightweight ADS command to see if route already exists
-	_, probeErr := sess.client.GetSymbolVersion()
+	_, probeErr := sess.client.Load().GetSymbolVersion()
 	if probeErr == nil {
 		sess.logger.Debug("route still valid, skipping re-registration")
 		sess.route.routeProbeFailures.Store(0)
@@ -1101,7 +1105,7 @@ func (sess *Session) reloadSymbols() error {
 
 	default:
 		// No symbols were loaded — read symbol version for future use
-		version, err := sess.client.GetSymbolVersion()
+		version, err := sess.client.Load().GetSymbolVersion()
 		if err != nil {
 			sess.logger.Debug("could not read symbol version during reconnect", "error", err)
 		} else {
@@ -1136,8 +1140,8 @@ func (sess *Session) tearDownAndReset(resetFeatureFlags bool) {
 	// Wait for the previous batch of Client workers (listen, transmit,
 	// recvWorker) to exit. They share ctx with lifecycle.ctx; the cancel
 	// above plus the closed TCP socket trigger their exit.
-	if sess.client != nil {
-		sess.client.waitGroup.Wait()
+	if c := sess.client.Load(); c != nil {
+		c.waitGroup.Wait()
 	}
 	sess.lifecycle.waitGroup.Wait()
 	sess.lifecycle.ctxMu.Lock()
@@ -1187,7 +1191,7 @@ func (sess *Session) dialAndStart() error {
 	sess.lifecycle.ctxMu.RLock()
 	freshCtx := sess.lifecycle.ctx
 	sess.lifecycle.ctxMu.RUnlock()
-	sess.client = &Client{
+	newClient := &Client{
 		ip:             sess.ip,
 		port:           sess.port,
 		target:         sess.target,
@@ -1198,16 +1202,19 @@ func (sess *Session) dialAndStart() error {
 		ctx:            freshCtx,
 		cancel:         sess.lifecycle.shutdown,
 	}
-	sess.client.SetNotificationHandler(sess.handleNotification)
-	sess.client.SetOnDrop(sess.triggerReconnect)
-	sess.client.startWorkers()
+	newClient.SetNotificationHandler(sess.handleNotification)
+	newClient.SetOnDrop(sess.triggerReconnect)
+	newClient.startWorkers()
+	// Publish only after handlers + workers are wired so concurrent readers
+	// never observe a half-initialized Client.
+	sess.client.Store(newClient)
 	return nil
 }
 
 // localHandshake performs the local-mode AMSAddress probe used after dial when
 // isLocal is true. Updates sess.source on success.
 func (sess *Session) localHandshake() error {
-	resp, err := sess.client.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
+	resp, err := sess.client.Load().send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 	if err != nil {
 		return fmt.Errorf("local handshake send: %w", err)
 	}
@@ -1370,8 +1377,9 @@ func zeroOldSymbolHandles(m map[string]*Symbol) {
 
 // loadSymbols loads symbol table and datatypes from the PLC, and saves the symbol version.
 func (sess *Session) loadSymbols() error {
+	c := sess.client.Load()
 	// Read and store symbol version
-	version, err := sess.client.GetSymbolVersion()
+	version, err := c.GetSymbolVersion()
 	if err != nil {
 		sess.logger.Warn("failed to read symbol version, continuing with symbol load", "error", err)
 	} else {
@@ -1380,11 +1388,11 @@ func (sess *Session) loadSymbols() error {
 		sess.cache.lock.Unlock()
 	}
 
-	res, err := sess.client.GetSymbolUploadInfo()
+	res, err := c.GetSymbolUploadInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
-	datatypesResponse, err := sess.client.DownloadDataTypes(res.DataTypeLength)
+	datatypesResponse, err := c.DownloadDataTypes(res.DataTypeLength)
 	if err != nil {
 		return fmt.Errorf("failed to upload datatypes: %w", err)
 	}
@@ -1392,7 +1400,7 @@ func (sess *Session) loadSymbols() error {
 	if err != nil {
 		return fmt.Errorf("failed to parse datatypes: %w", err)
 	}
-	symbolsResponse, err := sess.client.DownloadSymbolList(res.SymbolLength)
+	symbolsResponse, err := c.DownloadSymbolList(res.SymbolLength)
 	if err != nil {
 		return fmt.Errorf("failed to upload symbols: %w", err)
 	}

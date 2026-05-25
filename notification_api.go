@@ -102,7 +102,7 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 			"flags", fmt.Sprintf("0x%04X", uint32(symbol.Flags)))
 	}
 
-	handle, err := sess.client.AddDeviceNotification(
+	handle, err := sess.client.Load().AddDeviceNotification(
 		uint32(GroupSymbolValueByHandle),
 		symbol.Handle,
 		symbol.Length,
@@ -282,7 +282,7 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 		return results, nil
 	}
 
-	subResults, err := sess.client.SumAddDeviceNotification(requests)
+	subResults, err := sess.client.Load().SumAddDeviceNotification(requests)
 	if err != nil {
 		// Transport-aborted batch: every entry that was about to be sent must
 		// be marked Skipped so callers can distinguish "lib didn't try" from
