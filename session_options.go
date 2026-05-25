@@ -160,7 +160,9 @@ func WithOnReconnect(fn func()) SessionOption {
 //
 // Values outside the SymbolVersionAutoReload/Close/Ignore enumeration are
 // rejected at option-application time: a warning is logged and the strategy
-// falls back to AutoReload (R-SES-011).
+// falls back to AutoReload. The strategy controls what handleStaleDetection
+// does when a stale-cache return code (0x711, 0x705, 0x710, 0x704, 0x703,
+// 0x702) is observed.
 func WithSymbolVersionStrategy(s SymbolVersionStrategy) SessionOption {
 	return func(sess *Session) {
 		switch s {
@@ -182,7 +184,7 @@ func WithSymbolVersionStrategy(s SymbolVersionStrategy) SessionOption {
 //
 // Note: unlike WithMaxReconnectAttempts (where n=0 means infinite), reload
 // attempts are intentionally bounded — runaway reload loops would hammer
-// the PLC under recurring online-change conditions (R-CACHE-013).
+// the PLC under recurring online-change conditions.
 func WithMaxSymbolVersionReloadAttempts(n int) SessionOption {
 	return func(sess *Session) {
 		if n < 1 {
@@ -196,8 +198,7 @@ func WithMaxSymbolVersionReloadAttempts(n int) SessionOption {
 }
 
 // WithSymbolVersionReloadWindow sets the sliding window for reload-attempt
-// counting. Default: 60s. d<=0 is rejected (logged Warn, default kept)
-// (R-CACHE-013).
+// counting. Default: 60s. d<=0 is rejected (logged Warn, default kept).
 func WithSymbolVersionReloadWindow(d time.Duration) SessionOption {
 	return func(sess *Session) {
 		if d <= 0 {
@@ -210,14 +211,15 @@ func WithSymbolVersionReloadWindow(d time.Duration) SessionOption {
 	}
 }
 
-// WithOnSymbolVersionChanged registers a callback fired once per
-// R-CACHE-009 detection. The reason argument matches R-NOT-016 enumerated
-// values. Callback runs in its own goroutine (R-SES-007) — do NOT block.
+// WithOnSymbolVersionChanged registers a callback fired once per stale-cache
+// detection. The reason argument is one of the documented enumerated values
+// on Update.Reason (symbol-version-invalid, invalid-size, ...). Callback
+// runs in its own goroutine — do NOT block.
 //
-// Under SymbolVersionIgnore strategy this callback is the load-bearing
-// signal for symbol-removed events: the dead handle's user channel goes
-// silent (no terminal Update). Surviving sibling handles still receive a
-// one-shot Stale=true Update; only the removed symbol's channel is mute.
+// Under SymbolVersionIgnore strategy this callback is the only signal for
+// symbol-removed events: the dead handle's user channel goes silent (no
+// terminal Update). Surviving sibling handles still receive a one-shot
+// Stale=true Update; only the removed symbol's channel is mute.
 func WithOnSymbolVersionChanged(fn func(reason string)) SessionOption {
 	return func(sess *Session) {
 		sess.versionCallback = fn

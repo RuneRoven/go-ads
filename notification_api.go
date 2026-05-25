@@ -59,9 +59,13 @@ type Update struct {
 	Value     string
 	TimeStamp time.Time
 	// Stale signals the value MAY be from a pre-online-change cache state.
-	// Validates: R-NOT-016.
+	// When true, the symbol's handle was marked stale by detectStaleCache
+	// after a 0x711 / 0x705 / 0x710 / 0x704 / 0x703 / 0x702 ReturnCode was
+	// observed; the next reload will re-resolve the handle.
 	Stale bool
-	// Reason is non-empty when Stale=true. See R-NOT-016 for enumerated values.
+	// Reason is non-empty when Stale=true. Enumerated values:
+	// symbol-version-invalid, invalid-size, target-not-reachable,
+	// service-not-supported, parameter-invalid, reload-in-progress.
 	Reason string
 }
 

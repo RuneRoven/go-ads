@@ -151,13 +151,13 @@ type Session struct {
 	logger *slog.Logger
 }
 
-// NewConnection creates a new ADS connection. requestTimeout is the timeout for individual ADS requests.
-// If requestTimeout is 0, a default of 5000ms is used.
-// If localPort is 0, a default of 10500 is used (arbitrary AMS source port for protocol headers).
+// NewSession creates a new ADS session. requestTimeout is the timeout for
+// individual ADS requests; if zero, a 5 s default is used. If localPort is
+// non-positive, 10500 is used (arbitrary AMS source port for protocol headers).
 //
-// The connection manages its own lifecycle context internally so that Close()
+// The session manages its own lifecycle context internally so that Close()
 // can send cleanup commands regardless of any caller context state.
-// Use sess.Close() to shut down the connection.
+// Use sess.Close() to shut down the session.
 func NewSession(ip string, port int, netid string, amsPort int, localNetID string, localPort int, requestTimeout time.Duration, opts ...SessionOption) (sess *Session, err error) {
 	if requestTimeout <= 0 {
 		requestTimeout = 5000 * time.Millisecond
@@ -860,8 +860,8 @@ func (sess *Session) Reconnect() error {
 
 	if sess.isClosed() {
 		// triggerReconnect may have created reconnectDone before Close ran.
-		// Close it so Session.Close()'s wait at session.go:686 unblocks
-		// instead of hanging forever.
+		// Close it so Session.Close()'s reconnectDone wait unblocks instead
+		// of hanging forever.
 		closeReconnectDone()
 		return fmt.Errorf("connection closed")
 	}
@@ -1182,11 +1182,11 @@ func (sess *Session) reloadSymbols() error {
 
 // tearDownAndReset cancels the active goroutines, closes the TCP connection,
 // and resets ctx/channels/activeRequests so the connection can be re-dialed.
-// Optionally resets feature-detection flags (sumReadCmd / sumWriteState /
-// sumNotifState / chunkedDownloadChecked) — needed during Reconnect when the
-// PLC may have changed; not needed during initial Connect cleanup.
+// The resetFeatureFlags parameter is retained for API symmetry with prior
+// callers but is now a no-op — capability state lives on *Client, and
+// dialAndStart allocates a fresh zero-valued Client on every attempt.
 //
-// Consolidates four previously-duplicated reset paths:
+// Used by three reset paths:
 //   - Connect()'s post-route-registration TCP teardown
 //   - Reconnect()'s pre-retry-loop reset
 //   - resetForRetry()

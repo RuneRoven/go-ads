@@ -280,12 +280,14 @@ var parseableTypes = []string{
 // loaded return "" so the caller surfaces a clear error and the user
 // resolves the type via LoadSymbols (Beckhoff-blessed path).
 //
-// baseType is accepted but not currently consulted — the parameter is kept
-// in the signature so callers thread the protocol code through to keep the
-// resolution chain explicit and to leave room for tightening (e.g. refusing
-// 1/2 byte inference when baseType is also clearly non-integer).
+// baseType is the ADST_ protocol code for the symbol's resolved primitive,
+// when known. The parameter exists so callers thread the protocol code
+// through to keep the resolution chain explicit. Currently the function
+// inspects only `size` because the 1/2-byte cases are unambiguous regardless
+// of baseType; future tightening (refusing 1/2-byte inference when baseType
+// indicates a non-integer primitive) lands here.
 func inferBaseType(size, baseType uint32) string {
-	_ = baseType
+	_ = baseType // reserved for future width+type tightening; see godoc above.
 	switch size {
 	case 1:
 		return "SINT"

@@ -24,22 +24,22 @@ import (
 // For normal operation, prefer symbol-based access (ReadFromSymbol/WriteToSymbol)
 // which is safer and self-documenting.
 
-// ReadProcessInput reads bytes from the input process image at the given byte offset.
+// EXPERIMENTAL: ReadProcessInput reads bytes from the input process image at the given byte offset.
 func (c *Client) ReadProcessInput(byteOffset, length uint32) ([]byte, error) {
 	return c.Read(uint32(GroupIoImageRwib), byteOffset, length)
 }
 
-// ReadProcessOutput reads bytes from the output process image at the given byte offset.
+// EXPERIMENTAL: ReadProcessOutput reads bytes from the output process image at the given byte offset.
 func (c *Client) ReadProcessOutput(byteOffset, length uint32) ([]byte, error) {
 	return c.Read(uint32(GroupIoImageRwob), byteOffset, length)
 }
 
-// WriteProcessOutput writes bytes to the output process image at the given byte offset.
+// EXPERIMENTAL: WriteProcessOutput writes bytes to the output process image at the given byte offset.
 func (c *Client) WriteProcessOutput(byteOffset uint32, data []byte) error {
 	return c.Write(uint32(GroupIoImageRwob), byteOffset, data)
 }
 
-// ReadProcessInputBit reads a single bit from the input process image.
+// EXPERIMENTAL: ReadProcessInputBit reads a single bit from the input process image.
 // bitIndex must be 0-7 (bit within a single byte).
 func (c *Client) ReadProcessInputBit(byteOffset uint32, bitIndex uint8) (bool, error) {
 	if bitIndex > 7 {
@@ -59,7 +59,7 @@ func (c *Client) ReadProcessInputBit(byteOffset uint32, bitIndex uint8) (bool, e
 	return data[0] != 0, nil
 }
 
-// WriteProcessOutputBit writes a single bit to the output process image.
+// EXPERIMENTAL: WriteProcessOutputBit writes a single bit to the output process image.
 // bitIndex must be 0-7 (bit within a single byte).
 func (c *Client) WriteProcessOutputBit(byteOffset uint32, bitIndex uint8, value bool) error {
 	if bitIndex > 7 {
@@ -76,7 +76,7 @@ func (c *Client) WriteProcessOutputBit(byteOffset uint32, bitIndex uint8, value 
 	return c.Write(uint32(GroupIoImageRwox), uint32(bitOffset), []byte{v})
 }
 
-// ReadProcessInputSize returns the size of the input process image in bytes.
+// EXPERIMENTAL: ReadProcessInputSize returns the size of the input process image in bytes.
 func (c *Client) ReadProcessInputSize() (uint32, error) {
 	data, err := c.Read(uint32(GroupIoImageRisize), 0, 4)
 	if err != nil {
@@ -88,12 +88,12 @@ func (c *Client) ReadProcessInputSize() (uint32, error) {
 	return binary.LittleEndian.Uint32(data), nil
 }
 
-// ClearProcessInputs writes all input process image bytes to zero.
+// EXPERIMENTAL: ClearProcessInputs writes all input process image bytes to zero.
 func (c *Client) ClearProcessInputs() error {
 	return c.Write(uint32(GroupIoImageCleari), 0, []byte{0})
 }
 
-// ClearProcessOutputs writes all output process image bytes to zero.
+// EXPERIMENTAL: ClearProcessOutputs writes all output process image bytes to zero.
 func (c *Client) ClearProcessOutputs() error {
 	return c.Write(uint32(GroupIoImageClearo), 0, []byte{0})
 }

@@ -65,7 +65,7 @@ func (c *Client) Read(group uint32, offset uint32, length uint32) (data []byte, 
 	return respBuff.Next(int(response.Length)), nil
 }
 
-// Write - ADS command id: 3
+// Write issues ADS Write (cmd 3) to the PLC at the given index group/offset.
 func (c *Client) Write(group uint32, offset uint32, data []byte) error {
 	type writeCommandPacket struct {
 		Group  uint32
@@ -157,7 +157,7 @@ func (c *Client) WriteRead(group uint32, offset uint32, readLength uint32, send 
 	if response.Error > 0 {
 		return nil, fmt.Errorf("ADS error in WriteRead: %w", response.Error)
 	}
-	// validate body length against declared Length. See commandRead.go.
+	// validate body length against declared Length (same rationale as Read above).
 	if uint64(respBuff.Len()) < uint64(response.Length) {
 		return nil, fmt.Errorf("WriteRead: declared length %d, body has %d bytes", response.Length, respBuff.Len())
 	}
@@ -198,7 +198,9 @@ func (c *Client) ReadState() (response States, err error) {
 	return stateResponse.States, nil
 }
 
-// DeviceInfo connected device info
+// DeviceInfo is the PLC's self-reported identity (returned by ReadDeviceInfo).
+// DeviceName is a 16-byte null-padded ASCII field; trim at the first null byte
+// for display.
 type DeviceInfo struct {
 	Major      uint8
 	Minor      uint8
