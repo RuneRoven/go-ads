@@ -268,3 +268,118 @@ func TestCollectSubtreeDepthCap(t *testing.T) {
 		t.Fatal("expected at least one collected view before cap fires")
 	}
 }
+
+// TestBaseTypeName_LayeredResolution exercises the public BaseTypeName
+// orchestrator across its three layers in the documented priority order:
+//  1. Protocol BaseType (ADST_ code) — authoritative when set.
+//  2. Datatype-table lookup by DataType name — for ADST_BIGTYPE aliases.
+//  3. Size-based inference — 1- and 2-byte widths only (4/8 deliberately
+//     refused to avoid REAL/LREAL ambiguity).
+//
+// A regression that swaps the layer order would silently corrupt parsing
+// for symbols where layers disagree (TC2 enums, type aliases).
+func TestBaseTypeName_LayeredResolution(t *testing.T) {
+	t.Run("layer1_adst_primitive_wins", func(t *testing.T) {
+		// BaseType=ADSTReal32 should resolve to "REAL" regardless of any
+		// table entry or size that might disagree.
+		sess := newViewTestSession()
+		sess.cache.datatypes = map[string]SymbolUploadDataType{
+			"FakeAlias": {DataType: "INT"}, // would mis-resolve if layer 2 ran
+		}
+		view := SymbolView{
+			BaseType: ADSTReal32,
+			DataType: "FakeAlias",
+			Length:   4,
+			conn:     sess,
+		}
+		if got := view.BaseTypeName(); got != "REAL" {
+			t.Errorf("BaseTypeName = %q, want REAL (layer 1 must win)", got)
+		}
+	})
+
+	t.Run("layer2_datatype_table_for_bigtype", func(t *testing.T) {
+		// BaseType=ADSTBigType (composite) forces layer 1 to return "";
+		// layer 2 looks up "MyAlias" in the table and returns its DataType.
+		sess := newViewTestSession()
+		sess.cache.datatypes = map[string]SymbolUploadDataType{
+			"MyAlias": {DataType: "DINT"},
+		}
+		view := SymbolView{
+			BaseType: ADSTBigType,
+			DataType: "MyAlias",
+			Length:   4,
+			conn:     sess,
+		}
+		if got := view.BaseTypeName(); got != "DINT" {
+			t.Errorf("BaseTypeName = %q, want DINT (layer 2 table lookup)", got)
+		}
+	})
+
+	t.Run("layer3_size_inference_1byte", func(t *testing.T) {
+		// No table loaded; BaseType=BigType. Size=1 → SINT.
+		sess := newViewTestSession()
+		view := SymbolView{
+			BaseType: ADSTBigType,
+			DataType: "UnknownType",
+			Length:   1,
+			conn:     sess,
+		}
+		if got := view.BaseTypeName(); got != "SINT" {
+			t.Errorf("BaseTypeName = %q, want SINT (layer 3 size=1 inference)", got)
+		}
+	})
+
+	t.Run("layer3_size_inference_2byte", func(t *testing.T) {
+		sess := newViewTestSession()
+		view := SymbolView{
+			BaseType: ADSTBigType,
+			DataType: "UnknownType",
+			Length:   2,
+			conn:     sess,
+		}
+		if got := view.BaseTypeName(); got != "INT" {
+			t.Errorf("BaseTypeName = %q, want INT (layer 3 size=2 inference)", got)
+		}
+	})
+
+	t.Run("layer3_refuses_4byte", func(t *testing.T) {
+		// 4 bytes is ambiguous between DINT/REAL — must NOT infer.
+		// Returns "" so caller surfaces a clear error.
+		sess := newViewTestSession()
+		view := SymbolView{
+			BaseType: ADSTBigType,
+			DataType: "UnknownType",
+			Length:   4,
+			conn:     sess,
+		}
+		if got := view.BaseTypeName(); got != "" {
+			t.Errorf("BaseTypeName = %q, want \"\" (layer 3 refuses 4-byte to avoid REAL/DINT ambiguity)", got)
+		}
+	})
+
+	t.Run("layer3_refuses_8byte", func(t *testing.T) {
+		sess := newViewTestSession()
+		view := SymbolView{
+			BaseType: ADSTBigType,
+			DataType: "UnknownType",
+			Length:   8,
+			conn:     sess,
+		}
+		if got := view.BaseTypeName(); got != "" {
+			t.Errorf("BaseTypeName = %q, want \"\" (layer 3 refuses 8-byte LREAL/LINT ambiguity)", got)
+		}
+	})
+
+	t.Run("nil_conn_falls_through_to_inference", func(t *testing.T) {
+		// Detached SymbolView (no Session) — layer 2 silently skipped.
+		view := SymbolView{
+			BaseType: ADSTBigType,
+			DataType: "UnknownType",
+			Length:   2,
+			conn:     nil,
+		}
+		if got := view.BaseTypeName(); got != "INT" {
+			t.Errorf("BaseTypeName with nil conn = %q, want INT", got)
+		}
+	})
+}

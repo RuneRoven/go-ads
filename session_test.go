@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"encoding/binary"
 	"errors"
 	"log/slog"
 	"runtime"
@@ -717,5 +718,152 @@ func TestSession_IsClosed_TrueAfterClose(t *testing.T) {
 	}
 	if !sess.IsClosed() {
 		t.Error("IsClosed=false after transition to Closed, want true")
+	}
+}
+
+// TestReleasePLCResources_NotificationCleanup exercises the notification
+// cleanup branch of releasePLCResources directly (rather than via Close,
+// which blocks on the Client waitGroup in test harness setups where the
+// Client ctx is independent of sess.lifecycle.ctx). The helper is the
+// shared entry point used by both Close() and the Reconnect-exhaustion
+// path; testing it directly covers both call sites.
+//
+// Validates: PLC-side notification delete fires for every staged handle.
+func TestReleasePLCResources_NotificationCleanup(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	const stagedHandle uint32 = 0xC0DE
+	var deletes atomic.Int32
+	// releasePLCResources calls bestEffortDeleteNotifications which prefers
+	// SumDeleteDeviceNotification; register that handler so the sum path
+	// completes instead of falling back. Count handles passed through.
+	srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(req []byte) []byte {
+		nItems := len(req) / 4
+		codes := make([]ReturnCode, nItems)
+		for i := 0; i < nItems; i++ {
+			h := binary.LittleEndian.Uint32(req[i*4:])
+			if h == stagedHandle {
+				deletes.Add(1)
+			}
+			codes[i] = ReturnCodeNoErrors
+		}
+		return buildSumDeleteNotifPayload(codes)
+	})
+
+	sess, _ := newWiredTestSession(t, srv)
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[stagedHandle] = &Symbol{FullName: "MAIN.x"}
+	sess.notifications.lock.Unlock()
+
+	sess.releasePLCResources(false)
+
+	if got := deletes.Load(); got < 1 {
+		t.Errorf("staged handle delivered to SumDelete = %d, want >= 1 (must release PLC subscriptions)", got)
+	}
+}
+
+// TestReleasePLCResources_SymbolHandleRelease_SkippedWhenDisconnected pins
+// the wasDisconnected=true short-circuit: when the transport is already
+// dead, the helper must NOT issue PLC Write commands for handle release.
+// Issuing them against a dead socket would block Close behind requestTimeout
+// for every staged handle.
+//
+// Validates: wasDisconnected gate on symbol-handle release path.
+func TestReleasePLCResources_SymbolHandleRelease_SkippedWhenDisconnected(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var writes atomic.Int32
+	srv.onWrite(GroupSymbolReleaseHandle, func(_, _ uint32, _ []byte) ReturnCode {
+		writes.Add(1)
+		return ReturnCodeNoErrors
+	})
+
+	sess, _ := newWiredTestSession(t, srv)
+	sess.cache.lock.Lock()
+	sess.cache.symbols[symbolKey("MAIN.x")] = &Symbol{
+		FullName: "MAIN.x", Name: "MAIN.x", Handle: 0x12345678,
+	}
+	sess.cache.lock.Unlock()
+
+	sess.releasePLCResources(true) // wasDisconnected=true
+
+	if got := writes.Load(); got != 0 {
+		t.Errorf("GroupSymbolReleaseHandle writes = %d, want 0 (must skip when disconnected)", got)
+	}
+}
+
+// TestReleasePLCResources_SymbolHandleRelease_FiredWhenConnected: with the
+// transport alive, the helper must issue ReleaseHandle for every cached
+// symbol with a non-zero Handle.
+func TestReleasePLCResources_SymbolHandleRelease_FiredWhenConnected(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	const stagedHandle uint32 = 0xABCD0001
+	var writes atomic.Int32
+	srv.onWrite(GroupSymbolReleaseHandle, func(_, _ uint32, _ []byte) ReturnCode {
+		writes.Add(1)
+		return ReturnCodeNoErrors
+	})
+
+	sess, _ := newWiredTestSession(t, srv)
+	sess.cache.lock.Lock()
+	sess.cache.symbols[symbolKey("MAIN.x")] = &Symbol{
+		FullName: "MAIN.x", Name: "MAIN.x", Handle: stagedHandle,
+	}
+	sess.cache.lock.Unlock()
+
+	sess.releasePLCResources(false) // wasDisconnected=false
+
+	if got := writes.Load(); got < 1 {
+		t.Errorf("ReleaseHandle writes = %d, want >= 1 (alive transport must release)", got)
+	}
+}
+
+// TestHandleStaleDetection_Ignore_FiresCallbackPerTrigger pins the contract
+// that under SymbolVersionIgnore, N concurrent stale-cache detections fire N
+// versionCallback invocations. The Ignore strategy intentionally does NOT
+// gate the callback behind reloadInProgress CAS (which is AutoReload-only) —
+// callers using Ignore typically install their own dedup logic and rely on
+// every detection being observable.
+//
+// Companion to TestSession_AutoReload_SingleFlight, which pins the inverse
+// contract for AutoReload (1 callback per N triggers).
+func TestHandleStaleDetection_Ignore_FiresCallbackPerTrigger(t *testing.T) {
+	sess := newTestConnection()
+	defer sess.lifecycle.shutdown()
+	sess.versionStrategy = SymbolVersionIgnore
+
+	var callbacks atomic.Int32
+	sess.versionCallback = func(_ string) {
+		callbacks.Add(1)
+	}
+
+	const N = 25
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			sess.handleStaleDetection(ReturnCodeDeviceSymbolVersionInvalid)
+		}()
+	}
+	wg.Wait()
+
+	// versionCallback is launched in a goroutine; give them all room to run.
+	// Each callback is trivial (single atomic.Add), so a short bounded wait
+	// is enough — but use a deadline so a regression that drops callbacks
+	// fails reliably instead of timing out the whole test.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if callbacks.Load() == int32(N) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := callbacks.Load(); got != int32(N) {
+		t.Errorf("Ignore strategy: %d callbacks for %d triggers, want %d (every detection must be observable)", got, N, N)
 	}
 }

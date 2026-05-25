@@ -477,3 +477,81 @@ func TestSumReadFallback_PreservesADSReturnCode(t *testing.T) {
 		t.Errorf("results[0].Error = %v, want ReturnCodeDeviceSymbolVersionInvalid", results[0].Error)
 	}
 }
+
+// TestParseSumReadResponse_ErroredItemAdvancesOffset pins the deliberate
+// behaviour that an errored item still consumes its declared length in the
+// response data section so subsequent items remain aligned. Without this,
+// a successful follow-up item parses the wrong bytes and silently corrupts
+// the caller's data. A regression that skips dataOffset += lengths[i] for
+// errored items would break this test on item 2's payload comparison.
+func TestParseSumReadResponse_ErroredItemAdvancesOffset(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	conn := &Session{logger: logger}
+	conn.client.Store(&Client{logger: logger})
+
+	// Three items: OK(4 bytes), ERR(declared 4 bytes), OK(4 bytes).
+	// If alignment regresses, item 2 reads bytes 4..7 (item 1's payload)
+	// instead of bytes 8..11.
+	item1 := []byte{0xAA, 0xAA, 0xAA, 0xAA}
+	item1Err := []byte{0xBB, 0xBB, 0xBB, 0xBB} // PLC may or may not send these
+	item2 := []byte{0xCC, 0xCC, 0xCC, 0xCC}
+	data := append(append(append([]byte{}, item1...), item1Err...), item2...)
+
+	resp := craftSumReadResponse(
+		[]ReturnCode{ReturnCodeNoErrors, ReturnCodeDeviceSymbolVersionInvalid, ReturnCodeNoErrors},
+		[]uint32{4, 4, 4},
+		data,
+	)
+	requests := []SumReadRequest{{Length: 4}, {Length: 4}, {Length: 4}}
+
+	results, err := conn.client.Load().parseSumReadResponse(resp, 3, requests)
+	if err != nil {
+		t.Fatalf("unexpected outer error: %v", err)
+	}
+
+	if results[0].Error != ReturnCodeNoErrors {
+		t.Errorf("results[0].Error = %v, want NoErrors", results[0].Error)
+	}
+	if !bytes.Equal(results[0].Data, item1) {
+		t.Errorf("results[0].Data = %v, want %v", results[0].Data, item1)
+	}
+	if results[1].Error != ReturnCodeDeviceSymbolVersionInvalid {
+		t.Errorf("results[1].Error = %v, want SymbolVersionInvalid", results[1].Error)
+	}
+	if results[2].Error != ReturnCodeNoErrors {
+		t.Errorf("results[2].Error = %v, want NoErrors (alignment preserved across errored item)", results[2].Error)
+	}
+	if !bytes.Equal(results[2].Data, item2) {
+		t.Errorf("results[2].Data = %v, want %v — errored item must advance dataOffset", results[2].Data, item2)
+	}
+}
+
+// TestParseSumReadResponse_ErroredItemOverflowsRemaining: an errored item
+// declaring a length exceeding the bytes remaining in the response data
+// section must cascade-mark every remaining item DeviceInvalidSize, mirroring
+// the per-item-oversize / truncation path. Prevents silent garbage parsing.
+func TestParseSumReadResponse_ErroredItemOverflowsRemaining(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	conn := &Session{logger: logger}
+	conn.client.Store(&Client{logger: logger})
+
+	// Two items, second errored with absurd declared length, only 4 actual data bytes.
+	resp := craftSumReadResponse(
+		[]ReturnCode{ReturnCodeNoErrors, ReturnCodeDeviceSymbolVersionInvalid},
+		[]uint32{4, 0xFFFFFFFE}, // item 1 errored, claims ~4 GiB; remaining < that
+		[]byte{1, 2, 3, 4},
+	)
+	requests := []SumReadRequest{{Length: 4}, {Length: 4}}
+
+	results, err := conn.client.Load().parseSumReadResponse(resp, 2, requests)
+	if err != nil {
+		t.Fatalf("unexpected outer error: %v", err)
+	}
+	if results[1].Error != ReturnCodeDeviceInvalidSize {
+		t.Errorf("results[1].Error = %v, want DeviceInvalidSize (errored-item overflow cascade)", results[1].Error)
+	}
+	if !strings.Contains(logBuf.String(), "errored-item declared length exceeds remaining bytes") {
+		t.Errorf("expected errored-item-overflow log, got: %s", logBuf.String())
+	}
+}
