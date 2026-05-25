@@ -221,9 +221,17 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 
 // Connect dials the PLC and transitions the session to Connected.
 // local=true targets the in-process TwinCAT runtime (127.0.0.1).
+// Not safe for concurrent invocation on the same Session — the FSM gate via
+// transitionToOnce(Connecting) serializes callers, but races on sess.tx /
+// sess.client publishing would still leak resources. Call once per Session.
 func (sess *Session) Connect(local bool) error {
 	sess.isLocal = local
-	sess.transitionState(SessionStateConnecting)
+	// transitionToOnce returns ok=false if another goroutine already won
+	// the Constructed→Connecting transition; reject concurrent calls rather
+	// than letting both race on socket + client publish.
+	if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateConnecting); !ok {
+		return fmt.Errorf("ads: Connect already in progress or session past Constructed state")
+	}
 	var err error
 	sess.logger.Debug("dialing", "ip", sess.ip, "port", sess.port)
 	if local {
@@ -449,9 +457,6 @@ func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason str
 	}
 	sess.logger.Warn("stale-cache detection",
 		"code", rc, "reason", reason, "strategy", sess.versionStrategy)
-	if sess.versionCallback != nil {
-		go sess.versionCallback(reason)
-	}
 	switch sess.versionStrategy {
 	case SymbolVersionIgnore:
 		// Mark all active notification handles stale — next sample for each
@@ -459,10 +464,23 @@ func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason str
 		// error surfaces to the calling op via the existing errors.As
 		// intercept.
 		sess.markAllHandlesStale(reason)
+		if sess.versionCallback != nil {
+			go sess.versionCallback(reason)
+		}
 	case SymbolVersionClose:
+		if sess.versionCallback != nil {
+			go sess.versionCallback(reason)
+		}
 		go sess.closeOnStaleDetection(reason)
 	case SymbolVersionAutoReload:
+		// CAS gates both the reload goroutine AND the callback so N
+		// concurrent triggers fire one callback total (R-SES-011
+		// "once per detection"). Without this, the callback was launched
+		// unconditionally above and N triggers fired N callbacks.
 		if sess.reloadInProgress.CompareAndSwap(false, true) {
+			if sess.versionCallback != nil {
+				go sess.versionCallback(reason)
+			}
 			go sess.autoReloadOnStaleDetection(reason)
 		}
 	}
@@ -684,9 +702,13 @@ func (sess *Session) Close() {
 	} else {
 		sess.logger.Info("already disconnected, skipping handle cleanup")
 	}
+	// Capture cancel under RLock then release before invoking — see
+	// tearDownAndReset for the symmetric pattern. Holding RLock across the
+	// cancel() blocks tearDownAndReset's ctxMu.Lock replacement.
 	sess.lifecycle.ctxMu.RLock()
-	sess.lifecycle.shutdown()
+	cancel := sess.lifecycle.shutdown
 	sess.lifecycle.ctxMu.RUnlock()
+	cancel()
 	// Close the TCP connection to unblock listen() which may be stuck in ReadFull
 	sess.tx.connMu.Lock()
 	if sess.tx.connection != nil {
@@ -1129,9 +1151,14 @@ func (sess *Session) reloadSymbols() error {
 //   - Reconnect()'s pre-retry-loop reset
 //   - resetForRetry()
 func (sess *Session) tearDownAndReset(resetFeatureFlags bool) {
+	// Capture cancel under RLock then release before invoking. Calling the
+	// cancel under RLock would deadlock against the subsequent ctxMu.Lock
+	// at the ctx replacement below if shutdown ever became a function that
+	// took the same lock.
 	sess.lifecycle.ctxMu.RLock()
-	sess.lifecycle.shutdown()
+	cancel := sess.lifecycle.shutdown
 	sess.lifecycle.ctxMu.RUnlock()
+	cancel()
 	sess.tx.connMu.Lock()
 	if sess.tx.connection != nil {
 		sess.tx.connection.Close()
@@ -1176,7 +1203,6 @@ func (sess *Session) dialAndStart() error {
 	sess.tx.connection = newConn
 	sess.tx.connMu.Unlock()
 	configureKeepAlive(newConn)
-	sess.tx.disconnected.Store(false)
 	if sess.isClosed() {
 		// Session was Closed mid-dial. Don't Add to waitGroup.
 		sess.tx.connMu.Lock()
@@ -1185,11 +1211,11 @@ func (sess *Session) dialAndStart() error {
 		sess.tx.connMu.Unlock()
 		return fmt.Errorf("connection closed during dial")
 	}
-	// Allocate a fresh Client (or rewire the existing one's transport
-	// references — fields that change after a redial: ctx, source, tx
-	// pointer is the same).
+	// Allocate a fresh Client. Capture ctx + cancel under a single RLock so
+	// a concurrent tearDownAndReset replacement cannot split the pair.
 	sess.lifecycle.ctxMu.RLock()
 	freshCtx := sess.lifecycle.ctx
+	freshCancel := sess.lifecycle.shutdown
 	sess.lifecycle.ctxMu.RUnlock()
 	newClient := &Client{
 		ip:             sess.ip,
@@ -1200,14 +1226,17 @@ func (sess *Session) dialAndStart() error {
 		logger:         sess.logger,
 		tx:             sess.tx,
 		ctx:            freshCtx,
-		cancel:         sess.lifecycle.shutdown,
+		cancel:         freshCancel,
 	}
 	newClient.SetNotificationHandler(sess.handleNotification)
 	newClient.SetOnDrop(sess.triggerReconnect)
 	newClient.startWorkers()
 	// Publish only after handlers + workers are wired so concurrent readers
-	// never observe a half-initialized Client.
+	// never observe a half-initialized Client. Clear disconnected AFTER
+	// startWorkers so a user RPC that observes disconnected=false is
+	// guaranteed to find transmitWorker actually running.
 	sess.client.Store(newClient)
+	sess.tx.disconnected.Store(false)
 	return nil
 }
 
