@@ -833,7 +833,7 @@ Unsupported commands return `0x0701` (service not supported).
 | ServerCycle2 (5) | Silently ignored   | Rejected (0x070B)    | Works               |
 | ServerOnChange2 (6)| Silently ignored | Rejected (0x070B)    | Works               |
 
-TC2 does not return an error for v2 modes — notifications silently never fire. TC3 rejects v2 modes with `0x070B` (InvalidParam) when the symbol's ContextMask is 0. The `go-ads` library auto-falls back to modes 3/4 in both cases.
+TC2 does not return an error for v2 modes — notifications silently never fire. TC3 rejects v2 modes with `0x070B` (InvalidParam) when the symbol's ContextMask is 0. Implementations should auto-fall back to modes 3/4 in both cases (downgrade table 5→3, 6→4).
 
 ### Symbol System
 
@@ -1029,23 +1029,16 @@ important implications for containerized deployments.
 
 #### Docker / Container Deployment
 
-**Minimum configuration**: only route credentials are needed. `WithHostIP` and explicit
-AMS NetID (`ADS_LOCAL_AMS`) are both optional.
+**Minimum configuration**: only route credentials are needed; an explicit
+local AMS NetID is optional because clients can derive one from the local
+TCP socket IP at runtime.
 
-```go
-conn, _ := NewSession(ctx, plcIP, 48898, targetAMS, 851, "auto", 10500, 5*time.Second,
-    WithRoute("my-route", "Administrator", "password"),
-)
-conn.Connect(false)
-// Works from Docker, Kubernetes, VMs — no ADS_HOST_IP or ADS_LOCAL_AMS needed
-```
-
-**How it works:**
-1. TCP connects to PLC → auto-derive NetID from container IP (e.g., `172.17.0.2.1.1`)
-2. UDP route registration → PLC stores NetID + UDP source IP (post-NAT = host IP)
+**Wire-level sequence:**
+1. TCP connects to PLC; client derives a local NetID from the container IP (e.g., `172.17.0.2.1.1`)
+2. UDP route registration → PLC stores `NetID + UDP source IP` (post-NAT = host IP)
 3. TCP reconnects after route registration (PLC may reset pre-route connections)
-4. ADS commands use the auto-derived NetID → PLC matches route → accepts
-5. Notifications delivered over existing TCP → no reverse connection needed
+4. ADS commands carry the derived NetID → PLC matches route → accepts
+5. Notifications delivered over the existing TCP connection → no reverse connection needed
 
 | Scenario | NetID | Route IP | Works? |
 |----------|-------|----------|--------|
@@ -1056,12 +1049,12 @@ conn.Connect(false)
 | Docker, UDP port 48899 blocked | Any | Can't register | **No** |
 
 **Key findings from Docker bridge testing (Colima/macOS, April 2025):**
-1. Auto-derived NetID from container IP works — PLC accepts ADS commands
-   and sends notifications over the existing TCP connection
-2. `WithHostIP` / `ADS_HOST_IP` has no effect on route IP — PLC uses UDP source IP regardless
+1. Derived NetID from container IP works — PLC accepts ADS commands and
+   sends notifications over the existing TCP connection
+2. Caller-supplied "host IP" tags do not affect route IP — PLC uses the UDP source IP regardless
 3. Route credentials are **required** — without them, no route is created and the PLC
    closes the TCP connection (EOF / connection reset) on the first ADS command
-4. `ADS_LOCAL_AMS` is **optional** — auto-derived NetID from container works fine
+4. An explicit local AMS NetID is **optional** — a derived NetID from the container works
 5. UDP port 48899 must be open — route registration is UDP-based and cannot fall back to TCP
 6. TCP port 48898 is used for ADS data — must be open
 7. When the PLC has no route for a source NetID, it closes the TCP connection immediately.
@@ -1083,7 +1076,8 @@ can be used to probe whether a route already exists before attempting registrati
 Routes persist across PLC reboots in most configurations but may be lost in some environments
 (e.g., TwinCAT CE devices, certain VM configurations).
 
-See [IMPLEMENTATION.md](IMPLEMENTATION.md) for how go-ads handles route registration and reconnection.
+For an implementation that handles route registration and reconnection
+end-to-end, see this repository's [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ---
 

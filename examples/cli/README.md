@@ -17,8 +17,9 @@ Live event hooks while the REPL runs:
 - `WithSymbolVersionStrategy(SymbolVersionAutoReload)` +
   `WithOnSymbolVersionChanged` print `[online-change] reason=...` for DP-1
   events.
-- Notification updates print on a background goroutine; `Update.Stale=true`
-  is rendered prominently as `[notify] *STALE* ...`.
+- Notification updates print on a background goroutine; non-nil
+  `Update.Stale` is rendered prominently as `[notify] *STALE* ...`
+  carrying `Update.Stale.Reason`.
 
 REPL commands:
 

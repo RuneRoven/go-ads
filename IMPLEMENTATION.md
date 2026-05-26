@@ -271,7 +271,7 @@ Configured via `WithSymbolVersionStrategy(s)`:
 |----------|----------|-----------|
 | AutoReload (default) | `SymbolVersionAutoReload` | bump epoch → zero old symbol handles → `LoadSymbols` → `resubscribeNotifications` → fire `onReconnect`; rate-limited by reload window (R-CACHE-013) |
 | Close | `SymbolVersionClose` | Fire `onDisconnect` then `Session.Close()`; Session enters terminal Closed state and cannot be reused |
-| Ignore | `SymbolVersionIgnore` | Surface the PLC error verbatim; `markAllHandlesStale` flags affected handles so the next notification sample carries `Stale=true, Reason=<detection-reason>` (one-shot) |
+| Ignore | `SymbolVersionIgnore` | Surface the PLC error verbatim; `markAllHandlesStale` flags affected handles so the next notification sample carries `Stale=&StaleInfo{Reason: ...}` (one-shot) |
 
 ### Detection set (R-CACHE-009)
 
@@ -300,7 +300,7 @@ Six return codes trigger the dispatcher:
 
 ### Update semantics for affected samples
 
-On detection, `Update.Stale` is set to `true` and `Update.Reason` carries the detection-reason string. This is one-shot (consumed via `consumeStaleFlag(handle)` on next read). Callers should treat the value as suspect and re-resolve.
+On detection, `Update.Stale` is set to a non-nil `*StaleInfo{Reason: ...}` carrying the typed `Reason` enum value. This is one-shot (consumed via `consumeStaleFlag(handle)` on next read). Callers should treat the value as suspect and re-resolve.
 
 ### Callback hook
 
@@ -431,11 +431,11 @@ By default, missing on-demand symbols after reconnect are skipped with a warning
 
 | Method | Description |
 |--------|-------------|
-| `NewSession(ip, port, netid, amsPort, localNetID, localPort, requestTimeout, opts...)` | Construct Session with options |
-| `Connect(local bool)` | TCP dial + start goroutines + probe/register route |
-| `Close()` | Delete notifications, release handles, close TCP, terminal Closed |
-| `Reconnect()` | Re-establish after failure (auto or manual) |
-| `AddRoute(routeName, username, password)` | Register an AMS route over UDP after construction |
+| `NewSession(ctx, AMSEndpoint{IP, Port, AMS}, opts...)` | Construct Session with options (no I/O) |
+| `Connect(ctx)` | TCP dial + start goroutines + probe/register route. Local-mode via `WithLocalMode()` option |
+| `Close() error` | Delete notifications, release handles, close TCP, terminal Closed. Implements `io.Closer` |
+| `Reconnect(ctx)` | Re-establish after failure (auto or manual) |
+| `AddRoute(ctx, routeName, username, password)` | Register an AMS route over UDP after construction |
 | `IsDisconnected()` | True while transport is down (auto-reconnect may resolve) |
 | `IsClosed()` | True after `Close()` or a terminal FSM transition (e.g. `SymbolVersionClose`) — Session cannot be reused |
 
@@ -443,55 +443,51 @@ By default, missing on-demand symbols after reconnect are skipped with a warning
 
 | Method | Description |
 |--------|-------------|
-| `ReadFromSymbol(name)` | Resolve symbol + read + parse to string |
-| `WriteToSymbol(name, value)` | Resolve + parse string + write |
-| `ReadMultipleSymbols(names)` | Batch read via SumRead with fallback |
-| `WriteMultipleSymbols(values)` | Batch write via SumWrite with fallback |
+| `ReadFromSymbol(ctx, name)` | Resolve symbol + read + parse to string |
+| `WriteToSymbol(ctx, name, value)` | Resolve + parse string + write |
+| `ReadMultipleSymbols(ctx, names)` | Batch read via SumRead with fallback |
+| `WriteMultipleSymbols(ctx, values)` | Batch write via SumWrite with fallback |
 
 ### Notifications (4)
 
 | Method | Description |
 |--------|-------------|
-| `AddSymbolNotification(name, maxDelay, cycleTime, mode, ch)` | Subscribe single symbol |
-| `AddSymbolNotifications(configs, ch)` | Subscribe many (uses SumAdd internally) |
-| `DeleteDeviceNotification(handle)` | Unsubscribe one |
-| `SumDeleteDeviceNotification(handles)` | Unsubscribe many |
+| `AddSymbolNotification(ctx, name, maxDelay, cycleTime, mode, ch)` | Subscribe single symbol |
+| `AddSymbolNotifications(ctx, configs, ch)` | Subscribe many (uses SumAdd internally) |
+| `DeleteDeviceNotification(ctx, handle)` | Unsubscribe one |
+| `SumDeleteDeviceNotification(ctx, handles)` | Unsubscribe many |
 
 ### Symbol discovery (8)
 
 | Method | Description |
 |--------|-------------|
-| `LoadSymbols()` | Full discovery — single request (locks PLC task) |
-| `LoadSymbolsSlow(cfg)` | Full discovery in chunks (PLC-friendly) |
-| `LoadSymbolList(cfg)` | Symbol names only |
-| `LoadDataTypes(cfg)` | Datatype definitions only |
+| `LoadSymbols(ctx)` | Full discovery — single request (locks PLC task) |
+| `LoadSymbolsSlow(ctx, cfg)` | Full discovery in chunks (PLC-friendly) |
+| `LoadSymbolList(ctx, cfg)` | Symbol names only |
+| `LoadDataTypes(ctx, cfg)` | Datatype definitions only |
 | `BrowseSymbols(path)` | Navigate symbol hierarchy |
 | `ListSymbols()` | Get full symbol map (requires LoadSymbols) |
-| `GetSymbol(name)` | Get symbol; resolve on-demand if needed |
-| `RefreshSymbols()` | Reload if version changed |
-| `CheckSymbolVersion()` | Check version without reload |
+| `GetSymbol(ctx, name)` | Get symbol; resolve on-demand if needed |
+| `RefreshSymbols(ctx)` | Reload if version changed |
+| `CheckSymbolVersion(ctx)` | Check version without reload |
 
-### SessionOption (17)
+### SessionOption
 
-All options compose — no mutual exclusions.
+All options compose — no mutual exclusions. See [README.md → Connection
+options](README.md#connection-options) for the user-facing reference;
+this section covers internal behavior that does not belong in the user
+quick-start.
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `WithLogger(logger)` | `slog.Default()` | Custom `*slog.Logger` |
-| `WithHostIP(ip)` | Derived from AMS NetID | IP the PLC uses to reach this client. Only affects route registration |
-| `WithRoute(name, user, pass)` | No registration | Register AMS route over UDP. Credentials sent in plaintext |
-| `WithForceRouteRegistration()` | Probe first | Always register with credentials. Requires `WithRoute` |
-| `WithBackoff(cfg)` | 1s×3, 5s×3, 15s×4, 30s cap | Stepped reconnect backoff |
-| `WithMaxReconnectAttempts(n)` | Unbounded | Hard cap on reconnect attempts before terminal Close |
-| `WithRequestTimeout(d)` | Constructor arg | Per-request timeout |
-| `WithAutoReconnect(bool)` | `true` | Spawn reconnect manager on transport drop |
-| `WithStrictReconnect(maxAttempts)` | Graceful: warn + drop | Fail reconnect if previously-resolved symbols are missing |
-| `WithOnDisconnect(fn)` | None | Callback on disconnect (goroutine, must not block) |
-| `WithOnReconnect(fn)` | None | Callback after successful reconnect |
-| `WithSymbolVersionStrategy(s)` | `AutoReload` | Online-change strategy: AutoReload / Close / Ignore |
-| `WithMaxSymbolVersionReloadAttempts(n)` | 3 | Sliding-window cap on AutoReload firings |
-| `WithSymbolVersionReloadWindow(d)` | 60s | Sliding-window duration for the cap above |
-| `WithOnSymbolVersionChanged(fn)` | None | Callback fired on every online-change detection |
+- `WithBackoff(cfg)` shares its `BackoffConfig` validator with the
+  caller-side `Validate()` method — invalid configs are rejected at
+  option-application time with a Warn log; the default is kept.
+- `WithStrictReconnect(maxAttempts)` only affects on-demand symbols
+  (resolved via `GetSymbol` before reconnect). Symbols loaded via
+  `LoadSymbols(Slow)` are not in scope.
+- `WithSymbolVersionStrategy(SymbolVersionAutoReload)` gates the
+  sliding-window cap (`WithMaxSymbolVersionReloadAttempts`,
+  `WithSymbolVersionReloadWindow`) — these options are no-ops under
+  `Close` or `Ignore` strategies.
 
 ### Client (raw RPC, escape hatch)
 
@@ -502,29 +498,29 @@ Lifecycle:
 | Method | Description |
 |--------|-------------|
 | `Dial(...)` | Connect a raw Client |
-| `Close()` | Tear down sockets + goroutines |
+| `Close() error` | Tear down sockets + goroutines |
 | `SetOnDrop(fn)` | Register unexpected-drop callback |
 | `SetNotificationHandler(fn)` | Register notification dispatcher |
-| `ReleaseHandle(handle)` | Release a symbol handle |
+| `ReleaseHandle(ctx, handle)` | Release a symbol handle |
 
-Raw RPC:
+Raw RPC (every method takes `ctx context.Context` as first arg):
 
 | Method | Description |
 |--------|-------------|
-| `Read(group, offset, length)` | ADS Read |
-| `Write(group, offset, data)` | ADS Write |
-| `WriteRead(group, offset, readLen, data)` | ADS ReadWrite |
-| `ReadState()` | ADS / device state |
-| `ReadDeviceInfo()` | Device name + version |
+| `Read(ctx, group, offset, length)` | ADS Read |
+| `Write(ctx, group, offset, data)` | ADS Write |
+| `WriteRead(ctx, group, offset, readLen, data)` | ADS ReadWrite |
+| `ReadState(ctx)` | ADS / device state |
+| `ReadDeviceInfo(ctx)` | Device name + version |
 
 Sum-batch (with fallback):
 
 | Method | Description |
 |--------|-------------|
-| `SumRead(requests)` | 0xF084 → 0xF083 → individual |
-| `SumWrite(requests)` | 0xF081 → individual |
-| `SumAddDeviceNotification(requests)` | 0xF085 → individual + mode downgrade |
-| `SumDeleteDeviceNotification(handles)` | 0xF086 → individual |
+| `SumRead(ctx, requests)` | 0xF084 → 0xF083 → individual |
+| `SumWrite(ctx, requests)` | 0xF081 → individual |
+| `SumAddDeviceNotification(ctx, requests)` | 0xF085 → individual + mode downgrade |
+| `SumDeleteDeviceNotification(ctx, handles)` | 0xF086 → individual |
 
 Process I/O / discovery: `ReadProcessInput`, `ReadProcessOutput`, `WriteProcessOutput`, `DownloadInChunks`, `GetSymbolInfoByName`, `GetHandleByName`, `GetSymbolUploadInfo`, `GetSymbolVersion`.
 
@@ -542,17 +538,17 @@ Process I/O / discovery: `ReadProcessInput`, `ReadProcessOutput`, `WriteProcessO
 ## Connection Lifecycle
 
 ```text
-1. NewSession(..., opts...)         configure target, source, timeouts, options
+1. NewSession(ctx, AMSEndpoint{...}, opts...)   configure target, source, timeouts, options
        │
        ▼
-2. Connect(false)                   TCP dial → probe route → register if needed
+2. Connect(ctx)                     TCP dial → probe route → register if needed
        │                            → start listen + transmitWorker
        │                            FSM: Constructed → Connecting → Connected
        │
-3. [optional] LoadSymbols() /       full discovery
-   LoadSymbolsSlow(cfg) /           chunked discovery (PLC-friendly)
-   LoadSymbolList(cfg) /            names only
-   LoadDataTypes(cfg)               datatypes only
+3. [optional] LoadSymbols(ctx) /    full discovery
+   LoadSymbolsSlow(ctx, cfg) /      chunked discovery (PLC-friendly)
+   LoadSymbolList(ctx, cfg) /       names only
+   LoadDataTypes(ctx, cfg)          datatypes only
        │
        ▼
 4. Use the Session:

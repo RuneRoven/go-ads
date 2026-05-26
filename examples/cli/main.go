@@ -60,7 +60,7 @@ func run() int {
 			return 1
 		}
 	case "client":
-		if err := runClientDemo(logger); err != nil {
+		if err := runClientDemo(ctx, logger); err != nil {
 			logger.Error("client demo failed", "error", err)
 			return 1
 		}
@@ -103,6 +103,7 @@ func selectMode() string {
 // repl holds shared state for the REPL command loop.
 type repl struct {
 	sess    *ads.Session
+	ctx     context.Context
 	logger  *slog.Logger
 	updates chan *ads.Update
 	subs    map[uint32]string // handle -> symbol name (for unsub + state output)
@@ -124,27 +125,40 @@ func runSessionDemo(ctx context.Context, logger *slog.Logger) error {
 			fmt.Println("\n[session] reconnected — cache + notifications restored")
 		}),
 		ads.WithSymbolVersionStrategy(ads.SymbolVersionAutoReload),
-		ads.WithOnSymbolVersionChanged(func(reason string) {
+		ads.WithOnSymbolVersionChanged(func(reason ads.Reason) {
 			// Surface DP-1 events live so the user sees online-change detection.
 			fmt.Printf("\n[online-change] reason=%s\n", reason)
 		}),
+		ads.WithRequestTimeout(5 * time.Second),
 	}
 	if routeUser != "" {
 		opts = append(opts, ads.WithRoute(routeName, routeUser, routePass))
 	}
+	target, err := ads.NewAMSAddress(targetAMS, uint16(targetPort))
+	if err != nil {
+		return fmt.Errorf("invalid target AMS: %w", err)
+	}
+	opts = append(opts, ads.WithLocalAMS(ads.AMSAddress{Port: uint16(localPort)}))
+	if localAMS != "auto" && localAMS != "" {
+		local, err := ads.NewAMSAddress(localAMS, uint16(localPort))
+		if err != nil {
+			return fmt.Errorf("invalid local AMS: %w", err)
+		}
+		opts = append(opts, ads.WithLocalAMS(local))
+	}
 
-	sess, err := ads.NewSession(ip, 48898, targetAMS, targetPort, localAMS, localPort, 5*time.Second, opts...)
+	sess, err := ads.NewSession(ctx, ads.AMSEndpoint{IP: ip, Port: 48898, AMS: target}, opts...)
 	if err != nil {
 		return fmt.Errorf("NewSession: %w", err)
 	}
 	defer sess.Close()
 
-	if err := sess.Connect(false); err != nil {
+	if err := sess.Connect(ctx); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
 	fmt.Printf("[session] connected plc=%s ams=%s\n", ip, targetAMS)
 
-	if err := sess.LoadSymbols(); err != nil {
+	if err := sess.LoadSymbols(ctx); err != nil {
 		// Non-fatal: REPL can still operate via on-demand handle resolve.
 		fmt.Printf("[session] LoadSymbols failed: %v (continuing — on-demand resolve still works)\n", err)
 	} else {
@@ -154,6 +168,7 @@ func runSessionDemo(ctx context.Context, logger *slog.Logger) error {
 
 	r := &repl{
 		sess:    sess,
+		ctx:     ctx,
 		logger:  logger,
 		updates: updates,
 		subs:    make(map[uint32]string),
@@ -181,9 +196,9 @@ func runSessionDemo(ctx context.Context, logger *slog.Logger) error {
 func (r *repl) notifyLoop(done chan struct{}) {
 	defer close(done)
 	for u := range r.updates {
-		if u.Stale {
+		if u.Stale != nil {
 			fmt.Printf("\n[notify] *STALE* symbol=%s value=%s reason=%s ts=%s\n",
-				u.Variable, u.Value, u.Reason, u.TimeStamp.Format(time.RFC3339Nano))
+				u.Variable, u.Value, u.Stale.Reason, u.TimeStamp.Format(time.RFC3339Nano))
 		} else {
 			fmt.Printf("\n[notify] %s = %s (ts=%s)\n",
 				u.Variable, u.Value, u.TimeStamp.Format("15:04:05.000"))
@@ -331,7 +346,7 @@ func (r *repl) cmdRead(args []string) {
 		return
 	}
 	name := args[0]
-	v, err := r.sess.ReadFromSymbol(name)
+	v, err := r.sess.ReadFromSymbol(r.ctx, name)
 	if err != nil {
 		fmt.Printf("  error: %v\n", err)
 		return
@@ -347,13 +362,13 @@ func (r *repl) cmdWrite(args []string) {
 	name := args[0]
 	// Re-join the rest so quoted strings with spaces survive (best-effort).
 	value := strings.Join(args[1:], " ")
-	if err := r.sess.WriteToSymbol(name, value); err != nil {
+	if err := r.sess.WriteToSymbol(r.ctx, name, value); err != nil {
 		fmt.Printf("  error: %v\n", err)
 		return
 	}
 	fmt.Printf("  wrote %s = %s\n", name, value)
 	// Read-back confirms what the PLC observed (and exercises invalidation).
-	if back, err := r.sess.ReadFromSymbol(name); err == nil {
+	if back, err := r.sess.ReadFromSymbol(r.ctx, name); err == nil {
 		fmt.Printf("  confirmed: %s = %s\n", name, back)
 	}
 }
@@ -364,7 +379,7 @@ func (r *repl) cmdInfo(args []string) {
 		return
 	}
 	name := args[0]
-	v, err := r.sess.GetSymbol(name)
+	v, err := r.sess.GetSymbol(r.ctx, name)
 	if err != nil {
 		fmt.Printf("  error: %v\n", err)
 		return
@@ -375,7 +390,7 @@ func (r *repl) cmdInfo(args []string) {
 	fmt.Printf("  Group:    0x%X\n", v.Group)
 	fmt.Printf("  Offset:   0x%X\n", v.Offset)
 	fmt.Printf("  Handle:   %d\n", v.Handle)
-	fmt.Printf("  BaseType: %d (%s)\n", v.BaseType, baseTypeName(v.BaseType))
+	fmt.Printf("  BaseType: %d (%s)\n", uint32(v.BaseType), baseTypeName(uint32(v.BaseType)))
 	if v.Comment != "" {
 		fmt.Printf("  Comment:  %s\n", v.Comment)
 	}
@@ -388,6 +403,7 @@ func (r *repl) cmdSub(args []string) {
 	}
 	name := args[0]
 	h, err := r.sess.AddSymbolNotification(
+		r.ctx,
 		name,
 		100*time.Millisecond,
 		100*time.Millisecond,
@@ -413,7 +429,7 @@ func (r *repl) cmdUnsub(args []string) {
 		return
 	}
 	handle := uint32(h)
-	if err := r.sess.DeleteDeviceNotification(handle); err != nil {
+	if err := r.sess.DeleteDeviceNotification(r.ctx, handle); err != nil {
 		fmt.Printf("  error: %v\n", err)
 		return
 	}
@@ -423,7 +439,7 @@ func (r *repl) cmdUnsub(args []string) {
 }
 
 func (r *repl) cmdReload() {
-	if err := r.sess.RefreshSymbols(); err != nil {
+	if err := r.sess.RefreshSymbols(r.ctx); err != nil {
 		fmt.Printf("  error: %v\n", err)
 		return
 	}
@@ -460,7 +476,7 @@ func (r *repl) cmdSlowLoad(args []string) {
 		}
 	}
 	fmt.Printf("  loading symbols (chunkSize=%d, delay=%s)...\n", cfg.ChunkSize, cfg.ChunkDelay)
-	if err := r.sess.LoadSymbolsSlow(cfg); err != nil {
+	if err := r.sess.LoadSymbolsSlow(r.ctx, cfg); err != nil {
 		fmt.Printf("  slow-load failed: %v\n", err)
 		return
 	}
@@ -505,7 +521,7 @@ func baseTypeName(code uint32) string {
 
 // ----- Client demo (single-shot, unchanged) ---------------------------------
 
-func runClientDemo(logger *slog.Logger) error {
+func runClientDemo(ctx context.Context, logger *slog.Logger) error {
 	ip, targetAMS, targetPort, localAMS, localPort, symbolName, _, _, _ := readEnv()
 
 	target, err := parseAMS(targetAMS, uint16(targetPort))
@@ -530,7 +546,7 @@ func runClientDemo(logger *slog.Logger) error {
 	defer func() { _ = c.Close() }()
 	logger.Info("client: dialed", "plc", ip, "ams", targetAMS)
 
-	if info, err := c.ReadDeviceInfo(); err != nil {
+	if info, err := c.ReadDeviceInfo(ctx); err != nil {
 		logger.Warn("ReadDeviceInfo failed", "error", err)
 	} else {
 		name := strings.TrimRight(string(info.DeviceName[:]), "\x00")
@@ -539,13 +555,13 @@ func runClientDemo(logger *slog.Logger) error {
 			"version", fmt.Sprintf("%d.%d.%d", info.Major, info.Minor, info.Version))
 	}
 
-	if state, err := c.ReadState(); err != nil {
+	if state, err := c.ReadState(ctx); err != nil {
 		logger.Warn("ReadState failed", "error", err)
 	} else {
 		logger.Info("client: ads state", "ads", state.ADSState, "device", state.DeviceState)
 	}
 
-	sym, err := c.GetSymbolInfoByName(symbolName)
+	sym, err := c.GetSymbolInfoByName(ctx, symbolName)
 	if err != nil {
 		logger.Warn("GetSymbolInfoByName failed", "symbol", symbolName, "error", err)
 		return nil
@@ -557,7 +573,7 @@ func runClientDemo(logger *slog.Logger) error {
 		"length", sym.Length,
 		"type", sym.DataType)
 
-	handleBytes, err := c.WriteRead(uint32(ads.GroupSymbolHandleByName), 0, 4, []byte(symbolName))
+	handleBytes, err := c.WriteRead(ctx, uint32(ads.GroupSymbolHandleByName), 0, 4, []byte(symbolName))
 	if err != nil {
 		logger.Warn("resolve handle failed", "symbol", symbolName, "error", err)
 		return nil
@@ -569,10 +585,10 @@ func runClientDemo(logger *slog.Logger) error {
 	defer func() {
 		hb := make([]byte, 4)
 		binary.LittleEndian.PutUint32(hb, handle)
-		_ = c.Write(uint32(ads.GroupSymbolReleaseHandle), 0, hb)
+		_ = c.Write(ctx, uint32(ads.GroupSymbolReleaseHandle), 0, hb)
 	}()
 
-	data, err := c.Read(uint32(ads.GroupSymbolValueByHandle), handle, sym.Length)
+	data, err := c.Read(ctx, uint32(ads.GroupSymbolValueByHandle), handle, sym.Length)
 	if err != nil {
 		logger.Warn("raw Read failed", "symbol", symbolName, "error", err)
 		return nil
