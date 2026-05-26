@@ -465,7 +465,7 @@ func TestScriptableServer_Smoke(t *testing.T) {
 	}
 	defer c.Close()
 
-	got, err := c.Read(uint32(GroupSymbolVersion), 0, 1)
+	got, err := c.Read(context.Background(), uint32(GroupSymbolVersion), 0, 1)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}

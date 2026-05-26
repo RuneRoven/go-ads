@@ -20,6 +20,7 @@
 package ads
 
 import (
+	"context"
 	"bufio"
 	"fmt"
 	"os"
@@ -111,7 +112,7 @@ func symbolVersionSession(t *testing.T, strategy string, extraOpts ...SessionOpt
 	}
 	t.Cleanup(func() { sess.Close() })
 
-	if err := sess.LoadSymbols(); err != nil {
+	if err := sess.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols: %v", err)
 	}
 	return sess
@@ -216,7 +217,7 @@ func TestSymbolVersionAutoReload_TypeChange(t *testing.T) {
 	// change. Required because nProbeA may not be written to by PLC code,
 	// so ServerOnChange would yield 0 samples.
 	ch := make(chan *Update, 256)
-	if _, err := sess.AddSymbolNotification(symProbeA, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch); err != nil {
+	if _, err := sess.AddSymbolNotification(context.Background(), symProbeA, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch); err != nil {
 		t.Fatalf("AddSymbolNotification: %v", err)
 	}
 	col := startCollector(ch)
@@ -257,12 +258,12 @@ func TestSymbolVersionAutoReload_SymbolRemoved(t *testing.T) {
 	assertSymbolPresent(t, sess, symProbeB)
 
 	ch := make(chan *Update, 16)
-	if _, err := sess.AddSymbolNotification(symProbeB, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch); err != nil {
+	if _, err := sess.AddSymbolNotification(context.Background(), symProbeB, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch); err != nil {
 		t.Fatalf("AddSymbolNotification: %v", err)
 	}
 
 	// Confirm baseline read works.
-	if _, err := sess.ReadFromSymbol(symProbeB); err != nil {
+	if _, err := sess.ReadFromSymbol(context.Background(), symProbeB); err != nil {
 		t.Fatalf("baseline read: %v", err)
 	}
 
@@ -270,7 +271,7 @@ func TestSymbolVersionAutoReload_SymbolRemoved(t *testing.T) {
 
 	// Post-change: read should fail; channel may receive Stale terminal sample.
 	time.Sleep(3 * time.Second) // let auto-reload settle
-	if _, err := sess.ReadFromSymbol(symProbeB); err == nil {
+	if _, err := sess.ReadFromSymbol(context.Background(), symProbeB); err == nil {
 		t.Error("expected read error after symbol removal, got nil")
 	} else {
 		t.Logf("post-removal read err (expected): %v", err)
@@ -288,7 +289,7 @@ func TestSymbolVersionAutoReload_StructMemberOffsetShift(t *testing.T) {
 	assertSymbolPresent(t, sess, symStructC)
 
 	ch := make(chan *Update, 256)
-	if _, err := sess.AddSymbolNotification(symStructC, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch); err != nil {
+	if _, err := sess.AddSymbolNotification(context.Background(), symStructC, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch); err != nil {
 		t.Fatalf("AddSymbolNotification: %v", err)
 	}
 	col := startCollector(ch)
@@ -341,7 +342,7 @@ func TestSymbolVersionClose_OnDetection(t *testing.T) {
 	assertSymbolPresent(t, sess, symProbeA)
 
 	ch := make(chan *Update, 256)
-	if _, err := sess.AddSymbolNotification(symProbeA, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch); err != nil {
+	if _, err := sess.AddSymbolNotification(context.Background(), symProbeA, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch); err != nil {
 		t.Fatalf("AddSymbolNotification: %v", err)
 	}
 	col := startCollector(ch)
@@ -353,7 +354,7 @@ func TestSymbolVersionClose_OnDetection(t *testing.T) {
 	// after online change. Detection only triggers via explicit op (Read).
 	// Probe with a Read; under "close" strategy the resulting 0x711/0x0703
 	// must close the session.
-	_, readErr := sess.ReadFromSymbol(symProbeA)
+	_, readErr := sess.ReadFromSymbol(context.Background(), symProbeA)
 	t.Logf("post-change probe read err: %v", readErr)
 
 	// Hardware-only assertion: real TC3 detection code surfaces through the
@@ -390,7 +391,7 @@ func TestSymbolVersionIgnore_StaleFlag(t *testing.T) {
 	// Counter increments every PLC scan (10ms = 100Hz). Use big buffer +
 	// active drainer goroutine so the channel never blocks the listen loop.
 	ch := make(chan *Update, 1024)
-	if _, err := sess.AddSymbolNotification(symCounter, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch); err != nil {
+	if _, err := sess.AddSymbolNotification(context.Background(), symCounter, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch); err != nil {
 		t.Fatalf("AddSymbolNotification: %v", err)
 	}
 	col := startCollector(ch)
@@ -467,7 +468,7 @@ func TestSymbolVersionIgnore_RemovedSymbolStops(t *testing.T) {
 	// ServerCycle so we get steady-state samples pre-deletion (proves
 	// subscription alive); silence post-deletion is the assertion target.
 	ch := make(chan *Update, 256)
-	if _, err := sess.AddSymbolNotification(symProbeB, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch); err != nil {
+	if _, err := sess.AddSymbolNotification(context.Background(), symProbeB, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch); err != nil {
 		t.Fatalf("AddSymbolNotification: %v", err)
 	}
 	col := startCollector(ch)

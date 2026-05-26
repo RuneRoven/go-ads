@@ -33,8 +33,8 @@ func (sess *Session) ListSymbols() (map[string]SymbolView, error) {
 // This downloads the entire symbol and datatype tables in single requests,
 // which may cause real-time jitter on the PLC. For large programs, consider
 // LoadSymbolsSlow() instead.
-func (sess *Session) LoadSymbols() error {
-	err := sess.loadSymbols()
+func (sess *Session) LoadSymbols(ctx context.Context) error {
+	err := sess.loadSymbols(ctx)
 	if err != nil {
 		return err
 	}
@@ -70,11 +70,11 @@ func (cfg *SlowDiscoveryConfig) applyDefaults() {
 // between each chunk, to minimize disruption to the PLC's real-time task.
 // If the PLC does not support offset-based chunked reads, it falls back
 // to downloading each table in a single request with a delay between them.
-func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
+func (sess *Session) LoadSymbolsSlow(ctx context.Context, cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Step 1: Read symbol version
-	version, err := sess.client.Load().GetSymbolVersion()
+	version, err := sess.client.Load().GetSymbolVersion(ctx)
 	if err != nil {
 		sess.logger.Warn("failed to read symbol version during slow discovery", "error", err)
 	} else {
@@ -84,7 +84,7 @@ func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	}
 
 	// Step 2: Get upload info (small request)
-	uploadInfo, err := sess.client.Load().GetSymbolUploadInfo()
+	uploadInfo, err := sess.client.Load().GetSymbolUploadInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
@@ -92,7 +92,7 @@ func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Step 3: Download datatypes in chunks
-	datatypesData, err := sess.client.Load().DownloadInChunks(
+	datatypesData, err := sess.client.Load().DownloadInChunks(ctx, 
 		uint32(GroupSymbolDataTypeUpload),
 		uploadInfo.DataTypeLength,
 		cfg.ChunkSize,
@@ -101,7 +101,7 @@ func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download datatypes in one request
 		sess.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
-		datatypesData, err = sess.client.Load().DownloadDataTypes(uploadInfo.DataTypeLength)
+		datatypesData, err = sess.client.Load().DownloadDataTypes(ctx, uploadInfo.DataTypeLength)
 		if err != nil {
 			return fmt.Errorf("failed to download datatypes: %w", err)
 		}
@@ -114,7 +114,7 @@ func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Step 4: Download symbols in chunks
-	symbolsData, err := sess.client.Load().DownloadInChunks(
+	symbolsData, err := sess.client.Load().DownloadInChunks(ctx, 
 		uint32(GroupSymbolUpload),
 		uploadInfo.SymbolLength,
 		cfg.ChunkSize,
@@ -123,7 +123,7 @@ func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download symbols in one request
 		sess.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
-		symbolsData, err = sess.client.Load().DownloadSymbolList(uploadInfo.SymbolLength)
+		symbolsData, err = sess.client.Load().DownloadSymbolList(ctx, uploadInfo.SymbolLength)
 		if err != nil {
 			return fmt.Errorf("failed to download symbols: %w", err)
 		}
@@ -158,7 +158,7 @@ func (sess *Session) LoadSymbolsSlow(cfg SlowDiscoveryConfig) error {
 // in capabilities so subsequent calls short-circuit when the PLC does not
 // support it. Used by the Slow / List / DataTypes loaders to fetch large
 // upload tables without overwhelming the PLC's real-time loop.
-func (c *Client) DownloadInChunks(group uint32, totalLength uint32, chunkSize uint32, delay time.Duration) ([]byte, error) {
+func (c *Client) DownloadInChunks(ctx context.Context, group uint32, totalLength uint32, chunkSize uint32, delay time.Duration) ([]byte, error) {
 	if totalLength == 0 {
 		return []byte{}, nil
 	}
@@ -177,7 +177,7 @@ func (c *Client) DownloadInChunks(group uint32, totalLength uint32, chunkSize ui
 		if remaining < readLen {
 			readLen = remaining
 		}
-		chunk, err := c.Read(group, offset, readLen)
+		chunk, err := c.Read(ctx, group, offset, readLen)
 		if err != nil {
 			if !c.capabilities.ChunkedDownloadCheckedLoad() {
 				c.capabilities.ChunkedDownloadSupportedStore(false)
@@ -207,8 +207,8 @@ func (c *Client) DownloadInChunks(group uint32, totalLength uint32, chunkSize ui
 // GetSymbol returns a read-only SymbolView for the named symbol.
 // Resolves on-demand if the symbol is not in the cache (single-symbol
 // lookup against the PLC).
-func (sess *Session) GetSymbol(symbolName string) (SymbolView, error) {
-	sym, err := sess.getSymbol(symbolName)
+func (sess *Session) GetSymbol(ctx context.Context, symbolName string) (SymbolView, error) {
+	sym, err := sess.getSymbol(ctx, symbolName)
 	if err != nil {
 		return SymbolView{}, err
 	}
@@ -220,7 +220,7 @@ func (sess *Session) GetSymbol(symbolName string) (SymbolView, error) {
 // getSymbol returns the internal *symbol for the named symbol. Used by
 // in-package code paths that need direct access to mutable symbol state
 // (notifications, reads, writes). External callers should use GetSymbol.
-func (sess *Session) getSymbol(symbolName string) (*symbol, error) {
+func (sess *Session) getSymbol(ctx context.Context, symbolName string) (*symbol, error) {
 	sess.cache.lock.Lock()
 	localSymbol, ok := sess.cache.symbols[symbolKey(symbolName)]
 	needHandle := ok && localSymbol.Handle == 0
@@ -230,7 +230,7 @@ func (sess *Session) getSymbol(symbolName string) (*symbol, error) {
 		if needHandle {
 			// Network I/O must happen outside the lock to avoid deadlock
 			// with handleNotification which also acquires cache.lock.
-			handle, err := sess.client.Load().GetHandleByName(symbolName)
+			handle, err := sess.client.Load().GetHandleByName(ctx, symbolName)
 			if err != nil {
 				return nil, err
 			}
@@ -240,7 +240,7 @@ func (sess *Session) getSymbol(symbolName string) (*symbol, error) {
 				sess.cache.lock.Unlock()
 				handleBytes := make([]byte, 4)
 				binary.LittleEndian.PutUint32(handleBytes, handle)
-				if err := sess.client.Load().Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+				if err := sess.client.Load().Write(ctx, uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 					sess.logger.Warn("failed to release duplicate symbol handle",
 						"symbol", symbolName, "handle", handle, "error", err)
 				}
@@ -254,12 +254,12 @@ func (sess *Session) getSymbol(symbolName string) (*symbol, error) {
 	}
 
 	// On-demand resolution: query the PLC for this specific symbol
-	sym, err := sess.client.Load().GetSymbolInfoByName(symbolName)
+	sym, err := sess.client.Load().GetSymbolInfoByName(ctx, symbolName)
 	if err != nil {
 		return nil, fmt.Errorf("symbol %q not found and on-demand lookup failed: %w", symbolName, err)
 	}
 
-	handle, err := sess.client.Load().GetHandleByName(symbolName)
+	handle, err := sess.client.Load().GetHandleByName(ctx, symbolName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get handle for %q: %w", symbolName, err)
 	}
@@ -272,7 +272,7 @@ func (sess *Session) getSymbol(symbolName string) (*symbol, error) {
 		// Release the handle we just acquired since another goroutine beat us
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, handle)
-		if err := sess.client.Load().Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+		if err := sess.client.Load().Write(ctx, uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 			sess.logger.Warn("failed to release duplicate symbol handle",
 				"symbol", symbolName, "handle", handle, "error", err)
 		}
@@ -296,8 +296,9 @@ func (sess *Session) getSymbol(symbolName string) (*symbol, error) {
 // populated symbol with Group, Offset, Length, DataType, etc. Does NOT
 // populate Children (struct / array children require full discovery via
 // LoadSymbols / LoadSymbolList + LoadDataTypes). This is a raw RPC and bypasses the symbol cache; the caller is responsible for decoding the response.
-func (c *Client) GetSymbolInfoByName(symbolName string) (*symbol, error) {
+func (c *Client) GetSymbolInfoByName(ctx context.Context, symbolName string) (*symbol, error) {
 	resp, err := c.WriteRead(
+		ctx,
 		uint32(GroupSymbolInfoByNameEx),
 		0,
 		2048,
@@ -346,8 +347,8 @@ func (c *Client) GetSymbolInfoByName(symbolName string) (*symbol, error) {
 // GetHandleByName resolves a symbol name to its PLC-side handle. Wire RPC;
 // no cache. The handle is valid until the TCP transport drops or until
 // the caller releases it via ReleaseHandle.
-func (c *Client) GetHandleByName(symbolName string) (uint32, error) {
-	resp, err := c.WriteRead(uint32(GroupSymbolHandleByName), 0, 4, append([]byte(symbolName), 0))
+func (c *Client) GetHandleByName(ctx context.Context, symbolName string) (uint32, error) {
+	resp, err := c.WriteRead(ctx, uint32(GroupSymbolHandleByName), 0, 4, append([]byte(symbolName), 0))
 	if err != nil {
 		return 0, fmt.Errorf("getting handle for %q: %w", symbolName, err)
 	}
@@ -361,12 +362,12 @@ func (c *Client) GetHandleByName(symbolName string) (uint32, error) {
 // Tries extended info (0xF00F, 24 bytes) first; falls back to basic info
 // (0xF00C, 16 bytes) for older PLCs. Used by LoadSymbols / LoadSymbolList /
 // LoadDataTypes to size the subsequent download. This is a raw RPC and bypasses the symbol cache; the caller is responsible for decoding the response.
-func (c *Client) GetSymbolUploadInfo() (SymbolUploadInfo, error) {
+func (c *Client) GetSymbolUploadInfo(ctx context.Context) (SymbolUploadInfo, error) {
 	var uploadInfo SymbolUploadInfo
-	res, err := c.Read(uint32(GroupSymbolUploadInfo2), 0, 24)
+	res, err := c.Read(ctx, uint32(GroupSymbolUploadInfo2), 0, 24)
 	if err != nil {
 		c.logger.Debug("GroupSymbolUploadInfo2 not supported, falling back to GroupSymbolUploadInfo", "error", err)
-		res, err = c.Read(uint32(GroupSymbolUploadInfo), 0, 16)
+		res, err = c.Read(ctx, uint32(GroupSymbolUploadInfo), 0, 16)
 		if err != nil {
 			return uploadInfo, fmt.Errorf("GetSymbolUploadInfo failed: %w", err)
 		}
@@ -397,8 +398,8 @@ func (c *Client) GetSymbolUploadInfo() (SymbolUploadInfo, error) {
 
 // DownloadSymbolList downloads the raw symbol-table bytes (group 0xF00B).
 // Caller decodes per parseUploadSymbolInfoSymbols. This is a raw RPC and bypasses the symbol cache; the caller is responsible for decoding the response.
-func (c *Client) DownloadSymbolList(length uint32) ([]byte, error) {
-	res, err := c.Read(uint32(GroupSymbolUpload), 0, length)
+func (c *Client) DownloadSymbolList(ctx context.Context, length uint32) ([]byte, error) {
+	res, err := c.Read(ctx, uint32(GroupSymbolUpload), 0, length)
 	if err != nil {
 		return nil, fmt.Errorf("DownloadSymbolList failed: %w", err)
 	}
@@ -407,8 +408,8 @@ func (c *Client) DownloadSymbolList(length uint32) ([]byte, error) {
 
 // DownloadDataTypes downloads the raw datatype-table bytes (group 0xF00E).
 // Caller decodes via parseUploadSymbolInfoDataTypes. This is a raw RPC and bypasses the symbol cache; the caller is responsible for decoding the response.
-func (c *Client) DownloadDataTypes(length uint32) ([]byte, error) {
-	res, err := c.Read(uint32(GroupSymbolDataTypeUpload), 0x0, length)
+func (c *Client) DownloadDataTypes(ctx context.Context, length uint32) ([]byte, error) {
+	res, err := c.Read(ctx, uint32(GroupSymbolDataTypeUpload), 0x0, length)
 	if err != nil {
 		return nil, fmt.Errorf("DownloadDataTypes failed: %w", err)
 	}
@@ -417,8 +418,8 @@ func (c *Client) DownloadDataTypes(length uint32) ([]byte, error) {
 
 // GetSymbolVersion reads the current PLC symbol version (single byte).
 // Increments on online-change or download. This is a raw RPC and bypasses the symbol cache; the caller is responsible for decoding the response.
-func (c *Client) GetSymbolVersion() (uint8, error) {
-	data, err := c.Read(uint32(GroupSymbolVersion), 0, 1)
+func (c *Client) GetSymbolVersion(ctx context.Context) (uint8, error) {
+	data, err := c.Read(ctx, uint32(GroupSymbolVersion), 0, 1)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read symbol version: %w", err)
 	}
@@ -430,8 +431,8 @@ func (c *Client) GetSymbolVersion() (uint8, error) {
 
 // CheckSymbolVersion compares the current PLC symbol version against the stored version.
 // Returns true if the version has changed.
-func (sess *Session) CheckSymbolVersion() (changed bool, err error) {
-	version, err := sess.client.Load().GetSymbolVersion()
+func (sess *Session) CheckSymbolVersion(ctx context.Context) (changed bool, err error) {
+	version, err := sess.client.Load().GetSymbolVersion(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -449,8 +450,8 @@ func (sess *Session) CheckSymbolVersion() (changed bool, err error) {
 
 // RefreshSymbols reloads the symbol table if the symbol version has changed.
 // It releases old handles, reloads symbol/datatype tables, and re-acquires handles for active symbols.
-func (sess *Session) RefreshSymbols() error {
-	changed, err := sess.CheckSymbolVersion()
+func (sess *Session) RefreshSymbols(ctx context.Context) error {
+	changed, err := sess.CheckSymbolVersion(ctx)
 	if err != nil {
 		return err
 	}
@@ -473,13 +474,13 @@ func (sess *Session) RefreshSymbols() error {
 	for _, h := range handleList {
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, h)
-		if err := sess.client.Load().Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+		if err := sess.client.Load().Write(ctx, uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 			sess.logger.Warn("failed to release symbol handle", "error", err, "handle", h)
 		}
 	}
 
 	// Reload symbols
-	err = sess.loadSymbols()
+	err = sess.loadSymbols(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to refresh symbols: %w", err)
 	}
@@ -495,11 +496,11 @@ func (sess *Session) RefreshSymbols() error {
 // This is the smaller of the two tables and enables browsing top-level symbol names.
 // After calling this, BrowseSymbols() can list root symbols and navigate by prefix.
 // To also expand struct/array children, call LoadDataTypes() afterwards.
-func (sess *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
+func (sess *Session) LoadSymbolList(ctx context.Context, cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Read symbol version
-	version, err := sess.client.Load().GetSymbolVersion()
+	version, err := sess.client.Load().GetSymbolVersion(ctx)
 	if err != nil {
 		sess.logger.Warn("failed to read symbol version during LoadSymbolList", "error", err)
 	} else {
@@ -509,7 +510,7 @@ func (sess *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	}
 
 	// Get upload info
-	uploadInfo, err := sess.client.Load().GetSymbolUploadInfo()
+	uploadInfo, err := sess.client.Load().GetSymbolUploadInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
@@ -517,7 +518,7 @@ func (sess *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Download symbols in chunks
-	symbolsData, err := sess.client.Load().DownloadInChunks(
+	symbolsData, err := sess.client.Load().DownloadInChunks(ctx, 
 		uint32(GroupSymbolUpload),
 		uploadInfo.SymbolLength,
 		cfg.ChunkSize,
@@ -526,7 +527,7 @@ func (sess *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download symbols in one request
 		sess.logger.Info("chunked symbol download failed, falling back to single request", "error", err)
-		symbolsData, err = sess.client.Load().DownloadSymbolList(uploadInfo.SymbolLength)
+		symbolsData, err = sess.client.Load().DownloadSymbolList(ctx, uploadInfo.SymbolLength)
 		if err != nil {
 			return fmt.Errorf("failed to download symbols: %w", err)
 		}
@@ -559,11 +560,11 @@ func (sess *Session) LoadSymbolList(cfg SlowDiscoveryConfig) error {
 // LoadDataTypes downloads only the datatype table (0xF00E) from the PLC in chunks.
 // After calling this along with LoadSymbolList(), struct/array children can be
 // browsed and expanded via BrowseSymbols().
-func (sess *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
+func (sess *Session) LoadDataTypes(ctx context.Context, cfg SlowDiscoveryConfig) error {
 	cfg.applyDefaults()
 
 	// Get upload info
-	uploadInfo, err := sess.client.Load().GetSymbolUploadInfo()
+	uploadInfo, err := sess.client.Load().GetSymbolUploadInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
@@ -571,7 +572,7 @@ func (sess *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	time.Sleep(cfg.ChunkDelay)
 
 	// Download datatypes in chunks
-	datatypesData, err := sess.client.Load().DownloadInChunks(
+	datatypesData, err := sess.client.Load().DownloadInChunks(ctx, 
 		uint32(GroupSymbolDataTypeUpload),
 		uploadInfo.DataTypeLength,
 		cfg.ChunkSize,
@@ -580,7 +581,7 @@ func (sess *Session) LoadDataTypes(cfg SlowDiscoveryConfig) error {
 	if err != nil {
 		// Fallback: download datatypes in one request
 		sess.logger.Info("chunked datatype download failed, falling back to single request", "error", err)
-		datatypesData, err = sess.client.Load().DownloadDataTypes(uploadInfo.DataTypeLength)
+		datatypesData, err = sess.client.Load().DownloadDataTypes(ctx, uploadInfo.DataTypeLength)
 		if err != nil {
 			return fmt.Errorf("failed to download datatypes: %w", err)
 		}

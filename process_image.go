@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -25,23 +26,23 @@ import (
 // which is safer and self-documenting.
 
 // EXPERIMENTAL: ReadProcessInput reads bytes from the input process image at the given byte offset.
-func (c *Client) ReadProcessInput(byteOffset, length uint32) ([]byte, error) {
-	return c.Read(uint32(GroupIoImageRwib), byteOffset, length)
+func (c *Client) ReadProcessInput(ctx context.Context, byteOffset, length uint32) ([]byte, error) {
+	return c.Read(ctx, uint32(GroupIoImageRwib), byteOffset, length)
 }
 
 // EXPERIMENTAL: ReadProcessOutput reads bytes from the output process image at the given byte offset.
-func (c *Client) ReadProcessOutput(byteOffset, length uint32) ([]byte, error) {
-	return c.Read(uint32(GroupIoImageRwob), byteOffset, length)
+func (c *Client) ReadProcessOutput(ctx context.Context, byteOffset, length uint32) ([]byte, error) {
+	return c.Read(ctx, uint32(GroupIoImageRwob), byteOffset, length)
 }
 
 // EXPERIMENTAL: WriteProcessOutput writes bytes to the output process image at the given byte offset.
-func (c *Client) WriteProcessOutput(byteOffset uint32, data []byte) error {
-	return c.Write(uint32(GroupIoImageRwob), byteOffset, data)
+func (c *Client) WriteProcessOutput(ctx context.Context, byteOffset uint32, data []byte) error {
+	return c.Write(ctx, uint32(GroupIoImageRwob), byteOffset, data)
 }
 
 // EXPERIMENTAL: ReadProcessInputBit reads a single bit from the input process image.
 // bitIndex must be 0-7 (bit within a single byte).
-func (c *Client) ReadProcessInputBit(byteOffset uint32, bitIndex uint8) (bool, error) {
+func (c *Client) ReadProcessInputBit(ctx context.Context, byteOffset uint32, bitIndex uint8) (bool, error) {
 	if bitIndex > 7 {
 		return false, fmt.Errorf("bitIndex must be 0-7, got %d", bitIndex)
 	}
@@ -49,7 +50,7 @@ func (c *Client) ReadProcessInputBit(byteOffset uint32, bitIndex uint8) (bool, e
 	if bitOffset > math.MaxUint32 {
 		return false, fmt.Errorf("byteOffset %d overflow: bit address %d exceeds uint32 max", byteOffset, bitOffset)
 	}
-	data, err := c.Read(uint32(GroupIoImageRwix), uint32(bitOffset), 1)
+	data, err := c.Read(ctx, uint32(GroupIoImageRwix), uint32(bitOffset), 1)
 	if err != nil {
 		return false, err
 	}
@@ -61,7 +62,7 @@ func (c *Client) ReadProcessInputBit(byteOffset uint32, bitIndex uint8) (bool, e
 
 // EXPERIMENTAL: WriteProcessOutputBit writes a single bit to the output process image.
 // bitIndex must be 0-7 (bit within a single byte).
-func (c *Client) WriteProcessOutputBit(byteOffset uint32, bitIndex uint8, value bool) error {
+func (c *Client) WriteProcessOutputBit(ctx context.Context, byteOffset uint32, bitIndex uint8, value bool) error {
 	if bitIndex > 7 {
 		return fmt.Errorf("bitIndex must be 0-7, got %d", bitIndex)
 	}
@@ -73,12 +74,12 @@ func (c *Client) WriteProcessOutputBit(byteOffset uint32, bitIndex uint8, value 
 	if bitOffset > math.MaxUint32 {
 		return fmt.Errorf("byteOffset %d overflow: bit address %d exceeds uint32 max", byteOffset, bitOffset)
 	}
-	return c.Write(uint32(GroupIoImageRwox), uint32(bitOffset), []byte{v})
+	return c.Write(ctx, uint32(GroupIoImageRwox), uint32(bitOffset), []byte{v})
 }
 
 // EXPERIMENTAL: ReadProcessInputSize returns the size of the input process image in bytes.
-func (c *Client) ReadProcessInputSize() (uint32, error) {
-	data, err := c.Read(uint32(GroupIoImageRisize), 0, 4)
+func (c *Client) ReadProcessInputSize(ctx context.Context) (uint32, error) {
+	data, err := c.Read(ctx, uint32(GroupIoImageRisize), 0, 4)
 	if err != nil {
 		return 0, err
 	}
@@ -89,11 +90,11 @@ func (c *Client) ReadProcessInputSize() (uint32, error) {
 }
 
 // EXPERIMENTAL: ClearProcessInputs writes all input process image bytes to zero.
-func (c *Client) ClearProcessInputs() error {
-	return c.Write(uint32(GroupIoImageCleari), 0, []byte{0})
+func (c *Client) ClearProcessInputs(ctx context.Context) error {
+	return c.Write(ctx, uint32(GroupIoImageCleari), 0, []byte{0})
 }
 
 // EXPERIMENTAL: ClearProcessOutputs writes all output process image bytes to zero.
-func (c *Client) ClearProcessOutputs() error {
-	return c.Write(uint32(GroupIoImageClearo), 0, []byte{0})
+func (c *Client) ClearProcessOutputs(ctx context.Context) error {
+	return c.Write(ctx, uint32(GroupIoImageClearo), 0, []byte{0})
 }

@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"log/slog"
@@ -674,7 +675,7 @@ func TestSession_ReadFromSymbol_LengthMismatchTriggersDetection(t *testing.T) {
 		DataType: "LREAL",
 	}
 
-	_, err := sess.ReadFromSymbol(symName)
+	_, err := sess.ReadFromSymbol(context.Background(), symName)
 	if err == nil {
 		t.Fatal("expected error from ReadFromSymbol on length mismatch, got nil")
 	}
