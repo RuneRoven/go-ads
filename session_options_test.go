@@ -96,14 +96,14 @@ func TestWithSymbolVersionStrategy_InvalidNoLoggerNoPanic(t *testing.T) {
 // Validates: R-SES-011 callback registration.
 func TestWithOnSymbolVersionChanged(t *testing.T) {
 	s := &Session{}
-	called := make(chan string, 1)
-	WithOnSymbolVersionChanged(func(reason string) { called <- reason })(s)
+	called := make(chan Reason, 1)
+	WithOnSymbolVersionChanged(func(reason Reason) { called <- reason })(s)
 	if s.versionCallback == nil {
 		t.Fatal("callback not stored")
 	}
-	s.versionCallback("test-reason")
+	s.versionCallback(ReasonSymbolVersionInvalid)
 	got := <-called
-	if got != "test-reason" {
-		t.Errorf("callback received %q, want test-reason", got)
+	if got != ReasonSymbolVersionInvalid {
+		t.Errorf("callback received %q, want %q", got, ReasonSymbolVersionInvalid)
 	}
 }

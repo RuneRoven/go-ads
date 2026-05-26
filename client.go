@@ -279,9 +279,7 @@ func (c *Client) listen() {
 			if hint != "" {
 				c.logger.Error("PLC closed connection, transport down",
 					"error", err, "hint", hint,
-					"sourceNetID", fmt.Sprintf("%d.%d.%d.%d.%d.%d",
-						c.source.NetID[0], c.source.NetID[1], c.source.NetID[2],
-						c.source.NetID[3], c.source.NetID[4], c.source.NetID[5]))
+					"sourceNetID", c.source.NetIDString())
 			} else {
 				c.logger.Error("listen read error, transport down", "error", err)
 			}

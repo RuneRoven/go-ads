@@ -335,7 +335,7 @@ func (c *Client) GetSymbolInfoByName(symbolName string) (*Symbol, error) {
 		Group:             entry.IGroup,
 		Offset:            entry.IOffs,
 		Length:            entry.Size,
-		BaseType:          entry.DataType,
+		BaseType:          ADSDataType(entry.DataType),
 		Flags:             flags,
 		ContextMask:       flags.ContextMask(),
 		LastUpdateTime:    time.Now(),

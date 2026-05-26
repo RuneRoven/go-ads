@@ -298,10 +298,10 @@ func TestSession_ReadMultipleSymbols_StaleDetection(t *testing.T) {
 	srv := startScriptableServer(t)
 	defer srv.stop()
 
-	cbReason := make(chan string, 1)
+	cbReason := make(chan Reason, 1)
 	sess, _ := newWiredTestSession(t, srv,
 		WithSymbolVersionStrategy(SymbolVersionIgnore),
-		WithOnSymbolVersionChanged(func(r string) {
+		WithOnSymbolVersionChanged(func(r Reason) {
 			select {
 			case cbReason <- r:
 			default:
@@ -350,10 +350,10 @@ func TestSession_ReadMultipleSymbols_FiresCallbackOncePerBatch(t *testing.T) {
 
 	// Buffer of 4 so a buggy implementation (one callback per stale item)
 	// would visibly fill the channel; correct impl pushes exactly 1.
-	calls := make(chan string, 4)
+	calls := make(chan Reason, 4)
 	sess, _ := newWiredTestSession(t, srv,
 		WithSymbolVersionStrategy(SymbolVersionIgnore),
-		WithOnSymbolVersionChanged(func(r string) { calls <- r }),
+		WithOnSymbolVersionChanged(func(r Reason) { calls <- r }),
 	)
 	seedSymbol(sess, "MAIN.a", 0x2001)
 	seedSymbol(sess, "MAIN.b", 0x2002)
@@ -403,10 +403,10 @@ func TestSession_WriteMultipleSymbols_StaleDetection(t *testing.T) {
 	srv := startScriptableServer(t)
 	defer srv.stop()
 
-	cbReason := make(chan string, 1)
+	cbReason := make(chan Reason, 1)
 	sess, _ := newWiredTestSession(t, srv,
 		WithSymbolVersionStrategy(SymbolVersionIgnore),
-		WithOnSymbolVersionChanged(func(r string) {
+		WithOnSymbolVersionChanged(func(r Reason) {
 			select {
 			case cbReason <- r:
 			default:

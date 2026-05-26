@@ -585,21 +585,27 @@ func (rc ReturnCode) Error() string {
 // The PLC sends these numeric codes in symbolEntry.DataType to identify
 // the base type of a variable. Works on both TwinCAT 2 and TwinCAT 3.
 // Source: Beckhoff TC2_Utilities ADSDATATYPEID
+// ADSDataType identifies a primitive IEC 61131-3 data type by the numeric
+// code Beckhoff publishes in symbolEntry.DataType. Works on both TwinCAT 2
+// and TwinCAT 3. The companion ADSTBigType code is the catch-all for
+// composite types (structs, enums, type aliases, arrays).
+type ADSDataType uint32
+
 const (
-	ADSTVoid    uint32 = 0
-	ADSTInt16   uint32 = 2  // INT
-	ADSTInt32   uint32 = 3  // DINT
-	ADSTReal32  uint32 = 4  // REAL
-	ADSTReal64  uint32 = 5  // LREAL
-	ADSTInt8    uint32 = 16 // SINT
-	ADSTUint8   uint32 = 17 // USINT/BYTE
-	ADSTUint16  uint32 = 18 // UINT/WORD
-	ADSTUint32  uint32 = 19 // UDINT/DWORD
-	ADSTInt64   uint32 = 20 // LINT
-	ADSTUint64  uint32 = 21 // ULINT/LWORD
-	ADSTString  uint32 = 30 // STRING
-	ADSTWString uint32 = 31 // WSTRING
-	ADSTBool    uint32 = 33 // BOOL
+	ADSTVoid    ADSDataType = 0
+	ADSTInt16   ADSDataType = 2  // INT
+	ADSTInt32   ADSDataType = 3  // DINT
+	ADSTReal32  ADSDataType = 4  // REAL
+	ADSTReal64  ADSDataType = 5  // LREAL
+	ADSTInt8    ADSDataType = 16 // SINT
+	ADSTUint8   ADSDataType = 17 // USINT/BYTE
+	ADSTUint16  ADSDataType = 18 // UINT/WORD
+	ADSTUint32  ADSDataType = 19 // UDINT/DWORD
+	ADSTInt64   ADSDataType = 20 // LINT
+	ADSTUint64  ADSDataType = 21 // ULINT/LWORD
+	ADSTString  ADSDataType = 30 // STRING
+	ADSTWString ADSDataType = 31 // WSTRING
+	ADSTBool    ADSDataType = 33 // BOOL
 	// ADSTBigType is the PLC's catch-all for composite/user-defined types:
 	// structs, enums, type aliases, arrays. PLC sends this when the leaf does
 	// not have a primitive ADST_ code (e.g. TC2 always reports enums this way;
@@ -607,13 +613,13 @@ const (
 	// for opaque types). Structs are caught earlier by the parse path's
 	// Children branch, so a symbol reaching inferBaseType with BIGTYPE + a
 	// 1/2/4/8 byte size is enum-like — safe to interpret as signed integer.
-	ADSTBigType uint32 = 65
+	ADSTBigType ADSDataType = 65
 )
 
 // adsTypeToString maps an ADST_ numeric type code to the corresponding
 // IEC 61131-3 type name used in the parse switch statement.
 // Returns "" for unknown or composite types.
-func adsTypeToString(code uint32) string {
+func adsTypeToString(code ADSDataType) string {
 	switch code {
 	case ADSTBool:
 		return "BOOL"
@@ -699,19 +705,21 @@ func (s SymbolVersionStrategy) String() string {
 	}
 }
 
-// Reason values populate Update.Reason (R-NOT-016) and the
-// WithOnSymbolVersionChanged callback. These strings are STABLE — safe
-// for switch/case comparison by callers. New reasons may be added in
-// future versions; callers SHOULD have a default branch.
+// Reason is the enumerated cause of a stale-cache detection or one-shot
+// Update.Stale notification. Values are STABLE — safe for switch/case
+// comparison by callers. New reasons may be added in future versions;
+// callers SHOULD have a default branch.
+type Reason string
+
 const (
-	ReasonSymbolVersionInvalid = "symbol-version-invalid"
-	ReasonSymbolNotFound       = "symbol-not-found"
-	ReasonInvalidOffset        = "invalid-offset"
-	ReasonSymbolNotActive      = "symbol-not-active"
-	ReasonNotifyHandleInvalid  = "notify-handle-invalid"
-	ReasonInvalidSize          = "invalid-size"
-	ReasonReloadCapExhausted   = "reload-cap-exhausted"
-	ReasonReloadInProgress     = "reload-in-progress"
+	ReasonSymbolVersionInvalid Reason = "symbol-version-invalid"
+	ReasonSymbolNotFound       Reason = "symbol-not-found"
+	ReasonInvalidOffset        Reason = "invalid-offset"
+	ReasonSymbolNotActive      Reason = "symbol-not-active"
+	ReasonNotifyHandleInvalid  Reason = "notify-handle-invalid"
+	ReasonInvalidSize          Reason = "invalid-size"
+	ReasonReloadCapExhausted   Reason = "reload-cap-exhausted"
+	ReasonReloadInProgress     Reason = "reload-in-progress"
 )
 
 // detectStaleCache classifies a PLC return code against the R-CACHE-009
@@ -719,7 +727,7 @@ const (
 // staleness from a PLC online change; (false, "") otherwise.
 //
 // Detection codes verified against Beckhoff InfoSys (TC2 Utilities).
-func detectStaleCache(rc ReturnCode) (stale bool, reason string) {
+func detectStaleCache(rc ReturnCode) (stale bool, reason Reason) {
 	switch rc {
 	case ReturnCodeDeviceSymbolVersionInvalid: // 0x711 — Beckhoff: "online change. Create a new handle."
 		return true, ReasonSymbolVersionInvalid

@@ -25,9 +25,10 @@ type amsHeader struct {
 	InvokeID  uint32
 }
 
-// stringToNetID converts a dotted notation NetID string (e.g. "192.168.1.1.1.1") to a 6-byte array.
-// Returns an error if the string is malformed (wrong number of parts or non-numeric values).
-func stringToNetID(source string) (result [6]byte, err error) {
+// ParseNetID converts a dotted-notation NetID string (e.g. "192.168.1.1.1.1")
+// to a 6-byte array. Returns an error if the string is malformed (wrong
+// number of parts or non-numeric values).
+func ParseNetID(source string) (result [6]byte, err error) {
 	parts := strings.Split(source, ".")
 	if len(parts) != 6 {
 		return result, fmt.Errorf("invalid NetID %q: expected 6 dot-separated parts, got %d", source, len(parts))
@@ -40,6 +41,33 @@ func stringToNetID(source string) (result [6]byte, err error) {
 		result[i] = byte(value)
 	}
 	return
+}
+
+// NewAMSAddress parses a dotted-notation NetID string plus a uint16 port
+// into an AMSAddress. The typical TwinCAT 3 PLC runtime listens on port
+// 851 (PortR0PlcTc3).
+func NewAMSAddress(netID string, port uint16) (AMSAddress, error) {
+	id, err := ParseNetID(netID)
+	if err != nil {
+		return AMSAddress{}, err
+	}
+	return AMSAddress{NetID: id, Port: port}, nil
+}
+
+// NetIDString returns the AMS NetID in dotted notation
+// (e.g. "192.168.1.1.1.1"). Use String for the full "NetID:Port" form.
+func (a AMSAddress) NetIDString() string {
+	return fmt.Sprintf("%d.%d.%d.%d.%d.%d", a.NetID[0], a.NetID[1], a.NetID[2], a.NetID[3], a.NetID[4], a.NetID[5])
+}
+
+// String returns "NetID:Port" in dotted notation, e.g. "1.2.3.4.1.1:851".
+func (a AMSAddress) String() string {
+	return fmt.Sprintf("%s:%d", a.NetIDString(), a.Port)
+}
+
+// Equal reports whether a and other have the same NetID and Port.
+func (a AMSAddress) Equal(other AMSAddress) bool {
+	return a.NetID == other.NetID && a.Port == other.Port
 }
 
 // encode lives on *Client. Session callers reach it via s.client.encode
