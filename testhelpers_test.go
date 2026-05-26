@@ -153,6 +153,18 @@ func buildNotificationPacketMultiSample(stamps []struct {
 	return buf.Bytes()
 }
 
+// testEndpoint returns the conventional AMSEndpoint used by unit tests:
+// loopback IP, TwinCAT TCP default port, fixed AMS NetID 1.2.3.4.1.1,
+// AMS port 851 (PortR0PlcTc3). Tests that need a different target should
+// build their own AMSEndpoint inline.
+func testEndpoint() AMSEndpoint {
+	return AMSEndpoint{
+		IP:   "127.0.0.1",
+		Port: 48898,
+		AMS:  AMSAddress{NetID: [6]byte{1, 2, 3, 4, 1, 1}, Port: 851},
+	}
+}
+
 // newTestConnection creates a minimal Session for unit testing notification parsing.
 // The Session has a synthetic *Client wired with its handleNotification installed
 // so packet-level tests can drive `conn.client.Load().deviceNotification(ctx, packet)`

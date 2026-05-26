@@ -98,16 +98,28 @@ func symbolVersionSession(t *testing.T, strategy string, extraOpts ...SessionOpt
 	default:
 		t.Fatalf("unknown strategy %q", strategy)
 	}
-	opts = append(opts, WithOnSymbolVersionChanged(func(reason string) {
+	opts = append(opts, WithOnSymbolVersionChanged(func(reason Reason) {
 		t.Logf("symbol-version-changed callback: reason=%s", reason)
 	}))
+	target, err := NewAMSAddress(targetAMS, uint16(targetPort))
+	if err != nil {
+		t.Fatalf("invalid target AMS: %v", err)
+	}
+	opts = append(opts, WithRequestTimeout(5*time.Second), WithLocalAMS(AMSAddress{Port: 11000}))
+	if localAMS != "auto" && localAMS != "" {
+		local, err := NewAMSAddress(localAMS, 11000)
+		if err != nil {
+			t.Fatalf("invalid local AMS: %v", err)
+		}
+		opts = append(opts, WithLocalAMS(local))
+	}
 	opts = append(opts, extraOpts...)
 
-	sess, err := NewSession(ip, 48898, targetAMS, targetPort, localAMS, 11000, 5*time.Second, opts...)
+	sess, err := NewSession(context.Background(), AMSEndpoint{IP: ip, Port: 48898, AMS: target}, opts...)
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
-	if err := sess.Connect(false); err != nil {
+	if err := sess.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	t.Cleanup(func() { sess.Close() })

@@ -151,21 +151,46 @@ type Session struct {
 	logger *slog.Logger
 }
 
-// NewSession creates a new ADS session. requestTimeout is the timeout for
-// individual ADS requests; if zero, a 5 s default is used. If localPort is
-// non-positive, 10500 is used (arbitrary AMS source port for protocol headers).
+// AMSEndpoint identifies a remote ADS endpoint at the TCP and AMS layers.
+// IP+Port locate the TwinCAT runtime over TCP (port 48898 by default);
+// AMS is the target AMSAddress carried in every ADS request header.
+type AMSEndpoint struct {
+	IP   string
+	Port int
+	AMS  AMSAddress
+}
+
+// NewSession creates a new ADS session targeting remote. The session does
+// no I/O until Connect; ctx is captured for the long-lived session
+// lifecycle and cancelling it shuts the session down.
 //
-// The session manages its own lifecycle context internally so that Close()
-// can send cleanup commands regardless of any caller context state.
+// Local AMS NetID + port default to auto-derivation from the local TCP
+// address and port 10500. Override with WithLocalAMS / WithRequestTimeout
+// / other options.
+//
 // Use sess.Close() to shut down the session.
-func NewSession(ip string, port int, netid string, amsPort int, localNetID string, localPort int, requestTimeout time.Duration, opts ...SessionOption) (sess *Session, err error) {
-	if requestTimeout <= 0 {
-		requestTimeout = 5000 * time.Millisecond
+func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) (sess *Session, err error) {
+	if remote.IP == "" {
+		return nil, fmt.Errorf("ads: NewSession: remote.IP must be set")
 	}
+	if remote.Port <= 0 {
+		remote.Port = 48898 // TwinCAT TCP default
+	}
+	if remote.AMS.NetID == [6]byte{} {
+		return nil, fmt.Errorf("ads: NewSession: remote.AMS.NetID must be set")
+	}
+	if remote.AMS.Port == 0 {
+		return nil, fmt.Errorf("ads: NewSession: remote.AMS.Port must be set (e.g. PortR0PlcTc3 = 851)")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sessCtx, cancel := context.WithCancel(ctx)
 	sess = &Session{
-		ip:             ip,
-		port:           port,
-		requestTimeout: requestTimeout,
+		ip:             remote.IP,
+		port:           remote.Port,
+		target:         remote.AMS,
+		requestTimeout: 5 * time.Second,
 		route:          &routeManager{},
 		notifications:  &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
 		cache: &symbolCache{
@@ -183,50 +208,34 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 			maxReconnectAttempts: 0, // 0 = infinite retries
 			backoffConfig:        DefaultBackoffConfig(),
 			closedCh:             make(chan struct{}),
+			ctx:                  sessCtx,
+			shutdown:             cancel,
 		},
 		logger: slog.Default(),
 	}
-	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(context.Background()) //nolint:gosec // cancel stored in lifecycle.shutdown, called from Close
 	// idempotent: zero state is Constructed already
 	sess.lifecycle.state.transitionTo(SessionStateConstructed)
 	// Online-change defaults (R-SES-011, R-CACHE-013). Applied before opts so
-	// callers can override. versionStrategy zero-value = SymbolVersionAutoReload
-	// is intentional — no init needed (verified by
-	// TestSymbolVersionStrategy_ZeroValueIsAutoReload).
+	// callers can override.
 	sess.maxReloadAttempts = 3
 	sess.reloadWindow = 60 * time.Second
+	// Default local AMS port; WithLocalAMS may override.
+	sess.source.Port = 10500
 	for _, opt := range opts {
 		opt(sess)
 	}
-	netIDBytes, err := ParseNetID(netid)
-	if err != nil {
-		return nil, fmt.Errorf("invalid target NetID: %w", err)
-	}
-	sess.target.NetID = netIDBytes
-	sess.target.Port = uint16(amsPort)
-	if localNetID != "auto" && localNetID != "" {
-		localBytes, err := ParseNetID(localNetID)
-		if err != nil {
-			return nil, fmt.Errorf("invalid local NetID: %w", err)
-		}
-		sess.source.NetID = localBytes
-	}
-	// If localNetID is "auto" or empty, source.NetID stays zero and will be auto-derived in Connect()
-	if localPort <= 0 {
-		localPort = 10500
-	}
-	sess.source.Port = uint16(localPort)
-	// closedCh and ctx/shutdown initialized in struct literal above (lifecycle field).
-	return
+	return sess, nil
 }
 
-// Connect dials the PLC and transitions the session to Connected.
-// local=true targets the in-process TwinCAT runtime (127.0.0.1).
+// Connect dials the PLC and transitions the session to Connected. Local-mode
+// (in-process TwinCAT runtime at 127.0.0.1) is selected via WithLocalMode at
+// NewSession time.
+//
 // Not safe for concurrent invocation on the same Session — the FSM gate via
 // transitionToOnce(Connecting) serializes callers, but races on sess.tx /
 // sess.client publishing would still leak resources. Call once per Session.
-func (sess *Session) Connect(local bool) (retErr error) {
-	sess.isLocal = local
+func (sess *Session) Connect(ctx context.Context) (retErr error) {
+	local := sess.isLocal
 	// transitionToOnce returns ok=false if another goroutine already won
 	// the Constructed→Connecting transition; reject concurrent calls rather
 	// than letting both race on socket + client publish.
@@ -377,7 +386,7 @@ func (sess *Session) Connect(local bool) (retErr error) {
 	// (which sends an ADS command over TCP). If route is registered, TCP reconnect
 	// is needed because PLC may close connections from previously-unknown NetIDs.
 	if sess.route.name != "" {
-		registered, err := sess.ensureRouteOnConnect()
+		registered, err := sess.ensureRouteOnConnect(ctx)
 		if err != nil {
 			// WithRoute is an explicit caller requirement — silently swallowing
 			// the error and continuing leads to every subsequent ADS command
@@ -398,7 +407,7 @@ func (sess *Session) Connect(local bool) (retErr error) {
 	}
 
 	// Read symbol version for later change detection (best-effort, don't fail connect)
-	version, err := sess.client.Load().GetSymbolVersion(sess.lifecycle.ctx)
+	version, err := sess.client.Load().GetSymbolVersion(ctx)
 	if err != nil {
 		sess.logger.Debug("could not read symbol version during connect", "error", err)
 	} else {
@@ -416,7 +425,7 @@ func (sess *Session) Connect(local bool) (retErr error) {
 // ensureRouteOnConnect probes the PLC and registers a route if needed during Connect().
 // Returns (registered bool, err error) where registered=true means a route was added
 // and the caller should TCP-reconnect.
-func (sess *Session) ensureRouteOnConnect() (registered bool, err error) {
+func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool, err error) {
 	if sess.isClosed() {
 		return false, fmt.Errorf("connection closed")
 	}
@@ -424,12 +433,12 @@ func (sess *Session) ensureRouteOnConnect() (registered bool, err error) {
 	// Force mode → always register
 	if sess.route.forceRouteRegistration {
 		sess.logger.Info("registering route (force mode)")
-		err = sess.AddRoute(sess.lifecycle.ctx, sess.route.name, sess.route.username, string(sess.route.password))
+		err = sess.AddRoute(ctx, sess.route.name, sess.route.username, string(sess.route.password))
 		return err == nil, err
 	}
 
 	// Probe: try a lightweight ADS command to see if route exists
-	_, probeErr := sess.client.Load().GetSymbolVersion(sess.lifecycle.ctx)
+	_, probeErr := sess.client.Load().GetSymbolVersion(ctx)
 	if probeErr == nil {
 		sess.logger.Info("route already exists on PLC, skipping registration")
 		sess.route.routeProbeFailures.Store(0)
@@ -443,7 +452,7 @@ func (sess *Session) ensureRouteOnConnect() (registered bool, err error) {
 	// Probe failed → register with credentials
 	sess.route.routeProbeFailures.Add(1)
 	sess.logger.Info("route probe failed, registering route", "error", probeErr)
-	err = sess.AddRoute(sess.lifecycle.ctx, sess.route.name, sess.route.username, string(sess.route.password))
+	err = sess.AddRoute(ctx, sess.route.name, sess.route.username, string(sess.route.password))
 	if err != nil {
 		return false, err
 	}

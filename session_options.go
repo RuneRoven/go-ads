@@ -29,6 +29,31 @@ func WithHostIP(ip string) SessionOption {
 	}
 }
 
+// WithLocalAMS sets the local (source) AMSAddress carried in outgoing ADS
+// headers. NetID defaults to auto-derivation from the local TCP source IP
+// when this option is omitted; Port defaults to 10500. AMS port semantics
+// match the wire protocol — any non-conflicting value works for a client.
+func WithLocalAMS(local AMSAddress) SessionOption {
+	return func(s *Session) {
+		if local.NetID != [6]byte{} {
+			s.source.NetID = local.NetID
+		}
+		if local.Port != 0 {
+			s.source.Port = local.Port
+		}
+	}
+}
+
+// WithLocalMode targets the in-process TwinCAT runtime at 127.0.0.1, used
+// when the application runs on the same machine as the PLC runtime. Sets
+// the local-mode flag that Connect uses to short-circuit the route probe
+// and force the loopback target NetID 127.0.0.1.1.1.
+func WithLocalMode() SessionOption {
+	return func(s *Session) {
+		s.isLocal = true
+	}
+}
+
 // WithRoute configures automatic AMS route registration during Connect().
 // The route is registered via UDP (port 48899) after the TCP connection is established
 // and the source AMS NetID is derived, but before any ADS commands are sent.

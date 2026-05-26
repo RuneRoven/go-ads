@@ -41,12 +41,24 @@ func setupConnectionWithDefaults(t *testing.T, d connDefaults) *Session {
 		opts = append(opts, WithRoute(d.routeName, routeUser, routePass))
 	}
 
-	conn, err := NewSession(ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second, opts...)
+	target, err := NewAMSAddress(targetAMS, uint16(targetPort))
+	if err != nil {
+		t.Fatalf("invalid target AMS: %v", err)
+	}
+	opts = append(opts, WithRequestTimeout(5*time.Second), WithLocalAMS(AMSAddress{Port: 10500}))
+	if localAMS != "auto" && localAMS != "" {
+		local, err := NewAMSAddress(localAMS, 10500)
+		if err != nil {
+			t.Fatalf("invalid local AMS: %v", err)
+		}
+		opts = append(opts, WithLocalAMS(local))
+	}
+	conn, err := NewSession(context.Background(), AMSEndpoint{IP: ip, Port: 48898, AMS: target}, opts...)
 	if err != nil {
 		t.Fatalf("NewConnection failed: %v", err)
 	}
 
-	err = conn.Connect(false)
+	err = conn.Connect(context.Background())
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
