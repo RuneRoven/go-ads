@@ -2,7 +2,9 @@
 
 A pure Go library for communicating with Beckhoff TwinCAT PLCs using the ADS (Automation Device Specification) protocol.
 
-> **v2.1 breaking change**: the previous `Connection` type has been renamed to `Session`, and the raw RPC surface has been split off into a separate `Client` type. The constructor is now `NewSession` (no context argument). See [Two layers](#two-layers) for the new architecture and the migration story. v2.0.x is deprecated.
+> **v2.2 breaking change**: every RPC method takes a `context.Context` as the first argument. `NewSession` accepts a typed `AMSEndpoint` plus options instead of 7 positional arguments. `Connect` takes `ctx` instead of a local-mode bool (use `WithLocalMode()`). `Symbol` is unexported (use `SymbolView`). `Update.Stale` is now `*StaleInfo`. See [CHANGELOG.md](CHANGELOG.md) for the full migration sketch.
+>
+> **v2.1 breaking change**: the previous `Connection` type has been renamed to `Session`, and the raw RPC surface has been split off into a separate `Client` type.
 
 ## Features
 
@@ -30,6 +32,7 @@ go get github.com/RuneRoven/go-ads/v2
 package main
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -37,20 +40,24 @@ import (
 )
 
 func main() {
-	sess, _ := ads.NewSession("192.168.1.100", 48898, "5.1.2.3.1.1", 851, "auto", 10500, 5*time.Second,
+	ctx := context.Background()
+
+	target, _ := ads.NewAMSAddress("5.1.2.3.1.1", 851)
+	sess, _ := ads.NewSession(ctx, ads.AMSEndpoint{IP: "192.168.1.100", Port: 48898, AMS: target},
 		ads.WithRoute("my-route", "Administrator", "1"),
+		ads.WithRequestTimeout(5*time.Second),
 	)
-	if err := sess.Connect(false); err != nil {
+	if err := sess.Connect(ctx); err != nil {
 		panic(err)
 	}
 	defer sess.Close()
 
 	// Symbols are resolved on-demand — no full discovery needed.
-	value, _ := sess.ReadFromSymbol("MAIN.myVar")
+	value, _ := sess.ReadFromSymbol(ctx, "MAIN.myVar")
 	fmt.Println("Value:", value)
 
 	// Optional: load full symbol table for listing / struct access.
-	sess.LoadSymbols()
+	sess.LoadSymbols(ctx)
 	symbols, _ := sess.ListSymbols()
 	fmt.Printf("Total symbols: %d\n", len(symbols))
 }
@@ -67,6 +74,8 @@ The library exposes two types. Pick the one that fits your consumer.
 Use this for one-shot consumers — CLI tools, web ADS browsers doing a quick probe, scripts that send a single command and exit.
 
 ```go
+ctx := context.Background()
+
 client, err := ads.Dial(
     "192.168.1.100", 48898,
     ads.AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851},
@@ -79,13 +88,13 @@ if err != nil {
 }
 defer client.Close()
 
-info, _ := client.ReadDeviceInfo()
+info, _ := client.ReadDeviceInfo(ctx)
 fmt.Printf("Device: %s\n", string(info.DeviceName[:]))
 
-handle, _ := client.GetHandleByName("MAIN.myVar")
-defer client.ReleaseHandle(handle)
+handle, _ := client.GetHandleByName(ctx, "MAIN.myVar")
+defer client.ReleaseHandle(ctx, handle)
 
-data, _ := client.Read(uint32(ads.GroupSymbolValueByHandle), handle, 4)
+data, _ := client.Read(ctx, uint32(ads.GroupSymbolValueByHandle), handle, 4)
 fmt.Printf("Value bytes: %v\n", data)
 ```
 
@@ -96,22 +105,28 @@ fmt.Printf("Value bytes: %v\n", data)
 Use this for daemons, message brokers, or anything that should survive a network blip without manual intervention.
 
 ```go
-sess, _ := ads.NewSession("192.168.1.100", 48898, "5.1.2.3.1.1", 851, "auto", 10500, 5*time.Second,
+ctx := context.Background()
+target, _ := ads.NewAMSAddress("5.1.2.3.1.1", 851)
+sess, _ := ads.NewSession(ctx, ads.AMSEndpoint{IP: "192.168.1.100", Port: 48898, AMS: target},
     ads.WithRoute("my-route", "Administrator", "1"),
     ads.WithAutoReconnect(true),
     ads.WithOnReconnect(func() { log.Println("back online") }),
 )
-sess.Connect(false)
+sess.Connect(ctx)
 defer sess.Close()
 
 // Cache-aware read (resolves on-demand, then caches for the connection's lifetime).
-value, _ := sess.ReadFromSymbol("MAIN.myVar")
+value, _ := sess.ReadFromSymbol(ctx, "MAIN.myVar")
 
 // Persistent subscription (resubscribes automatically after a reconnect).
 ch := make(chan *ads.Update, 64)
-sess.AddSymbolNotification("MAIN.bCounter", 100*time.Millisecond, 100*time.Millisecond,
+sess.AddSymbolNotification(ctx, "MAIN.bCounter", 100*time.Millisecond, 100*time.Millisecond,
     ads.TransModeServerOnChange, ch)
 for update := range ch {
+    if update.Stale != nil {
+        fmt.Println("STALE:", update.Stale.Reason, update.Variable, update.Value)
+        continue
+    }
     fmt.Println(update.Variable, update.Value)
 }
 ```
@@ -134,7 +149,8 @@ See `examples/cli/README.md` for the full env-var reference.
 All options are passed to `NewSession` and have sensible defaults:
 
 ```go
-sess, _ := ads.NewSession(ip, 48898, netid, 851, "auto", 10500, 5*time.Second,
+target, _ := ads.NewAMSAddress(netid, 851)
+sess, _ := ads.NewSession(ctx, ads.AMSEndpoint{IP: ip, Port: 48898, AMS: target},
     // Route registration — probe first, register with credentials only if needed
     ads.WithRoute("my-route", "Administrator", "1"),
 
@@ -185,7 +201,10 @@ sess, _ := ads.NewSession(ip, 48898, netid, 851, "auto", 10500, 5*time.Second,
 | `WithSymbolVersionStrategy(s)` | `SymbolVersionAutoReload` | Online-change handling strategy (`AutoReload` / `Close` / `Ignore`) |
 | `WithMaxSymbolVersionReloadAttempts(n)` | `3` | Cap reload attempts within the sliding window (AutoReload only) |
 | `WithSymbolVersionReloadWindow(d)` | `60s` | Sliding window length for the reload-attempt cap |
-| `WithOnSymbolVersionChanged(fn)` | None | Callback fired once per online-change detection (`reason` from R-NOT-016) |
+| `WithOnSymbolVersionChanged(fn)` | None | Callback fired once per online-change detection (`reason` is one of the `Reason*` constants) |
+| `WithLocalAMS(addr)` | NetID auto-derived, Port 10500 | Override local (source) AMSAddress for protocol headers |
+| `WithLocalMode()` | Off | Target the in-process TwinCAT runtime at 127.0.0.1 |
+| `WithRequestTimeout(d)` | 5s | Per-request timeout for ADS commands and initial TCP dial |
 
 ### Combining options
 
@@ -228,17 +247,17 @@ Process image methods live on `*Client` only — they are pure wire ops with no 
 
 ```go
 // Read 4 bytes from input image at byte offset 0
-data, _ := client.ReadProcessInput(0, 4)
+data, _ := client.ReadProcessInput(ctx, 0, 4)
 
 // Read a single input bit (byte 2, bit 3)
-val, _ := client.ReadProcessInputBit(2, 3)
+val, _ := client.ReadProcessInputBit(ctx, 2, 3)
 
 // Write to output image (use with extreme caution)
-client.WriteProcessOutput(10, []byte{0xFF})
-client.WriteProcessOutputBit(10, 0, true)
+client.WriteProcessOutput(ctx, 10, []byte{0xFF})
+client.WriteProcessOutputBit(ctx, 10, 0, true)
 
 // Query input image size
-size, _ := client.ReadProcessInputSize()
+size, _ := client.ReadProcessInputSize(ctx)
 ```
 
 ## Development
@@ -284,10 +303,11 @@ ADS works with pre-existing routes but `WithRoute` cannot register new ones.
 Only route credentials are needed — `WithHostIP` and `ADS_LOCAL_AMS` are optional:
 
 ```go
-sess, _ := ads.NewSession(plcIP, 48898, targetAMS, 851, "auto", 10500, 5*time.Second,
+target, _ := ads.NewAMSAddress(targetAMS, 851)
+sess, _ := ads.NewSession(ctx, ads.AMSEndpoint{IP: plcIP, Port: 48898, AMS: target},
     ads.WithRoute("my-route", "Administrator", "password"),
 )
-sess.Connect(false)
+sess.Connect(ctx)
 ```
 
 The PLC stores the UDP source IP (post-NAT) for the route, not the `computerName` from the
