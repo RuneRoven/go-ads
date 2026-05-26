@@ -63,10 +63,9 @@ type Update struct {
 	// after a 0x711 / 0x705 / 0x710 / 0x704 / 0x703 / 0x702 ReturnCode was
 	// observed; the next reload will re-resolve the handle.
 	Stale bool
-	// Reason is non-empty when Stale=true. Enumerated values:
-	// symbol-version-invalid, invalid-size, target-not-reachable,
-	// service-not-supported, parameter-invalid, reload-in-progress.
-	Reason string
+	// Reason is non-empty when Stale=true. See the Reason* constants for
+	// enumerated values.
+	Reason Reason
 }
 
 // NotificationConfig holds configuration for a symbol notification, used for batch add and reconnect re-subscribe.

@@ -166,7 +166,7 @@ type Symbol struct {
 	Group             uint32
 	Offset            uint32
 	Length            uint32
-	BaseType          uint32 // ADST_ numeric type code from protocol (e.g., ADSTReal32=4 for REAL)
+	BaseType          ADSDataType // protocol ADST_ code (e.g., ADSTReal32=4 for REAL)
 	Flags             SymbolFlag
 	ContextMask       uint8 // PLC task context (bits 8-11 of Flags); 0 = no task binding
 
@@ -208,7 +208,7 @@ type SymbolView struct {
 	Group       uint32
 	Offset      uint32
 	Length      uint32
-	BaseType    uint32 // ADST_ numeric type code from protocol
+	BaseType    ADSDataType // protocol ADST_ code; see adsTypeToString
 	Flags       SymbolFlag
 	ContextMask uint8 // PLC task context (bits 8-11 of Flags); 0 = no task binding
 	Parsed      bool  // true if Value has been parsed at least once at snapshot time
@@ -436,7 +436,7 @@ func addSymbol(symbol symbolUploadSymbol, datatypes map[string]SymbolUploadDataT
 		DataType:          symbol.DataType,
 		Comment:           symbol.Comment,
 		Length:            symbol.SymbolEntry.Size,
-		BaseType:          symbol.SymbolEntry.DataType,
+		BaseType:          ADSDataType(symbol.SymbolEntry.DataType),
 		Group:             symbol.SymbolEntry.IGroup,
 		Offset:            symbol.SymbolEntry.IOffs,
 		Flags:             flags,

@@ -479,9 +479,9 @@ func TestNotification_TerminalZeroByteSample_TriggersDetection(t *testing.T) {
 	conn := newTestConnection()
 	defer conn.lifecycle.shutdown()
 
-	cbReason := make(chan string, 1)
+	cbReason := make(chan Reason, 1)
 	conn.versionStrategy = SymbolVersionIgnore
-	conn.versionCallback = func(r string) {
+	conn.versionCallback = func(r Reason) {
 		select {
 		case cbReason <- r:
 		default:
@@ -626,8 +626,8 @@ func TestNotification_ListenerPathTriggersIgnoreMarksOtherHandles(t *testing.T) 
 	defer conn.lifecycle.shutdown()
 	conn.versionStrategy = SymbolVersionIgnore
 
-	cbReason := make(chan string, 1)
-	conn.versionCallback = func(r string) {
+	cbReason := make(chan Reason, 1)
+	conn.versionCallback = func(r Reason) {
 		select {
 		case cbReason <- r:
 		default:

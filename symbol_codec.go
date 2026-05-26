@@ -286,7 +286,7 @@ var parseableTypes = []string{
 // inspects only `size` because the 1/2-byte cases are unambiguous regardless
 // of baseType; future tightening (refusing 1/2-byte inference when baseType
 // indicates a non-integer primitive) lands here.
-func inferBaseType(size, baseType uint32) string {
+func inferBaseType(size uint32, baseType ADSDataType) string {
 	_ = baseType // reserved for future width+type tightening; see godoc above.
 	switch size {
 	case 1:

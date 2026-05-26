@@ -220,7 +220,7 @@ func WithSymbolVersionReloadWindow(d time.Duration) SessionOption {
 // symbol-removed events: the dead handle's user channel goes silent (no
 // terminal Update). Surviving sibling handles still receive a one-shot
 // Stale=true Update; only the removed symbol's channel is mute.
-func WithOnSymbolVersionChanged(fn func(reason string)) SessionOption {
+func WithOnSymbolVersionChanged(fn func(reason Reason)) SessionOption {
 	return func(sess *Session) {
 		sess.versionCallback = fn
 	}

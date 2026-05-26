@@ -136,13 +136,13 @@ type Session struct {
 
 	// Online-change handling (R-SES-011, R-CACHE-013).
 	versionStrategy   SymbolVersionStrategy
-	versionCallback   func(reason string)
+	versionCallback   func(reason Reason)
 	maxReloadAttempts int
 	reloadWindow      time.Duration
 	reloadAttempts    []time.Time
 	reloadMu          sync.Mutex
 	reloadInProgress  atomic.Bool
-	staleHandles      map[uint32]string
+	staleHandles      map[uint32]Reason
 	staleHandlesMu    sync.Mutex
 
 	// Route registration config (populated by WithRoute / WithForceRouteRegistration).
@@ -198,14 +198,14 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 	for _, opt := range opts {
 		opt(sess)
 	}
-	netIDBytes, err := stringToNetID(netid)
+	netIDBytes, err := ParseNetID(netid)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target NetID: %w", err)
 	}
 	sess.target.NetID = netIDBytes
 	sess.target.Port = uint16(amsPort)
 	if localNetID != "auto" && localNetID != "" {
-		localBytes, err := stringToNetID(localNetID)
+		localBytes, err := ParseNetID(localNetID)
 		if err != nil {
 			return nil, fmt.Errorf("invalid local NetID: %w", err)
 		}
@@ -289,7 +289,7 @@ func (sess *Session) Connect(local bool) (retErr error) {
 			}
 			sess.source.NetID = [6]byte{ip[0], ip[1], ip[2], ip[3], 1, 1}
 			sess.logger.Info("auto-derived source AMS NetID from local IP",
-				"netid", fmt.Sprintf("%d.%d.%d.%d.1.1", ip[0], ip[1], ip[2], ip[3]))
+				"netid", sess.source.NetIDString())
 		}
 
 		// NAT/Docker detection: compare TCP and UDP source IPs
@@ -324,9 +324,9 @@ func (sess *Session) Connect(local bool) (retErr error) {
 		routeHostIP = fmt.Sprintf("%d.%d.%d.%d (from NetID, PLC will use UDP source IP)", sess.source.NetID[0], sess.source.NetID[1], sess.source.NetID[2], sess.source.NetID[3])
 	}
 	sess.logger.Info("ADS addressing",
-		"sourceNetID", fmt.Sprintf("%d.%d.%d.%d.%d.%d", sess.source.NetID[0], sess.source.NetID[1], sess.source.NetID[2], sess.source.NetID[3], sess.source.NetID[4], sess.source.NetID[5]),
+		"sourceNetID", sess.source.NetIDString(),
 		"routeHostIP", routeHostIP,
-		"target", fmt.Sprintf("%d.%d.%d.%d.%d.%d:%d", sess.target.NetID[0], sess.target.NetID[1], sess.target.NetID[2], sess.target.NetID[3], sess.target.NetID[4], sess.target.NetID[5], sess.target.Port))
+		"target", sess.target.String())
 
 	sess.logger.Log(context.Background(), LevelTrace, "connected")
 	// Allocate the underlying Client and start its workers. Session and
@@ -464,7 +464,7 @@ func (sess *Session) ensureRouteOnConnect() (registered bool, err error) {
 //   - SymbolVersionClose: terminate the session asynchronously
 //     (R-CACHE-011).
 //   - SymbolVersionAutoReload: trigger full reload + resub (R-CACHE-010).
-func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason string) {
+func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason Reason) {
 	stale, reason = detectStaleCache(rc)
 	if !stale {
 		return false, ""
@@ -504,18 +504,18 @@ func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason str
 // markSymbolStale flags the next notification sample for handle h to be
 // delivered with Update.Stale=true and Update.Reason=reason. One-shot —
 // consumed on first delivery via consumeStaleFlag (R-NOT-017).
-func (sess *Session) markSymbolStale(handle uint32, reason string) {
+func (sess *Session) markSymbolStale(handle uint32, reason Reason) {
 	sess.staleHandlesMu.Lock()
 	defer sess.staleHandlesMu.Unlock()
 	if sess.staleHandles == nil {
-		sess.staleHandles = map[uint32]string{}
+		sess.staleHandles = map[uint32]Reason{}
 	}
 	sess.staleHandles[handle] = reason
 }
 
 // consumeStaleFlag returns the pending stale reason for handle h and
 // clears the entry. Returns ("", false) if no pending flag (R-NOT-017).
-func (sess *Session) consumeStaleFlag(handle uint32) (string, bool) {
+func (sess *Session) consumeStaleFlag(handle uint32) (Reason, bool) {
 	sess.staleHandlesMu.Lock()
 	defer sess.staleHandlesMu.Unlock()
 	r, ok := sess.staleHandles[handle]
@@ -531,7 +531,7 @@ func (sess *Session) consumeStaleFlag(handle uint32) (string, bool) {
 //
 // Nil-guard: bare Session{} unit tests may construct without the
 // notification manager; production NewSession always sets it.
-func (sess *Session) markAllHandlesStale(reason string) {
+func (sess *Session) markAllHandlesStale(reason Reason) {
 	if sess.notifications == nil {
 		return
 	}
@@ -554,7 +554,7 @@ func (sess *Session) markAllHandlesStale(reason string) {
 // contract) before Close() so observers see the lifecycle event even
 // though the termination is locally initiated. Skipped if the session is
 // already Closed (idempotent re-entry).
-func (sess *Session) closeOnStaleDetection(reason string) {
+func (sess *Session) closeOnStaleDetection(reason Reason) {
 	sess.logger.Info("Close strategy fired on stale-cache detection", "reason", reason)
 	if sess.onDisconnect != nil && !sess.isClosed() {
 		go sess.onDisconnect()
@@ -594,7 +594,7 @@ func (sess *Session) tryRecordReloadAttempt() bool {
 // Sequence: markAllHandlesStale(ReasonReloadInProgress) → bumpEpoch →
 // zero old handles → LoadSymbols → resubscribeNotifications →
 // fire onReconnect.
-func (sess *Session) autoReloadOnStaleDetection(reason string) {
+func (sess *Session) autoReloadOnStaleDetection(reason Reason) {
 	defer sess.reloadInProgress.Store(false)
 	if !sess.tryRecordReloadAttempt() {
 		sess.logger.Warn("reload cap exhausted - degrading to Ignore",

@@ -375,12 +375,12 @@ func buildSumDeleteNotifPayload(codes []ReturnCode) []byte {
 
 // buildSymbolInfoPayload encodes a GetSymbolInfoByName response: symbolEntry
 // struct followed by name+0, datatype+0, comment+0.
-func buildSymbolInfoPayload(name, dataType, comment string, group, offset, size, baseType uint32, flags SymbolFlag) []byte {
+func buildSymbolInfoPayload(name, dataType, comment string, group, offset, size uint32, baseType ADSDataType, flags SymbolFlag) []byte {
 	entry := symbolEntry{
 		IGroup:        group,
 		IOffs:         offset,
 		Size:          size,
-		DataType:      baseType,
+		DataType:      uint32(baseType),
 		Flags:         uint32(flags),
 		NameLength:    uint16(len(name)),
 		TypeLength:    uint16(len(dataType)),

@@ -334,10 +334,10 @@ func TestSession_HandleStaleDetection_NoMatch(t *testing.T) {
 //
 // Validates: R-CACHE-012 (Ignore) + R-NOT-016 (callback reason).
 func TestSession_HandleStaleDetection_Ignore_FiresCallback(t *testing.T) {
-	cbReason := make(chan string, 1)
+	cbReason := make(chan Reason, 1)
 	sess := &Session{
 		versionStrategy: SymbolVersionIgnore,
-		versionCallback: func(r string) { cbReason <- r },
+		versionCallback: func(r Reason) { cbReason <- r },
 		logger:          getDefaultLogger(),
 	}
 
@@ -538,8 +538,8 @@ func TestSession_AutoReload_CapExhaustion_FiresCallback(t *testing.T) {
 	srv := startScriptableServer(t)
 	defer srv.stop()
 
-	exhausted := make(chan string, 4)
-	cb := func(reason string) {
+	exhausted := make(chan Reason, 4)
+	cb := func(reason Reason) {
 		if reason == ReasonReloadCapExhausted {
 			select {
 			case exhausted <- reason:
@@ -649,10 +649,10 @@ func TestSession_ReadFromSymbol_LengthMismatchTriggersDetection(t *testing.T) {
 		return ReturnCodeNoErrors, []byte{0x05, 0x00}
 	})
 
-	cbReason := make(chan string, 1)
+	cbReason := make(chan Reason, 1)
 	sess, _ := newWiredTestSession(t, srv,
 		WithSymbolVersionStrategy(SymbolVersionIgnore),
-		WithOnSymbolVersionChanged(func(r string) { cbReason <- r }),
+		WithOnSymbolVersionChanged(func(r Reason) { cbReason <- r }),
 	)
 
 	// Pre-seed the cache with a stale LREAL (Length=8) symbol carrying an
@@ -837,7 +837,7 @@ func TestHandleStaleDetection_Ignore_FiresCallbackPerTrigger(t *testing.T) {
 	sess.versionStrategy = SymbolVersionIgnore
 
 	var callbacks atomic.Int32
-	sess.versionCallback = func(_ string) {
+	sess.versionCallback = func(_ Reason) {
 		callbacks.Add(1)
 	}
 

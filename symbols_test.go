@@ -596,7 +596,7 @@ func TestMakeArrayChildren_ZeroElements(t *testing.T) {
 func TestInferBaseType(t *testing.T) {
 	tests := []struct {
 		size     uint32
-		baseType uint32
+		baseType ADSDataType
 		want     string
 	}{
 		{1, 0, "SINT"},

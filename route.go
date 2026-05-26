@@ -49,7 +49,7 @@ func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID
 	}
 	logger.Info("registering route",
 		"remoteHost", remoteHost,
-		"localNetID", fmt.Sprintf("%d.%d.%d.%d.%d.%d", localNetID[0], localNetID[1], localNetID[2], localNetID[3], localNetID[4], localNetID[5]),
+		"localNetID", AMSAddress{NetID: localNetID}.NetIDString(),
 		"computerName", computerName,
 		"routeName", routeName,
 		"hasAuth", username != "")

@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// --- stringToNetID ---
+// --- ParseNetID ---
 
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
 // Pins NetID parser semantics: six dot-separated decimal octets → [6]byte.
@@ -24,12 +24,12 @@ func TestStringToNetID(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			result, err := stringToNetID(tt.input)
+			result, err := ParseNetID(tt.input)
 			if err != nil {
-				t.Fatalf("stringToNetID(%q) unexpected error: %v", tt.input, err)
+				t.Fatalf("ParseNetID(%q) unexpected error: %v", tt.input, err)
 			}
 			if result != tt.expected {
-				t.Errorf("stringToNetID(%q) = %v, want %v", tt.input, result, tt.expected)
+				t.Errorf("ParseNetID(%q) = %v, want %v", tt.input, result, tt.expected)
 			}
 		})
 	}
@@ -50,9 +50,9 @@ func TestStringToNetIDErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.desc, func(t *testing.T) {
-			_, err := stringToNetID(tt.input)
+			_, err := ParseNetID(tt.input)
 			if err == nil {
-				t.Errorf("stringToNetID(%q) expected error for %s, got nil", tt.input, tt.desc)
+				t.Errorf("ParseNetID(%q) expected error for %s, got nil", tt.input, tt.desc)
 			}
 		})
 	}
@@ -230,7 +230,7 @@ func TestAppendNull(t *testing.T) {
 // Validates: R-SYM-004.
 func TestADSTypeToString(t *testing.T) {
 	tests := []struct {
-		code uint32
+		code ADSDataType
 		want string
 	}{
 		{ADSTBool, "BOOL"},
@@ -287,7 +287,7 @@ func TestSymbolVersionStrategy_String(t *testing.T) {
 
 // Validates: R-NOT-016 reason enumeration.
 func TestStaleReasonConstants(t *testing.T) {
-	cases := map[string]string{
+	cases := map[Reason]string{
 		ReasonSymbolVersionInvalid: "symbol-version-invalid",
 		ReasonSymbolNotFound:       "symbol-not-found",
 		ReasonInvalidOffset:        "invalid-offset",
@@ -298,8 +298,8 @@ func TestStaleReasonConstants(t *testing.T) {
 		ReasonReloadInProgress:     "reload-in-progress",
 	}
 	for got, want := range cases {
-		if got != want {
-			t.Errorf("constant value drift: got %q, want %q", got, want)
+		if string(got) != want {
+			t.Errorf("constant value drift: got %q, want %q", string(got), want)
 		}
 	}
 }
@@ -309,7 +309,7 @@ func TestDetectStaleCache(t *testing.T) {
 	tests := []struct {
 		rc        ReturnCode
 		wantStale bool
-		wantReas  string
+		wantReas  Reason
 	}{
 		// 5 codes in detection set.
 		{ReturnCodeDeviceSymbolVersionInvalid, true, ReasonSymbolVersionInvalid}, // 0x711
