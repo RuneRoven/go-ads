@@ -593,11 +593,23 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	}
 	localAMS := getEnvOrDefault("ADS_LOCAL_AMS", "auto")
 
-	conn, err := NewSession(ip, 48898, targetAMS, targetPort, localAMS, 10500, 5*time.Second)
+	target, err := NewAMSAddress(targetAMS, uint16(targetPort))
 	if err != nil {
-		t.Fatalf("NewConnection failed: %v", err)
+		t.Fatalf("invalid target AMS: %v", err)
 	}
-	err = conn.Connect(false)
+	opts := []SessionOption{WithRequestTimeout(5 * time.Second), WithLocalAMS(AMSAddress{Port: 10500})}
+	if localAMS != "auto" && localAMS != "" {
+		local, err := NewAMSAddress(localAMS, 10500)
+		if err != nil {
+			t.Fatalf("invalid local AMS: %v", err)
+		}
+		opts = append(opts, WithLocalAMS(local))
+	}
+	conn, err := NewSession(context.Background(), AMSEndpoint{IP: ip, Port: 48898, AMS: target}, opts...)
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	err = conn.Connect(context.Background())
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
@@ -643,11 +655,19 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	// Reconnect and verify no stale handles exist by subscribing to the same
 	// symbols again — if Close() didn't release, the PLC would eventually
 	// run out of handles.
-	conn2, err := NewSession(ip, 48898, targetAMS, targetPort, localAMS, 10501, 5*time.Second)
-	if err != nil {
-		t.Fatalf("second NewConnection failed: %v", err)
+	opts2 := []SessionOption{WithRequestTimeout(5 * time.Second), WithLocalAMS(AMSAddress{Port: 10501})}
+	if localAMS != "auto" && localAMS != "" {
+		local, err := NewAMSAddress(localAMS, 10501)
+		if err != nil {
+			t.Fatalf("invalid local AMS: %v", err)
+		}
+		opts2 = append(opts2, WithLocalAMS(local))
 	}
-	err = conn2.Connect(false)
+	conn2, err := NewSession(context.Background(), AMSEndpoint{IP: ip, Port: 48898, AMS: target}, opts2...)
+	if err != nil {
+		t.Fatalf("second NewSession failed: %v", err)
+	}
+	err = conn2.Connect(context.Background())
 	if err != nil {
 		t.Fatalf("second Connect failed: %v", err)
 	}

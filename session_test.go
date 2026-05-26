@@ -84,7 +84,7 @@ func TestNewSession_TotalConstruction(t *testing.T) {
 	}
 	baseline := runtime.NumGoroutine()
 
-	sess, err := NewSession("127.0.0.1", 48898, "1.2.3.4.1.1", 851, "auto", 0, 0)
+	sess, err := NewSession(context.Background(), testEndpoint())
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
@@ -118,7 +118,8 @@ func TestNewSession_TotalConstruction(t *testing.T) {
 //
 // Validates: R-SES-001, R-SES-006 (option apply-time validation).
 func TestNewSession_OptionsApplied(t *testing.T) {
-	sess, err := NewSession("127.0.0.1", 48898, "1.2.3.4.1.1", 851, "auto", 1234, 7*time.Second,
+	sess, err := NewSession(context.Background(), testEndpoint(),
+		WithLocalAMS(AMSAddress{Port: 1234}),
 		WithRequestTimeout(11*time.Second))
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
@@ -151,7 +152,7 @@ func TestSession_OptionValidation_NoOpOnZeroValues(t *testing.T) {
 	// the monotonic Initial <= Mid <= Slow <= Max invariant intact.
 	customBackoff := DefaultBackoffConfig()
 	customBackoff.InitialAttempts = 9
-	sess, err := NewSession("127.0.0.1", 48898, "1.2.3.4.1.1", 851, "auto", 10500, 5*time.Second,
+	sess, err := NewSession(context.Background(), testEndpoint(),
 		WithLogger(customLogger),
 		WithBackoff(customBackoff),
 	)
@@ -161,7 +162,7 @@ func TestSession_OptionValidation_NoOpOnZeroValues(t *testing.T) {
 	defer sess.Close()
 
 	// Now apply zero-valued options to a SEPARATE sess and confirm defaults survive.
-	sess2, err := NewSession("127.0.0.1", 48898, "1.2.3.4.1.1", 851, "auto", 10500, 5*time.Second,
+	sess2, err := NewSession(context.Background(), testEndpoint(),
 		WithLogger(nil),
 		WithRequestTimeout(0),
 		WithRoute("", "", ""),
@@ -205,7 +206,8 @@ func TestSession_OptionValidation_NoOpOnZeroValues(t *testing.T) {
 //
 // Validates: R-SES-006 (option validation, observable behavior).
 func TestSession_WithMaxReconnectAttempts_NegativeNoOp(t *testing.T) {
-	sess, err := NewSession("127.0.0.1", 48898, "1.2.3.4.1.1", 851, "auto", 10500, time.Second,
+	sess, err := NewSession(context.Background(), testEndpoint(),
+		WithRequestTimeout(time.Second),
 		WithMaxReconnectAttempts(-1))
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
@@ -231,7 +233,9 @@ func TestSession_WithMaxReconnectAttempts_NegativeNoOp(t *testing.T) {
 //
 // Validates: R-SES-005 (Connect after Close rejected).
 func TestSession_ConnectAfterCloseRejected(t *testing.T) {
-	sess, err := NewSession("127.0.0.1", 1, "1.2.3.4.1.1", 851, "auto", 10500, 200*time.Millisecond)
+	ep := testEndpoint()
+	ep.Port = 1
+	sess, err := NewSession(context.Background(), ep, WithRequestTimeout(200*time.Millisecond))
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
@@ -245,7 +249,7 @@ func TestSession_ConnectAfterCloseRejected(t *testing.T) {
 	// Attempt to Connect — port 1 ensures dial fails fast even if the FSM
 	// permitted the transition. Either path (FSM rejection or dial
 	// failure) leaves state Closed.
-	_ = sess.Connect(false)
+	_ = sess.Connect(context.Background())
 
 	if state := sess.lifecycle.state.load(); state != SessionStateClosed {
 		t.Errorf("after Connect post-Close: state = %v, want Closed (no transition out of terminal)", state)
