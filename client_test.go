@@ -815,7 +815,7 @@ func TestClient_ConcurrentMultiplexing(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			// Read with length 0 — server returns empty data section, no error.
-			_, rerr := c.Read(0xF003, 0, 0)
+			_, rerr := c.Read(context.Background(), 0xF003, 0, 0)
 			if rerr != nil {
 				errs <- rerr
 			}
@@ -849,38 +849,38 @@ func TestClient_ClosedReturnsErrTransportClosed(t *testing.T) {
 		fn   func() error
 	}
 	calls := []call{
-		{"Read", func() error { _, e := c.Read(0, 0, 0); return e }},
-		{"Write", func() error { return c.Write(0, 0, nil) }},
-		{"WriteRead", func() error { _, e := c.WriteRead(0, 0, 0, nil); return e }},
-		{"ReadDeviceInfo", func() error { _, e := c.ReadDeviceInfo(); return e }},
-		{"ReadState", func() error { _, e := c.ReadState(); return e }},
-		{"GetHandleByName", func() error { _, e := c.GetHandleByName("X"); return e }},
-		{"GetSymbolVersion", func() error { _, e := c.GetSymbolVersion(); return e }},
-		{"GetSymbolUploadInfo", func() error { _, e := c.GetSymbolUploadInfo(); return e }},
+		{"Read", func() error { _, e := c.Read(context.Background(), 0, 0, 0); return e }},
+		{"Write", func() error { return c.Write(context.Background(), 0, 0, nil) }},
+		{"WriteRead", func() error { _, e := c.WriteRead(context.Background(), 0, 0, 0, nil); return e }},
+		{"ReadDeviceInfo", func() error { _, e := c.ReadDeviceInfo(context.Background()); return e }},
+		{"ReadState", func() error { _, e := c.ReadState(context.Background()); return e }},
+		{"GetHandleByName", func() error { _, e := c.GetHandleByName(context.Background(), "X"); return e }},
+		{"GetSymbolVersion", func() error { _, e := c.GetSymbolVersion(context.Background()); return e }},
+		{"GetSymbolUploadInfo", func() error { _, e := c.GetSymbolUploadInfo(context.Background()); return e }},
 		{"AddDeviceNotification", func() error {
-			_, e := c.AddDeviceNotification(0, 0, 0, TransModeNoTransmission, 0, 0)
+			_, e := c.AddDeviceNotification(context.Background(), 0, 0, 0, TransModeNoTransmission, 0, 0)
 			return e
 		}},
-		{"DeleteDeviceNotification", func() error { return c.DeleteDeviceNotification(1) }},
-		{"ReleaseHandle", func() error { return c.ReleaseHandle(1) }},
+		{"DeleteDeviceNotification", func() error { return c.DeleteDeviceNotification(context.Background(), 1) }},
+		{"ReleaseHandle", func() error { return c.ReleaseHandle(context.Background(), 1) }},
 		{"SumRead", func() error {
-			_, e := c.SumRead([]SumReadRequest{{Group: 1, Length: 1}})
+			_, e := c.SumRead(context.Background(), []SumReadRequest{{Group: 1, Length: 1}})
 			return e
 		}},
 		{"SumWrite", func() error {
-			_, e := c.SumWrite([]SumWriteRequest{{Group: 1, Data: []byte{0}}})
+			_, e := c.SumWrite(context.Background(), []SumWriteRequest{{Group: 1, Data: []byte{0}}})
 			return e
 		}},
 		{"SumAddDeviceNotification", func() error {
-			_, e := c.SumAddDeviceNotification([]SumNotificationRequest{{Group: 1, Length: 1}})
+			_, e := c.SumAddDeviceNotification(context.Background(), []SumNotificationRequest{{Group: 1, Length: 1}})
 			return e
 		}},
 		{"SumDeleteDeviceNotification", func() error {
-			_, e := c.SumDeleteDeviceNotification([]uint32{1})
+			_, e := c.SumDeleteDeviceNotification(context.Background(), []uint32{1})
 			return e
 		}},
-		{"ReadProcessInput", func() error { _, e := c.ReadProcessInput(0, 1); return e }},
-		{"WriteProcessOutput", func() error { return c.WriteProcessOutput(0, []byte{0}) }},
+		{"ReadProcessInput", func() error { _, e := c.ReadProcessInput(context.Background(), 0, 1); return e }},
+		{"WriteProcessOutput", func() error { return c.WriteProcessOutput(context.Background(), 0, []byte{0}) }},
 	}
 	for _, tc := range calls {
 		err := tc.fn()
@@ -973,7 +973,7 @@ func TestClient_ReleaseHandleWritesToReleaseGroup(t *testing.T) {
 	defer c.Close()
 
 	const handle uint32 = 0xCAFEBABE
-	if err := c.ReleaseHandle(handle); err != nil {
+	if err := c.ReleaseHandle(context.Background(), handle); err != nil {
 		t.Fatalf("ReleaseHandle: %v", err)
 	}
 
@@ -1106,7 +1106,7 @@ func TestSystemResponseChannelIsBuffered(t *testing.T) {
 
 func TestReadProcessInputBit_ByteOffsetOverflow(t *testing.T) {
 	c := &Client{}
-	_, err := c.ReadProcessInputBit(math.MaxUint32, 0)
+	_, err := c.ReadProcessInputBit(context.Background(), math.MaxUint32, 0)
 	if err == nil {
 		t.Fatal("expected error for byteOffset that overflows uint32*8, got nil")
 	}
@@ -1117,7 +1117,7 @@ func TestReadProcessInputBit_ByteOffsetOverflow(t *testing.T) {
 
 func TestWriteProcessOutputBit_ByteOffsetOverflow(t *testing.T) {
 	c := &Client{}
-	err := c.WriteProcessOutputBit(math.MaxUint32, 0, true)
+	err := c.WriteProcessOutputBit(context.Background(), math.MaxUint32, 0, true)
 	if err == nil {
 		t.Fatal("expected error for byteOffset that overflows uint32*8, got nil")
 	}

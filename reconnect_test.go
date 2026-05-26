@@ -240,7 +240,7 @@ func TestReconnectExhaustsMaxAttemptsTransitionsToClosed(t *testing.T) {
 	sess.lifecycle.state.transitionTo(SessionStateConnected)
 	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
 
-	reconnErr := sess.Reconnect()
+	reconnErr := sess.Reconnect(context.Background())
 	if reconnErr == nil {
 		t.Fatal("expected Reconnect() to return error after max attempts")
 	}
@@ -315,7 +315,7 @@ func TestReconnectExhaustConcurrentClose_NoPanic(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			_ = sess.Reconnect()
+			_ = sess.Reconnect(context.Background())
 		}()
 		go func() {
 			defer wg.Done()
@@ -397,7 +397,7 @@ func TestReconnect_FlapDetection_AccumulatesAcrossCycles(t *testing.T) {
 	sess.lifecycle.flapMu.Unlock()
 	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
 
-	if err := sess.Reconnect(); err == nil {
+	if err := sess.Reconnect(context.Background()); err == nil {
 		t.Fatal("expected Reconnect to fail (port refused)")
 	}
 

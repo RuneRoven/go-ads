@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"context"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -130,11 +131,11 @@ func TestParseSumReadResponse_PerItemOversize(t *testing.T) {
 func TestBestEffortDeleteNotifications_Empty(t *testing.T) {
 	conn := &Session{logger: getDefaultLogger()}
 	conn.client.Store(&Client{logger: conn.logger})
-	got := conn.bestEffortDeleteNotifications(nil)
+	got := conn.bestEffortDeleteNotifications(context.Background(), nil)
 	if got != 0 {
 		t.Errorf("expected 0, got %d", got)
 	}
-	got = conn.bestEffortDeleteNotifications([]uint32{})
+	got = conn.bestEffortDeleteNotifications(context.Background(), []uint32{})
 	if got != 0 {
 		t.Errorf("expected 0, got %d", got)
 	}
@@ -168,7 +169,7 @@ func TestSumReadOverflowGuard(t *testing.T) {
 		{Group: 1, Offset: 0, Length: 1}, // total > MaxUint32
 	}
 
-	_, err := c.SumRead(requests)
+	_, err := c.SumRead(context.Background(), requests)
 	if err == nil {
 		t.Fatal("expected overflow error, got nil")
 	}
@@ -322,7 +323,7 @@ func TestSession_ReadMultipleSymbols_StaleDetection(t *testing.T) {
 		return resp
 	})
 
-	_, err := sess.ReadMultipleSymbols([]string{"MAIN.a", "MAIN.b"})
+	_, err := sess.ReadMultipleSymbols(context.Background(), []string{"MAIN.a", "MAIN.b"})
 	if err != nil {
 		t.Fatalf("ReadMultipleSymbols: %v", err)
 	}
@@ -372,7 +373,7 @@ func TestSession_ReadMultipleSymbols_FiresCallbackOncePerBatch(t *testing.T) {
 		)
 	})
 
-	_, err := sess.ReadMultipleSymbols([]string{"MAIN.a", "MAIN.b", "MAIN.c"})
+	_, err := sess.ReadMultipleSymbols(context.Background(), []string{"MAIN.a", "MAIN.b", "MAIN.c"})
 	if err != nil {
 		t.Fatalf("ReadMultipleSymbols: %v", err)
 	}
@@ -424,7 +425,7 @@ func TestSession_WriteMultipleSymbols_StaleDetection(t *testing.T) {
 		return buf
 	})
 
-	_, err := sess.WriteMultipleSymbols(map[string]string{
+	_, err := sess.WriteMultipleSymbols(context.Background(), map[string]string{
 		"MAIN.a": "true",
 		"MAIN.b": "false",
 	})
@@ -466,7 +467,7 @@ func TestSumReadFallback_PreservesADSReturnCode(t *testing.T) {
 	defer c.Close()
 
 	reqs := []SumReadRequest{{Group: uint32(testGroup), Offset: 0, Length: 4}}
-	results, err := c.sumReadFallback(reqs)
+	results, err := c.sumReadFallback(context.Background(), reqs)
 	if err != nil {
 		t.Fatalf("sumReadFallback returned unexpected top-level error: %v", err)
 	}

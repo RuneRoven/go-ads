@@ -398,7 +398,7 @@ func (sess *Session) Connect(local bool) (retErr error) {
 	}
 
 	// Read symbol version for later change detection (best-effort, don't fail connect)
-	version, err := sess.client.Load().GetSymbolVersion()
+	version, err := sess.client.Load().GetSymbolVersion(sess.lifecycle.ctx)
 	if err != nil {
 		sess.logger.Debug("could not read symbol version during connect", "error", err)
 	} else {
@@ -424,12 +424,12 @@ func (sess *Session) ensureRouteOnConnect() (registered bool, err error) {
 	// Force mode → always register
 	if sess.route.forceRouteRegistration {
 		sess.logger.Info("registering route (force mode)")
-		err = sess.AddRoute(sess.route.name, sess.route.username, string(sess.route.password))
+		err = sess.AddRoute(sess.lifecycle.ctx, sess.route.name, sess.route.username, string(sess.route.password))
 		return err == nil, err
 	}
 
 	// Probe: try a lightweight ADS command to see if route exists
-	_, probeErr := sess.client.Load().GetSymbolVersion()
+	_, probeErr := sess.client.Load().GetSymbolVersion(sess.lifecycle.ctx)
 	if probeErr == nil {
 		sess.logger.Info("route already exists on PLC, skipping registration")
 		sess.route.routeProbeFailures.Store(0)
@@ -443,7 +443,7 @@ func (sess *Session) ensureRouteOnConnect() (registered bool, err error) {
 	// Probe failed → register with credentials
 	sess.route.routeProbeFailures.Add(1)
 	sess.logger.Info("route probe failed, registering route", "error", probeErr)
-	err = sess.AddRoute(sess.route.name, sess.route.username, string(sess.route.password))
+	err = sess.AddRoute(sess.lifecycle.ctx, sess.route.name, sess.route.username, string(sess.route.password))
 	if err != nil {
 		return false, err
 	}
@@ -639,7 +639,7 @@ func (sess *Session) autoReloadOnStaleDetection(reason Reason) {
 // reloadSymbolsAndResubscribe re-runs symbol discovery + notification
 // resub. Re-uses existing reconnect-path helpers (R-NOT-013).
 func (sess *Session) reloadSymbolsAndResubscribe() error {
-	if err := sess.LoadSymbols(); err != nil {
+	if err := sess.LoadSymbols(sess.lifecycle.ctx); err != nil {
 		return fmt.Errorf("LoadSymbols: %w", err)
 	}
 	return sess.resubscribeNotifications()
@@ -676,7 +676,7 @@ func (sess *Session) releasePLCResources(wasDisconnected bool) {
 	}
 	sess.notifications.lock.Unlock()
 	if len(handles) > 0 {
-		deleted := sess.bestEffortDeleteNotifications(handles)
+		deleted := sess.bestEffortDeleteNotifications(sess.lifecycle.ctx, handles)
 		sess.logger.Info("releasePLCResources: best-effort notification cleanup",
 			"requested", len(handles), "deleted", deleted,
 			"wasDisconnected", wasDisconnected)
@@ -708,7 +708,7 @@ func (sess *Session) releasePLCResources(wasDisconnected bool) {
 		}
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, h)
-		if err := sess.client.Load().Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+		if err := sess.client.Load().Write(sess.lifecycle.ctx, uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 			sess.logger.Warn("failed to release symbol handle", "error", err, "handle", h)
 		} else {
 			sess.logger.Info("handle deleted", "handle", h)
@@ -837,7 +837,7 @@ func (sess *Session) triggerReconnect() {
 	}
 
 	if sess.lifecycle.autoReconnect {
-		go func() { _ = sess.Reconnect() }()
+		go func() { _ = sess.Reconnect(sess.lifecycle.ctx) }()
 	} else {
 		// No auto-reconnect: close reconnectDone immediately so sendRequest
 		// waiters unblock with ErrDisconnected instead of hanging forever.
@@ -854,7 +854,7 @@ func (sess *Session) triggerReconnect() {
 // and re-subscribe to previously registered notifications.
 // Uses configurable backoff (see WithBackoff) with fast initial retries and
 // progressive slowdown. Backoff resets on each successful reconnect.
-func (sess *Session) Reconnect() error {
+func (sess *Session) Reconnect(ctx context.Context) error {
 	// closeReconnectDone closes the reconnectDone channel if still open and
 	// nils it. Mutex + nil-check is safe against concurrent callers — only
 	// the first observer of a non-nil channel closes it.
@@ -1062,7 +1062,7 @@ func (sess *Session) ensureRoute() error {
 	probeFailures := sess.route.routeProbeFailures.Load()
 	if sess.route.forceRouteRegistration || probeFailures >= 3 {
 		sess.logger.Info("registering route (forced/fallback)", "probeFailures", probeFailures)
-		if err := sess.AddRoute(sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
+		if err := sess.AddRoute(sess.lifecycle.ctx, sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
 			return fmt.Errorf("route registration failed: %w", err)
 		}
 
@@ -1071,7 +1071,7 @@ func (sess *Session) ensureRoute() error {
 	}
 
 	// Probe: try a lightweight ADS command to see if route already exists
-	_, probeErr := sess.client.Load().GetSymbolVersion()
+	_, probeErr := sess.client.Load().GetSymbolVersion(sess.lifecycle.ctx)
 	if probeErr == nil {
 		sess.logger.Debug("route still valid, skipping re-registration")
 		sess.route.routeProbeFailures.Store(0)
@@ -1085,7 +1085,7 @@ func (sess *Session) ensureRoute() error {
 	// Probe failed → register with credentials
 	failuresAfter := sess.route.routeProbeFailures.Add(1)
 	sess.logger.Info("route probe failed, registering route", "error", probeErr, "probeFailures", failuresAfter)
-	if err := sess.AddRoute(sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
+	if err := sess.AddRoute(sess.lifecycle.ctx, sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
 		return fmt.Errorf("route registration failed after probe: %w", err)
 	}
 
@@ -1126,17 +1126,17 @@ func (sess *Session) reloadSymbols() error {
 	switch {
 	case fullyLoaded:
 		// Full discovery was done — redo it
-		return sess.loadSymbols()
+		return sess.loadSymbols(sess.lifecycle.ctx)
 
 	case listLoaded || dtLoaded:
 		// Partial discovery — re-download what was loaded
 		if listLoaded {
-			if err := sess.LoadSymbolList(SlowDiscoveryConfig{}); err != nil {
+			if err := sess.LoadSymbolList(sess.lifecycle.ctx, SlowDiscoveryConfig{}); err != nil {
 				return fmt.Errorf("reload symbol list: %w", err)
 			}
 		}
 		if dtLoaded {
-			if err := sess.LoadDataTypes(SlowDiscoveryConfig{}); err != nil {
+			if err := sess.LoadDataTypes(sess.lifecycle.ctx, SlowDiscoveryConfig{}); err != nil {
 				return fmt.Errorf("reload datatypes: %w", err)
 			}
 		}
@@ -1162,7 +1162,7 @@ func (sess *Session) reloadSymbols() error {
 		sess.cache.lock.Unlock()
 
 		for name := range oldSymbols {
-			if _, err := sess.getSymbol(name); err != nil {
+			if _, err := sess.getSymbol(sess.lifecycle.ctx, name); err != nil {
 				if sess.lifecycle.strictReconnect {
 					sess.lifecycle.strictReconnectFailures++
 					if sess.lifecycle.strictReconnectMaxAttempts == 0 || sess.lifecycle.strictReconnectFailures > sess.lifecycle.strictReconnectMaxAttempts {
@@ -1177,7 +1177,7 @@ func (sess *Session) reloadSymbols() error {
 
 	default:
 		// No symbols were loaded — read symbol version for future use
-		version, err := sess.client.Load().GetSymbolVersion()
+		version, err := sess.client.Load().GetSymbolVersion(sess.lifecycle.ctx)
 		if err != nil {
 			sess.logger.Debug("could not read symbol version during reconnect", "error", err)
 		} else {
@@ -1350,7 +1350,7 @@ func (sess *Session) resubscribeNotifications() error {
 	}
 	sess.notifications.lock.Unlock()
 
-	subResults, err := sess.AddSymbolNotifications(validConfigs, savedChannel)
+	subResults, err := sess.AddSymbolNotifications(sess.lifecycle.ctx, validConfigs, savedChannel)
 
 	// Collect Skipped+Handle entries: AddSymbolNotifications surfaces handles
 	// for items where the PLC accepted but the library refused to commit
@@ -1378,7 +1378,7 @@ func (sess *Session) resubscribeNotifications() error {
 		}
 	}
 	if len(orphanHandles) > 0 {
-		deleted := sess.bestEffortDeleteNotifications(orphanHandles)
+		deleted := sess.bestEffortDeleteNotifications(sess.lifecycle.ctx, orphanHandles)
 		sess.logger.Warn("resubscribe: released PLC handles for Skipped+Handle entries",
 			"orphan_handles", len(orphanHandles),
 			"deleted", deleted)
@@ -1415,7 +1415,7 @@ func (sess *Session) resubscribeNotifications() error {
 		sess.notifications.notificationChannel = savedChannel
 		sess.notifications.lock.Unlock()
 		if len(newHandles) > 0 {
-			deleted := sess.bestEffortDeleteNotifications(newHandles)
+			deleted := sess.bestEffortDeleteNotifications(sess.lifecycle.ctx, newHandles)
 			sess.logger.Warn("resubscribe rollback: deleted partial-success handles",
 				"new_handles", len(newHandles),
 				"deleted", deleted)
@@ -1465,10 +1465,10 @@ func zeroOldSymbolHandles(m map[string]*symbol) {
 }
 
 // loadSymbols loads symbol table and datatypes from the PLC, and saves the symbol version.
-func (sess *Session) loadSymbols() error {
+func (sess *Session) loadSymbols(ctx context.Context) error {
 	c := sess.client.Load()
 	// Read and store symbol version
-	version, err := c.GetSymbolVersion()
+	version, err := c.GetSymbolVersion(ctx)
 	if err != nil {
 		sess.logger.Warn("failed to read symbol version, continuing with symbol load", "error", err)
 	} else {
@@ -1477,11 +1477,11 @@ func (sess *Session) loadSymbols() error {
 		sess.cache.lock.Unlock()
 	}
 
-	res, err := c.GetSymbolUploadInfo()
+	res, err := c.GetSymbolUploadInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
-	datatypesResponse, err := c.DownloadDataTypes(res.DataTypeLength)
+	datatypesResponse, err := c.DownloadDataTypes(ctx, res.DataTypeLength)
 	if err != nil {
 		return fmt.Errorf("failed to upload datatypes: %w", err)
 	}
@@ -1489,7 +1489,7 @@ func (sess *Session) loadSymbols() error {
 	if err != nil {
 		return fmt.Errorf("failed to parse datatypes: %w", err)
 	}
-	symbolsResponse, err := c.DownloadSymbolList(res.SymbolLength)
+	symbolsResponse, err := c.DownloadSymbolList(ctx, res.SymbolLength)
 	if err != nil {
 		return fmt.Errorf("failed to upload symbols: %w", err)
 	}
@@ -1514,7 +1514,7 @@ func (sess *Session) loadSymbols() error {
 // AddRoute registers a route on the remote PLC using this connection's settings.
 // It uses callbackIP (from WithHostIP) if set, otherwise derives the callback
 // address from the source AMS NetID (first 4 bytes = IP).
-func (sess *Session) AddRoute(routeName, username, password string) error {
+func (sess *Session) AddRoute(ctx context.Context, routeName, username, password string) error {
 	hostIP := sess.callbackIP
 	if hostIP == "" {
 		hostIP = fmt.Sprintf("%d.%d.%d.%d",

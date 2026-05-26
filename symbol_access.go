@@ -9,14 +9,14 @@ import (
 
 // WriteToSymbol writes a value to a PLC symbol by name (handle resolved
 // on-demand and cached).
-func (sess *Session) WriteToSymbol(symbolName string, value string) error {
-	return sess.writeToSymbolRetry(symbolName, value, 1)
+func (sess *Session) WriteToSymbol(ctx context.Context, symbolName string, value string) error {
+	return sess.writeToSymbolRetry(ctx, symbolName, value, 1)
 }
 
-func (sess *Session) writeToSymbolRetry(symbolName string, value string, retriesLeft int) error {
+func (sess *Session) writeToSymbolRetry(ctx context.Context, symbolName string, value string, retriesLeft int) error {
 	gen := sess.epoch()
 
-	symbol, err := sess.getSymbol(symbolName)
+	symbol, err := sess.getSymbol(ctx, symbolName)
 	if err != nil {
 		return fmt.Errorf("write to %q: %w", symbolName, err)
 	}
@@ -35,7 +35,7 @@ func (sess *Session) writeToSymbolRetry(symbolName string, value string, retries
 	}
 
 	// Network I/O without lock
-	err = sess.client.Load().Write(uint32(GroupSymbolValueByHandle), handle, data)
+	err = sess.client.Load().Write(ctx, uint32(GroupSymbolValueByHandle), handle, data)
 	if err != nil {
 		// Online-change detection (R-CACHE-009).
 		var rc ReturnCode
@@ -45,7 +45,7 @@ func (sess *Session) writeToSymbolRetry(symbolName string, value string, retries
 		// If a reconnect happened during our operation, retry once with fresh handles
 		sess.waitForReconnect()
 		if retriesLeft > 0 && sess.epoch() != gen {
-			return sess.writeToSymbolRetry(symbolName, value, retriesLeft-1)
+			return sess.writeToSymbolRetry(ctx, symbolName, value, retriesLeft-1)
 		}
 		return fmt.Errorf("write to %q: %w", symbolName, err)
 	}
@@ -64,14 +64,14 @@ func (sess *Session) writeToSymbolRetry(symbolName string, value string, retries
 
 // ReadFromSymbol reads a PLC symbol by name and returns its stringified
 // value (handle resolved on-demand and cached).
-func (sess *Session) ReadFromSymbol(symbolName string) (string, error) {
-	return sess.readFromSymbolRetry(symbolName, 1)
+func (sess *Session) ReadFromSymbol(ctx context.Context, symbolName string) (string, error) {
+	return sess.readFromSymbolRetry(ctx, symbolName, 1)
 }
 
-func (sess *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (string, error) {
+func (sess *Session) readFromSymbolRetry(ctx context.Context, symbolName string, retriesLeft int) (string, error) {
 	gen := sess.epoch()
 
-	symbol, err := sess.getSymbol(symbolName)
+	symbol, err := sess.getSymbol(ctx, symbolName)
 	if err != nil {
 		return "", fmt.Errorf("read %q: %w", symbolName, err)
 	}
@@ -90,7 +90,7 @@ func (sess *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (st
 	sess.cache.lock.Unlock()
 
 	// Network I/O without lock
-	data, err := sess.client.Load().Read(uint32(GroupSymbolValueByHandle), handle, length)
+	data, err := sess.client.Load().Read(ctx, uint32(GroupSymbolValueByHandle), handle, length)
 	if err != nil {
 		// Online-change detection (R-CACHE-009).
 		var rc ReturnCode
@@ -100,7 +100,7 @@ func (sess *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (st
 		// If a reconnect happened during our operation, retry once with fresh handles
 		sess.waitForReconnect()
 		if retriesLeft > 0 && sess.epoch() != gen {
-			return sess.readFromSymbolRetry(symbolName, retriesLeft-1)
+			return sess.readFromSymbolRetry(ctx, symbolName, retriesLeft-1)
 		}
 		return "", fmt.Errorf("read %q: %w", symbolName, err)
 	}
@@ -169,11 +169,11 @@ func symbolSumAddress(sym *symbol) (group, offset uint32) {
 
 // ReadMultipleSymbols reads multiple symbols in a single ADS round-trip using SumRead.
 // Returns a map of symbol name to parsed string value.
-func (sess *Session) ReadMultipleSymbols(names []string) (map[string]string, error) {
-	return sess.readMultipleSymbolsRetry(names, 1)
+func (sess *Session) ReadMultipleSymbols(ctx context.Context, names []string) (map[string]string, error) {
+	return sess.readMultipleSymbolsRetry(ctx, names, 1)
 }
 
-func (sess *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (map[string]string, error) {
+func (sess *Session) readMultipleSymbolsRetry(ctx context.Context, names []string, retriesLeft int) (map[string]string, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
@@ -189,7 +189,7 @@ func (sess *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (
 	var requests []SumReadRequest
 
 	for _, name := range names {
-		symbol, err := sess.getSymbol(name)
+		symbol, err := sess.getSymbol(ctx, name)
 		if err != nil {
 			sess.logger.Error("error getting symbol for batch read", "error", err, "symbol", name)
 			continue
@@ -210,12 +210,12 @@ func (sess *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (
 		return nil, fmt.Errorf("no valid symbols found for batch read")
 	}
 
-	results, err := sess.client.Load().SumRead(requests)
+	results, err := sess.client.Load().SumRead(ctx, requests)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
 		sess.waitForReconnect()
 		if retriesLeft > 0 && sess.epoch() != gen {
-			return sess.readMultipleSymbolsRetry(names, retriesLeft-1)
+			return sess.readMultipleSymbolsRetry(ctx, names, retriesLeft-1)
 		}
 		return nil, fmt.Errorf("batch read failed: %w", err)
 	}
@@ -273,11 +273,11 @@ func (sess *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (
 // Returns a map of symbol name to per-symbol error code.
 // Uses direct iGroup/iOffs addressing when available (after LoadSymbols),
 // falling back to handle-based addressing for on-demand symbols.
-func (sess *Session) WriteMultipleSymbols(values map[string]string) (map[string]ReturnCode, error) {
-	return sess.writeMultipleSymbolsRetry(values, 1)
+func (sess *Session) WriteMultipleSymbols(ctx context.Context, values map[string]string) (map[string]ReturnCode, error) {
+	return sess.writeMultipleSymbolsRetry(ctx, values, 1)
 }
 
-func (sess *Session) writeMultipleSymbolsRetry(values map[string]string, retriesLeft int) (map[string]ReturnCode, error) {
+func (sess *Session) writeMultipleSymbolsRetry(ctx context.Context, values map[string]string, retriesLeft int) (map[string]ReturnCode, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}
@@ -297,7 +297,7 @@ func (sess *Session) writeMultipleSymbolsRetry(values map[string]string, retries
 	var requests []SumWriteRequest
 
 	for name, value := range values {
-		symbol, err := sess.getSymbol(name)
+		symbol, err := sess.getSymbol(ctx, name)
 		if err != nil {
 			sess.logger.Error("error getting symbol for batch write", "error", err, "symbol", name)
 			continue
@@ -323,12 +323,12 @@ func (sess *Session) writeMultipleSymbolsRetry(values map[string]string, retries
 		return nil, fmt.Errorf("no valid symbols found for batch write")
 	}
 
-	results, err := sess.client.Load().SumWrite(requests)
+	results, err := sess.client.Load().SumWrite(ctx, requests)
 	if err != nil {
 		// If a reconnect happened during our operation, retry once with fresh handles
 		sess.waitForReconnect()
 		if retriesLeft > 0 && sess.epoch() != gen {
-			return sess.writeMultipleSymbolsRetry(values, retriesLeft-1)
+			return sess.writeMultipleSymbolsRetry(ctx, values, retriesLeft-1)
 		}
 		return nil, fmt.Errorf("batch write failed: %w", err)
 	}

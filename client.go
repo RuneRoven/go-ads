@@ -464,10 +464,10 @@ func (c *Client) deviceNotification(ctx context.Context, in []byte) error {
 // ReleaseHandle releases a symbol handle previously acquired via
 // GetHandleByName. Wraps Write to GroupSymbolReleaseHandle so the
 // Beckhoff-equivalent surface includes a symmetric release primitive.
-func (c *Client) ReleaseHandle(handle uint32) error {
+func (c *Client) ReleaseHandle(ctx context.Context, handle uint32) error {
 	handleBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(handleBytes, handle)
-	return c.Write(uint32(GroupSymbolReleaseHandle), 0, handleBytes)
+	return c.Write(ctx, uint32(GroupSymbolReleaseHandle), 0, handleBytes)
 }
 
 // send is the local-mode handshake primitive. NOT safe for concurrent use —
@@ -504,13 +504,17 @@ func (c *Client) send(data []byte) ([]byte, error) {
 // sendRequest is the single-shot RPC primitive used by every Client RPC
 // method. Encodes the AMS frame, registers a per-invoke response channel,
 // pushes the frame to the transmit worker, and waits for the response or
-// context timeout.
+// context cancel / timeout.
+//
+// The caller's ctx is merged with c.requestTimeout via context.WithTimeout;
+// whichever fires first cancels the wait. Pass context.Background() to
+// preserve the v2.1 "timeout-only" semantic.
 //
 // Returns ErrTransportClosed immediately if the transport is known dead
 // (Close called or drop detected). Otherwise no retry — drops mid-flight
 // surface as context.Canceled / DeadlineExceeded; Session wraps this with
 // wait-for-reconnect retry semantics in its own helpers.
-func (c *Client) sendRequest(command CommandID, data []byte) ([]byte, error) {
+func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte) ([]byte, error) {
 	if c.tx.disconnected.Load() {
 		return nil, ErrTransportClosed
 	}
@@ -535,7 +539,13 @@ func (c *Client) sendRequest(command CommandID, data []byte) ([]byte, error) {
 	c.tx.chanMu.RLock()
 	sendCh := c.tx.sendChannel
 	c.tx.chanMu.RUnlock()
-	ctx, cancel := context.WithTimeout(c.ctx, c.requestTimeout)
+	// Merge caller ctx with c.requestTimeout. ctx==nil falls back to the
+	// Client's own ctx so callers passing context.Background() still get
+	// the configured request timeout AND respect Close-driven cancel.
+	if ctx == nil {
+		ctx = c.ctx
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.requestTimeout)
 	defer cancel()
 	select {
 	case <-ctx.Done():

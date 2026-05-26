@@ -13,7 +13,7 @@ import (
 // call s.client.Read/Write internally.
 
 // Read issues ADS Read (cmd 2) against the given index group/offset.
-func (c *Client) Read(group uint32, offset uint32, length uint32) (data []byte, err error) {
+func (c *Client) Read(ctx context.Context, group uint32, offset uint32, length uint32) (data []byte, err error) {
 	request := new(bytes.Buffer)
 	type readCommandPacket struct {
 		Group  uint32
@@ -35,7 +35,7 @@ func (c *Client) Read(group uint32, offset uint32, length uint32) (data []byte, 
 	c.logger.Log(context.Background(), LevelTrace, "request", "request", content)
 
 	// Try to send the request
-	resp, err := c.sendRequest(CommandIDRead, request.Bytes())
+	resp, err := c.sendRequest(ctx, CommandIDRead, request.Bytes())
 	if err != nil {
 		c.logger.Error("send request failed", "error", err)
 		return
@@ -66,7 +66,7 @@ func (c *Client) Read(group uint32, offset uint32, length uint32) (data []byte, 
 }
 
 // Write issues ADS Write (cmd 3) to the PLC at the given index group/offset.
-func (c *Client) Write(group uint32, offset uint32, data []byte) error {
+func (c *Client) Write(ctx context.Context, group uint32, offset uint32, data []byte) error {
 	type writeCommandPacket struct {
 		Group  uint32
 		Offset uint32
@@ -91,7 +91,7 @@ func (c *Client) Write(group uint32, offset uint32, data []byte) error {
 	}
 
 	// Try to send the request
-	resp, err := c.sendRequest(CommandIDWrite, request.Bytes())
+	resp, err := c.sendRequest(ctx, CommandIDWrite, request.Bytes())
 	if err != nil {
 		c.logger.Error("error during send request for write", "error", err)
 		return err
@@ -111,7 +111,7 @@ func (c *Client) Write(group uint32, offset uint32, data []byte) error {
 
 // WriteRead issues ADS ReadWrite (cmd 9): writes send and reads back up to
 // readLength bytes in a single round-trip.
-func (c *Client) WriteRead(group uint32, offset uint32, readLength uint32, send []byte) (data []byte, err error) {
+func (c *Client) WriteRead(ctx context.Context, group uint32, offset uint32, readLength uint32, send []byte) (data []byte, err error) {
 	request := new(bytes.Buffer)
 	type writeReadCommandPacket struct {
 		Group       uint32
@@ -143,7 +143,7 @@ func (c *Client) WriteRead(group uint32, offset uint32, readLength uint32, send 
 	c.logger.Log(context.Background(), LevelTrace, "request", "request", request)
 
 	// Try to send the request
-	resp, err := c.sendRequest(CommandIDReadWrite, request.Bytes())
+	resp, err := c.sendRequest(ctx, CommandIDReadWrite, request.Bytes())
 	if err != nil {
 		return
 	}
@@ -171,9 +171,9 @@ type States struct {
 }
 
 // ReadState issues ADS ReadState (cmd 4) and returns the PLC's ADS+device state.
-func (c *Client) ReadState() (response States, err error) {
+func (c *Client) ReadState(ctx context.Context) (response States, err error) {
 	// Try to send the request
-	resp, err := c.sendRequest(CommandIDReadState, []byte{})
+	resp, err := c.sendRequest(ctx, CommandIDReadState, []byte{})
 	if err != nil {
 		c.logger.Error("Error during read state", "error", err)
 		return
@@ -209,9 +209,9 @@ type DeviceInfo struct {
 }
 
 // ReadDeviceInfo issues ADS ReadDeviceInfo (cmd 1).
-func (c *Client) ReadDeviceInfo() (response DeviceInfo, err error) {
+func (c *Client) ReadDeviceInfo(ctx context.Context) (response DeviceInfo, err error) {
 	// Try to send the request
-	resp, err := c.sendRequest(CommandIDReadDeviceInfo, []byte{})
+	resp, err := c.sendRequest(ctx, CommandIDReadDeviceInfo, []byte{})
 	if err != nil {
 		return
 	}

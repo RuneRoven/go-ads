@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -41,7 +42,7 @@ func captureSymbol(sess *Session, name, value string, parsed bool) (SymbolView, 
 	sess.cache.lock.Lock()
 	sess.cache.symbols[symbolKey(name)] = sym
 	sess.cache.lock.Unlock()
-	v, _ := sess.GetSymbol(name) // takes cache.lock internally for view()
+	v, _ := sess.GetSymbol(context.Background(), name) // takes cache.lock internally for view()
 	return v, sym
 }
 
@@ -118,7 +119,7 @@ func TestSymbolView_ChildrenReturnsFreshMap(t *testing.T) {
 	sess.cache.symbols[symbolKey(child.FullName)] = child
 	sess.cache.lock.Unlock()
 
-	pv, err := sess.GetSymbol(parent.FullName)
+	pv, err := sess.GetSymbol(context.Background(), parent.FullName)
 	if err != nil {
 		t.Fatalf("GetSymbol: %v", err)
 	}
@@ -163,7 +164,7 @@ func TestSymbolView_ChildrenWalk_FnMayTakeCacheLock(t *testing.T) {
 	sess.cache.symbols[symbolKey(leaf.FullName)] = leaf
 	sess.cache.lock.Unlock()
 
-	pv, err := sess.GetSymbol(parent.FullName)
+	pv, err := sess.GetSymbol(context.Background(), parent.FullName)
 	if err != nil {
 		t.Fatalf("GetSymbol: %v", err)
 	}
@@ -175,7 +176,7 @@ func TestSymbolView_ChildrenWalk_FnMayTakeCacheLock(t *testing.T) {
 		pv.ChildrenWalk(func(v SymbolView) bool {
 			// fn calls GetSymbol, which takes cache.lock. A retained
 			// cache.lock around fn would deadlock here.
-			_, _ = sess.GetSymbol(v.FullName)
+			_, _ = sess.GetSymbol(context.Background(), v.FullName)
 			return true
 		})
 	}()

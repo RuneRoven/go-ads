@@ -35,6 +35,7 @@ func durationToADSTicks(d time.Duration, name string) (uint32, error) {
 // returns the PLC-assigned handle. Raw RPC: no Session-side persistence.
 // Callers wanting auto-resubscribe-on-reconnect use Session.AddSymbolNotification.
 func (c *Client) AddDeviceNotification(
+	ctx context.Context,
 	group uint32,
 	offset uint32,
 	length uint32,
@@ -76,7 +77,7 @@ func (c *Client) AddDeviceNotification(
 		Error  ReturnCode
 		Handle uint32
 	}
-	resp, err := c.sendRequest(CommandIDAddDeviceNotification, request.Bytes())
+	resp, err := c.sendRequest(ctx, CommandIDAddDeviceNotification, request.Bytes())
 	if err != nil {
 		return
 	}
@@ -98,7 +99,7 @@ func (c *Client) AddDeviceNotification(
 // returns the wire-level success/error. Callers that maintain
 // activeNotifications must clean up themselves (Session does this in its
 // wrapper Session.DeleteDeviceNotification below).
-func (c *Client) DeleteDeviceNotification(handle uint32) error {
+func (c *Client) DeleteDeviceNotification(ctx context.Context, handle uint32) error {
 	request := &bytes.Buffer{}
 	type deleteNotificationCommandPacket struct {
 		Handle uint32
@@ -107,7 +108,7 @@ func (c *Client) DeleteDeviceNotification(handle uint32) error {
 	if err := binary.Write(request, binary.LittleEndian, content); err != nil {
 		return fmt.Errorf("binary.Write failed: %w", err)
 	}
-	resp, err := c.sendRequest(CommandIDDeleteDeviceNotification, request.Bytes())
+	resp, err := c.sendRequest(ctx, CommandIDDeleteDeviceNotification, request.Bytes())
 	if err != nil {
 		c.logger.Warn("error deleting handle", "handle", handle, "error", err)
 		return err
@@ -130,7 +131,7 @@ func (c *Client) DeleteDeviceNotification(handle uint32) error {
 // the cached notificationConfig, and clears notificationChannel when the
 // last subscription dies. Callers that want raw delete behavior use
 // the Client method directly.
-func (sess *Session) DeleteDeviceNotification(handle uint32) error {
+func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32) error {
 	// Snapshot symbol name BEFORE PLC RPC so a concurrent Reconnect clearing
 	// activeNotifications mid-flight doesn't strand notificationConfigs (which
 	// would cause resubscribeNotifications to re-subscribe a deleted symbol).
@@ -141,7 +142,7 @@ func (sess *Session) DeleteDeviceNotification(handle uint32) error {
 	}
 	sess.notifications.lock.Unlock()
 
-	if err := sess.client.Load().DeleteDeviceNotification(handle); err != nil {
+	if err := sess.client.Load().DeleteDeviceNotification(ctx, handle); err != nil {
 		return err
 	}
 	sess.notifications.lock.Lock()
@@ -160,8 +161,8 @@ func (sess *Session) DeleteDeviceNotification(handle uint32) error {
 // notifications.lock cleanup. Returns the per-handle ReturnCode slice from the
 // PLC. Successfully deleted handles (or handle-invalid, treated as
 // success-equivalent) are removed from activeNotifications.
-func (sess *Session) SumDeleteDeviceNotification(handles []uint32) ([]ReturnCode, error) {
-	errors, err := sess.client.Load().SumDeleteDeviceNotification(handles)
+func (sess *Session) SumDeleteDeviceNotification(ctx context.Context, handles []uint32) ([]ReturnCode, error) {
+	errors, err := sess.client.Load().SumDeleteDeviceNotification(ctx, handles)
 	if err != nil {
 		return nil, err
 	}

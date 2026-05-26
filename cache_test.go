@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"context"
 	"encoding/binary"
 	"sync"
 	"sync/atomic"
@@ -174,7 +175,7 @@ func TestCacheLockOrdering_NoSimultaneousHold(t *testing.T) {
 }
 
 // TestCache_OnDemandResolve_DuplicateHandleReleased is the canonical R-CACHE-007
-// test: two goroutines call sess.getSymbol("MAIN.x") concurrently; one
+// test: two goroutines call sess.getSymbol(context.Background(), "MAIN.x") concurrently; one
 // must observe the in-cache symbol from the other; the loser must release
 // the duplicate handle to the PLC via Write(GroupSymbolReleaseHandle, ...).
 //
@@ -214,7 +215,7 @@ func TestCache_OnDemandResolve_DuplicateHandleReleased(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			sym, err := sess.getSymbol("MAIN.x")
+			sym, err := sess.getSymbol(context.Background(), "MAIN.x")
 			results[idx] = sym
 			errs[idx] = err
 		}(i)

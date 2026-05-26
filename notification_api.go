@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -121,7 +122,7 @@ const resubscribeMaxAttempts = 3
 // channel will silently drop notifications and emit Error logs. To stop
 // receiving notifications, call DeleteDeviceNotification or Close() — these
 // remove the PLC-side registration before the channel is no longer used.
-func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Duration, cycleTime time.Duration, transMode TransMode, updateReceiver chan *Update) (uint32, error) {
+func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName string, maxDelay time.Duration, cycleTime time.Duration, transMode TransMode, updateReceiver chan *Update) (uint32, error) {
 	// Pre-check: channel match + duplicate-subscribe.
 	sess.notifications.lock.Lock()
 	if sess.notifications.notificationChannel != nil && sess.notifications.notificationChannel != updateReceiver {
@@ -134,7 +135,7 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 	}
 	sess.notifications.lock.Unlock()
 
-	symbol, err := sess.getSymbol(symbolName)
+	symbol, err := sess.getSymbol(ctx, symbolName)
 	if err != nil {
 		return 0, fmt.Errorf("notification for %q: %w", symbolName, err)
 	}
@@ -158,7 +159,7 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 	// stored after the RPC, the previous-subscribe timestamp would falsely
 	// elevate a legitimate first-sample to Warn.
 	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
-	handle, err := sess.client.Load().AddDeviceNotification(
+	handle, err := sess.client.Load().AddDeviceNotification(ctx, 
 		uint32(GroupSymbolValueByHandle),
 		symbol.Handle,
 		symbol.Length,
@@ -186,7 +187,7 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 	cacheGen := sess.epoch()
 	sess.cache.lock.Unlock()
 	if fresh == nil {
-		if delErr := sess.DeleteDeviceNotification(handle); delErr != nil {
+		if delErr := sess.DeleteDeviceNotification(ctx, handle); delErr != nil {
 			sess.logger.Warn("failed to release PLC handle after symbol vanished",
 				"handle", handle, "symbol", symbolName, "error", delErr)
 		}
@@ -198,7 +199,7 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 	sess.notifications.lock.Lock()
 	if sess.epoch() != cacheGen {
 		sess.notifications.lock.Unlock()
-		if delErr := sess.DeleteDeviceNotification(handle); delErr != nil {
+		if delErr := sess.DeleteDeviceNotification(ctx, handle); delErr != nil {
 			sess.logger.Warn("failed to release PLC handle after cache reload during subscribe",
 				"handle", handle, "symbol", symbolName, "error", delErr)
 		}
@@ -206,7 +207,7 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 	}
 	if sess.notifications.notificationChannel != nil && sess.notifications.notificationChannel != updateReceiver {
 		sess.notifications.lock.Unlock()
-		if delErr := sess.DeleteDeviceNotification(handle); delErr != nil {
+		if delErr := sess.DeleteDeviceNotification(ctx, handle); delErr != nil {
 			sess.logger.Warn("failed to release PLC handle after channel-mismatch reject",
 				"handle", handle, "symbol", symbolName, "error", delErr)
 		}
@@ -214,7 +215,7 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 	}
 	if sess.notifications.hasConfig(symbolName) {
 		sess.notifications.lock.Unlock()
-		if delErr := sess.DeleteDeviceNotification(handle); delErr != nil {
+		if delErr := sess.DeleteDeviceNotification(ctx, handle); delErr != nil {
 			sess.logger.Warn("failed to release PLC handle after duplicate-subscribe reject",
 				"handle", handle, "symbol", symbolName, "error", delErr)
 		}
@@ -253,7 +254,7 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 // active on this connection. To stop receiving notifications, call
 // DeleteDeviceNotification or Close() — these remove the PLC-side registration
 // before the channel is no longer used.
-func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch chan *Update) ([]SumNotificationResult, error) {
+func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []NotificationConfig, ch chan *Update) ([]SumNotificationResult, error) {
 	if len(configs) == 0 {
 		return nil, nil
 	}
@@ -302,7 +303,7 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 		}
 		batchSeen[key] = struct{}{}
 
-		symbol, err := sess.getSymbol(cfg.SymbolName)
+		symbol, err := sess.getSymbol(ctx, cfg.SymbolName)
 		if err != nil {
 			results[i].Skipped = fmt.Errorf("resolve symbol %q: %w", cfg.SymbolName, err)
 			sess.logger.Error("error getting symbol for batch notification", "error", err, "symbol", cfg.SymbolName)
@@ -338,7 +339,7 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 	// during PLC-roundtrip + map-insert race window log at Debug not Warn.
 	// See AddSymbolNotification for the same ordering rationale.
 	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
-	subResults, err := sess.client.Load().SumAddDeviceNotification(requests)
+	subResults, err := sess.client.Load().SumAddDeviceNotification(ctx, requests)
 	if err != nil {
 		// Transport-aborted batch: every entry that was about to be sent must
 		// be marked Skipped so callers can distinguish "lib didn't try" from

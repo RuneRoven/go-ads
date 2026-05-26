@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
@@ -70,7 +71,7 @@ func TestAddSymbolNotification_ChannelMismatchRejected(t *testing.T) {
 
 	// Attempt AddSymbolNotification with chB ≠ chA.
 	chB := make(chan *Update, 1)
-	_, err := sess.AddSymbolNotification("MAIN.x", 0, 0, TransModeServerOnChange, chB)
+	_, err := sess.AddSymbolNotification(context.Background(), "MAIN.x", 0, 0, TransModeServerOnChange, chB)
 	if err == nil {
 		t.Fatal("AddSymbolNotification with mismatched channel: err = nil, want error")
 	}
@@ -103,7 +104,7 @@ func TestAddSymbolNotifications_DuplicateRejected(t *testing.T) {
 		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.x"})
 		sess.notifications.lock.Unlock()
 
-		results, err := sess.AddSymbolNotifications([]NotificationConfig{
+		results, err := sess.AddSymbolNotifications(context.Background(), []NotificationConfig{
 			{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange},
 		}, ch)
 		if err != nil {
@@ -133,7 +134,7 @@ func TestAddSymbolNotifications_DuplicateRejected(t *testing.T) {
 		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.dup"})
 		sess.notifications.lock.Unlock()
 
-		results, err := sess.AddSymbolNotifications([]NotificationConfig{
+		results, err := sess.AddSymbolNotifications(context.Background(), []NotificationConfig{
 			{SymbolName: "MAIN.dup", TransmissionMode: TransModeServerOnChange},
 			{SymbolName: "MAIN.dup", TransmissionMode: TransModeServerOnChange},
 		}, ch)
@@ -167,7 +168,7 @@ func TestAddSymbolNotifications_DuplicateRejected(t *testing.T) {
 		sess.notifications.lock.Unlock()
 
 		chB := make(chan *Update, 1)
-		_, err := sess.AddSymbolNotifications([]NotificationConfig{
+		_, err := sess.AddSymbolNotifications(context.Background(), []NotificationConfig{
 			{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange},
 		}, chB)
 		if err == nil {
@@ -227,7 +228,7 @@ func TestAddSymbolNotification_StrandedSymbol_DetectedByEpoch(t *testing.T) {
 	ch := make(chan *Update, 1)
 	addErr := make(chan error, 1)
 	go func() {
-		_, err := sess.AddSymbolNotification("MAIN.x", 0, 0, TransModeServerOnChange, ch)
+		_, err := sess.AddSymbolNotification(context.Background(), "MAIN.x", 0, 0, TransModeServerOnChange, ch)
 		addErr <- err
 	}()
 
@@ -314,7 +315,7 @@ func TestAddSymbolNotification_TOCTOURecheck(t *testing.T) {
 	resCh := make(chan result, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
-			h, err := sess.AddSymbolNotification("MAIN.x", 0, 0, TransModeServerOnChange, ch)
+			h, err := sess.AddSymbolNotification(context.Background(), "MAIN.x", 0, 0, TransModeServerOnChange, ch)
 			resCh <- result{handle: h, err: err}
 		}()
 	}
@@ -392,7 +393,7 @@ func TestDeleteDeviceNotification_ClearsState(t *testing.T) {
 		preSeedSymbol(sess, "MAIN.x")
 
 		ch := make(chan *Update, 1)
-		h, err := sess.AddSymbolNotification("MAIN.x", 0, 0, TransModeServerOnChange, ch)
+		h, err := sess.AddSymbolNotification(context.Background(), "MAIN.x", 0, 0, TransModeServerOnChange, ch)
 		if err != nil {
 			t.Fatalf("AddSymbolNotification: %v", err)
 		}
@@ -409,7 +410,7 @@ func TestDeleteDeviceNotification_ClearsState(t *testing.T) {
 			t.Fatalf("post-add: hasNotif=%v configs=%d chanSet=%v", hasNotif, nConfigs, hasChan)
 		}
 
-		if err := sess.DeleteDeviceNotification(h); err != nil {
+		if err := sess.DeleteDeviceNotification(context.Background(), h); err != nil {
 			t.Fatalf("DeleteDeviceNotification: %v", err)
 		}
 
@@ -452,11 +453,11 @@ func TestDeleteDeviceNotification_ClearsState(t *testing.T) {
 		preSeedSymbol(sess, "MAIN.x")
 
 		ch := make(chan *Update, 1)
-		h, err := sess.AddSymbolNotification("MAIN.x", 0, 0, TransModeServerOnChange, ch)
+		h, err := sess.AddSymbolNotification(context.Background(), "MAIN.x", 0, 0, TransModeServerOnChange, ch)
 		if err != nil {
 			t.Fatalf("AddSymbolNotification: %v", err)
 		}
-		err = sess.DeleteDeviceNotification(h)
+		err = sess.DeleteDeviceNotification(context.Background(), h)
 		if err == nil {
 			t.Errorf("DeleteDeviceNotification with 0x745: err = nil, want non-nil (Session wrapper surfaces RPC error)")
 		}
@@ -478,7 +479,7 @@ func TestNotificationChannel_SetOnFirstSuccess(t *testing.T) {
 		sess := newNotifTestSession()
 		ch := make(chan *Update, 1)
 
-		_, err := sess.AddSymbolNotifications(nil, ch)
+		_, err := sess.AddSymbolNotifications(context.Background(), nil, ch)
 		if err != nil {
 			t.Fatalf("AddSymbolNotifications nil configs: %v", err)
 		}
@@ -500,7 +501,7 @@ func TestNotificationChannel_SetOnFirstSuccess(t *testing.T) {
 		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.dup"})
 		sess.notifications.lock.Unlock()
 
-		_, _ = sess.AddSymbolNotifications([]NotificationConfig{
+		_, _ = sess.AddSymbolNotifications(context.Background(), []NotificationConfig{
 			{SymbolName: "MAIN.dup", TransmissionMode: TransModeServerOnChange},
 		}, ch)
 		// Channel was never set by AddSymbolNotifications since all entries
@@ -534,7 +535,7 @@ func TestNotificationChannel_SetOnFirstSuccess(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_, _ = sess.AddSymbolNotifications([]NotificationConfig{
+				_, _ = sess.AddSymbolNotifications(context.Background(), []NotificationConfig{
 					{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange},
 				}, ch)
 			}()
@@ -651,7 +652,7 @@ func TestResubscribeRetry_UpToMax(t *testing.T) {
 func TestBestEffortDeleteNotifications_MixedSuccess(t *testing.T) {
 	t.Run("empty_returns_zero", func(t *testing.T) {
 		sess := newNotifTestSession()
-		got := sess.bestEffortDeleteNotifications(nil)
+		got := sess.bestEffortDeleteNotifications(context.Background(), nil)
 		if got != 0 {
 			t.Errorf("empty handles: got %d, want 0", got)
 		}
@@ -676,7 +677,7 @@ func TestBestEffortDeleteNotifications_MixedSuccess(t *testing.T) {
 		sess, _ := newWiredTestSession(t, srv)
 		sess.logger = slog.New(logHandler)
 
-		got := sess.bestEffortDeleteNotifications([]uint32{1, 2, 3})
+		got := sess.bestEffortDeleteNotifications(context.Background(), []uint32{1, 2, 3})
 		if got != 2 {
 			t.Errorf("deleted count = %d, want 2 (NoErrors + handle-invalid)", got)
 		}
@@ -766,7 +767,7 @@ func TestSumNotificationResultTriState(t *testing.T) {
 		{SymbolName: "MAIN.z", TransmissionMode: TransModeServerOnChange},
 	}
 
-	results, err := sess.AddSymbolNotifications(configs, ch)
+	results, err := sess.AddSymbolNotifications(context.Background(), configs, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotifications: %v", err)
 	}
