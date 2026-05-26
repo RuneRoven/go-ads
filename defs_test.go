@@ -259,12 +259,12 @@ func TestADSTypeToString(t *testing.T) {
 
 // Validates: R-NOT-016.
 func TestUpdate_StaleReasonFields(t *testing.T) {
-	u := Update{Variable: "x", Value: "1", Stale: true, Reason: "symbol-version-invalid"}
-	if !u.Stale {
+	u := Update{Variable: "x", Value: "1", Stale: &StaleInfo{Reason: ReasonSymbolVersionInvalid}}
+	if u.Stale == nil {
 		t.Error("Stale field missing")
 	}
-	if u.Reason != "symbol-version-invalid" {
-		t.Errorf("Reason field missing or wrong: %q", u.Reason)
+	if u.Stale.Reason != ReasonSymbolVersionInvalid {
+		t.Errorf("Stale.Reason field missing or wrong: %q", u.Stale.Reason)
 	}
 }
 

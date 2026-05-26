@@ -402,7 +402,7 @@ func TestDeleteDeviceNotification_ClearsState(t *testing.T) {
 		// Sanity: state populated.
 		sess.notifications.lock.Lock()
 		_, hasNotif := sess.notifications.activeNotifications[h]
-		nConfigs := len(sess.notifications.notificationConfigs)
+		nConfigs := len(sess.notifications.pending)
 		hasChan := sess.notifications.notificationChannel != nil
 		sess.notifications.lock.Unlock()
 		if !hasNotif || nConfigs != 1 || !hasChan {
@@ -415,7 +415,7 @@ func TestDeleteDeviceNotification_ClearsState(t *testing.T) {
 
 		sess.notifications.lock.Lock()
 		_, stillThere := sess.notifications.activeNotifications[h]
-		nConfigs = len(sess.notifications.notificationConfigs)
+		nConfigs = len(sess.notifications.pending)
 		chanNil := sess.notifications.notificationChannel == nil
 		sess.notifications.lock.Unlock()
 		if stillThere {
@@ -576,9 +576,10 @@ func TestResubscribeRetry_UpToMax(t *testing.T) {
 	// Pre-populate config + channel so resubscribe has work to do.
 	ch := make(chan *Update, 1)
 	sess.notifications.lock.Lock()
-	sess.notifications.notificationConfigs = []NotificationConfig{
-		{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange},
+	sess.notifications.pending = []pendingNotification{
+		{Config: NotificationConfig{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange}},
 	}
+	sess.notifications.configsByKey[symbolKey("MAIN.x")] = struct{}{}
 	sess.notifications.notificationChannel = ch
 	sess.notifications.lock.Unlock()
 
@@ -625,7 +626,7 @@ func TestResubscribeRetry_UpToMax(t *testing.T) {
 	// After resubscribeMaxAttempts iterations: the config must be DROPPED,
 	// not requeued.
 	sess.notifications.lock.Lock()
-	leftover := len(sess.notifications.notificationConfigs)
+	leftover := len(sess.notifications.pending)
 	sess.notifications.lock.Unlock()
 	if leftover != 0 {
 		t.Errorf("after %d retries: notificationConfigs still has %d entries, want 0 (dropped at cap)",
@@ -824,8 +825,8 @@ func TestResubscribeNotifications_RollbackOnError(t *testing.T) {
 	sess, _ := newWiredTestSession(t, srv)
 	preSeedSymbol(sess, "MAIN.x")
 	ch := make(chan *Update, 1)
-	saved := []NotificationConfig{
-		{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange, MaxDelay: 0, CycleTime: 0},
+	saved := []pendingNotification{
+		{Config: NotificationConfig{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange, MaxDelay: 0, CycleTime: 0}},
 	}
 
 	sess.notifications.lock.Lock()
@@ -840,12 +841,12 @@ func TestResubscribeNotifications_RollbackOnError(t *testing.T) {
 
 	// Rollback restored — savedConfigs is back in place.
 	sess.notifications.lock.Lock()
-	got := sess.notifications.notificationConfigs
+	got := sess.notifications.pending
 	gotChannel := sess.notifications.notificationChannel
 	sess.notifications.lock.Unlock()
 
-	if len(got) != 1 || got[0].SymbolName != "MAIN.x" {
-		t.Errorf("notificationConfigs after rollback = %+v, want 1 entry for MAIN.x", got)
+	if len(got) != 1 || got[0].Config.SymbolName != "MAIN.x" {
+		t.Errorf("pending after rollback = %+v, want 1 entry for MAIN.x", got)
 	}
 	if gotChannel != ch {
 		t.Errorf("notificationChannel after rollback = %v, want %v (saved channel)", gotChannel, ch)

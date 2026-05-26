@@ -552,9 +552,9 @@ func TestNotification_StaleFlag_OneShotAfterDetection(t *testing.T) {
 	}
 	select {
 	case u := <-ch:
-		if !u.Stale || u.Reason != ReasonSymbolVersionInvalid {
-			t.Errorf("first sample: got Stale=%v Reason=%q, want Stale=true Reason=%q",
-				u.Stale, u.Reason, ReasonSymbolVersionInvalid)
+		if u.Stale == nil || u.Stale.Reason != ReasonSymbolVersionInvalid {
+			t.Errorf("first sample: got Stale=%v, want non-nil with Reason=%q",
+				u.Stale, ReasonSymbolVersionInvalid)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no first sample")
@@ -567,9 +567,8 @@ func TestNotification_StaleFlag_OneShotAfterDetection(t *testing.T) {
 	}
 	select {
 	case u := <-ch:
-		if u.Stale || u.Reason != "" {
-			t.Errorf("second sample: got Stale=%v Reason=%q, want Stale=false Reason=\"\"",
-				u.Stale, u.Reason)
+		if u.Stale != nil {
+			t.Errorf("second sample: got Stale=%+v, want nil", u.Stale)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no second sample")
@@ -677,9 +676,9 @@ func TestNotification_ListenerPathTriggersIgnoreMarksOtherHandles(t *testing.T) 
 	}
 	select {
 	case u := <-chLive:
-		if !u.Stale || u.Reason != ReasonSymbolNotFound {
-			t.Errorf("live first post-detection sample: Stale=%v Reason=%q, want Stale=true Reason=%q",
-				u.Stale, u.Reason, ReasonSymbolNotFound)
+		if u.Stale == nil || u.Stale.Reason != ReasonSymbolNotFound {
+			t.Errorf("live first post-detection sample: Stale=%v, want non-nil with Reason=%q",
+				u.Stale, ReasonSymbolNotFound)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no live sample after listener-path detection")
@@ -692,9 +691,8 @@ func TestNotification_ListenerPathTriggersIgnoreMarksOtherHandles(t *testing.T) 
 	}
 	select {
 	case u := <-chLive:
-		if u.Stale || u.Reason != "" {
-			t.Errorf("live second sample: Stale=%v Reason=%q, want Stale=false Reason=\"\"",
-				u.Stale, u.Reason)
+		if u.Stale != nil {
+			t.Errorf("live second sample: Stale=%+v, want nil", u.Stale)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no live sample #2")
