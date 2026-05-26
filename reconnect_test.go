@@ -22,8 +22,8 @@ import (
 func newReconnectTestSession() *Session {
 	return &Session{
 		tx:            &transport{},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
-		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
+		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 		lifecycle: &sessionLifecycle{
 			closedCh:      make(chan struct{}),
@@ -213,8 +213,8 @@ func TestReconnectExhaustsMaxAttemptsTransitionsToClosed(t *testing.T) {
 			recvQueue:      make(chan []byte, recvQueueSize),
 			activeRequests: map[uint32]chan []byte{},
 		},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
-		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
+		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 		lifecycle: &sessionLifecycle{
 			closedCh:             make(chan struct{}),
@@ -280,8 +280,8 @@ func TestReconnectExhaustConcurrentClose_NoPanic(t *testing.T) {
 				recvQueue:      make(chan []byte, recvQueueSize),
 				activeRequests: map[uint32]chan []byte{},
 			},
-			notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
-			cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
+			notifications: &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
+			cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 			logger:        getDefaultLogger(),
 			lifecycle: &sessionLifecycle{
 				closedCh:             make(chan struct{}),
@@ -365,8 +365,8 @@ func TestReconnect_FlapDetection_AccumulatesAcrossCycles(t *testing.T) {
 			recvQueue:      make(chan []byte, recvQueueSize),
 			activeRequests: map[uint32]chan []byte{},
 		},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
-		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
+		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 		lifecycle: &sessionLifecycle{
 			closedCh:             make(chan struct{}),

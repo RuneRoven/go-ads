@@ -22,8 +22,8 @@ import (
 // zero-value Constructed state so bumpEpoch / epoch read paths work.
 func newCacheTestSession() *Session {
 	return &Session{
-		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
+		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
 		lifecycle:     &sessionLifecycle{},
 		logger:        getDefaultLogger(),
 	}
@@ -51,7 +51,7 @@ func TestCacheLock_GuardsMutations(t *testing.T) {
 			for j := 0; j < Iterations; j++ {
 				key := symbolKey(string(rune('a' + (id+j)%26)))
 				sess.cache.lock.Lock()
-				sess.cache.symbols[key] = &Symbol{FullName: key, Name: key}
+				sess.cache.symbols[key] = &symbol{FullName: key, Name: key}
 				sess.cache.lock.Unlock()
 			}
 		}(i)
@@ -87,7 +87,7 @@ func TestCacheEpoch_BumpsOnSwapNotInsert(t *testing.T) {
 	// In-place insert (mimicking on-demand getSymbol): epoch unchanged.
 	before := sess.epoch()
 	sess.cache.lock.Lock()
-	sess.cache.symbols[symbolKey("a")] = &Symbol{FullName: "a"}
+	sess.cache.symbols[symbolKey("a")] = &symbol{FullName: "a"}
 	sess.cache.lock.Unlock()
 	if got := sess.epoch(); got != before {
 		t.Errorf("after insert: epoch = %d, want unchanged %d", got, before)
@@ -95,7 +95,7 @@ func TestCacheEpoch_BumpsOnSwapNotInsert(t *testing.T) {
 
 	// Swap (mimicking loadSymbols): bumpEpoch under cache.lock, epoch++.
 	sess.cache.lock.Lock()
-	sess.cache.symbols = map[string]*Symbol{symbolKey("b"): {FullName: "b"}}
+	sess.cache.symbols = map[string]*symbol{symbolKey("b"): {FullName: "b"}}
 	sess.bumpEpoch()
 	sess.cache.lock.Unlock()
 	if got := sess.epoch(); got != before+1 {
@@ -105,7 +105,7 @@ func TestCacheEpoch_BumpsOnSwapNotInsert(t *testing.T) {
 	// Second insert into the new map: still no bump.
 	mid := sess.epoch()
 	sess.cache.lock.Lock()
-	sess.cache.symbols[symbolKey("c")] = &Symbol{FullName: "c"}
+	sess.cache.symbols[symbolKey("c")] = &symbol{FullName: "c"}
 	sess.cache.lock.Unlock()
 	if got := sess.epoch(); got != mid {
 		t.Errorf("after second insert: epoch = %d, want unchanged %d", got, mid)
@@ -130,7 +130,7 @@ func TestCacheLockOrdering_NoSimultaneousHold(t *testing.T) {
 	sess := newCacheTestSession()
 	// Seed cache with one symbol so the readers do real work.
 	sess.cache.lock.Lock()
-	sess.cache.symbols[symbolKey("MAIN.x")] = &Symbol{FullName: "MAIN.x", Name: "x"}
+	sess.cache.symbols[symbolKey("MAIN.x")] = &symbol{FullName: "MAIN.x", Name: "x"}
 	sess.cache.lock.Unlock()
 
 	const Goroutines = 25
@@ -207,7 +207,7 @@ func TestCache_OnDemandResolve_DuplicateHandleReleased(t *testing.T) {
 	sess, _ := newWiredTestSession(t, srv)
 
 	const N = 4
-	results := make([]*Symbol, N)
+	results := make([]*symbol, N)
 	errs := make([]error, N)
 	var wg sync.WaitGroup
 	for i := 0; i < N; i++ {
@@ -226,7 +226,7 @@ func TestCache_OnDemandResolve_DuplicateHandleReleased(t *testing.T) {
 			t.Fatalf("getSymbol[%d]: %v", i, e)
 		}
 	}
-	// All goroutines must observe the SAME *Symbol pointer.
+	// All goroutines must observe the SAME *symbol pointer.
 	for i := 1; i < N; i++ {
 		if results[i] != results[0] {
 			t.Errorf("results[%d] (%p) != results[0] (%p) — duplicate cache entries", i, results[i], results[0])

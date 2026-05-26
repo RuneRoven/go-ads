@@ -255,7 +255,7 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 		timeStamp := int64(timestamp)/windowsTick - secToUnixEpoch
 		notificationTime = time.Unix(timeStamp, int64(timestamp)%(windowsTick)*100)
 	}
-	// cache.lock for parse() — Symbol fields live in cache.symbols and parse
+	// cache.lock for parse() — symbol fields live in cache.symbols and parse
 	// mutates Value/Valid. Lock ordering: cache after notifications release
 	// (never both held).
 	// Re-resolve via cache.symbols[FullName]: the symbol fetched from

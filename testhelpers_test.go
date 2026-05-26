@@ -161,8 +161,8 @@ func newTestConnection() *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := &Session{
 		lifecycle:     &sessionLifecycle{ctx: ctx, shutdown: cancel},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
-		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
+		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 	}
 	conn.client.Store(&Client{
@@ -227,18 +227,18 @@ func encodeUTF16LE(s string) []byte {
 	return buf
 }
 
-// --- Symbol writeToNode round-trip helper ---
+// --- symbol writeToNode round-trip helper ---
 
 // testWriteRoundTrip writes a value via writeToNode then reads it back via parse and compares.
 func testWriteRoundTrip(t *testing.T, dataType string, length uint32, value string) {
 	t.Helper()
-	sym := &Symbol{DataType: dataType, Length: length}
+	sym := &symbol{DataType: dataType, Length: length}
 	data, err := sym.writeToNode(value, nil)
 	if err != nil {
 		t.Fatalf("writeToNode(%q, %q) error: %v", dataType, value, err)
 	}
 
-	sym2 := &Symbol{DataType: dataType, Length: length}
+	sym2 := &symbol{DataType: dataType, Length: length}
 	parsed, err := sym2.parse(data, 0, nil)
 	if err != nil {
 		t.Fatalf("parse(%q) error: %v", dataType, err)

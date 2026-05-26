@@ -217,10 +217,10 @@ func (sess *Session) GetSymbol(symbolName string) (SymbolView, error) {
 	return sym.view(sess), nil
 }
 
-// getSymbol returns the internal *Symbol for the named symbol. Used by
-// in-package code paths that need direct access to mutable Symbol state
+// getSymbol returns the internal *symbol for the named symbol. Used by
+// in-package code paths that need direct access to mutable symbol state
 // (notifications, reads, writes). External callers should use GetSymbol.
-func (sess *Session) getSymbol(symbolName string) (*Symbol, error) {
+func (sess *Session) getSymbol(symbolName string) (*symbol, error) {
 	sess.cache.lock.Lock()
 	localSymbol, ok := sess.cache.symbols[symbolKey(symbolName)]
 	needHandle := ok && localSymbol.Handle == 0
@@ -293,10 +293,10 @@ func (sess *Session) getSymbol(symbolName string) (*Symbol, error) {
 // getSymbolInfoByName queries a single symbol's metadata from the PLC
 // using GroupSymbolInfoByNameEx (0xF009).
 // GetSymbolInfoByName resolves a single symbol on the PLC and returns a
-// populated Symbol with Group, Offset, Length, DataType, etc. Does NOT
+// populated symbol with Group, Offset, Length, DataType, etc. Does NOT
 // populate Children (struct / array children require full discovery via
 // LoadSymbols / LoadSymbolList + LoadDataTypes). This is a raw RPC and bypasses the symbol cache; the caller is responsible for decoding the response.
-func (c *Client) GetSymbolInfoByName(symbolName string) (*Symbol, error) {
+func (c *Client) GetSymbolInfoByName(symbolName string) (*symbol, error) {
 	resp, err := c.WriteRead(
 		uint32(GroupSymbolInfoByNameEx),
 		0,
@@ -327,7 +327,7 @@ func (c *Client) GetSymbolInfoByName(symbolName string) (*Symbol, error) {
 	}
 	dataType := normalizeStringDataType(string(dt))
 	flags := SymbolFlag(entry.Flags)
-	return &Symbol{
+	return &symbol{
 		FullName:          string(name), // PLC-returned casing (authoritative)
 		Name:              string(name),
 		DataType:          dataType,
@@ -617,7 +617,7 @@ func (sess *Session) rebuildSymbolChildrenLocked() {
 
 	// Collect top-level symbol names (those without a dot, i.e., not children)
 	// We rebuild from the original top-level symbols only
-	topLevel := make(map[string]*Symbol)
+	topLevel := make(map[string]*symbol)
 	for name, sym := range sess.cache.symbols {
 		topLevel[name] = sym
 	}

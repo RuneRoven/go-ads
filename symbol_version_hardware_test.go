@@ -1,6 +1,6 @@
 //go:build symbol_version_hardware
 
-// Symbol-version hardware tests — online-change strategies.
+// symbol-version hardware tests — online-change strategies.
 //
 // REQUIREMENTS (Plan-C, R-CACHE-009..014, R-NOT-016/017, R-SES-011):
 //   - PLC project must contain MAIN_DP1 with: nCounter (DINT), sStable (STRING),

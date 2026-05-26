@@ -5,7 +5,7 @@ import (
 )
 
 // TestBrowseSymbols_VirtualRootGroupingPreservesCase validates that virtual
-// root-level groupings (where no Symbol exists for the prefix itself, only
+// root-level groupings (where no symbol exists for the prefix itself, only
 // for child paths) display in the original PLC casing, not the lowercased
 // cache-key form. Regression test for browse.go::browseRoot.
 func TestBrowseSymbols_VirtualRootGroupingPreservesCase(t *testing.T) {
@@ -13,7 +13,7 @@ func TestBrowseSymbols_VirtualRootGroupingPreservesCase(t *testing.T) {
 	defer sess.lifecycle.shutdown()
 
 	// Seed cache: only "MAIN_DP1.nCounter" exists, no symbol named "MAIN_DP1" itself.
-	sess.cache.symbols[symbolKey("MAIN_DP1.nCounter")] = &Symbol{
+	sess.cache.symbols[symbolKey("MAIN_DP1.nCounter")] = &symbol{
 		FullName: "MAIN_DP1.nCounter",
 		Name:     "nCounter",
 		DataType: "DINT",
@@ -55,7 +55,7 @@ func TestBrowseSymbols_VirtualChildGroupingPreservesCase(t *testing.T) {
 	// "MAIN_DP1.stStruct" themselves. browseChildren("MAIN_DP1") falls
 	// through to the prefix-scan branch (no exact-match symbol with
 	// Children present), exercising the virtual-middle-grouping case.
-	sess.cache.symbols[symbolKey("MAIN_DP1.stStruct.nField")] = &Symbol{
+	sess.cache.symbols[symbolKey("MAIN_DP1.stStruct.nField")] = &symbol{
 		FullName: "MAIN_DP1.stStruct.nField",
 		Name:     "nField",
 		DataType: "INT",
