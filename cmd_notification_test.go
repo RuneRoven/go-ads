@@ -115,9 +115,8 @@ func TestDeviceNotification_SingleSample(t *testing.T) {
 		FullName:     "MAIN.testVar",
 		DataType:     "INT",
 		Length:       2,
-		Notification: ch,
 	}
-	conn.notifications.activeNotifications[42] = sym
+	conn.notifications.activeNotifications[42] = activeNotification{Sym: sym, Ch: ch}
 	conn.cache.symbols[symbolKey(sym.FullName)] = sym
 
 	// Build INT value = 1234
@@ -233,10 +232,10 @@ func TestDeviceNotification_MultipleStampsAndSamples(t *testing.T) {
 	defer conn.lifecycle.shutdown()
 
 	ch := make(chan *Update, 10)
-	sym1 := &symbol{FullName: "var1", DataType: "BYTE", Length: 1, Notification: ch}
-	sym2 := &symbol{FullName: "var2", DataType: "BYTE", Length: 1, Notification: ch}
-	conn.notifications.activeNotifications[1] = sym1
-	conn.notifications.activeNotifications[2] = sym2
+	sym1 := &symbol{FullName: "var1", DataType: "BYTE", Length: 1}
+	sym2 := &symbol{FullName: "var2", DataType: "BYTE", Length: 1}
+	conn.notifications.activeNotifications[1] = activeNotification{Sym: sym1, Ch: ch}
+	conn.notifications.activeNotifications[2] = activeNotification{Sym: sym2, Ch: ch}
 	conn.cache.symbols[symbolKey(sym1.FullName)] = sym1
 	conn.cache.symbols[symbolKey(sym2.FullName)] = sym2
 
@@ -342,8 +341,8 @@ func TestDeviceNotification_BoolType(t *testing.T) {
 	defer conn.lifecycle.shutdown()
 
 	ch := make(chan *Update, 5)
-	sym := &symbol{FullName: "MAIN.bFlag", DataType: "BOOL", Length: 1, Notification: ch}
-	conn.notifications.activeNotifications[10] = sym
+	sym := &symbol{FullName: "MAIN.bFlag", DataType: "BOOL", Length: 1}
+	conn.notifications.activeNotifications[10] = activeNotification{Sym: sym, Ch: ch}
 	conn.cache.symbols[symbolKey(sym.FullName)] = sym
 
 	packet := buildNotificationPacket(10, 0, []byte{1})
@@ -368,8 +367,8 @@ func TestDeviceNotification_StringType(t *testing.T) {
 	defer conn.lifecycle.shutdown()
 
 	ch := make(chan *Update, 5)
-	sym := &symbol{FullName: "MAIN.sName", DataType: "STRING", Length: 20, Notification: ch}
-	conn.notifications.activeNotifications[11] = sym
+	sym := &symbol{FullName: "MAIN.sName", DataType: "STRING", Length: 20}
+	conn.notifications.activeNotifications[11] = activeNotification{Sym: sym, Ch: ch}
 	conn.cache.symbols[symbolKey(sym.FullName)] = sym
 
 	strData := make([]byte, 20)
@@ -435,9 +434,8 @@ func TestWindowsFiletimeConversion(t *testing.T) {
 				FullName:     "MAIN.x",
 				DataType:     "INT",
 				Length:       2,
-				Notification: ch,
 			}
-			conn.notifications.activeNotifications[7] = sym
+			conn.notifications.activeNotifications[7] = activeNotification{Sym: sym, Ch: ch}
 			conn.cache.symbols[symbolKey(sym.FullName)] = sym
 
 			data := make([]byte, 2)
@@ -493,9 +491,8 @@ func TestNotification_TerminalZeroByteSample_TriggersDetection(t *testing.T) {
 		FullName:     "MAIN.x",
 		DataType:     "DINT",
 		Length:       4,
-		Notification: ch,
 	}
-	conn.notifications.activeNotifications[42] = sym
+	conn.notifications.activeNotifications[42] = activeNotification{Sym: sym, Ch: ch}
 	conn.cache.symbols[symbolKey(sym.FullName)] = sym
 
 	// Inject 0-byte terminal sample. drivePacket may or may not return an
@@ -532,11 +529,11 @@ func TestNotification_StaleFlag_OneShotAfterDetection(t *testing.T) {
 
 	ch := make(chan *Update, 4)
 	sym := &symbol{
-		FullName: "MAIN.x", DataType: "INT", Length: 2, Notification: ch,
+		FullName: "MAIN.x", DataType: "INT", Length: 2,
 	}
 	const handle uint32 = 7
 	sess.notifications.lock.Lock()
-	sess.notifications.activeNotifications[handle] = sym
+	sess.notifications.activeNotifications[handle] = activeNotification{Sym: sym, Ch: ch}
 	sess.notifications.lock.Unlock()
 	sess.cache.lock.Lock()
 	sess.cache.symbols[symbolKey(sym.FullName)] = sym
@@ -584,8 +581,8 @@ func TestNotification_StaleFlag_IgnoreMarksAllHandles(t *testing.T) {
 
 	const h1, h2 uint32 = 11, 22
 	sess.notifications.lock.Lock()
-	sess.notifications.activeNotifications[h1] = &symbol{FullName: "a"}
-	sess.notifications.activeNotifications[h2] = &symbol{FullName: "b"}
+	sess.notifications.activeNotifications[h1] = activeNotification{Sym: &symbol{FullName: "a"}}
+	sess.notifications.activeNotifications[h2] = activeNotification{Sym: &symbol{FullName: "b"}}
 	sess.notifications.lock.Unlock()
 
 	// Trigger detection through the strategy dispatcher.
@@ -636,11 +633,11 @@ func TestNotification_ListenerPathTriggersIgnoreMarksOtherHandles(t *testing.T) 
 	const hDead, hLive uint32 = 100, 200
 	chDead := make(chan *Update, 4)
 	chLive := make(chan *Update, 4)
-	symDead := &symbol{FullName: "MAIN.dead", DataType: "DINT", Length: 4, Notification: chDead}
-	symLive := &symbol{FullName: "MAIN.live", DataType: "INT", Length: 2, Notification: chLive}
+	symDead := &symbol{FullName: "MAIN.dead", DataType: "DINT", Length: 4}
+	symLive := &symbol{FullName: "MAIN.live", DataType: "INT", Length: 2}
 
-	conn.notifications.activeNotifications[hDead] = symDead
-	conn.notifications.activeNotifications[hLive] = symLive
+	conn.notifications.activeNotifications[hDead] = activeNotification{Sym: symDead, Ch: chDead}
+	conn.notifications.activeNotifications[hLive] = activeNotification{Sym: symLive, Ch: chLive}
 	conn.cache.symbols[symbolKey(symDead.FullName)] = symDead
 	conn.cache.symbols[symbolKey(symLive.FullName)] = symLive
 

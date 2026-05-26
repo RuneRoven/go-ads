@@ -192,7 +192,7 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 		target:         remote.AMS,
 		requestTimeout: 5 * time.Second,
 		route:          &routeManager{},
-		notifications:  &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
+		notifications:  &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{})},
 		cache: &symbolCache{
 			symbols:         map[string]*symbol{},
 			onDemandSymbols: map[string]bool{},
@@ -949,7 +949,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 
 	// Clear active notifications (old handles invalid after reconnect).
 	sess.notifications.lock.Lock()
-	sess.notifications.activeNotifications = make(map[uint32]*symbol)
+	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
 	sess.notifications.lock.Unlock()
 
 	sess.tearDownAndReset(true)

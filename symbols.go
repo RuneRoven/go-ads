@@ -148,10 +148,6 @@ type SymbolUploadInfo struct {
 //     An observed-zero Handle naturally fails the next PLC operation with
 //     ReturnCodeDeviceNotifyHandleInvalid, prompting re-resolve via GetSymbol.
 //
-//   - Guarded by Session.notifications.lock (mutated by AddSymbolNotification(s)
-//     and DeleteDeviceNotification):
-//     Notification.
-//
 // The Children map and Parent pointer form a tree, set up during discovery
 // and never mutated after - callers may walk freely without a lock as long
 // as no concurrent reload (LoadSymbols/LoadSymbolsSlow) is in progress.
@@ -173,8 +169,6 @@ type symbol struct {
 	Value       string
 	Valid       bool
 	ValueParsed bool // true after first successful parse
-
-	Notification chan<- *Update
 
 	Parent   *symbol
 	Children map[string]*symbol
