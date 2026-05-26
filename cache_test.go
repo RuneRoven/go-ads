@@ -24,7 +24,7 @@ import (
 func newCacheTestSession() *Session {
 	return &Session{
 		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{})},
 		lifecycle:     &sessionLifecycle{},
 		logger:        getDefaultLogger(),
 	}

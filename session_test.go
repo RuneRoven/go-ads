@@ -278,7 +278,7 @@ func TestSession_OnDisconnectFiresOnceOnConcurrentTrigger(t *testing.T) {
 	// require a live transport).
 	sess := &Session{
 		tx:            &transport{},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{})},
 		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 		lifecycle: &sessionLifecycle{
@@ -481,8 +481,8 @@ func TestSession_TryRecordReloadAttempt_SlidingWindow(t *testing.T) {
 func TestSession_MarkAllHandlesStale(t *testing.T) {
 	sess := newTestConnection()
 	defer sess.lifecycle.shutdown()
-	sess.notifications.activeNotifications[42] = &symbol{}
-	sess.notifications.activeNotifications[99] = &symbol{}
+	sess.notifications.activeNotifications[42] = activeNotification{Sym: &symbol{}}
+	sess.notifications.activeNotifications[99] = activeNotification{Sym: &symbol{}}
 
 	sess.markAllHandlesStale(ReasonReloadInProgress)
 
@@ -764,7 +764,7 @@ func TestReleasePLCResources_NotificationCleanup(t *testing.T) {
 
 	sess, _ := newWiredTestSession(t, srv)
 	sess.notifications.lock.Lock()
-	sess.notifications.activeNotifications[stagedHandle] = &symbol{FullName: "MAIN.x"}
+	sess.notifications.activeNotifications[stagedHandle] = activeNotification{Sym: &symbol{FullName: "MAIN.x"}}
 	sess.notifications.lock.Unlock()
 
 	sess.releasePLCResources(false)

@@ -16,9 +16,20 @@ import (
 // "unknown handle" warnings during the first-sample race window).
 //
 // Lock ordering: NEVER hold both cache.lock and notifications.lock simultaneously.
+// activeNotification couples a subscribed symbol with the user channel
+// updates flow to. Stored in notificationManager.activeNotifications under
+// notifications.lock. Pairing the channel with the symbol here (instead of
+// on the symbol struct) keeps the cross-lock invariant entirely inside the
+// notifications subsystem — symbol records reachable via cache.symbols no
+// longer carry notifications.lock-guarded state.
+type activeNotification struct {
+	Sym *symbol
+	Ch  chan<- *Update
+}
+
 type notificationManager struct {
 	lock                sync.Mutex
-	activeNotifications map[uint32]*symbol
+	activeNotifications map[uint32]activeNotification
 	// pending holds the resubscribe-aware copy of every active user
 	// subscription. Internal type — exposed via NotificationConfig in public
 	// API. configsByKey mirrors pending for O(1) duplicate-subscribe probes
@@ -222,8 +233,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 		return 0, fmt.Errorf("symbol %q already has an active notification; delete it before re-subscribing", symbolName)
 	}
 	defer sess.notifications.lock.Unlock()
-	fresh.Notification = updateReceiver
-	sess.notifications.activeNotifications[handle] = fresh
+	sess.notifications.activeNotifications[handle] = activeNotification{Sym: fresh, Ch: updateReceiver}
 
 	// Save config for reconnect re-subscribe
 	sess.notifications.addConfig(NotificationConfig{
@@ -439,8 +449,7 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 			continue
 		}
 		results[info.configIndex] = r
-		fresh.Notification = ch
-		sess.notifications.activeNotifications[r.Handle] = fresh
+		sess.notifications.activeNotifications[r.Handle] = activeNotification{Sym: fresh, Ch: ch}
 		// addConfig wraps in a fresh pendingNotification with
 		// resubscribeAttempts=0, so a successful subscribe naturally resets
 		// any prior retry counter that may have been on this symbol.

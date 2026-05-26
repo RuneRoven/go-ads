@@ -137,8 +137,8 @@ func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32
 	// would cause resubscribeNotifications to re-subscribe a deleted symbol).
 	sess.notifications.lock.Lock()
 	var symbolName string
-	if sym := sess.notifications.activeNotifications[handle]; sym != nil {
-		symbolName = sym.FullName
+	if entry, ok := sess.notifications.activeNotifications[handle]; ok && entry.Sym != nil {
+		symbolName = entry.Sym.FullName
 	}
 	sess.notifications.lock.Unlock()
 
@@ -172,8 +172,8 @@ func (sess *Session) SumDeleteDeviceNotification(ctx context.Context, handles []
 	sess.notifications.lock.Lock()
 	for i, h := range handles {
 		if errors[i] == ReturnCodeNoErrors || errors[i] == ReturnCodeDeviceNotifyHandleInvalid {
-			if sym := sess.notifications.activeNotifications[h]; sym != nil {
-				sess.removeNotificationConfig(sym.FullName)
+			if entry, ok := sess.notifications.activeNotifications[h]; ok && entry.Sym != nil {
+				sess.removeNotificationConfig(entry.Sym.FullName)
 			}
 			delete(sess.notifications.activeNotifications, h)
 			sess.logger.Info("batch deleted notification handle", "handle", h, "errorCode", uint32(errors[i]))
@@ -221,9 +221,9 @@ type NotificationSample struct {
 // Session.Connect.
 
 func (sess *Session) handleNotification(ctx context.Context, handle uint32, timestamp uint64, content []byte) {
-	// notifications.lock: handle lookup + symbol pointer/field snapshot.
+	// notifications.lock: handle lookup + symbol pointer/channel snapshot.
 	sess.notifications.lock.Lock()
-	symbol, ok := sess.notifications.activeNotifications[handle]
+	entry, ok := sess.notifications.activeNotifications[handle]
 	if !ok {
 		sess.notifications.lock.Unlock()
 		// Stale notifications are expected during:
@@ -245,8 +245,8 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 		}
 		return
 	}
-	notification := symbol.Notification
-	fullName := symbol.FullName
+	notification := entry.Ch
+	fullName := entry.Sym.FullName
 	sess.notifications.lock.Unlock()
 
 	var notificationTime time.Time

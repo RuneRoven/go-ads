@@ -50,10 +50,16 @@ func (sess *Session) writeToSymbolRetry(ctx context.Context, symbolName string, 
 		return fmt.Errorf("write to %q: %w", symbolName, err)
 	}
 
-	// Invalidate cached value so the next ReadFromSymbol fetches fresh data
+	// Invalidate cached value so the next ReadFromSymbol fetches fresh data.
+	// Re-resolve via cache.symbols: the symbol pointer captured at the top of
+	// this function may be stranded if loadSymbols swapped the cache during
+	// the Write roundtrip. writeMultipleSymbolsRetry uses the same pattern at
+	// the per-item commit site; symmetric here.
 	sess.cache.lock.Lock()
-	symbol.Value = ""
-	symbol.ValueParsed = false
+	if live := sess.cache.symbols[symbolKey(symbolName)]; live != nil {
+		live.Value = ""
+		live.ValueParsed = false
+	}
 	sess.cache.lock.Unlock()
 
 	sess.logger.Log(context.Background(), LevelTrace, "wrote to symbol",
