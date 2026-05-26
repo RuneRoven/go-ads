@@ -144,9 +144,15 @@ func TestSession_OptionValidation_NoOpOnZeroValues(t *testing.T) {
 	// zero-valued options and assert they did NOT clobber the default.
 	defaultBackoff := DefaultBackoffConfig()
 
+	// Use a fully-specified BackoffConfig — v2.2 Validate() rejects partial
+	// configs that previously silently overrode defaults with zero values.
+	// Override only the fields we want to differ from the default, keeping
+	// the monotonic Initial <= Mid <= Slow <= Max invariant intact.
+	customBackoff := DefaultBackoffConfig()
+	customBackoff.InitialAttempts = 9
 	sess, err := NewSession("127.0.0.1", 48898, "1.2.3.4.1.1", 851, "auto", 10500, 5*time.Second,
 		WithLogger(customLogger),
-		WithBackoff(BackoffConfig{InitialInterval: 7 * time.Second, InitialAttempts: 9}),
+		WithBackoff(customBackoff),
 	)
 	if err != nil {
 		t.Fatalf("NewSession real: %v", err)

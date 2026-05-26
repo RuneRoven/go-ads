@@ -304,8 +304,7 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 	}
 	// One-shot Stale flag (R-NOT-017): consume on first delivered sample.
 	if reason, ok := sess.consumeStaleFlag(handle); ok {
-		updateStruct.Stale = true
-		updateStruct.Reason = reason
+		updateStruct.Stale = &StaleInfo{Reason: reason}
 	}
 	sess.deliverNotification(ctx, notification, updateStruct, handle, fullName)
 }

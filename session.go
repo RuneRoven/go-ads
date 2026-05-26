@@ -1083,21 +1083,22 @@ func (sess *Session) ensureRoute() error {
 	return nil
 }
 
-// filterValidNotificationConfigs returns only configs whose symbols still exist
+// filterValidPending returns only pending entries whose symbols still exist
 // in the current symbol table. Logs a warning for dropped subscriptions.
-func (sess *Session) filterValidNotificationConfigs(configs []NotificationConfig) []NotificationConfig {
+func (sess *Session) filterValidPending(entries []pendingNotification) []pendingNotification {
 	sess.cache.lock.Lock()
 	defer sess.cache.lock.Unlock()
 
-	valid := make([]NotificationConfig, 0, len(configs))
-	for _, cfg := range configs {
-		if _, exists := sess.cache.symbols[symbolKey(cfg.SymbolName)]; exists {
-			valid = append(valid, cfg)
-		} else if _, onDemand := sess.cache.onDemandSymbols[symbolKey(cfg.SymbolName)]; onDemand {
-			valid = append(valid, cfg)
+	valid := make([]pendingNotification, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Config.SymbolName
+		if _, exists := sess.cache.symbols[symbolKey(name)]; exists {
+			valid = append(valid, entry)
+		} else if _, onDemand := sess.cache.onDemandSymbols[symbolKey(name)]; onDemand {
+			valid = append(valid, entry)
 		} else {
 			sess.logger.Warn("notification symbol gone after reconnect, dropping subscription",
-				"symbol", cfg.SymbolName)
+				"symbol", name)
 		}
 	}
 	return valid
@@ -1305,17 +1306,21 @@ func (sess *Session) localHandshake() error {
 // the next reconnect attempt.
 func (sess *Session) resubscribeNotifications() error {
 	sess.notifications.lock.Lock()
-	savedConfigs := sess.notifications.notificationConfigs
+	savedPending := sess.notifications.pending
 	savedChannel := sess.notifications.notificationChannel
 	// Clear via resetConfigs so the key-index mirror is wiped in lockstep —
 	// AddSymbolNotifications dup-checks against the mirror and would reject
 	// every resubscribe if the old keys remained.
 	sess.notifications.resetConfigs(nil)
 	sess.notifications.lock.Unlock()
-	if len(savedConfigs) == 0 || savedChannel == nil {
+	if len(savedPending) == 0 || savedChannel == nil {
 		return nil
 	}
-	validConfigs := sess.filterValidNotificationConfigs(savedConfigs)
+	validPending := sess.filterValidPending(savedPending)
+	validConfigs := make([]NotificationConfig, len(validPending))
+	for i, p := range validPending {
+		validConfigs[i] = p.Config
+	}
 	if len(validConfigs) == 0 {
 		// All symbols gone (e.g., PLC online change removed all subscribed vars).
 		// Clear channel reference so a future AddSymbolNotification can use a new channel.
@@ -1347,20 +1352,20 @@ func (sess *Session) resubscribeNotifications() error {
 	// reconnect retries; drop after resubscribeMaxAttempts to prevent infinite
 	// churn on persistently-flapping symbols.
 	var orphanHandles []uint32
-	var retryConfigs []NotificationConfig
+	var retryEntries []pendingNotification
 	var droppedConfigs []string
 	for i, r := range subResults {
 		if r.Skipped != nil && r.Handle != 0 {
 			orphanHandles = append(orphanHandles, r.Handle)
 		}
-		if r.Skipped != nil && i < len(validConfigs) {
-			cfg := validConfigs[i]
-			cfg.resubscribeAttempts++
-			if cfg.resubscribeAttempts >= resubscribeMaxAttempts {
-				droppedConfigs = append(droppedConfigs, cfg.SymbolName)
+		if r.Skipped != nil && i < len(validPending) {
+			entry := validPending[i]
+			entry.resubscribeAttempts++
+			if entry.resubscribeAttempts >= resubscribeMaxAttempts {
+				droppedConfigs = append(droppedConfigs, entry.Config.SymbolName)
 				continue
 			}
-			retryConfigs = append(retryConfigs, cfg)
+			retryEntries = append(retryEntries, entry)
 		}
 	}
 	if len(orphanHandles) > 0 {
@@ -1369,14 +1374,14 @@ func (sess *Session) resubscribeNotifications() error {
 			"orphan_handles", len(orphanHandles),
 			"deleted", deleted)
 	}
-	if len(retryConfigs) > 0 {
+	if len(retryEntries) > 0 {
 		sess.notifications.lock.Lock()
-		for _, cfg := range retryConfigs {
-			sess.notifications.addConfig(cfg)
+		for _, p := range retryEntries {
+			sess.notifications.addPending(p)
 		}
 		sess.notifications.lock.Unlock()
 		sess.logger.Info("resubscribe: queued Skipped configs for next reconnect retry",
-			"retry_count", len(retryConfigs))
+			"retry_count", len(retryEntries))
 	}
 	if len(droppedConfigs) > 0 {
 		sess.logger.Warn("resubscribe: dropping configs after max retries",
@@ -1396,8 +1401,8 @@ func (sess *Session) resubscribeNotifications() error {
 			}
 		}
 		// Restore configs so they can be retried by the next reconnect attempt.
-		// resetConfigs rebuilds the key-index mirror to match savedConfigs.
-		sess.notifications.resetConfigs(savedConfigs)
+		// resetConfigs rebuilds the key-index mirror to match savedPending.
+		sess.notifications.resetConfigs(savedPending)
 		sess.notifications.notificationChannel = savedChannel
 		sess.notifications.lock.Unlock()
 		if len(newHandles) > 0 {

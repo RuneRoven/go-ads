@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -73,10 +74,58 @@ func DefaultBackoffConfig() BackoffConfig {
 	}
 }
 
-// WithBackoff sets the reconnect backoff configuration.
-// If not provided, DefaultBackoffConfig() is used.
+// Validate reports configuration problems that would produce pathological
+// reconnect behavior: zero-or-negative intervals (zero-delay retry storms
+// that exhaust ephemeral ports), negative attempt counts (skipped tiers
+// surfacing as silent fast-fail), or a MaxInterval below the previous tier
+// (caps that defeat the slow-tier ramp).
+func (c BackoffConfig) Validate() error {
+	if c.InitialInterval <= 0 {
+		return fmt.Errorf("BackoffConfig.InitialInterval must be > 0 (got %v); zero-delay retries exhaust ephemeral ports", c.InitialInterval)
+	}
+	if c.MidInterval <= 0 {
+		return fmt.Errorf("BackoffConfig.MidInterval must be > 0 (got %v)", c.MidInterval)
+	}
+	if c.SlowInterval <= 0 {
+		return fmt.Errorf("BackoffConfig.SlowInterval must be > 0 (got %v)", c.SlowInterval)
+	}
+	if c.MaxInterval <= 0 {
+		return fmt.Errorf("BackoffConfig.MaxInterval must be > 0 (got %v)", c.MaxInterval)
+	}
+	if c.InitialAttempts < 0 {
+		return fmt.Errorf("BackoffConfig.InitialAttempts must be >= 0 (got %d); negative silently skips the tier", c.InitialAttempts)
+	}
+	if c.MidAttempts < 0 {
+		return fmt.Errorf("BackoffConfig.MidAttempts must be >= 0 (got %d)", c.MidAttempts)
+	}
+	if c.SlowAttempts < 0 {
+		return fmt.Errorf("BackoffConfig.SlowAttempts must be >= 0 (got %d)", c.SlowAttempts)
+	}
+	if c.MidInterval < c.InitialInterval {
+		return fmt.Errorf("BackoffConfig.MidInterval (%v) < InitialInterval (%v); tiers must be monotonically non-decreasing", c.MidInterval, c.InitialInterval)
+	}
+	if c.SlowInterval < c.MidInterval {
+		return fmt.Errorf("BackoffConfig.SlowInterval (%v) < MidInterval (%v); tiers must be monotonically non-decreasing", c.SlowInterval, c.MidInterval)
+	}
+	if c.MaxInterval < c.SlowInterval {
+		return fmt.Errorf("BackoffConfig.MaxInterval (%v) < SlowInterval (%v); cap below slow tier defeats the ramp", c.MaxInterval, c.SlowInterval)
+	}
+	return nil
+}
+
+// WithBackoff sets the reconnect backoff configuration. Invalid configs are
+// rejected at option-application time: a Warn is logged and the default is
+// kept. Callers wanting hard validation can call cfg.Validate() before
+// passing.
 func WithBackoff(cfg BackoffConfig) SessionOption {
 	return func(s *Session) {
+		if err := cfg.Validate(); err != nil {
+			if s.logger != nil {
+				s.logger.Warn("WithBackoff: invalid config, keeping current value",
+					"error", err)
+			}
+			return
+		}
 		s.lifecycle.backoffConfig = cfg
 	}
 }

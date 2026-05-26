@@ -18,22 +18,31 @@ import (
 type notificationManager struct {
 	lock                sync.Mutex
 	activeNotifications map[uint32]*Symbol
-	notificationConfigs []NotificationConfig
-	// configsByKey mirrors notificationConfigs for O(1) duplicate-subscribe
-	// probes (R-NOT-013 hot path under bulk Add). Keys are lower-cased symbol
-	// names to match the EqualFold semantic used elsewhere. MUST be kept in
-	// lockstep with notificationConfigs — use addConfig / removeConfigByName /
-	// resetConfigs to mutate.
+	// pending holds the resubscribe-aware copy of every active user
+	// subscription. Internal type — exposed via NotificationConfig in public
+	// API. configsByKey mirrors pending for O(1) duplicate-subscribe probes
+	// (hot path under bulk Add). Keys are lower-cased symbol names to match
+	// the EqualFold semantic used elsewhere. MUST be kept in lockstep with
+	// pending — use addConfig / removeConfigByName / resetConfigs to mutate.
+	pending             []pendingNotification
 	configsByKey        map[string]struct{}
 	notificationChannel chan *Update
 	lastSubscribeNs     atomic.Int64
 }
 
-// addConfig appends cfg to notificationConfigs and updates the key index.
-// Caller must hold lock.
+// addConfig wraps cfg into a fresh pendingNotification (resubscribeAttempts=0)
+// and appends it to pending. Caller must hold lock.
 func (m *notificationManager) addConfig(cfg NotificationConfig) {
-	m.notificationConfigs = append(m.notificationConfigs, cfg)
+	m.pending = append(m.pending, pendingNotification{Config: cfg})
 	m.configsByKey[symbolKey(cfg.SymbolName)] = struct{}{}
+}
+
+// addPending appends an already-wrapped pending entry (preserving its
+// resubscribeAttempts counter). Used by resubscribeNotifications when
+// re-queueing Skipped retries. Caller must hold lock.
+func (m *notificationManager) addPending(p pendingNotification) {
+	m.pending = append(m.pending, p)
+	m.configsByKey[symbolKey(p.Config.SymbolName)] = struct{}{}
 }
 
 // hasConfig returns true if any existing config matches symbolName
@@ -45,43 +54,53 @@ func (m *notificationManager) hasConfig(symbolName string) bool {
 
 // resetConfigs swaps the entire slice and rebuilds the key index. Used by
 // resubscribeNotifications during the save/rollback dance. Caller must hold lock.
-func (m *notificationManager) resetConfigs(cfgs []NotificationConfig) {
-	m.notificationConfigs = cfgs
-	m.configsByKey = make(map[string]struct{}, len(cfgs))
-	for _, cfg := range cfgs {
-		m.configsByKey[symbolKey(cfg.SymbolName)] = struct{}{}
+func (m *notificationManager) resetConfigs(p []pendingNotification) {
+	m.pending = p
+	m.configsByKey = make(map[string]struct{}, len(p))
+	for _, entry := range p {
+		m.configsByKey[symbolKey(entry.Config.SymbolName)] = struct{}{}
 	}
 }
 
+// StaleInfo describes why a one-shot Stale Update was delivered. Non-nil iff
+// the corresponding Update's value MAY be from a pre-online-change cache
+// state. Reason is one of the documented Reason* constants.
+type StaleInfo struct {
+	Reason Reason
+}
+
 // Update is delivered to the user channel for each PLC notification sample.
+// Stale is non-nil only on the first sample following a stale-cache detection
+// (R-NOT-017 one-shot); the field is nil for normal samples. Couples the
+// "this sample may be stale" signal with the reason in a single check —
+// callers do `if u.Stale != nil { /* handle stale */ }`.
 type Update struct {
 	Variable  string
 	Value     string
 	TimeStamp time.Time
-	// Stale signals the value MAY be from a pre-online-change cache state.
-	// When true, the symbol's handle was marked stale by detectStaleCache
-	// after a 0x711 / 0x705 / 0x710 / 0x704 / 0x703 / 0x702 ReturnCode was
-	// observed; the next reload will re-resolve the handle.
-	Stale bool
-	// Reason is non-empty when Stale=true. See the Reason* constants for
-	// enumerated values.
-	Reason Reason
+	Stale     *StaleInfo
 }
 
-// NotificationConfig holds configuration for a symbol notification, used for batch add and reconnect re-subscribe.
-// MaxDelay and CycleTime use time.Duration for consistency with SumNotificationRequest
-// and the rest of the standard library.
-//
-// resubscribeAttempts is incremented each time a reconnect re-subscribe round
-// returns this config as Skipped (e.g. TOCTOU loss against a concurrent
-// caller, cache stranded mid-batch). Above resubscribeMaxAttempts the
-// library drops the config rather than retrying forever.
+// NotificationConfig holds configuration for a symbol notification, used for
+// batch add and reconnect re-subscribe. MaxDelay and CycleTime use
+// time.Duration for consistency with SumNotificationRequest and the rest of
+// the standard library.
 type NotificationConfig struct {
-	SymbolName          string
-	MaxDelay            time.Duration
-	CycleTime           time.Duration
-	TransmissionMode    TransMode
-	resubscribeAttempts int // unexported; reset on successful re-subscribe
+	SymbolName       string
+	MaxDelay         time.Duration
+	CycleTime        time.Duration
+	TransmissionMode TransMode
+}
+
+// pendingNotification wraps a user-supplied NotificationConfig with internal
+// resubscribe bookkeeping. resubscribeAttempts is incremented each time a
+// reconnect re-subscribe round returns the config as Skipped (TOCTOU loss
+// against a concurrent caller, cache stranded mid-batch). Above
+// resubscribeMaxAttempts the library drops the entry rather than retrying
+// forever.
+type pendingNotification struct {
+	Config              NotificationConfig
+	resubscribeAttempts int
 }
 
 // resubscribeMaxAttempts caps Skipped-config retries across reconnect cycles
@@ -421,12 +440,10 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 		results[info.configIndex] = r
 		fresh.Notification = ch
 		sess.notifications.activeNotifications[r.Handle] = fresh
-		// Reset resubscribe attempts on successful subscribe; if this entry
-		// originated from a previous reconnect Skipped retry, the counter is
-		// no longer relevant.
-		commitCfg := info.config
-		commitCfg.resubscribeAttempts = 0
-		sess.notifications.addConfig(commitCfg)
+		// addConfig wraps in a fresh pendingNotification with
+		// resubscribeAttempts=0, so a successful subscribe naturally resets
+		// any prior retry counter that may have been on this symbol.
+		sess.notifications.addConfig(info.config)
 		postExisting[key] = struct{}{}
 		successes++
 		sess.logger.Info("batch notification created",
@@ -449,9 +466,9 @@ func (sess *Session) removeNotificationConfig(symbolName string) {
 		return
 	}
 	delete(sess.notifications.configsByKey, key)
-	for i, cfg := range sess.notifications.notificationConfigs {
-		if strings.EqualFold(cfg.SymbolName, symbolName) {
-			sess.notifications.notificationConfigs = append(sess.notifications.notificationConfigs[:i], sess.notifications.notificationConfigs[i+1:]...)
+	for i, entry := range sess.notifications.pending {
+		if strings.EqualFold(entry.Config.SymbolName, symbolName) {
+			sess.notifications.pending = append(sess.notifications.pending[:i], sess.notifications.pending[i+1:]...)
 			return
 		}
 	}
