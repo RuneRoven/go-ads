@@ -103,7 +103,7 @@ func TestIntegrationConnect(t *testing.T) {
 
 func TestIntegrationReadDeviceInfo(t *testing.T) {
 	conn := setupConnection(t)
-	info, err := conn.client.Load().ReadDeviceInfo()
+	info, err := conn.client.Load().ReadDeviceInfo(context.Background())
 	if err != nil {
 		t.Fatalf("ReadDeviceInfo failed: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestIntegrationReadDeviceInfo(t *testing.T) {
 
 func TestIntegrationReadState(t *testing.T) {
 	conn := setupConnection(t)
-	state, err := conn.client.Load().ReadState()
+	state, err := conn.client.Load().ReadState(context.Background())
 	if err != nil {
 		t.Fatalf("ReadState failed: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestIntegrationListSymbols(t *testing.T) {
 		t.Error("expected error from ListSymbols before LoadSymbols")
 	}
 
-	err = conn.LoadSymbols()
+	err = conn.LoadSymbols(context.Background())
 	if err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestIntegrationListSymbols(t *testing.T) {
 func TestIntegrationReadStructWithEnum(t *testing.T) {
 	conn := setupConnection(t)
 
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
@@ -235,7 +235,7 @@ func TestIntegrationReadStructWithEnum(t *testing.T) {
 		}
 	}
 
-	value, err := conn.ReadFromSymbol(structName)
+	value, err := conn.ReadFromSymbol(context.Background(), structName)
 	if err != nil {
 		t.Fatalf("ReadFromSymbol(%q) failed: %v", structName, err)
 	}
@@ -257,7 +257,7 @@ func TestIntegrationReadSymbol(t *testing.T) {
 	symbolName := os.Getenv("ADS_SYMBOL_NAME")
 	if symbolName == "" {
 		// Need full discovery to pick a symbol
-		err := conn.LoadSymbols()
+		err := conn.LoadSymbols(context.Background())
 		if err != nil {
 			t.Fatalf("LoadSymbols failed: %v", err)
 		}
@@ -269,7 +269,7 @@ func TestIntegrationReadSymbol(t *testing.T) {
 	}
 
 	// ReadFromSymbol uses on-demand resolution if symbol not already loaded
-	value, err := conn.ReadFromSymbol(symbolName)
+	value, err := conn.ReadFromSymbol(context.Background(), symbolName)
 	if err != nil {
 		t.Fatalf("ReadFromSymbol(%q) failed: %v", symbolName, err)
 	}
@@ -285,7 +285,7 @@ func TestIntegrationBrowseSymbols(t *testing.T) {
 		t.Error("expected error from BrowseSymbols before LoadSymbolList")
 	}
 
-	err = conn.LoadSymbolList(SlowDiscoveryConfig{})
+	err = conn.LoadSymbolList(context.Background(), SlowDiscoveryConfig{})
 	if err != nil {
 		t.Fatalf("LoadSymbolList failed: %v", err)
 	}
@@ -325,12 +325,12 @@ func TestIntegrationBrowseWithDataTypes(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Load symbols first, then datatypes
-	err := conn.LoadSymbolList(SlowDiscoveryConfig{})
+	err := conn.LoadSymbolList(context.Background(), SlowDiscoveryConfig{})
 	if err != nil {
 		t.Fatalf("LoadSymbolList failed: %v", err)
 	}
 
-	err = conn.LoadDataTypes(SlowDiscoveryConfig{})
+	err = conn.LoadDataTypes(context.Background(), SlowDiscoveryConfig{})
 	if err != nil {
 		t.Fatalf("LoadDataTypes failed: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestIntegrationNotification(t *testing.T) {
 	conn := setupConnection(t)
 	symbolName := os.Getenv("ADS_SYMBOL_NAME")
 	if symbolName == "" {
-		err := conn.LoadSymbols()
+		err := conn.LoadSymbols(context.Background())
 		if err != nil {
 			t.Fatalf("LoadSymbols failed: %v", err)
 		}
@@ -401,7 +401,7 @@ func TestIntegrationNotification(t *testing.T) {
 	}
 
 	ch := make(chan *Update, 10)
-	handle, err := conn.AddSymbolNotification(symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch)
+	handle, err := conn.AddSymbolNotification(context.Background(), symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotification(%q) failed: %v", symbolName, err)
 	}
@@ -427,7 +427,7 @@ func TestIntegrationNotification(t *testing.T) {
 	}
 
 	// Clean up: delete the notification and verify handle removal
-	err = conn.DeleteDeviceNotification(handle)
+	err = conn.DeleteDeviceNotification(context.Background(), handle)
 	if err != nil {
 		t.Fatalf("DeleteDeviceNotification(%d) failed: %v", handle, err)
 	}
@@ -444,7 +444,7 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 	conn := setupConnection(t)
 	symbolName := os.Getenv("ADS_SYMBOL_NAME")
 	if symbolName == "" {
-		err := conn.LoadSymbols()
+		err := conn.LoadSymbols(context.Background())
 		if err != nil {
 			t.Fatalf("LoadSymbols failed: %v", err)
 		}
@@ -465,7 +465,7 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 	conn.notifications.lock.Unlock()
 
 	// Subscribe
-	handle, err := conn.AddSymbolNotification(symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch)
+	handle, err := conn.AddSymbolNotification(context.Background(), symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotification(%q) failed: %v", symbolName, err)
 	}
@@ -487,7 +487,7 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 	}
 
 	// Unsubscribe
-	err = conn.DeleteDeviceNotification(handle)
+	err = conn.DeleteDeviceNotification(context.Background(), handle)
 	if err != nil {
 		t.Fatalf("DeleteDeviceNotification(%d) failed: %v", handle, err)
 	}
@@ -515,7 +515,7 @@ func TestIntegrationSubscribeUnsubscribe(t *testing.T) {
 func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
 	conn := setupConnection(t)
 
-	err := conn.LoadSymbols()
+	err := conn.LoadSymbols(context.Background())
 	if err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
@@ -540,7 +540,7 @@ func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
 	// Subscribe to multiple symbols
 	var handles []uint32
 	for _, name := range symbolNames {
-		handle, err := conn.AddSymbolNotification(name, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch)
+		handle, err := conn.AddSymbolNotification(context.Background(), name, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch)
 		if err != nil {
 			t.Fatalf("AddSymbolNotification(%q) failed: %v", name, err)
 		}
@@ -558,7 +558,7 @@ func TestIntegrationHandleLeakMultipleSubscriptions(t *testing.T) {
 
 	// Delete handles one by one and verify count decreases
 	for i, handle := range handles {
-		err := conn.DeleteDeviceNotification(handle)
+		err := conn.DeleteDeviceNotification(context.Background(), handle)
 		if err != nil {
 			t.Fatalf("DeleteDeviceNotification(%d) failed: %v", handle, err)
 		}
@@ -615,7 +615,7 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	}
 	// Do NOT use t.Cleanup(conn.Close) — we call Close() explicitly to test it
 
-	err = conn.LoadSymbols()
+	err = conn.LoadSymbols(context.Background())
 	if err != nil {
 		conn.Close()
 		t.Fatalf("LoadSymbols failed: %v", err)
@@ -631,7 +631,7 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	ch := make(chan *Update, 100)
 	var handles []uint32
 	for _, name := range symbolNames {
-		handle, err := conn.AddSymbolNotification(name, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch)
+		handle, err := conn.AddSymbolNotification(context.Background(), name, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch)
 		if err != nil {
 			conn.Close()
 			t.Fatalf("AddSymbolNotification(%q) failed: %v", name, err)
@@ -673,7 +673,7 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	}
 	defer conn2.Close()
 
-	err = conn2.LoadSymbols()
+	err = conn2.LoadSymbols(context.Background())
 	if err != nil {
 		t.Fatalf("second LoadSymbols failed: %v", err)
 	}
@@ -690,7 +690,7 @@ func TestIntegrationCloseReleasesNotificationHandles(t *testing.T) {
 	// Subscribe to same symbols on new connection to confirm PLC accepts them
 	ch2 := make(chan *Update, 100)
 	for _, name := range symbolNames {
-		handle, err := conn2.AddSymbolNotification(name, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch2)
+		handle, err := conn2.AddSymbolNotification(context.Background(), name, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch2)
 		if err != nil {
 			t.Errorf("re-subscribe to %s on fresh connection failed: %v (possible PLC handle leak)", name, err)
 		} else {
@@ -781,12 +781,12 @@ func TestIntegrationWriteAndConfirm(t *testing.T) {
 			conn := setupConnection(t)
 
 			// Load full symbol table so parse() works correctly
-			if err := conn.LoadSymbols(); err != nil {
+			if err := conn.LoadSymbols(context.Background()); err != nil {
 				t.Fatalf("LoadSymbols failed: %v", err)
 			}
 
 			// 1. Read current value (save for restore)
-			original, err := conn.ReadFromSymbol(symbolName)
+			original, err := conn.ReadFromSymbol(context.Background(), symbolName)
 			if err != nil {
 				t.Fatalf("ReadFromSymbol(%q) failed: %v", symbolName, err)
 			}
@@ -800,13 +800,13 @@ func TestIntegrationWriteAndConfirm(t *testing.T) {
 			}
 
 			// 2. Write test value
-			err = conn.WriteToSymbol(symbolName, writeValue)
+			err = conn.WriteToSymbol(context.Background(), symbolName, writeValue)
 			if err != nil {
 				t.Fatalf("WriteToSymbol(%q, %q) failed: %v", symbolName, writeValue, err)
 			}
 
 			// 3. Read back and assert it changed
-			readBack, err := conn.ReadFromSymbol(symbolName)
+			readBack, err := conn.ReadFromSymbol(context.Background(), symbolName)
 			if err != nil {
 				t.Fatalf("ReadFromSymbol(%q) after write failed: %v", symbolName, err)
 			}
@@ -817,11 +817,11 @@ func TestIntegrationWriteAndConfirm(t *testing.T) {
 			}
 
 			// 4. Restore original value and confirm
-			err = conn.WriteToSymbol(symbolName, original)
+			err = conn.WriteToSymbol(context.Background(), symbolName, original)
 			if err != nil {
 				t.Fatalf("failed to restore original value %q to %s: %v", original, symbolName, err)
 			}
-			restored, err := conn.ReadFromSymbol(symbolName)
+			restored, err := conn.ReadFromSymbol(context.Background(), symbolName)
 			if err != nil {
 				t.Fatalf("ReadFromSymbol(%q) after restore failed: %v", symbolName, err)
 			}
@@ -854,14 +854,14 @@ func TestIntegrationWriteMultipleSymbols(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Load full symbol table so parse() works correctly
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
 	// 1. Read current values (save for restore)
 	originals := make(map[string]string)
 	for _, p := range pairs {
-		val, err := conn.ReadFromSymbol(p.name)
+		val, err := conn.ReadFromSymbol(context.Background(), p.name)
 		if err != nil {
 			t.Fatalf("ReadFromSymbol(%q) failed: %v", p.name, err)
 		}
@@ -880,7 +880,7 @@ func TestIntegrationWriteMultipleSymbols(t *testing.T) {
 	}
 
 	// 3. Write all via WriteMultipleSymbols
-	codes, err := conn.WriteMultipleSymbols(writeValues)
+	codes, err := conn.WriteMultipleSymbols(context.Background(), writeValues)
 	if err != nil {
 		t.Fatalf("WriteMultipleSymbols failed: %v", err)
 	}
@@ -895,7 +895,7 @@ func TestIntegrationWriteMultipleSymbols(t *testing.T) {
 	// 5. Read back each, assert it changed to the written value
 	for _, p := range pairs {
 		expected := writeValues[p.name]
-		readBack, err := conn.ReadFromSymbol(p.name)
+		readBack, err := conn.ReadFromSymbol(context.Background(), p.name)
 		if err != nil {
 			t.Errorf("ReadFromSymbol(%q) after batch write failed: %v", p.name, err)
 			continue
@@ -907,7 +907,7 @@ func TestIntegrationWriteMultipleSymbols(t *testing.T) {
 	}
 
 	// 6. Restore originals and confirm
-	restoreCodes, err := conn.WriteMultipleSymbols(originals)
+	restoreCodes, err := conn.WriteMultipleSymbols(context.Background(), originals)
 	if err != nil {
 		t.Fatalf("failed to restore originals: %v", err)
 	}
@@ -917,7 +917,7 @@ func TestIntegrationWriteMultipleSymbols(t *testing.T) {
 		}
 	}
 	for _, p := range pairs {
-		restored, err := conn.ReadFromSymbol(p.name)
+		restored, err := conn.ReadFromSymbol(context.Background(), p.name)
 		if err != nil {
 			t.Errorf("ReadFromSymbol(%q) after restore failed: %v", p.name, err)
 			continue
@@ -932,7 +932,7 @@ func TestIntegrationWriteMultipleSymbols(t *testing.T) {
 func TestIntegrationReadMultipleSymbols(t *testing.T) {
 	conn := setupConnection(t)
 
-	err := conn.LoadSymbols()
+	err := conn.LoadSymbols(context.Background())
 	if err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
@@ -943,7 +943,7 @@ func TestIntegrationReadMultipleSymbols(t *testing.T) {
 		t.Skip("need at least 2 parseable symbols for ReadMultipleSymbols test")
 	}
 
-	values, err := conn.ReadMultipleSymbols(names)
+	values, err := conn.ReadMultipleSymbols(context.Background(), names)
 	if err != nil {
 		t.Fatalf("ReadMultipleSymbols failed: %v", err)
 	}
@@ -958,7 +958,7 @@ func TestIntegrationReadMultipleSymbols(t *testing.T) {
 
 	// Verify each returned value matches an individual read
 	for name, batchVal := range values {
-		singleVal, err := conn.ReadFromSymbol(name)
+		singleVal, err := conn.ReadFromSymbol(context.Background(), name)
 		if err != nil {
 			t.Errorf("ReadFromSymbol(%q) failed: %v", name, err)
 			continue
@@ -972,7 +972,7 @@ func TestIntegrationReadMultipleSymbols(t *testing.T) {
 func TestIntegrationLoadSymbolsSlow(t *testing.T) {
 	conn := setupConnection(t)
 
-	err := conn.LoadSymbolsSlow(SlowDiscoveryConfig{
+	err := conn.LoadSymbolsSlow(context.Background(), SlowDiscoveryConfig{
 		ChunkSize:  2048,
 		ChunkDelay: 50 * time.Millisecond,
 	})
@@ -994,7 +994,7 @@ func TestIntegrationLoadSymbolsSlow(t *testing.T) {
 	if name == "" {
 		t.Skip("no parseable symbols available")
 	}
-	value, err := conn.ReadFromSymbol(name)
+	value, err := conn.ReadFromSymbol(context.Background(), name)
 	if err != nil {
 		t.Fatalf("ReadFromSymbol(%q) after slow load failed: %v", name, err)
 	}
@@ -1004,7 +1004,7 @@ func TestIntegrationLoadSymbolsSlow(t *testing.T) {
 func TestIntegrationCheckSymbolVersion(t *testing.T) {
 	conn := setupConnection(t)
 
-	changed, err := conn.CheckSymbolVersion()
+	changed, err := conn.CheckSymbolVersion(context.Background())
 	if err != nil {
 		// Some PLCs (e.g. TwinCAT 2) don't support GroupSymbolVersion
 		t.Skipf("CheckSymbolVersion not supported on this PLC: %v", err)
@@ -1017,7 +1017,7 @@ func TestIntegrationCheckSymbolVersion(t *testing.T) {
 	}
 
 	// Call again — should still be unchanged
-	changed2, err := conn.CheckSymbolVersion()
+	changed2, err := conn.CheckSymbolVersion(context.Background())
 	if err != nil {
 		t.Fatalf("second CheckSymbolVersion failed: %v", err)
 	}
@@ -1029,14 +1029,14 @@ func TestIntegrationCheckSymbolVersion(t *testing.T) {
 func TestIntegrationReadProcessData(t *testing.T) {
 	conn := setupConnection(t)
 
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
 	// Read counter twice with delay to verify live data
 	counterName := os.Getenv("ADS_READ_COUNTER")
 	if counterName != "" {
-		val1, err := conn.ReadFromSymbol(counterName)
+		val1, err := conn.ReadFromSymbol(context.Background(), counterName)
 		if err != nil {
 			t.Fatalf("ReadFromSymbol(%q) failed: %v", counterName, err)
 		}
@@ -1044,7 +1044,7 @@ func TestIntegrationReadProcessData(t *testing.T) {
 
 		time.Sleep(1100 * time.Millisecond) // counter updates every cycle (10ms), but value may be cached
 
-		val2, err := conn.ReadFromSymbol(counterName)
+		val2, err := conn.ReadFromSymbol(context.Background(), counterName)
 		if err != nil {
 			t.Fatalf("ReadFromSymbol(%q) second read failed: %v", counterName, err)
 		}
@@ -1065,7 +1065,7 @@ func TestIntegrationReadProcessData(t *testing.T) {
 	// Read a REAL value
 	realName := os.Getenv("ADS_READ_REAL")
 	if realName != "" {
-		val, err := conn.ReadFromSymbol(realName)
+		val, err := conn.ReadFromSymbol(context.Background(), realName)
 		if err != nil {
 			t.Fatalf("ReadFromSymbol(%q) failed: %v", realName, err)
 		}
@@ -1079,7 +1079,7 @@ func TestIntegrationReadProcessData(t *testing.T) {
 	// Read a STRING value
 	stringName := os.Getenv("ADS_READ_STRING")
 	if stringName != "" {
-		val, err := conn.ReadFromSymbol(stringName)
+		val, err := conn.ReadFromSymbol(context.Background(), stringName)
 		if err != nil {
 			t.Fatalf("ReadFromSymbol(%q) failed: %v", stringName, err)
 		}
@@ -1129,7 +1129,7 @@ func waitForReconnect(t *testing.T, conn *Session, timeout time.Duration) {
 func TestIntegrationReconnect(t *testing.T) {
 	conn := setupConnection(t)
 
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
@@ -1140,7 +1140,7 @@ func TestIntegrationReconnect(t *testing.T) {
 	}
 
 	// 1. Read symbol to confirm connection works
-	val1, err := conn.ReadFromSymbol(symbolName)
+	val1, err := conn.ReadFromSymbol(context.Background(), symbolName)
 	if err != nil {
 		t.Fatalf("pre-reconnect ReadFromSymbol(%q) failed: %v", symbolName, err)
 	}
@@ -1148,7 +1148,7 @@ func TestIntegrationReconnect(t *testing.T) {
 
 	// 2. Subscribe to notification
 	ch := make(chan *Update, 10)
-	handle, err := conn.AddSymbolNotification(symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch)
+	handle, err := conn.AddSymbolNotification(context.Background(), symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotification failed: %v", err)
 	}
@@ -1175,7 +1175,7 @@ func TestIntegrationReconnect(t *testing.T) {
 	t.Log("reconnect completed")
 
 	// 5. Read symbol again — must succeed after reconnect
-	val2, err := conn.ReadFromSymbol(symbolName)
+	val2, err := conn.ReadFromSymbol(context.Background(), symbolName)
 	if err != nil {
 		t.Fatalf("post-reconnect ReadFromSymbol(%q) failed: %v", symbolName, err)
 	}
@@ -1193,7 +1193,7 @@ func TestIntegrationReconnect(t *testing.T) {
 func TestIntegrationReconnectDuringBatchRead(t *testing.T) {
 	conn := setupConnection(t)
 
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
@@ -1204,7 +1204,7 @@ func TestIntegrationReconnectDuringBatchRead(t *testing.T) {
 	}
 
 	// 1. Successful batch read before reconnect
-	values1, err := conn.ReadMultipleSymbols(names)
+	values1, err := conn.ReadMultipleSymbols(context.Background(), names)
 	if err != nil {
 		t.Fatalf("pre-reconnect ReadMultipleSymbols failed: %v", err)
 	}
@@ -1226,7 +1226,7 @@ func TestIntegrationReconnectDuringBatchRead(t *testing.T) {
 	t.Log("reconnect completed")
 
 	// 4. Batch read again — must succeed, proving handles and SumRead work after reconnect
-	values2, err := conn.ReadMultipleSymbols(names)
+	values2, err := conn.ReadMultipleSymbols(context.Background(), names)
 	if err != nil {
 		t.Fatalf("post-reconnect ReadMultipleSymbols failed: %v", err)
 	}
@@ -1248,7 +1248,7 @@ func TestIntegrationReconnectDuringBatchRead(t *testing.T) {
 func TestIntegrationReconnectReadDuringDisconnect(t *testing.T) {
 	conn := setupConnection(t)
 
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
@@ -1259,7 +1259,7 @@ func TestIntegrationReconnectReadDuringDisconnect(t *testing.T) {
 	}
 
 	// 1. Confirm connection works
-	val1, err := conn.ReadFromSymbol(symbolName)
+	val1, err := conn.ReadFromSymbol(context.Background(), symbolName)
 	if err != nil {
 		t.Fatalf("pre-disconnect ReadFromSymbol(%q) failed: %v", symbolName, err)
 	}
@@ -1275,7 +1275,7 @@ func TestIntegrationReconnectReadDuringDisconnect(t *testing.T) {
 
 	// 3. Immediately read WITHOUT waiting for reconnect.
 	// sendRequest's retry loop should handle this transparently.
-	val2, err := conn.ReadFromSymbol(symbolName)
+	val2, err := conn.ReadFromSymbol(context.Background(), symbolName)
 	if err != nil {
 		t.Fatalf("read during reconnect failed (sendRequest retry should have handled this): %v", err)
 	}
@@ -1289,7 +1289,7 @@ func TestIntegrationReconnectReadDuringDisconnect(t *testing.T) {
 func TestIntegrationBatchNotification(t *testing.T) {
 	conn := setupConnection(t)
 
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -1310,7 +1310,7 @@ func TestIntegrationBatchNotification(t *testing.T) {
 		})
 	}
 
-	_, err := conn.AddSymbolNotifications(configs, ch)
+	_, err := conn.AddSymbolNotifications(context.Background(), configs, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotifications failed: %v", err)
 	}
@@ -1340,7 +1340,7 @@ func TestIntegrationBatchNotification(t *testing.T) {
 	}
 	conn.notifications.lock.Unlock()
 
-	codes, err := conn.SumDeleteDeviceNotification(handles)
+	codes, err := conn.SumDeleteDeviceNotification(context.Background(), handles)
 	if err != nil {
 		t.Fatalf("SumDeleteDeviceNotification failed: %v", err)
 	}
@@ -1362,7 +1362,7 @@ func TestIntegrationBatchNotification(t *testing.T) {
 func TestIntegrationProbeSumCommands(t *testing.T) {
 	conn := setupConnection(t)
 
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
@@ -1381,7 +1381,7 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 	}
 	var reqs []symReq
 	for _, name := range names[:2] {
-		sym, err := conn.getSymbol(name)
+		sym, err := conn.getSymbol(context.Background(), name)
 		if err != nil {
 			t.Fatalf("getSymbol(%s): %v", name, err)
 		}
@@ -1424,7 +1424,7 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 			readLen = uint32(n*8) + totalLen // [n*(error,length)][data]
 		}
 
-		resp, err := conn.client.Load().WriteRead(uint32(cmd.group), uint32(n), readLen, writeData)
+		resp, err := conn.client.Load().WriteRead(context.Background(), uint32(cmd.group), uint32(n), readLen, writeData)
 		if err != nil {
 			t.Logf("%s: NOT SUPPORTED (error: %v)", cmd.name, err)
 			continue
@@ -1482,7 +1482,7 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 	binary.LittleEndian.PutUint32(notifWriteData[16:], 1000000) // maxDelay 100ms in 100ns units
 	binary.LittleEndian.PutUint32(notifWriteData[20:], 1000000) // cycleTime 100ms in 100ns units
 
-	resp, err := conn.client.Load().WriteRead(uint32(GroupSumupAddDeviceNotification), 1, 8, notifWriteData)
+	resp, err := conn.client.Load().WriteRead(context.Background(), uint32(GroupSumupAddDeviceNotification), 1, 8, notifWriteData)
 	if err != nil {
 		t.Logf("SumAddDeviceNotification (0xF085): NOT SUPPORTED (error: %v)", err)
 	} else {
@@ -1493,7 +1493,7 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 			t.Logf("  error=0x%X, handle=%d", errCode, handle)
 			// Clean up: delete the notification
 			if errCode == 0 && handle != 0 {
-				_ = conn.DeleteDeviceNotification(handle)
+				_ = conn.DeleteDeviceNotification(context.Background(), handle)
 			}
 		}
 	}
@@ -1505,7 +1505,7 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 
 func TestIntegrationSumReadFallbackForced(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -1517,7 +1517,7 @@ func TestIntegrationSumReadFallbackForced(t *testing.T) {
 	// Force fallback: mark sum read as unsupported
 	conn.client.Load().capabilities.SumReadCmdStore(1)
 
-	values, err := conn.ReadMultipleSymbols(names)
+	values, err := conn.ReadMultipleSymbols(context.Background(), names)
 	if err != nil {
 		t.Fatalf("ReadMultipleSymbols (fallback) failed: %v", err)
 	}
@@ -1532,7 +1532,7 @@ func TestIntegrationSumReadFallbackForced(t *testing.T) {
 			t.Errorf("missing result for %s", name)
 			continue
 		}
-		singleVal, err := conn.ReadFromSymbol(name)
+		singleVal, err := conn.ReadFromSymbol(context.Background(), name)
 		if err != nil {
 			t.Errorf("ReadFromSymbol(%s) failed: %v", name, err)
 			continue
@@ -1563,7 +1563,7 @@ func TestIntegrationSumWriteFallbackForced(t *testing.T) {
 	}
 
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
@@ -1574,7 +1574,7 @@ func TestIntegrationSumWriteFallbackForced(t *testing.T) {
 	originals := make(map[string]string)
 	writeValues := make(map[string]string)
 	for _, p := range pairs {
-		orig, err := conn.ReadFromSymbol(p.name)
+		orig, err := conn.ReadFromSymbol(context.Background(), p.name)
 		if err != nil {
 			t.Fatalf("ReadFromSymbol(%s) failed: %v", p.name, err)
 		}
@@ -1587,7 +1587,7 @@ func TestIntegrationSumWriteFallbackForced(t *testing.T) {
 	}
 
 	// Batch write in fallback mode
-	codes, err := conn.WriteMultipleSymbols(writeValues)
+	codes, err := conn.WriteMultipleSymbols(context.Background(), writeValues)
 	if err != nil {
 		t.Fatalf("WriteMultipleSymbols (fallback) failed: %v", err)
 	}
@@ -1599,7 +1599,7 @@ func TestIntegrationSumWriteFallbackForced(t *testing.T) {
 
 	// Verify each individually
 	for name, expected := range writeValues {
-		actual, err := conn.ReadFromSymbol(name)
+		actual, err := conn.ReadFromSymbol(context.Background(), name)
 		if err != nil {
 			t.Errorf("ReadFromSymbol(%s) failed: %v", name, err)
 			continue
@@ -1610,12 +1610,12 @@ func TestIntegrationSumWriteFallbackForced(t *testing.T) {
 	}
 
 	// Restore
-	_, _ = conn.WriteMultipleSymbols(originals)
+	_, _ = conn.WriteMultipleSymbols(context.Background(), originals)
 }
 
 func TestIntegrationSumNotifFallbackForced(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -1638,7 +1638,7 @@ func TestIntegrationSumNotifFallbackForced(t *testing.T) {
 		})
 	}
 
-	_, err := conn.AddSymbolNotifications(configs, ch)
+	_, err := conn.AddSymbolNotifications(context.Background(), configs, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotifications (fallback) failed: %v", err)
 	}
@@ -1666,7 +1666,7 @@ func TestIntegrationSumNotifFallbackForced(t *testing.T) {
 	}
 
 	// Batch delete in fallback mode
-	codes, err := conn.SumDeleteDeviceNotification(handles)
+	codes, err := conn.SumDeleteDeviceNotification(context.Background(), handles)
 	if err != nil {
 		t.Fatalf("SumDeleteDeviceNotification (fallback) failed: %v", err)
 	}
@@ -1679,7 +1679,7 @@ func TestIntegrationSumNotifFallbackForced(t *testing.T) {
 
 func TestIntegrationSumNotifFallbackDowngrade(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -1690,7 +1690,7 @@ func TestIntegrationSumNotifFallbackDowngrade(t *testing.T) {
 
 	// Check ContextMask — with ContextMask=0, InContext mode gets downgraded at AddSymbolNotifications level.
 	// Then we also force the sum command fallback path which has its own downgrade.
-	sym, err := conn.GetSymbol(symbolName)
+	sym, err := conn.GetSymbol(context.Background(), symbolName)
 	if err != nil {
 		t.Fatalf("GetSymbol failed: %v", err)
 	}
@@ -1707,7 +1707,7 @@ func TestIntegrationSumNotifFallbackDowngrade(t *testing.T) {
 		TransmissionMode: TransModeServerCycle2, // should be downgraded to ServerCycle
 	}}
 
-	_, err = conn.AddSymbolNotifications(configs, ch)
+	_, err = conn.AddSymbolNotifications(context.Background(), configs, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotifications (downgrade) failed: %v", err)
 	}
@@ -1740,7 +1740,7 @@ done:
 	}
 	conn.notifications.lock.Unlock()
 	for _, h := range handles {
-		_ = conn.DeleteDeviceNotification(h)
+		_ = conn.DeleteDeviceNotification(context.Background(), h)
 	}
 }
 
@@ -1750,7 +1750,7 @@ done:
 
 func TestIntegrationSumReadPartialFailure(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -1759,7 +1759,7 @@ func TestIntegrationSumReadPartialFailure(t *testing.T) {
 		t.Skip("no parseable symbol")
 	}
 
-	sym, err := conn.getSymbol(name)
+	sym, err := conn.getSymbol(context.Background(), name)
 	if err != nil {
 		t.Fatalf("getSymbol(%s) failed: %v", name, err)
 	}
@@ -1770,7 +1770,7 @@ func TestIntegrationSumReadPartialFailure(t *testing.T) {
 		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Length: 4},               // bogus
 	}
 
-	results, err := conn.client.Load().SumRead(requests)
+	results, err := conn.client.Load().SumRead(context.Background(), requests)
 	if err != nil {
 		t.Fatalf("SumRead failed: %v", err)
 	}
@@ -1799,16 +1799,16 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 	}
 
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
-	sym, err := conn.getSymbol(symbolName)
+	sym, err := conn.getSymbol(context.Background(), symbolName)
 	if err != nil {
 		t.Fatalf("getSymbol(%s) failed: %v", symbolName, err)
 	}
 
-	original, err := conn.ReadFromSymbol(symbolName)
+	original, err := conn.ReadFromSymbol(context.Background(), symbolName)
 	if err != nil {
 		t.Fatalf("ReadFromSymbol failed: %v", err)
 	}
@@ -1818,21 +1818,21 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 	if original == "42" {
 		writeVal = "100"
 	}
-	codes, err := conn.WriteMultipleSymbols(map[string]string{symbolName: writeVal})
+	codes, err := conn.WriteMultipleSymbols(context.Background(), map[string]string{symbolName: writeVal})
 	if err != nil {
 		t.Fatalf("WriteMultipleSymbols failed: %v", err)
 	}
 	if codes[symbolName] != ReturnCodeNoErrors {
 		t.Fatalf("WriteMultipleSymbols returned error: 0x%X", uint32(codes[symbolName]))
 	}
-	readBack, _ := conn.ReadFromSymbol(symbolName)
+	readBack, _ := conn.ReadFromSymbol(context.Background(), symbolName)
 	if !valuesApproxEqual(writeVal, readBack, "ADS_WRITE_INT") {
 		t.Fatalf("SumWrite (via WriteMultipleSymbols) not working: wrote %q, read %q", writeVal, readBack)
 	}
 	t.Logf("SumWrite confirmed working: %s = %s", symbolName, readBack)
 
 	// Restore before mixed test
-	_ = conn.WriteToSymbol(symbolName, original)
+	_ = conn.WriteToSymbol(context.Background(), symbolName, original)
 
 	// Step 2: Now test mixed valid + bogus in one batch.
 	validGroup, validOffset := symbolSumAddress(sym)
@@ -1849,7 +1849,7 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 		{Group: 0xFFFF, Offset: 0xFFFFFFFF, Data: []byte{0, 0}},   // bogus
 	}
 
-	results, err := conn.client.Load().SumWrite(requests)
+	results, err := conn.client.Load().SumWrite(context.Background(), requests)
 	if err != nil {
 		t.Fatalf("SumWrite (mixed) failed: %v", err)
 	}
@@ -1866,7 +1866,7 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 	// Check if valid write in mixed batch was actually applied.
 	// Some PLCs roll back the entire batch when any entry fails (atomic behavior).
 	// Others apply entries independently. Both are valid PLC implementations.
-	mixedReadBack, _ := conn.ReadFromSymbol(symbolName)
+	mixedReadBack, _ := conn.ReadFromSymbol(context.Background(), symbolName)
 	if valuesApproxEqual(mixedWriteVal, mixedReadBack, "ADS_WRITE_INT") {
 		t.Logf("mixed batch: valid write applied independently (non-atomic)")
 	} else {
@@ -1874,7 +1874,7 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 	}
 
 	// Restore
-	_ = conn.WriteToSymbol(symbolName, original)
+	_ = conn.WriteToSymbol(context.Background(), symbolName, original)
 }
 
 // ============================================================
@@ -1905,7 +1905,7 @@ func TestIntegrationSumWriteVerifyData(t *testing.T) {
 	}
 
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
@@ -1914,7 +1914,7 @@ func TestIntegrationSumWriteVerifyData(t *testing.T) {
 	writeValues := make(map[string]string)
 	envVarMap := make(map[string]string)
 	for _, p := range pairs {
-		orig, err := conn.ReadFromSymbol(p.name)
+		orig, err := conn.ReadFromSymbol(context.Background(), p.name)
 		if err != nil {
 			t.Fatalf("ReadFromSymbol(%s) failed: %v", p.name, err)
 		}
@@ -1928,7 +1928,7 @@ func TestIntegrationSumWriteVerifyData(t *testing.T) {
 	}
 
 	// Batch write
-	codes, err := conn.WriteMultipleSymbols(writeValues)
+	codes, err := conn.WriteMultipleSymbols(context.Background(), writeValues)
 	if err != nil {
 		t.Fatalf("WriteMultipleSymbols failed: %v", err)
 	}
@@ -1940,7 +1940,7 @@ func TestIntegrationSumWriteVerifyData(t *testing.T) {
 
 	// Verify each INDIVIDUALLY (not batch) to confirm SumWrite correctness
 	for name, expected := range writeValues {
-		actual, err := conn.ReadFromSymbol(name)
+		actual, err := conn.ReadFromSymbol(context.Background(), name)
 		if err != nil {
 			t.Errorf("ReadFromSymbol(%s) failed: %v", name, err)
 			continue
@@ -1953,7 +1953,7 @@ func TestIntegrationSumWriteVerifyData(t *testing.T) {
 	}
 
 	// Restore
-	_, _ = conn.WriteMultipleSymbols(originals)
+	_, _ = conn.WriteMultipleSymbols(context.Background(), originals)
 }
 
 func TestIntegrationSumReadKnownValues(t *testing.T) {
@@ -1976,7 +1976,7 @@ func TestIntegrationSumReadKnownValues(t *testing.T) {
 	}
 
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
@@ -1985,7 +1985,7 @@ func TestIntegrationSumReadKnownValues(t *testing.T) {
 	knownValues := make(map[string]string)
 	envVarMap := make(map[string]string)
 	for _, p := range pairs {
-		orig, err := conn.ReadFromSymbol(p.name)
+		orig, err := conn.ReadFromSymbol(context.Background(), p.name)
 		if err != nil {
 			t.Fatalf("ReadFromSymbol(%s) failed: %v", p.name, err)
 		}
@@ -1994,7 +1994,7 @@ func TestIntegrationSumReadKnownValues(t *testing.T) {
 		if v == orig {
 			v = p.altValue
 		}
-		err = conn.WriteToSymbol(p.name, v)
+		err = conn.WriteToSymbol(context.Background(), p.name, v)
 		if err != nil {
 			t.Fatalf("WriteToSymbol(%s, %s) failed: %v", p.name, v, err)
 		}
@@ -2007,7 +2007,7 @@ func TestIntegrationSumReadKnownValues(t *testing.T) {
 	for name := range knownValues {
 		names = append(names, name)
 	}
-	batchValues, err := conn.ReadMultipleSymbols(names)
+	batchValues, err := conn.ReadMultipleSymbols(context.Background(), names)
 	if err != nil {
 		t.Fatalf("ReadMultipleSymbols failed: %v", err)
 	}
@@ -2028,7 +2028,7 @@ func TestIntegrationSumReadKnownValues(t *testing.T) {
 
 	// Restore
 	for name, orig := range originals {
-		_ = conn.WriteToSymbol(name, orig)
+		_ = conn.WriteToSymbol(context.Background(), name, orig)
 	}
 }
 
@@ -2066,11 +2066,11 @@ func TestIntegrationWrite64BitTypes(t *testing.T) {
 		}
 		t.Run(tc.envVar, func(t *testing.T) {
 			conn := setupConnection(t)
-			if err := conn.LoadSymbols(); err != nil {
+			if err := conn.LoadSymbols(context.Background()); err != nil {
 				t.Fatalf("LoadSymbols failed: %v", err)
 			}
 
-			original, err := conn.ReadFromSymbol(symbolName)
+			original, err := conn.ReadFromSymbol(context.Background(), symbolName)
 			if err != nil {
 				t.Skipf("symbol %s not available: %v", symbolName, err)
 			}
@@ -2081,12 +2081,12 @@ func TestIntegrationWrite64BitTypes(t *testing.T) {
 				writeValue = tc.altValue
 			}
 
-			err = conn.WriteToSymbol(symbolName, writeValue)
+			err = conn.WriteToSymbol(context.Background(), symbolName, writeValue)
 			if err != nil {
 				t.Fatalf("WriteToSymbol(%s, %s) failed: %v", symbolName, writeValue, err)
 			}
 
-			readBack, err := conn.ReadFromSymbol(symbolName)
+			readBack, err := conn.ReadFromSymbol(context.Background(), symbolName)
 			if err != nil {
 				t.Fatalf("ReadFromSymbol after write failed: %v", err)
 			}
@@ -2095,27 +2095,27 @@ func TestIntegrationWrite64BitTypes(t *testing.T) {
 			}
 			t.Logf("wrote %s, read back %s", writeValue, readBack)
 
-			_ = conn.WriteToSymbol(symbolName, original)
+			_ = conn.WriteToSymbol(context.Background(), symbolName, original)
 		})
 	}
 }
 
 func TestIntegrationRead64BitCounter(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
 	counterName := getEnvOrDefault("ADS_READ_COUNTER", "GVL_ProcessData.nMasterCycleCounter")
 
-	val1, err := conn.ReadFromSymbol(counterName)
+	val1, err := conn.ReadFromSymbol(context.Background(), counterName)
 	if err != nil {
 		t.Skipf("counter %s not available: %v", counterName, err)
 	}
 
 	time.Sleep(1100 * time.Millisecond)
 
-	val2, err := conn.ReadFromSymbol(counterName)
+	val2, err := conn.ReadFromSymbol(context.Background(), counterName)
 	if err != nil {
 		t.Fatalf("second read failed: %v", err)
 	}
@@ -2154,7 +2154,7 @@ func TestIntegrationEnumOnDemandRead(t *testing.T) {
 		enumName = "GVL_ProcessData.eMachineState"
 	}
 
-	value, err := conn.ReadFromSymbol(enumName)
+	value, err := conn.ReadFromSymbol(context.Background(), enumName)
 	if err != nil {
 		t.Skipf("enum symbol %s not available: %v", enumName, err)
 	}
@@ -2169,7 +2169,7 @@ func TestIntegrationEnumOnDemandRead(t *testing.T) {
 
 func TestIntegrationDeeplyNestedStruct(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
@@ -2203,7 +2203,7 @@ func TestIntegrationDeeplyNestedStruct(t *testing.T) {
 	}
 
 	// Read the struct
-	value, err := conn.ReadFromSymbol(structName)
+	value, err := conn.ReadFromSymbol(context.Background(), structName)
 	if err != nil {
 		t.Fatalf("ReadFromSymbol(%s) failed: %v", structName, err)
 	}
@@ -2236,7 +2236,7 @@ func TestIntegrationDeeplyNestedStruct(t *testing.T) {
 
 func TestIntegrationStructMultipleEnumChildren(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
@@ -2252,7 +2252,7 @@ func TestIntegrationStructMultipleEnumChildren(t *testing.T) {
 	}
 
 	// Read the struct to populate values
-	_, err := conn.ReadFromSymbol(structName)
+	_, err := conn.ReadFromSymbol(context.Background(), structName)
 	if err != nil {
 		t.Fatalf("ReadFromSymbol(%s) failed: %v", structName, err)
 	}
@@ -2299,7 +2299,7 @@ func TestIntegrationStructMultipleEnumChildren(t *testing.T) {
 
 func TestIntegrationNotificationServerCycle(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -2309,7 +2309,7 @@ func TestIntegrationNotificationServerCycle(t *testing.T) {
 	}
 
 	ch := make(chan *Update, 50)
-	handle, err := conn.AddSymbolNotification(symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch)
+	handle, err := conn.AddSymbolNotification(context.Background(), symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotification (ServerCycle) failed: %v", err)
 	}
@@ -2333,12 +2333,12 @@ done:
 		t.Errorf("ServerCycle should deliver periodic updates, got %d", count)
 	}
 
-	_ = conn.DeleteDeviceNotification(handle)
+	_ = conn.DeleteDeviceNotification(context.Background(), handle)
 }
 
 func TestIntegrationNotificationServerCycle2(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -2348,7 +2348,7 @@ func TestIntegrationNotificationServerCycle2(t *testing.T) {
 	}
 
 	// Check ContextMask before subscribing — determines if InContext or fallback
-	sym, err := conn.GetSymbol(symbolName)
+	sym, err := conn.GetSymbol(context.Background(), symbolName)
 	if err != nil {
 		t.Fatalf("GetSymbol failed: %v", err)
 	}
@@ -2359,7 +2359,7 @@ func TestIntegrationNotificationServerCycle2(t *testing.T) {
 	}
 
 	ch := make(chan *Update, 50)
-	handle, err := conn.AddSymbolNotification(symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle2, ch)
+	handle, err := conn.AddSymbolNotification(context.Background(), symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle2, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotification failed: %v", err)
 	}
@@ -2378,7 +2378,7 @@ func TestIntegrationNotificationServerCycle2(t *testing.T) {
 		}
 	}
 done:
-	_ = conn.DeleteDeviceNotification(handle)
+	_ = conn.DeleteDeviceNotification(context.Background(), handle)
 
 	if sym.ContextMask == 0 {
 		t.Logf("CyclicInContext fallback to ServerCycle: received %d notifications in 3s", count)
@@ -2397,12 +2397,12 @@ func TestIntegrationNotificationServerOnChange2(t *testing.T) {
 	}
 
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
 	// Check ContextMask — determines if InContext or fallback
-	sym, err := conn.GetSymbol(symbolName)
+	sym, err := conn.GetSymbol(context.Background(), symbolName)
 	if err != nil {
 		t.Fatalf("GetSymbol failed: %v", err)
 	}
@@ -2413,19 +2413,19 @@ func TestIntegrationNotificationServerOnChange2(t *testing.T) {
 	}
 
 	ch := make(chan *Update, 10)
-	handle, err := conn.AddSymbolNotification(symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange2, ch)
+	handle, err := conn.AddSymbolNotification(context.Background(), symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerOnChange2, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotification failed: %v", err)
 	}
 
 	// Read original, write a different value to trigger change
-	original, _ := conn.ReadFromSymbol(symbolName)
+	original, _ := conn.ReadFromSymbol(context.Background(), symbolName)
 	writeVal := "42"
 	if original == "42" {
 		writeVal = "100"
 	}
 
-	err = conn.WriteToSymbol(symbolName, writeVal)
+	err = conn.WriteToSymbol(context.Background(), symbolName, writeVal)
 	if err != nil {
 		t.Fatalf("WriteToSymbol failed: %v", err)
 	}
@@ -2443,8 +2443,8 @@ func TestIntegrationNotificationServerOnChange2(t *testing.T) {
 	}
 
 	// Restore
-	_ = conn.WriteToSymbol(symbolName, original)
-	_ = conn.DeleteDeviceNotification(handle)
+	_ = conn.WriteToSymbol(context.Background(), symbolName, original)
+	_ = conn.DeleteDeviceNotification(context.Background(), handle)
 	if !received {
 		t.Error("expected notification (with or without fallback) after write, got none")
 	}
@@ -2452,7 +2452,7 @@ func TestIntegrationNotificationServerOnChange2(t *testing.T) {
 
 func TestIntegrationNotificationBatchTransModes(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -2462,7 +2462,7 @@ func TestIntegrationNotificationBatchTransModes(t *testing.T) {
 	}
 
 	// Check ContextMask on the symbol that will use CyclicInContext
-	sym2, err := conn.GetSymbol(names[2])
+	sym2, err := conn.GetSymbol(context.Background(), names[2])
 	if err != nil {
 		t.Fatalf("GetSymbol(%s) failed: %v", names[2], err)
 	}
@@ -2479,7 +2479,7 @@ func TestIntegrationNotificationBatchTransModes(t *testing.T) {
 		{SymbolName: names[2], MaxDelay: 100 * time.Millisecond, CycleTime: 200 * time.Millisecond, TransmissionMode: TransModeServerCycle2},
 	}
 
-	_, err = conn.AddSymbolNotifications(configs, ch)
+	_, err = conn.AddSymbolNotifications(context.Background(), configs, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotifications (mixed modes) failed: %v", err)
 	}
@@ -2519,7 +2519,7 @@ done:
 		handles = append(handles, h)
 	}
 	conn.notifications.lock.Unlock()
-	_, _ = conn.SumDeleteDeviceNotification(handles)
+	_, _ = conn.SumDeleteDeviceNotification(context.Background(), handles)
 }
 
 // ============================================================
@@ -2528,7 +2528,7 @@ done:
 
 func TestIntegrationLargeBatchRead(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -2540,14 +2540,14 @@ func TestIntegrationLargeBatchRead(t *testing.T) {
 	// Ensure all symbols have handles before batch read to avoid
 	// intermittent failures from handle acquisition under load.
 	for _, name := range names {
-		if _, err := conn.GetSymbol(name); err != nil {
+		if _, err := conn.GetSymbol(context.Background(), name); err != nil {
 			t.Fatalf("GetSymbol(%s) failed: %v", name, err)
 		}
 	}
 
 	t.Logf("batch reading %d symbols", len(names))
 	start := time.Now()
-	values, err := conn.ReadMultipleSymbols(names)
+	values, err := conn.ReadMultipleSymbols(context.Background(), names)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("ReadMultipleSymbols failed: %v", err)
@@ -2586,7 +2586,7 @@ func TestIntegrationLargeBatchRead(t *testing.T) {
 
 func TestIntegrationLargeBatchNotification(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -2606,7 +2606,7 @@ func TestIntegrationLargeBatchNotification(t *testing.T) {
 		})
 	}
 
-	_, err := conn.AddSymbolNotifications(configs, ch)
+	_, err := conn.AddSymbolNotifications(context.Background(), configs, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotifications (large batch) failed: %v", err)
 	}
@@ -2643,7 +2643,7 @@ done:
 		handles = append(handles, h)
 	}
 	conn.notifications.lock.Unlock()
-	_, _ = conn.SumDeleteDeviceNotification(handles)
+	_, _ = conn.SumDeleteDeviceNotification(context.Background(), handles)
 }
 
 // TestIntegrationNotificationCycleTimes verifies notifications at different cycle times.
@@ -2651,7 +2651,7 @@ done:
 // the PLC delivers at approximately the requested rate.
 func TestIntegrationNotificationCycleTimes(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -2675,7 +2675,7 @@ func TestIntegrationNotificationCycleTimes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ch := make(chan *Update, 500)
-			handle, err := conn.AddSymbolNotification(symbolName, time.Duration(tt.cycleTime)*time.Millisecond, time.Duration(tt.maxDelay)*time.Millisecond, TransModeServerCycle, ch)
+			handle, err := conn.AddSymbolNotification(context.Background(), symbolName, time.Duration(tt.cycleTime)*time.Millisecond, time.Duration(tt.maxDelay)*time.Millisecond, TransModeServerCycle, ch)
 			if err != nil {
 				t.Fatalf("AddSymbolNotification (cycle=%dms) failed: %v", tt.cycleTime, err)
 			}
@@ -2691,7 +2691,7 @@ func TestIntegrationNotificationCycleTimes(t *testing.T) {
 				}
 			}
 		done:
-			_ = conn.DeleteDeviceNotification(handle)
+			_ = conn.DeleteDeviceNotification(context.Background(), handle)
 			t.Logf("cycle=%dms: received %d notifications in %v", tt.cycleTime, count, tt.duration)
 			if count < tt.minCount {
 				t.Errorf("expected at least %d notifications, got %d", tt.minCount, count)
@@ -2705,7 +2705,7 @@ func TestIntegrationNotificationCycleTimes(t *testing.T) {
 // may batch multiple changes before sending.
 func TestIntegrationNotificationMaxDelay(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -2716,7 +2716,7 @@ func TestIntegrationNotificationMaxDelay(t *testing.T) {
 
 	// Short cycle, long maxDelay — PLC may batch notifications
 	ch := make(chan *Update, 100)
-	handle, err := conn.AddSymbolNotification(symbolName, 50*time.Millisecond, 2000*time.Millisecond, TransModeServerCycle, ch)
+	handle, err := conn.AddSymbolNotification(context.Background(), symbolName, 50*time.Millisecond, 2000*time.Millisecond, TransModeServerCycle, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotification failed: %v", err)
 	}
@@ -2732,7 +2732,7 @@ func TestIntegrationNotificationMaxDelay(t *testing.T) {
 		}
 	}
 done:
-	_ = conn.DeleteDeviceNotification(handle)
+	_ = conn.DeleteDeviceNotification(context.Background(), handle)
 	t.Logf("cycle=50ms, maxDelay=2000ms: received %d notifications in 5s", count)
 	// Should still receive notifications, just possibly batched
 	if count == 0 {
@@ -2744,7 +2744,7 @@ done:
 // notifications as fast as possible (no batching).
 func TestIntegrationNotificationZeroMaxDelay(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -2754,7 +2754,7 @@ func TestIntegrationNotificationZeroMaxDelay(t *testing.T) {
 	}
 
 	ch := make(chan *Update, 500)
-	handle, err := conn.AddSymbolNotification(symbolName, 100*time.Millisecond, 0*time.Millisecond, TransModeServerCycle, ch)
+	handle, err := conn.AddSymbolNotification(context.Background(), symbolName, 100*time.Millisecond, 0*time.Millisecond, TransModeServerCycle, ch)
 	if err != nil {
 		t.Fatalf("AddSymbolNotification (maxDelay=0) failed: %v", err)
 	}
@@ -2770,7 +2770,7 @@ func TestIntegrationNotificationZeroMaxDelay(t *testing.T) {
 		}
 	}
 done:
-	_ = conn.DeleteDeviceNotification(handle)
+	_ = conn.DeleteDeviceNotification(context.Background(), handle)
 	t.Logf("maxDelay=0: received %d notifications in 3s", count)
 	if count < 2 {
 		t.Errorf("expected notifications with maxDelay=0, got %d", count)
@@ -2782,7 +2782,7 @@ done:
 // can parse every supported ADS datatype from real PLC data.
 func TestIntegrationReadAllParseableTypes(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -2800,7 +2800,7 @@ func TestIntegrationReadAllParseableTypes(t *testing.T) {
 	t.Logf("found %d parseable types on PLC", len(byType))
 	for dt, name := range byType {
 		t.Run(dt, func(t *testing.T) {
-			val, err := conn.ReadFromSymbol(name)
+			val, err := conn.ReadFromSymbol(context.Background(), name)
 			if err != nil {
 				t.Fatalf("ReadFromSymbol(%s) [type=%s] failed: %v", name, dt, err)
 			}
@@ -2823,7 +2823,7 @@ func TestIntegrationReadAllParseableTypes(t *testing.T) {
 // in a loop to verify handle management under rapid lifecycle churn.
 func TestIntegrationRapidSubscribeUnsubscribe(t *testing.T) {
 	conn := setupConnection(t)
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -2835,11 +2835,11 @@ func TestIntegrationRapidSubscribeUnsubscribe(t *testing.T) {
 	const iterations = 10
 	for i := 0; i < iterations; i++ {
 		ch := make(chan *Update, 5)
-		handle, err := conn.AddSymbolNotification(symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch)
+		handle, err := conn.AddSymbolNotification(context.Background(), symbolName, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch)
 		if err != nil {
 			t.Fatalf("iteration %d: AddSymbolNotification failed: %v", i, err)
 		}
-		err = conn.DeleteDeviceNotification(handle)
+		err = conn.DeleteDeviceNotification(context.Background(), handle)
 		if err != nil {
 			t.Fatalf("iteration %d: DeleteDeviceNotification failed: %v", i, err)
 		}
@@ -2873,13 +2873,13 @@ func TestIntegrationDockerRoute(t *testing.T) {
 	}
 
 	// Verify connection works (proves route is valid)
-	info, err := conn.client.Load().ReadDeviceInfo()
+	info, err := conn.client.Load().ReadDeviceInfo(context.Background())
 	if err != nil {
 		t.Fatalf("ReadDeviceInfo failed: %v", err)
 	}
 	t.Logf("device: %s v%d.%d.%d", string(info.DeviceName[:]), info.Major, info.Minor, info.Version)
 
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 	symbols, _ := conn.ListSymbols()
@@ -2889,7 +2889,7 @@ func TestIntegrationDockerRoute(t *testing.T) {
 func TestIntegrationWSTRING(t *testing.T) {
 	conn := setupConnection(t)
 
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
@@ -2913,7 +2913,7 @@ func TestIntegrationWSTRING(t *testing.T) {
 	t.Logf("found WSTRING symbol: %s", wstringName)
 
 	// Read current value
-	val, err := conn.ReadFromSymbol(wstringName)
+	val, err := conn.ReadFromSymbol(context.Background(), wstringName)
 	if err != nil {
 		t.Fatalf("ReadFromSymbol(%s) failed: %v", wstringName, err)
 	}
@@ -2921,12 +2921,12 @@ func TestIntegrationWSTRING(t *testing.T) {
 
 	// Write a test value and read back
 	testVal := "WTest"
-	if err := conn.WriteToSymbol(wstringName, testVal); err != nil {
+	if err := conn.WriteToSymbol(context.Background(), wstringName, testVal); err != nil {
 		t.Logf("WriteToSymbol(%s) failed (may be read-only): %v", wstringName, err)
 		return
 	}
 
-	readBack, err := conn.ReadFromSymbol(wstringName)
+	readBack, err := conn.ReadFromSymbol(context.Background(), wstringName)
 	if err != nil {
 		t.Fatalf("ReadFromSymbol after write failed: %v", err)
 	}
@@ -2936,14 +2936,14 @@ func TestIntegrationWSTRING(t *testing.T) {
 
 	// Restore original value
 	if val != "" {
-		_ = conn.WriteToSymbol(wstringName, val)
+		_ = conn.WriteToSymbol(context.Background(), wstringName, val)
 	}
 }
 
 func TestIntegrationBitSymbol(t *testing.T) {
 	conn := setupConnection(t)
 
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("LoadSymbols failed: %v", err)
 	}
 
@@ -2967,7 +2967,7 @@ func TestIntegrationBitSymbol(t *testing.T) {
 	t.Logf("found BitValue symbol: %s (flags=0x%04X)", bitName, uint32(symbols[bitName].Flags))
 
 	// Read should return "true" or "false"
-	val, err := conn.ReadFromSymbol(bitName)
+	val, err := conn.ReadFromSymbol(context.Background(), bitName)
 	if err != nil {
 		t.Fatalf("ReadFromSymbol(%s) failed: %v", bitName, err)
 	}
@@ -2980,7 +2980,7 @@ func TestIntegrationBitSymbol(t *testing.T) {
 func TestIntegrationReadProcessInputSize(t *testing.T) {
 	conn := setupConnection(t)
 
-	size, err := conn.client.Load().ReadProcessInputSize()
+	size, err := conn.client.Load().ReadProcessInputSize(context.Background())
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -2997,7 +2997,7 @@ func TestIntegrationReadProcessInput(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Read first 4 bytes of input image
-	data, err := conn.client.Load().ReadProcessInput(0, 4)
+	data, err := conn.client.Load().ReadProcessInput(context.Background(), 0, 4)
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -3014,7 +3014,7 @@ func TestIntegrationReadProcessOutput(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Read first 4 bytes of output image
-	data, err := conn.client.Load().ReadProcessOutput(0, 4)
+	data, err := conn.client.Load().ReadProcessOutput(context.Background(), 0, 4)
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -3031,7 +3031,7 @@ func TestIntegrationReadProcessInputBit(t *testing.T) {
 	conn := setupConnection(t)
 
 	// Read bit 0 of first input byte
-	val, err := conn.client.Load().ReadProcessInputBit(0, 0)
+	val, err := conn.client.Load().ReadProcessInputBit(context.Background(), 0, 0)
 	if err != nil {
 		if strings.Contains(err.Error(), "service not supported") {
 			t.Skip("PLC has no physical I/O configured (process image unavailable)")
@@ -3051,7 +3051,7 @@ func TestIntegrationReadProcessInputBit(t *testing.T) {
 func TestIntegrationDP3HandleLeak(t *testing.T) {
 	conn := setupConnection(t)
 
-	if err := conn.LoadSymbols(); err != nil {
+	if err := conn.LoadSymbols(context.Background()); err != nil {
 		t.Fatalf("initial LoadSymbols failed: %v", err)
 	}
 	symbols, err := conn.ListSymbols()
@@ -3074,13 +3074,13 @@ func TestIntegrationDP3HandleLeak(t *testing.T) {
 	for i := 0; i < cycles; i++ {
 		hs := make([]uint32, 0, len(picks))
 		for _, name := range picks {
-			view, gerr := conn.GetSymbol(name)
+			view, gerr := conn.GetSymbol(context.Background(), name)
 			if gerr != nil {
 				t.Fatalf("cycle %d GetSymbol(%q): %v", i, name, gerr)
 			}
 			hs = append(hs, view.Handle)
 		}
-		if lerr := conn.LoadSymbols(); lerr != nil {
+		if lerr := conn.LoadSymbols(context.Background()); lerr != nil {
 			t.Fatalf("cycle %d LoadSymbols: %v", i, lerr)
 		}
 		samples = append(samples, sample{cycle: i, handles: hs})
@@ -3118,7 +3118,7 @@ func TestIntegrationDP3LoadOrderEquivalence(t *testing.T) {
 	if probeSym == "" {
 		// fall back to first available top-level symbol with children
 		conn := setupConnection(t)
-		if err := conn.LoadSymbols(); err != nil {
+		if err := conn.LoadSymbols(context.Background()); err != nil {
 			t.Fatalf("LoadSymbols failed: %v", err)
 		}
 		symbols, err := conn.ListSymbols()
@@ -3166,13 +3166,13 @@ func TestIntegrationDP3LoadOrderEquivalence(t *testing.T) {
 
 	// Order A: LoadSymbolList → LoadDataTypes
 	connA := setupConnection(t)
-	if err := connA.LoadSymbolList(SlowDiscoveryConfig{}); err != nil {
+	if err := connA.LoadSymbolList(context.Background(), SlowDiscoveryConfig{}); err != nil {
 		t.Fatalf("A LoadSymbolList: %v", err)
 	}
-	if err := connA.LoadDataTypes(SlowDiscoveryConfig{}); err != nil {
+	if err := connA.LoadDataTypes(context.Background(), SlowDiscoveryConfig{}); err != nil {
 		t.Fatalf("A LoadDataTypes: %v", err)
 	}
-	viewA, err := connA.GetSymbol(probeSym)
+	viewA, err := connA.GetSymbol(context.Background(), probeSym)
 	if err != nil {
 		t.Fatalf("A GetSymbol(%q): %v", probeSym, err)
 	}
@@ -3181,13 +3181,13 @@ func TestIntegrationDP3LoadOrderEquivalence(t *testing.T) {
 
 	// Order B: LoadDataTypes → LoadSymbolList
 	connB := setupConnection(t)
-	if err := connB.LoadDataTypes(SlowDiscoveryConfig{}); err != nil {
+	if err := connB.LoadDataTypes(context.Background(), SlowDiscoveryConfig{}); err != nil {
 		t.Fatalf("B LoadDataTypes: %v", err)
 	}
-	if err := connB.LoadSymbolList(SlowDiscoveryConfig{}); err != nil {
+	if err := connB.LoadSymbolList(context.Background(), SlowDiscoveryConfig{}); err != nil {
 		t.Fatalf("B LoadSymbolList: %v", err)
 	}
-	viewB, err := connB.GetSymbol(probeSym)
+	viewB, err := connB.GetSymbol(context.Background(), probeSym)
 	if err != nil {
 		t.Fatalf("B GetSymbol(%q): %v", probeSym, err)
 	}

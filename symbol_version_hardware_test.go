@@ -435,18 +435,18 @@ func TestSymbolVersionIgnore_StaleFlag(t *testing.T) {
 	// real-world coverage gap that would need a different trigger).
 	var firstStale *Update
 	for _, u := range post {
-		if u.Stale {
+		if u.Stale != nil {
 			firstStale = u
 			break
 		}
 	}
 	if firstStale == nil {
-		t.Logf("no Stale=true sample observed across %d post-change samples — TC3 may not surface a detection code for this scenario via the listener path (operator-handle survival is acceptable Ignore semantics)", len(post))
+		t.Logf("no Stale sample observed across %d post-change samples — TC3 may not surface a detection code for this scenario via the listener path (operator-handle survival is acceptable Ignore semantics)", len(post))
 	} else {
-		if firstStale.Reason != "symbol-version-invalid" {
-			t.Errorf("first Stale sample: Reason=%q, want %q", firstStale.Reason, "symbol-version-invalid")
+		if firstStale.Stale.Reason != ReasonSymbolVersionInvalid {
+			t.Errorf("first Stale sample: Reason=%q, want %q", firstStale.Stale.Reason, ReasonSymbolVersionInvalid)
 		} else {
-			t.Logf("Stale sample observed: Reason=%q value=%v", firstStale.Reason, firstStale.Value)
+			t.Logf("Stale sample observed: Reason=%q value=%v", firstStale.Stale.Reason, firstStale.Value)
 		}
 	}
 	t.Logf("post samples: %d, first value=%v", len(post), post[0].Value)
@@ -466,9 +466,9 @@ func TestSymbolVersionIgnore_StaleFlag(t *testing.T) {
 // Validates: R-CACHE-009 (listener-path supplementary detection),
 // R-CACHE-012 (Ignore strategy), R-NOT-016 (callback delivery).
 func TestSymbolVersionIgnore_RemovedSymbolStops(t *testing.T) {
-	cbReason := make(chan string, 4)
+	cbReason := make(chan Reason, 4)
 	sess := symbolVersionSession(t, "ignore",
-		WithOnSymbolVersionChanged(func(reason string) {
+		WithOnSymbolVersionChanged(func(reason Reason) {
 			select {
 			case cbReason <- reason:
 			default:
@@ -498,7 +498,7 @@ func TestSymbolVersionIgnore_RemovedSymbolStops(t *testing.T) {
 	// Wait up to 5s for the listener-path detection to surface via the
 	// callback (TC3 emits the 0-byte terminal sample whenever it gets
 	// around to it after Activate completes).
-	var detectionReason string
+	var detectionReason Reason
 	select {
 	case detectionReason = <-cbReason:
 		t.Logf("listener-path detection callback fired: reason=%s", detectionReason)
@@ -518,7 +518,7 @@ func TestSymbolVersionIgnore_RemovedSymbolStops(t *testing.T) {
 	post := col.snapshot()
 	t.Logf("post-detection Ignore samples: %d (expect 0 — terminal 0-byte intercepted)", len(post))
 	for i, u := range post {
-		t.Logf("  [%d] value=%v Stale=%v Reason=%q", i, u.Value, u.Stale, u.Reason)
+		t.Logf("  [%d] value=%v Stale=%v", i, u.Value, u.Stale)
 	}
 	if len(post) != 0 {
 		t.Errorf("post-detection samples = %d, want 0 (dead handle should be silent after listener intercepts terminal sample)", len(post))

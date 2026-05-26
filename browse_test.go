@@ -3,6 +3,7 @@
 package ads
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sort"
@@ -25,7 +26,7 @@ func TestBrowseAllSymbols(t *testing.T) {
 	ip := getEnvOrDefault("ADS_PLC_IP", "192.168.0.1")
 
 	// Load all symbols + datatypes slowly to avoid disrupting PLC real-time tasks.
-	err := conn.LoadSymbolsSlow(SlowDiscoveryConfig{
+	err := conn.LoadSymbolsSlow(context.Background(), SlowDiscoveryConfig{
 		ChunkSize:  4096,
 		ChunkDelay: 100 * time.Millisecond,
 	})
@@ -41,7 +42,7 @@ func TestBrowseAllSymbols(t *testing.T) {
 	t.Logf("Loaded %d symbols from %s", len(symbols), ip)
 
 	// Get device info for the header.
-	info, err := conn.client.Load().ReadDeviceInfo()
+	info, err := conn.client.Load().ReadDeviceInfo(context.Background())
 	if err != nil {
 		t.Fatalf("ReadDeviceInfo failed: %v", err)
 	}
