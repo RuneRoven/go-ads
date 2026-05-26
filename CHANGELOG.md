@@ -6,6 +6,214 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) a
 [go-semantic-release](https://github.com/go-semantic-release/semantic-release) for
 automated versioning and changelog generation.
 
+## v2.2.0: context propagation, type safety, ergonomic constructor (breaking)
+
+v2.2 bundles the v2.1 self-review findings into a single break: every RPC
+method takes a `context.Context`, the constructor drops 7 positional
+arguments for a typed `AMSEndpoint` plus options, several wire-protocol
+values are now distinct types, and the public API surface shrinks (`Symbol`
+is unexported, internal retry counters split out of `NotificationConfig`).
+
+### Critical fixes (also worth backporting if you stay on v2.1.x)
+
+- `Session.client` is now `atomic.Pointer[Client]`. `Connect` and
+  `dialAndStart` publish the new Client after handlers + workers are wired,
+  so concurrent RPC paths cannot observe a half-initialized Client.
+- `makeArrayChildren` now passes `size / level.Elements` to the recursive
+  inner-dimension call. Multi-dimensional fixed-width arrays
+  (e.g. `ARRAY[0..3, 0..3] OF REAL`) compute per-element byte size
+  correctly; previously the inner-most elements got the outer row size.
+- `sumWriteFallback`, `sumAddNotificationFallback`,
+  `sumDeleteNotificationFallback` now use `errors.As` to extract the
+  underlying `ReturnCode` (matching `sumReadFallback`). On TC2 (always-
+  fallback) under online change, `detectStaleCache` now sees the real
+  0x711/0x705 codes and `SymbolVersionAutoReload` fires for writes and
+  notifications, not just reads.
+- `symbolSumAddress` callers (`ReadMultipleSymbols`, `WriteMultipleSymbols`)
+  take `cache.lock` around the handle snapshot to close the read-vs-
+  `zeroOldSymbolHandles` race surfaced by `-race`.
+
+### Breaking changes
+
+- **`context.Context` is now the first argument** on every RPC method.
+  This includes the raw `Client` surface (`Read`, `Write`, `WriteRead`,
+  `ReadState`, `ReadDeviceInfo`, `AddDeviceNotification`,
+  `DeleteDeviceNotification`, `SumRead`, `SumWrite`,
+  `SumAddDeviceNotification`, `SumDeleteDeviceNotification`,
+  `GetHandleByName`, `GetSymbolInfoByName`, `GetSymbolVersion`,
+  `GetSymbolUploadInfo`, `DownloadInChunks`, `DownloadDataTypes`,
+  `DownloadSymbolList`, `ReleaseHandle`, all `ReadProcess*`,
+  `WriteProcess*`, `ClearProcess*`) and the cache-aware `Session` surface
+  (`ReadFromSymbol`, `WriteToSymbol`, `ReadMultipleSymbols`,
+  `WriteMultipleSymbols`, `AddSymbolNotification`, `AddSymbolNotifications`,
+  `DeleteDeviceNotification`, `SumDeleteDeviceNotification`, `LoadSymbols`,
+  `LoadSymbolsSlow`, `LoadSymbolList`, `LoadDataTypes`, `GetSymbol`,
+  `RefreshSymbols`, `CheckSymbolVersion`, `Reconnect`, `AddRoute`).
+  The caller-supplied ctx is merged with the per-request timeout via
+  `context.WithTimeout`; pass `context.Background()` to preserve the v2.1
+  timeout-only semantic.
+- **`NewSession` ergonomic refactor.** Old:
+  `NewSession(ip, port, netid, amsPort, localNetID, localPort, requestTimeout, opts...)`.
+  New: `NewSession(ctx, AMSEndpoint{IP, Port, AMS: AMSAddress{NetID, Port}}, opts...)`.
+  Local NetID/port moved to `WithLocalAMS(AMSAddress{...})`. Request
+  timeout moved to `WithRequestTimeout(...)`. Local-mode flag moved from
+  `Connect(bool)` to `WithLocalMode()` option. `Connect` now takes a
+  `context.Context` instead of the local-mode bool.
+- **`Session.Close() error`** (was `Close()`). Implements `io.Closer`.
+  Returns nil today; reserved for future failure modes (TCP close failure,
+  PLC handle release failure).
+- **`Symbol` is unexported.** Use `SymbolView` (already the recommended
+  read-only handle returned by `GetSymbol` / `ListSymbols`). The internal
+  `(*Symbol).GetJSON` and `parseSymbol` methods are unexported; the new
+  `(SymbolView).GetJSON()` is the public entry point.
+- **`Update.Stale bool` + `Update.Reason string`** collapse into a single
+  `Update.Stale *StaleInfo`. Stale samples have `u.Stale != nil` and carry
+  `u.Stale.Reason`; normal samples have `u.Stale == nil`. The boolean is
+  no longer separately addressable.
+- **`NotificationConfig`** no longer carries the internal `resubscribeAttempts`
+  counter. Internal resubscribe bookkeeping moved to the unexported
+  `pendingNotification` wrapper.
+- **`ADSDataType`** is a distinct type (was `uint32`). The `ADST*`
+  constants (`ADSTBool`, `ADSTInt16`, ..., `ADSTBigType`) are typed
+  `ADSDataType`. `Symbol.BaseType` / `SymbolView.BaseType` / `inferBaseType`
+  signatures retyped.
+- **`Reason`** is a distinct type (was `string`). The `Reason*` constants
+  (`ReasonSymbolVersionInvalid`, ..., `ReasonReloadInProgress`) are typed
+  `Reason`. `Update.Reason` / `WithOnSymbolVersionChanged` callback /
+  `detectStaleCache` / `consumeStaleFlag` / `markAllHandlesStale` /
+  `staleHandles` map signatures retyped.
+- **`AMSAddress` constructor + methods.** `NewAMSAddress(netID, port)`,
+  `(AMSAddress).String() / NetIDString() / Equal()` are now public.
+  `stringToNetID` exported as `ParseNetID`.
+- **`BackoffConfig.Validate() error`** added. `WithBackoff` rejects invalid
+  configs (zero or negative intervals, negative attempts, non-monotonic
+  tiers) with a Warn log and keeps the default.
+- **Route-registration error propagation.** `Connect` now returns an error
+  if route registration fails, rather than logging Warn and continuing
+  with a half-working session.
+- **`parseRouteResponse`** returns an error when the PLC response has no
+  error tag (was treated as success, masking malformed/truncated
+  responses).
+
+### Migration sketch (top use cases)
+
+```go
+// v2.1
+sess, err := ads.NewSession("192.168.1.10", 48898, "5.154.236.19.1.1", 851,
+    "auto", 10500, 5*time.Second)
+if err != nil { return err }
+defer sess.Close()
+if err := sess.Connect(false); err != nil { return err }
+v, err := sess.ReadFromSymbol("MAIN.x")
+
+// v2.2
+target, _ := ads.NewAMSAddress("5.154.236.19.1.1", 851)
+sess, err := ads.NewSession(ctx, ads.AMSEndpoint{IP: "192.168.1.10", Port: 48898, AMS: target},
+    ads.WithRequestTimeout(5*time.Second),
+    ads.WithLocalAMS(ads.AMSAddress{Port: 10500}),
+)
+if err != nil { return err }
+defer sess.Close()
+if err := sess.Connect(ctx); err != nil { return err }
+v, err := sess.ReadFromSymbol(ctx, "MAIN.x")
+```
+
+```go
+// v2.1 Update consumer
+for u := range ch {
+    if u.Stale { handleStale(u.Reason) }
+    process(u.Value)
+}
+
+// v2.2
+for u := range ch {
+    if u.Stale != nil { handleStale(u.Stale.Reason) }
+    process(u.Value)
+}
+```
+
+### Non-breaking improvements (concurrency hardening)
+
+- `DeleteDeviceNotification`: snapshot symbol name BEFORE the PLC RPC so a
+  concurrent `Reconnect` clearing `activeNotifications` mid-flight cannot
+  strand the entry in `notificationConfigs` (which would cause
+  `resubscribeNotifications` to re-subscribe a symbol the user deleted).
+- `handleStaleDetection`: `versionCallback` now fires inside the
+  `reloadInProgress` CAS-success branch for `AutoReload`. N concurrent
+  triggers produce 1 callback (R-SES-011 once-per-detection); previously
+  N triggers fired N callbacks.
+- `notification_api.go`: `lastSubscribeNs` is stored BEFORE the
+  `AddDeviceNotification` / `SumAddDeviceNotification` RPC so a
+  first-sample arriving in the race window between PLC return and our map
+  insert sees a fresh timestamp in the unknown-handle log-level decision.
+- `Connect`: uses `transitionToOnce(Connecting)` to reject concurrent
+  callers instead of letting both race on socket + client publish.
+- `dialAndStart`: captures `ctx` and `cancel` under a single `RLock` (no
+  split-window); `disconnected.Store(false)` happens AFTER `startWorkers`
+  so a user RPC observing `disconnected=false` is guaranteed to find
+  `transmitWorker` running.
+- `Close` + `tearDownAndReset`: capture the shutdown cancel under RLock,
+  release, then invoke. Holding RLock across the cancel was blocking the
+  ctx-replacement path's `Lock`.
+- `closedCh` close is now `sync.Once`-gated. The `Reconnect`-exhaustion
+  path runs the full `releasePLCResources` cleanup so a subsequent
+  `Close` is not a no-op that strands PLC subscriptions per source NetID.
+- FSM gains `Connecting → Disconnected` and `Disconnected → Connecting`
+  edges. `Connect` rolls back to `Disconnected` on error so the caller
+  can retry via `Connect` (was stranded in `Connecting`, recoverable
+  only via `Reconnect` auto-path).
+- `notificationManager` gains a `configsByKey map[string]struct{}` mirror.
+  Duplicate-subscribe probes are O(1) instead of O(N) per call; bulk
+  subscribe is O(N) total instead of O(N²).
+- `cmd_sum.go executeSumCommand`: overflow guard on `n*itemReadSize` /
+  `n*itemWriteSize` (mirrors `SumRead`).
+- On-demand reconnect (`reloadSymbols`) keeps the requested set in
+  `cache.onDemandSymbols` across retries; previously partial-success on
+  retry N silently dropped failed names from retry N+1.
+
+### Documentation + style cleanup
+
+- Many `defs.go` exported types and constants gained godoc (was
+  fragments or missing): `AMSAddress`, `TransMode`, `ADSState`, `Port`,
+  `CommandID`, `Group`, `Offset`, `ReturnCode`, `Write`, `DeviceInfo`,
+  `NotificationStream`, `StampHeader`, `NotificationSample`.
+- `NewConnection` doc fragment fixed to `NewSession`.
+- `process_image.go` exported functions gained `EXPERIMENTAL:` per-symbol
+  prefix so pkg.go.dev surfaces the marker per method.
+- `session_options.go` `WithSymbolVersion*` docs replaced internal R-IDs
+  with prose users on pkg.go.dev can read.
+- Stale file references purged (`connection.go:575`, `commandRead.go`,
+  `four previously-duplicated reset paths`).
+- Phase tags (`Phase 1:`, `Phase 5.c relocated...`) stripped from
+  comments per the v2.1 cleanup sweep.
+- `capabilities.go` self-contradiction removed (`reset() clears all
+  fields` vs `Reset is implicit`).
+- `0xf010` → `0xF010` for consistency with surrounding hex constants.
+- CHANGELOG em-dashes replaced with ASCII punctuation.
+
+### Test coverage additions
+
+- `TestFSM_AllowedTransitions`: table test pinning every legal and
+  illegal (from, to) transition in the FSM.
+- `TestFSM_TransitionToOnce_FirstWinnerOnly`: N=50 concurrent
+  `transitionToOnce(Closed)` produces exactly one winner.
+- `TestReconnectExhaustConcurrentClose_NoPanic`: 20-iter race between
+  exhaustion path and `markClosed`; no double-close panic.
+- `TestReconnect_FlapDetection_AccumulatesAcrossCycles`: flap counter
+  increments across reconnect cycles within `flapWindow`.
+- `TestReleasePLCResources_NotificationCleanup` +
+  `TestReleasePLCResources_SymbolHandleRelease_{Skipped,Fired}`:
+  `Close()` cleanup helper.
+- `TestResubscribeNotifications_RollbackOnError`: rollback restores
+  saved configs after `AddSymbolNotifications` outer error.
+- `TestParseSumReadResponse_ErroredItemAdvancesOffset` +
+  `TestParseSumReadResponse_ErroredItemOverflowsRemaining`: per-item
+  alignment after an errored item.
+- `TestBaseTypeName_LayeredResolution`: 7 sub-cases pinning the layered
+  resolution priority (ADST_ primitive, datatype table, size inference).
+- `TestHandleStaleDetection_Ignore_FiresCallbackPerTrigger`: companion
+  to `TestSession_AutoReload_SingleFlight` for the Ignore strategy.
+
 ## v2.1.0: Layered architecture (breaking)
 
 The single `Connection` god-type is split into two distinct public types:
