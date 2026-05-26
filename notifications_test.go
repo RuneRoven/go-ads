@@ -17,7 +17,7 @@ import (
 //   - R-NOT-001 (channel-mismatch rejected — pre-roundtrip)
 //   - R-NOT-002 (duplicate-symbol rejected: single, in-batch, cross-batch)
 //   - R-NOT-003 (TOCTOU re-check on subscribe — partial; full path needs stub Client)
-//   - R-NOT-004 (generation bump mid-roundtrip → stranded-Symbol detected)
+//   - R-NOT-004 (generation bump mid-roundtrip → stranded-symbol detected)
 //   - R-NOT-008 (DeleteDeviceNotification clears state — partial; live transport needed)
 //   - R-NOT-010 (channel set only on first success)
 //   - R-NOT-013 (resubscribe retry up to max — TODO, depends on stub Client)
@@ -27,18 +27,18 @@ import (
 // lifecycle. No client; tests that need network use the echo helper.
 func newNotifTestSession() *Session {
 	return &Session{
-		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
+		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
 		lifecycle:     &sessionLifecycle{closedCh: make(chan struct{})},
 		logger:        getDefaultLogger(),
 	}
 }
 
-// preSeedSymbol primes the cache with a Symbol that has a non-zero handle
+// preSeedSymbol primes the cache with a symbol that has a non-zero handle
 // so getSymbol returns immediately without taking the GetHandleByName
 // network path.
-func preSeedSymbol(sess *Session, name string) *Symbol {
-	sym := &Symbol{
+func preSeedSymbol(sess *Session, name string) *symbol {
+	sym := &symbol{
 		FullName: name,
 		Name:     name,
 		DataType: "INT",
@@ -199,7 +199,7 @@ func TestAddSymbolNotifications_DuplicateRejected(t *testing.T) {
 // branch (a) fully exercises the orphan-handle release path that R-NOT-004
 // guards.
 //
-// Validates: R-NOT-004 (post-roundtrip stranded-Symbol detected; handle released).
+// Validates: R-NOT-004 (post-roundtrip stranded-symbol detected; handle released).
 func TestAddSymbolNotification_StrandedSymbol_DetectedByEpoch(t *testing.T) {
 	srv := startScriptableServer(t)
 	defer srv.stop()
@@ -590,7 +590,7 @@ func TestResubscribeRetry_UpToMax(t *testing.T) {
 	// to empty so the post-roundtrip re-fetch finds nil and Skipped fires.
 	srv.onWriteRead(GroupSumupAddDeviceNotification, func(_ []byte) []byte {
 		sess.cache.lock.Lock()
-		sess.cache.symbols = map[string]*Symbol{}
+		sess.cache.symbols = map[string]*symbol{}
 		sess.cache.lock.Unlock()
 		h := sumHandle.Add(1) - 1
 		return buildSumAddNotifPayload([]sumNotifResponse{{Handle: h, Error: ReturnCodeNoErrors}})
@@ -708,7 +708,7 @@ var (
 //  1. success — Handle != 0, Error == NoErrors, Skipped == nil.
 //  2. PLC error — Handle == 0, Error != NoErrors, Skipped == nil.
 //  3. library skip (duplicate name in batch) — Skipped != nil.
-//  4. TOCTOU loss (PLC accepted, library found stranded *Symbol
+//  4. TOCTOU loss (PLC accepted, library found stranded *symbol
 //     post-roundtrip) — Skipped != nil, Handle may be non-zero so
 //     caller must release.
 //
@@ -721,7 +721,7 @@ func TestSumNotificationResultTriState(t *testing.T) {
 
 	// Three symbols cached up-front: x, y, z.
 	for _, name := range []string{"MAIN.x", "MAIN.y", "MAIN.z"} {
-		sess.cache.symbols[symbolKey(name)] = &Symbol{
+		sess.cache.symbols[symbolKey(name)] = &symbol{
 			FullName:    name,
 			DataType:    "INT",
 			Length:      2,

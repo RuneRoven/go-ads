@@ -116,7 +116,7 @@ type Session struct {
 	source     AMSAddress
 	callbackIP string // IP PLC uses to reach us (for Docker/VPN; set via WithHostIP)
 
-	// Symbol cache + data-type table + discovery-mode flags.
+	// symbol cache + data-type table + discovery-mode flags.
 	cache *symbolCache
 
 	// Notification state (activeNotifications, notificationConfigs,
@@ -167,9 +167,9 @@ func NewSession(ip string, port int, netid string, amsPort int, localNetID strin
 		port:           port,
 		requestTimeout: requestTimeout,
 		route:          &routeManager{},
-		notifications:  &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
+		notifications:  &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
 		cache: &symbolCache{
-			symbols:         map[string]*Symbol{},
+			symbols:         map[string]*symbol{},
 			onDemandSymbols: map[string]bool{},
 		},
 		tx: &transport{
@@ -620,7 +620,7 @@ func (sess *Session) autoReloadOnStaleDetection(reason Reason) {
 	// Bump epoch first so any in-flight retry helpers observing epoch
 	// will see the change immediately (R-CACHE-003).
 	sess.bumpEpoch()
-	// Zero old handles so callers holding *Symbol pointers force
+	// Zero old handles so callers holding *symbol pointers force
 	// on-demand re-resolution (R-CACHE-004).
 	sess.cache.lock.Lock()
 	zeroOldSymbolHandles(sess.cache.symbols)
@@ -664,7 +664,7 @@ func (sess *Session) markClosed() {
 // that opens with the same NetID. bestEffortDelete logs failures but never
 // returns an error, so the call is safe even with a dead transport.
 //
-// Symbol handle release is skipped when disconnected — unlike notifications,
+// symbol handle release is skipped when disconnected — unlike notifications,
 // stranded symbol handles do not generate side effects on subsequent
 // sessions, so the cost of leaking them is just a small PLC-side handle
 // table entry that the PLC reaps on route timeout.
@@ -716,15 +716,23 @@ func (sess *Session) releasePLCResources(wasDisconnected bool) {
 	}
 }
 
-// Close closes connection and waits for completion
-func (sess *Session) Close() {
+// Close releases PLC-side notification subscriptions, releases the cached
+// PLC-side symbol handles when transport is still alive, cancels the
+// session context, closes the underlying TCP socket, and waits for the
+// listen + transmit + recv workers to exit. Idempotent — subsequent calls
+// return nil without re-running cleanup.
+//
+// Returns nil on success; future implementations may surface specific
+// failure modes via the error return (TCP close failure, PLC handle
+// release failure). Implements io.Closer.
+func (sess *Session) Close() error {
 	// Capture transport-disconnected state BEFORE the FSM transitions into
 	// Closed. The cleanup branch below uses this to decide whether to attempt
 	// network ops; once state is Closed, isDisconnected() returns false even
 	// if the transport was already gone.
 	wasDisconnected := sess.isDisconnected()
 	if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateClosed); !ok {
-		return // already closed (or transition not permitted from current state)
+		return nil // already closed (or transition not permitted from current state)
 	}
 	sess.markClosed()
 	sess.logger.Info("Close called, shutting down")
@@ -761,6 +769,7 @@ func (sess *Session) Close() {
 	}
 	sess.lifecycle.waitGroup.Wait()
 	sess.logger.Info("Close DONE")
+	return nil
 }
 
 // ErrDisconnected indicates the underlying TCP connection is not available —
@@ -931,7 +940,7 @@ func (sess *Session) Reconnect() error {
 
 	// Clear active notifications (old handles invalid after reconnect).
 	sess.notifications.lock.Lock()
-	sess.notifications.activeNotifications = make(map[uint32]*Symbol)
+	sess.notifications.activeNotifications = make(map[uint32]*symbol)
 	sess.notifications.lock.Unlock()
 
 	sess.tearDownAndReset(true)
@@ -1148,7 +1157,7 @@ func (sess *Session) reloadSymbols() error {
 		for k, v := range sess.cache.onDemandSymbols {
 			oldSymbols[k] = v
 		}
-		sess.cache.symbols = make(map[string]*Symbol)
+		sess.cache.symbols = make(map[string]*symbol)
 		sess.bumpEpoch()
 		sess.cache.lock.Unlock()
 
@@ -1437,13 +1446,13 @@ func configureKeepAlive(c net.Conn) {
 	}
 }
 
-// zeroOldSymbolHandles invalidates each *Symbol in the given map. Sets
+// zeroOldSymbolHandles invalidates each *symbol in the given map. Sets
 // Handle=0 so callers holding pointers to OLD-map values force on-demand
 // re-resolution via GetSymbol (defends against the PLC reusing the old
 // handle for a different symbol after reconnect), and clears cached
 // Value/Valid/ValueParsed/LastUpdateTime so a Read within MinUpdateInterval
 // of reconnect does not return stale pre-disconnect data. Nil-safe.
-func zeroOldSymbolHandles(m map[string]*Symbol) {
+func zeroOldSymbolHandles(m map[string]*symbol) {
 	for _, s := range m {
 		if s != nil {
 			s.Handle = 0
@@ -1489,7 +1498,7 @@ func (sess *Session) loadSymbols() error {
 		return fmt.Errorf("failed to parse symbols: %w", err)
 	}
 	sess.cache.lock.Lock()
-	// invalidate Handle on every old *Symbol before swap so external
+	// invalidate Handle on every old *symbol before swap so external
 	// callers holding old pointers (e.g. infos[i].symbol in
 	// readMultipleSymbolsRetry) fail fast on next use and re-resolve via
 	// GetSymbol instead of using a stale handle that the PLC may have

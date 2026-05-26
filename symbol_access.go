@@ -119,7 +119,7 @@ func (sess *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (st
 		return "", fmt.Errorf("read %q: %w", symbolName, ReturnCodeDeviceInvalidSize)
 	}
 
-	// parse() mutates Symbol fields (Value, Valid, etc.) so it must
+	// parse() mutates symbol fields (Value, Valid, etc.) so it must
 	// run under lock to avoid racing with handleNotification.
 	sess.cache.lock.Lock()
 	value, err := symbol.parse(data, 0, datatypes)
@@ -151,7 +151,7 @@ func (sess *Session) readFromSymbolRetry(symbolName string, retriesLeft int) (st
 //
 // Caller MUST hold cache.lock: this reads sym.Handle which is written by
 // zeroOldSymbolHandles + handle-resolve paths under the same lock.
-func symbolSumAddress(sym *Symbol) (group, offset uint32) {
+func symbolSumAddress(sym *symbol) (group, offset uint32) {
 	if sym.Handle != 0 {
 		return uint32(GroupSymbolValueByHandle), sym.Handle
 	}
@@ -183,7 +183,7 @@ func (sess *Session) readMultipleSymbolsRetry(names []string, retriesLeft int) (
 	// Resolve symbols and build SumRead requests
 	type symbolInfo struct {
 		name   string
-		symbol *Symbol
+		symbol *symbol
 	}
 	var infos []symbolInfo
 	var requests []SumReadRequest
@@ -291,7 +291,7 @@ func (sess *Session) writeMultipleSymbolsRetry(values map[string]string, retries
 
 	type symbolInfo struct {
 		name   string
-		symbol *Symbol
+		symbol *symbol
 	}
 	var infos []symbolInfo
 	var requests []SumWriteRequest

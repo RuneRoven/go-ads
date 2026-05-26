@@ -19,16 +19,16 @@ import (
 // tests: cache + lifecycle. No client, no transport.
 func newViewTestSession() *Session {
 	return &Session{
-		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
+		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
 		lifecycle:     &sessionLifecycle{closedCh: make(chan struct{})},
 		logger:        getDefaultLogger(),
 	}
 }
 
-// captureSymbol seeds the cache with a Symbol and returns a SymbolView.
-func captureSymbol(sess *Session, name, value string, parsed bool) (SymbolView, *Symbol) {
-	sym := &Symbol{
+// captureSymbol seeds the cache with a symbol and returns a SymbolView.
+func captureSymbol(sess *Session, name, value string, parsed bool) (SymbolView, *symbol) {
+	sym := &symbol{
 		FullName:    name,
 		Name:        name,
 		DataType:    "INT",
@@ -46,7 +46,7 @@ func captureSymbol(sess *Session, name, value string, parsed bool) (SymbolView, 
 }
 
 // TestSymbolView_SnapshotConsistency captures a view, mutates the underlying
-// Symbol via cache.lock, asserts the view's fields reflect the SNAPSHOT
+// symbol via cache.lock, asserts the view's fields reflect the SNAPSHOT
 // instant (not the post-mutation state).
 //
 // Validates: R-VIEW-001 (SymbolView is a snapshot).
@@ -54,7 +54,7 @@ func TestSymbolView_SnapshotConsistency(t *testing.T) {
 	sess := newViewTestSession()
 	view, sym := captureSymbol(sess, "MAIN.x", "42", true)
 
-	// Mutate Symbol fields under cache.lock as parse() would.
+	// Mutate symbol fields under cache.lock as parse() would.
 	sess.cache.lock.Lock()
 	sym.Value = "999"
 	sym.Valid = false
@@ -98,18 +98,18 @@ func TestSymbolView_IsValid(t *testing.T) {
 func TestSymbolView_ChildrenReturnsFreshMap(t *testing.T) {
 	sess := newViewTestSession()
 
-	child := &Symbol{
+	child := &symbol{
 		FullName: "MAIN.s.f",
 		Name:     "f",
 		DataType: "INT",
 		Length:   2,
 		Handle:   0xC0DE0001,
 	}
-	parent := &Symbol{
+	parent := &symbol{
 		FullName: "MAIN.s",
 		Name:     "s",
 		DataType: "ST_X",
-		Children: map[string]*Symbol{"f": child},
+		Children: map[string]*symbol{"f": child},
 		Handle:   0xC0DE0002,
 	}
 	child.Parent = parent
@@ -152,10 +152,10 @@ func TestSymbolView_ChildrenReturnsFreshMap(t *testing.T) {
 func TestSymbolView_ChildrenWalk_FnMayTakeCacheLock(t *testing.T) {
 	sess := newViewTestSession()
 
-	leaf := &Symbol{FullName: "MAIN.s.f", Name: "f", DataType: "INT", Length: 2, Handle: 0xBABE0001}
-	parent := &Symbol{
+	leaf := &symbol{FullName: "MAIN.s.f", Name: "f", DataType: "INT", Length: 2, Handle: 0xBABE0001}
+	parent := &symbol{
 		FullName: "MAIN.s", Name: "s", DataType: "ST_X",
-		Children: map[string]*Symbol{"f": leaf}, Handle: 0xBABE0002,
+		Children: map[string]*symbol{"f": leaf}, Handle: 0xBABE0002,
 	}
 	leaf.Parent = parent
 	sess.cache.lock.Lock()
@@ -245,16 +245,16 @@ func TestSymbolView_FieldReadAfterClose(t *testing.T) {
 	_ = view.Children()
 }
 
-// TestCollectSubtreeDepthCap verifies the recursion cap on Symbol.Children
+// TestCollectSubtreeDepthCap verifies the recursion cap on symbol.Children
 // walks defends against tree corruption (cycle in Children map).
 // Validates: R-VIEW-004.
 func TestCollectSubtreeDepthCap(t *testing.T) {
-	// Build a Symbol cycle: A -> B -> A. addOffset cannot produce this in
+	// Build a symbol cycle: A -> B -> A. addOffset cannot produce this in
 	// real cache data, but defensively we should not stack-overflow.
-	a := &Symbol{Name: "A", FullName: "A"}
-	b := &Symbol{Name: "B", FullName: "A.B"}
-	a.Children = map[string]*Symbol{"B": b}
-	b.Children = map[string]*Symbol{"A": a}
+	a := &symbol{Name: "A", FullName: "A"}
+	b := &symbol{Name: "B", FullName: "A.B"}
+	a.Children = map[string]*symbol{"B": b}
+	b.Children = map[string]*symbol{"A": a}
 
 	conn := newTestConnection()
 	defer conn.lifecycle.shutdown()

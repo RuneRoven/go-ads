@@ -13,14 +13,14 @@ import (
 
 // TestZeroOldSymbolHandles validates R-CACHE-004 in full: loadSymbols
 // replaces the cache.symbols map, but callers (e.g. readMultipleSymbolsRetry)
-// may hold *Symbol pointers into the OLD map. zeroOldSymbolHandles MUST
+// may hold *symbol pointers into the OLD map. zeroOldSymbolHandles MUST
 // clear Handle, Value, Valid, ValueParsed, and LastUpdateTime so stale
 // data cannot leak post-reconnect.
 //
 // Validates: R-CACHE-004.
 func TestZeroOldSymbolHandles(t *testing.T) {
 	t0 := time.Now()
-	oldMap := map[string]*Symbol{
+	oldMap := map[string]*symbol{
 		"a": {
 			Name:           "a",
 			Handle:         0x1234,
@@ -45,7 +45,7 @@ func TestZeroOldSymbolHandles(t *testing.T) {
 
 	zeroOldSymbolHandles(oldMap)
 
-	for _, p := range []*Symbol{pa, pb, pc} {
+	for _, p := range []*symbol{pa, pb, pc} {
 		if p.Handle != 0 {
 			t.Errorf("%s.Handle = 0x%X, want 0", p.Name, p.Handle)
 		}
@@ -67,7 +67,7 @@ func TestZeroOldSymbolHandles(t *testing.T) {
 // Nil and empty input must not panic. Validates: R-CACHE-004 (defensive).
 func TestZeroOldSymbolHandles_NilSafe(t *testing.T) {
 	zeroOldSymbolHandles(nil)
-	zeroOldSymbolHandles(map[string]*Symbol{})
+	zeroOldSymbolHandles(map[string]*symbol{})
 }
 
 // TestNewSession_TotalConstruction asserts NewSession does no I/O, spawns
@@ -273,8 +273,8 @@ func TestSession_OnDisconnectFiresOnceOnConcurrentTrigger(t *testing.T) {
 	// require a live transport).
 	sess := &Session{
 		tx:            &transport{},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]*Symbol), configsByKey: make(map[string]struct{})},
-		cache:         &symbolCache{symbols: map[string]*Symbol{}, onDemandSymbols: map[string]bool{}},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]*symbol), configsByKey: make(map[string]struct{})},
+		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 		lifecycle: &sessionLifecycle{
 			closedCh:      make(chan struct{}),
@@ -476,8 +476,8 @@ func TestSession_TryRecordReloadAttempt_SlidingWindow(t *testing.T) {
 func TestSession_MarkAllHandlesStale(t *testing.T) {
 	sess := newTestConnection()
 	defer sess.lifecycle.shutdown()
-	sess.notifications.activeNotifications[42] = &Symbol{}
-	sess.notifications.activeNotifications[99] = &Symbol{}
+	sess.notifications.activeNotifications[42] = &symbol{}
+	sess.notifications.activeNotifications[99] = &symbol{}
 
 	sess.markAllHandlesStale(ReasonReloadInProgress)
 
@@ -666,7 +666,7 @@ func TestSession_ReadFromSymbol_LengthMismatchTriggersDetection(t *testing.T) {
 	// network. This emulates the post-online-change state where the cache
 	// still holds the pre-change type metadata.
 	const symName = "MAIN_DP1.nProbeA"
-	sess.cache.symbols[symbolKey(symName)] = &Symbol{
+	sess.cache.symbols[symbolKey(symName)] = &symbol{
 		FullName: symName,
 		Name:     symName,
 		Handle:   fakeHandle,
@@ -759,7 +759,7 @@ func TestReleasePLCResources_NotificationCleanup(t *testing.T) {
 
 	sess, _ := newWiredTestSession(t, srv)
 	sess.notifications.lock.Lock()
-	sess.notifications.activeNotifications[stagedHandle] = &Symbol{FullName: "MAIN.x"}
+	sess.notifications.activeNotifications[stagedHandle] = &symbol{FullName: "MAIN.x"}
 	sess.notifications.lock.Unlock()
 
 	sess.releasePLCResources(false)
@@ -788,7 +788,7 @@ func TestReleasePLCResources_SymbolHandleRelease_SkippedWhenDisconnected(t *test
 
 	sess, _ := newWiredTestSession(t, srv)
 	sess.cache.lock.Lock()
-	sess.cache.symbols[symbolKey("MAIN.x")] = &Symbol{
+	sess.cache.symbols[symbolKey("MAIN.x")] = &symbol{
 		FullName: "MAIN.x", Name: "MAIN.x", Handle: 0x12345678,
 	}
 	sess.cache.lock.Unlock()
@@ -816,7 +816,7 @@ func TestReleasePLCResources_SymbolHandleRelease_FiredWhenConnected(t *testing.T
 
 	sess, _ := newWiredTestSession(t, srv)
 	sess.cache.lock.Lock()
-	sess.cache.symbols[symbolKey("MAIN.x")] = &Symbol{
+	sess.cache.symbols[symbolKey("MAIN.x")] = &symbol{
 		FullName: "MAIN.x", Name: "MAIN.x", Handle: stagedHandle,
 	}
 	sess.cache.lock.Unlock()

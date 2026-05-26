@@ -278,7 +278,7 @@ func TestSumProbeStateConcurrent(t *testing.T) {
 // Length=1 + DataType="BOOL" parses cleanly; Handle is non-zero so getSymbol
 // skips the PLC GetHandleByName roundtrip.
 func seedSymbol(sess *Session, name string, handle uint32) {
-	sym := &Symbol{
+	sym := &symbol{
 		FullName: name,
 		Handle:   handle,
 		Length:   1,

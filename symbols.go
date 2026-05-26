@@ -17,7 +17,7 @@ import (
 // detection), and discovery-mode flags that track which load function was
 // used (LoadSymbols, LoadSymbolsSlow, LoadSymbolList, LoadDataTypes).
 //
-// Lock also covers Symbol mutation during parse() — Symbol objects live
+// Lock also covers symbol mutation during parse() — symbol objects live
 // in the cache.symbols map and parse() rewrites their Value/Valid
 // fields. Lock ordering: NEVER hold both cache.lock and notifications.lock at
 // the same time. Paths that need both must release one before acquiring
@@ -29,7 +29,7 @@ import (
 // (on-demand getSymbol) does NOT bump — existing pointers stay valid
 // across an insert.
 //
-// Callers that need to publish a *Symbol pointer they obtained pre-roundtrip
+// Callers that need to publish a *symbol pointer they obtained pre-roundtrip
 // into another data structure (e.g. notifications.activeNotifications) MUST capture
 // the epoch before resolve and recheck before commit; if the value changed,
 // the pointer is stranded and must be discarded. Closes the residual race
@@ -37,7 +37,7 @@ import (
 // simple re-fetch pattern leaves open.
 type symbolCache struct {
 	lock               sync.Mutex
-	symbols            map[string]*Symbol
+	symbols            map[string]*symbol
 	datatypes          map[string]SymbolUploadDataType
 	symbolVersion      uint8
 	onDemandSymbols    map[string]bool
@@ -127,9 +127,9 @@ type SymbolUploadInfo struct {
 	ExtraLength    uint32
 }
 
-// Symbol is the internal cache record for a PLC symbol. External callers
+// symbol is the internal cache record for a PLC symbol. External callers
 // should use SymbolView (returned by GetSymbol/ListSymbols) - direct access
-// to *Symbol is reserved for in-package code paths that need to mutate
+// to *symbol is reserved for in-package code paths that need to mutate
 // state under the appropriate lock.
 //
 // Field guards:
@@ -155,7 +155,7 @@ type SymbolUploadInfo struct {
 // The Children map and Parent pointer form a tree, set up during discovery
 // and never mutated after - callers may walk freely without a lock as long
 // as no concurrent reload (LoadSymbols/LoadSymbolsSlow) is in progress.
-type Symbol struct {
+type symbol struct {
 	FullName          string
 	LastUpdateTime    time.Time
 	MinUpdateInterval time.Duration
@@ -176,8 +176,8 @@ type Symbol struct {
 
 	Notification chan<- *Update
 
-	Parent   *Symbol
-	Children map[string]*Symbol
+	Parent   *symbol
+	Children map[string]*symbol
 }
 
 // SymbolView is a read-only snapshot of a symbol's metadata and current
@@ -260,6 +260,30 @@ func (v SymbolView) BaseTypeName() string {
 	return inferBaseType(v.Length, v.BaseType)
 }
 
+// GetJSON serializes the symbol's current cached value to JSON. For
+// composite types (structs, arrays) the result is the nested JSON
+// representation walked from the children subtree; for primitives it is a
+// single JSON literal (number, boolean, or string).
+//
+// Returns "" if the view is detached (no underlying Session) or the
+// symbol no longer exists in the cache (e.g. removed by a concurrent
+// online change).
+//
+// Acquires cache.lock briefly to read the live symbol; safe to call from
+// any goroutine.
+func (v SymbolView) GetJSON() string {
+	if v.conn == nil {
+		return ""
+	}
+	v.conn.cache.lock.Lock()
+	defer v.conn.cache.lock.Unlock()
+	sym := v.conn.cache.symbols[symbolKey(v.FullName)]
+	if sym == nil {
+		return ""
+	}
+	return sym.getJSON()
+}
+
 // Children returns SymbolViews for struct/array members captured at view
 // creation time. Returns nil for scalars and for symbols whose subtree has
 // not been populated by full discovery. The map is freshly allocated per
@@ -325,13 +349,13 @@ func (v SymbolView) ChildrenWalk(fn func(SymbolView) bool) {
 // dozen levels.
 const collectSubtreeMaxDepth = 256
 
-func collectSubtree(s *Symbol, conn *Session, out *[]SymbolView) {
+func collectSubtree(s *symbol, conn *Session, out *[]SymbolView) {
 	collectSubtreeDepth(s, conn, out, 0)
 }
 
-func collectSubtreeDepth(s *Symbol, conn *Session, out *[]SymbolView, depth int) {
+func collectSubtreeDepth(s *symbol, conn *Session, out *[]SymbolView, depth int) {
 	if depth >= collectSubtreeMaxDepth {
-		getDefaultLogger().Warn("collectSubtree hit depth cap; possible Children cycle or malformed Symbol tree",
+		getDefaultLogger().Warn("collectSubtree hit depth cap; possible Children cycle or malformed symbol tree",
 			"symbol", s.FullName,
 			"max_depth", collectSubtreeMaxDepth)
 		return
@@ -347,7 +371,7 @@ func collectSubtreeDepth(s *Symbol, conn *Session, out *[]SymbolView, depth int)
 
 // view builds a SymbolView for s. Caller must hold cache.lock so the
 // snapshot of metadata + value is internally consistent. O(1).
-func (s *Symbol) view(conn *Session) SymbolView {
+func (s *symbol) view(conn *Session) SymbolView {
 	return SymbolView{
 		Name:        s.Name,
 		FullName:    s.FullName,
@@ -367,8 +391,8 @@ func (s *Symbol) view(conn *Session) SymbolView {
 	}
 }
 
-func parseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUploadDataType) (symbols map[string]*Symbol, err error) {
-	symbols = map[string]*Symbol{}
+func parseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUploadDataType) (symbols map[string]*symbol, err error) {
+	symbols = map[string]*symbol{}
 	buff := bytes.NewBuffer(data)
 
 	for buff.Len() > 0 {
@@ -417,8 +441,8 @@ func parseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUpload
 	return
 }
 
-func addChildren(symbol *Symbol, symbols map[string]*Symbol) {
-	for _, child := range symbol.Children {
+func addChildren(s *symbol, symbols map[string]*symbol) {
+	for _, child := range s.Children {
 		if _, ok := symbols[symbolKey(child.FullName)]; !ok {
 			symbols[symbolKey(child.FullName)] = child
 			addChildren(child, symbols)
@@ -426,24 +450,24 @@ func addChildren(symbol *Symbol, symbols map[string]*Symbol) {
 	}
 }
 
-func addSymbol(symbol symbolUploadSymbol, datatypes map[string]SymbolUploadDataType) *Symbol {
-	flags := SymbolFlag(symbol.SymbolEntry.Flags)
-	sym := &Symbol{
-		Name:              symbol.Name,
+func addSymbol(uploadSym symbolUploadSymbol, datatypes map[string]SymbolUploadDataType) *symbol {
+	flags := SymbolFlag(uploadSym.SymbolEntry.Flags)
+	sym := &symbol{
+		Name:              uploadSym.Name,
 		LastUpdateTime:    time.Now(),
 		MinUpdateInterval: 50 * time.Millisecond,
-		FullName:          symbol.Name,
-		DataType:          symbol.DataType,
-		Comment:           symbol.Comment,
-		Length:            symbol.SymbolEntry.Size,
-		BaseType:          ADSDataType(symbol.SymbolEntry.DataType),
-		Group:             symbol.SymbolEntry.IGroup,
-		Offset:            symbol.SymbolEntry.IOffs,
+		FullName:          uploadSym.Name,
+		DataType:          uploadSym.DataType,
+		Comment:           uploadSym.Comment,
+		Length:            uploadSym.SymbolEntry.Size,
+		BaseType:          ADSDataType(uploadSym.SymbolEntry.DataType),
+		Group:             uploadSym.SymbolEntry.IGroup,
+		Offset:            uploadSym.SymbolEntry.IOffs,
 		Flags:             flags,
 		ContextMask:       flags.ContextMask(),
 	}
 
-	dt, ok := datatypes[symbol.DataType]
+	dt, ok := datatypes[uploadSym.DataType]
 	if ok {
 		sym.Children = dt.addOffset(sym, datatypes, sym.Group)
 	}
@@ -457,12 +481,12 @@ func addSymbol(symbol symbolUploadSymbol, datatypes map[string]SymbolUploadDataT
 // but not enforced over the wire).
 const addOffsetMaxDepth = 256
 
-func (data *SymbolUploadDataType) addOffset(parent *Symbol, datatypes map[string]SymbolUploadDataType, group uint32) (children map[string]*Symbol) {
+func (data *SymbolUploadDataType) addOffset(parent *symbol, datatypes map[string]SymbolUploadDataType, group uint32) (children map[string]*symbol) {
 	return data.addOffsetDepth(parent, datatypes, group, 0)
 }
 
-func (data *SymbolUploadDataType) addOffsetDepth(parent *Symbol, datatypes map[string]SymbolUploadDataType, group uint32, depth int) (children map[string]*Symbol) {
-	children = map[string]*Symbol{}
+func (data *SymbolUploadDataType) addOffsetDepth(parent *symbol, datatypes map[string]SymbolUploadDataType, group uint32, depth int) (children map[string]*symbol) {
+	children = map[string]*symbol{}
 	if depth >= addOffsetMaxDepth {
 		getDefaultLogger().Warn("addOffset hit depth cap; possible datatype self-cycle in PLC response",
 			"parent", parent.FullName,
@@ -482,7 +506,7 @@ func (data *SymbolUploadDataType) addOffsetDepth(parent *Symbol, datatypes map[s
 			path = fmt.Sprint(parent.FullName, segment.Name)
 		}
 
-		child := Symbol{
+		child := symbol{
 			Name:              segment.Name,
 			LastUpdateTime:    time.Now(),
 			MinUpdateInterval: 50 * time.Millisecond,
@@ -686,12 +710,13 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (chil
 	return
 }
 
-// GetJSON returns symbol value as JSON string.
-func (symbol *Symbol) GetJSON() string {
-	data := symbol.parseSymbol()
+// getJSON returns the symbol's current value serialized as JSON.
+// Internal API — public access via SymbolView.GetJSON.
+func (s *symbol) getJSON() string {
+	data := s.parseTree()
 	jsonData, err := json.Marshal(data)
 	if err != nil {
-		getDefaultLogger().Warn("GetJSON marshal error", "symbol", symbol.Name, "error", err)
+		getDefaultLogger().Warn("getJSON marshal error", "symbol", s.Name, "error", err)
 		return ""
 	}
 	return string(jsonData)
@@ -699,32 +724,33 @@ func (symbol *Symbol) GetJSON() string {
 
 var stringsList = map[string]struct{}{"STRING": {}, "WSTRING": {}, "TIME": {}, "TOD": {}, "TIME_OF_DAY": {}, "DATE": {}, "DT": {}, "DATE_AND_TIME": {}}
 
-// parseSymbol returns JSON interface for symbol
-func (symbol *Symbol) parseSymbol() (rData interface{}) {
-	if len(symbol.Children) == 0 {
-		if symbol.DataType == "BOOL" {
-			v, err := strconv.ParseBool(symbol.Value)
+// parseTree returns a JSON-marshallable interface for the symbol subtree.
+// Internal API — public access via SymbolView.GetJSON.
+func (s *symbol) parseTree() (rData interface{}) {
+	if len(s.Children) == 0 {
+		if s.DataType == "BOOL" {
+			v, err := strconv.ParseBool(s.Value)
 			if err != nil {
-				getDefaultLogger().Warn("parseSymbol: invalid BOOL value, defaulting to false",
-					"symbol", symbol.Name, "value", symbol.Value, "error", err)
+				getDefaultLogger().Warn("parseTree: invalid BOOL value, defaulting to false",
+					"symbol", s.Name, "value", s.Value, "error", err)
 			}
 			rData = v
-		} else if _, ok := stringsList[symbol.DataType]; ok {
-			rData = symbol.Value
+		} else if _, ok := stringsList[s.DataType]; ok {
+			rData = s.Value
 		} else {
-			v, err := strconv.ParseFloat(symbol.Value, 64)
+			v, err := strconv.ParseFloat(s.Value, 64)
 			if err != nil {
-				getDefaultLogger().Warn("parseSymbol: invalid numeric value, defaulting to 0",
-					"symbol", symbol.Name, "dataType", symbol.DataType, "value", symbol.Value, "error", err)
+				getDefaultLogger().Warn("parseTree: invalid numeric value, defaulting to 0",
+					"symbol", s.Name, "dataType", s.DataType, "value", s.Value, "error", err)
 			}
 			rData = v
 		}
 	} else {
 		localMap := make(map[string]interface{})
-		for _, child := range symbol.Children {
-			s := strings.ReplaceAll(child.Name, "[", `"[`)
-			s = strings.ReplaceAll(s, "]", `]"`)
-			localMap[s] = child.parseSymbol()
+		for _, child := range s.Children {
+			key := strings.ReplaceAll(child.Name, "[", `"[`)
+			key = strings.ReplaceAll(key, "]", `]"`)
+			localMap[key] = child.parseTree()
 		}
 		rData = localMap
 	}

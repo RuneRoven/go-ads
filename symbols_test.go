@@ -88,7 +88,7 @@ func TestParseUploadSymbolInfoSymbols_Empty(t *testing.T) {
 
 // Validates: R-SYM-007.
 func TestAddOffsetEmptySegmentName(t *testing.T) {
-	parent := &Symbol{Name: "parent", FullName: "MAIN.parent"}
+	parent := &symbol{Name: "parent", FullName: "MAIN.parent"}
 	dt := &SymbolUploadDataType{
 		Children: map[string]*SymbolUploadDataType{
 			"": {Name: "", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2}},
@@ -103,7 +103,7 @@ func TestAddOffsetEmptySegmentName(t *testing.T) {
 
 // Validates: R-SYM-007.
 func TestAddOffsetFullNameWithDot(t *testing.T) {
-	parent := &Symbol{Name: "motor", FullName: "MAIN.motor"}
+	parent := &symbol{Name: "motor", FullName: "MAIN.motor"}
 	dt := &SymbolUploadDataType{
 		Children: map[string]*SymbolUploadDataType{
 			"speed": {Name: "speed", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2, Offs: 0}},
@@ -122,7 +122,7 @@ func TestAddOffsetFullNameWithDot(t *testing.T) {
 // Validates: R-SYM-007.
 func TestAddOffsetArrayFullName(t *testing.T) {
 	// Array children have names like "[0]", "[1]" — should use parent.FullName (F-05 fix)
-	parent := &Symbol{Name: "arr", FullName: "MAIN.arr"}
+	parent := &symbol{Name: "arr", FullName: "MAIN.arr"}
 	dt := &SymbolUploadDataType{
 		Children: map[string]*SymbolUploadDataType{
 			"[0]": {Name: "[0]", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2, Offs: 0}},
@@ -174,7 +174,7 @@ func TestParseEnumNestedInStruct(t *testing.T) {
 			},
 		}
 
-		motorSym := &Symbol{
+		motorSym := &symbol{
 			Name: "motor", FullName: "MAIN.motor",
 			DataType: "ST_Motor", Length: 8, Group: 0x4040,
 		}
@@ -239,7 +239,7 @@ func TestParseEnumNestedInStruct(t *testing.T) {
 			},
 		}
 
-		motorSym := &Symbol{
+		motorSym := &symbol{
 			Name: "motor", FullName: "MAIN.motor",
 			DataType: "ST_Motor", Length: 8, Group: 0x4040,
 		}
@@ -286,7 +286,7 @@ func TestParseEnumWithoutDatatypes(t *testing.T) {
 	}
 	for _, tt := range successCases {
 		t.Run(tt.name, func(t *testing.T) {
-			sym := &Symbol{
+			sym := &symbol{
 				Name:     "testEnum",
 				FullName: "MAIN.testEnum",
 				DataType: tt.dataType,
@@ -316,7 +316,7 @@ func TestParseEnumWithoutDatatypes(t *testing.T) {
 	}
 	for _, tt := range refusedCases {
 		t.Run(tt.name, func(t *testing.T) {
-			sym := &Symbol{
+			sym := &symbol{
 				Name:     "testEnum",
 				FullName: "MAIN.testEnum",
 				DataType: tt.dataType,
@@ -331,7 +331,7 @@ func TestParseEnumWithoutDatatypes(t *testing.T) {
 
 	// Verify non-standard sizes still error
 	t.Run("3-byte unknown type still errors", func(t *testing.T) {
-		sym := &Symbol{
+		sym := &symbol{
 			Name: "weird", FullName: "MAIN.weird",
 			DataType: "UNKNOWN_TYPE", Length: 3,
 		}
@@ -375,7 +375,7 @@ func TestArrayTypedefNotMistakenForEnum(t *testing.T) {
 		},
 	}
 
-	parent := &Symbol{
+	parent := &symbol{
 		Name:     "s",
 		FullName: "MAIN.s",
 		DataType: "ST_WithArray",
@@ -418,14 +418,14 @@ func TestArrayTypedefNotMistakenForEnum(t *testing.T) {
 }
 
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
-// Pins addChildren utility — child Symbol added to parent map under FullName key.
+// Pins addChildren utility — child symbol added to parent map under FullName key.
 func TestAddChildren(t *testing.T) {
-	child := &Symbol{Name: "x", FullName: "s.x", DataType: "INT", Length: 2}
-	parent := &Symbol{
+	child := &symbol{Name: "x", FullName: "s.x", DataType: "INT", Length: 2}
+	parent := &symbol{
 		Name: "s", FullName: "s", DataType: "ST_S", Length: 2,
-		Children: map[string]*Symbol{"x": child},
+		Children: map[string]*symbol{"x": child},
 	}
-	symbols := map[string]*Symbol{"s": parent}
+	symbols := map[string]*symbol{"s": parent}
 	addChildren(parent, symbols)
 	if _, ok := symbols["s.x"]; !ok {
 		t.Error("expected child 's.x' to be added to symbols map")
@@ -435,14 +435,14 @@ func TestAddChildren(t *testing.T) {
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
 // Pins addChildren no-clobber: pre-existing entry under same key is preserved.
 func TestAddChildrenNoDuplicates(t *testing.T) {
-	child := &Symbol{Name: "x", FullName: "s.x", DataType: "INT", Length: 2}
-	parent := &Symbol{
+	child := &symbol{Name: "x", FullName: "s.x", DataType: "INT", Length: 2}
+	parent := &symbol{
 		Name: "s", FullName: "s", DataType: "ST_S", Length: 2,
-		Children: map[string]*Symbol{"x": child},
+		Children: map[string]*symbol{"x": child},
 	}
 	// Pre-populate to ensure it doesn't overwrite
-	existing := &Symbol{Name: "x", FullName: "s.x", DataType: "DINT", Length: 4}
-	symbols := map[string]*Symbol{"s": parent, "s.x": existing}
+	existing := &symbol{Name: "x", FullName: "s.x", DataType: "DINT", Length: 4}
+	symbols := map[string]*symbol{"s": parent, "s.x": existing}
 	addChildren(parent, symbols)
 	if symbols["s.x"].DataType != "DINT" {
 		t.Error("addChildren should not overwrite existing symbols")
@@ -622,8 +622,8 @@ func TestInferBaseType(t *testing.T) {
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
 // Pins Sym.GetJSON for plain INT scalar (raw numeric literal, no quoting).
 func TestGetJSON(t *testing.T) {
-	sym := &Symbol{DataType: "INT", Length: 2, Value: "42"}
-	json := sym.GetJSON()
+	sym := &symbol{DataType: "INT", Length: 2, Value: "42"}
+	json := sym.getJSON()
 	if json != "42" {
 		t.Errorf("got %q, want %q", json, "42")
 	}
@@ -632,8 +632,8 @@ func TestGetJSON(t *testing.T) {
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
 // Pins BOOL JSON encoding (raw "true"/"false", no quoting).
 func TestGetJSONBool(t *testing.T) {
-	sym := &Symbol{DataType: "BOOL", Length: 1, Value: "true"}
-	json := sym.GetJSON()
+	sym := &symbol{DataType: "BOOL", Length: 1, Value: "true"}
+	json := sym.getJSON()
 	if json != "true" {
 		t.Errorf("got %q, want %q", json, "true")
 	}
@@ -642,8 +642,8 @@ func TestGetJSONBool(t *testing.T) {
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
 // Pins STRING JSON quoting (value wrapped in double-quotes).
 func TestGetJSONString(t *testing.T) {
-	sym := &Symbol{DataType: "STRING", Length: 20, Value: "hello"}
-	json := sym.GetJSON()
+	sym := &symbol{DataType: "STRING", Length: 20, Value: "hello"}
+	json := sym.getJSON()
 	if json != `"hello"` {
 		t.Errorf("got %q, want %q", json, `"hello"`)
 	}
@@ -652,12 +652,12 @@ func TestGetJSONString(t *testing.T) {
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
 // Pins struct JSON encoding via nested-children traversal.
 func TestGetJSONStruct(t *testing.T) {
-	child := &Symbol{Name: "x", FullName: "s.x", DataType: "INT", Length: 2, Value: "10"}
-	parent := &Symbol{
+	child := &symbol{Name: "x", FullName: "s.x", DataType: "INT", Length: 2, Value: "10"}
+	parent := &symbol{
 		Name: "s", FullName: "s", DataType: "ST_S", Length: 2,
-		Children: map[string]*Symbol{"x": child},
+		Children: map[string]*symbol{"x": child},
 	}
-	json := parent.GetJSON()
+	json := parent.getJSON()
 	if !strings.Contains(json, "10") {
 		t.Errorf("expected JSON to contain value 10, got %q", json)
 	}
@@ -666,8 +666,8 @@ func TestGetJSONStruct(t *testing.T) {
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
 // Pins empty STRING value → JSON empty-quoted string `""`.
 func TestGetJSON_EmptyValue(t *testing.T) {
-	sym := &Symbol{DataType: "STRING", Length: 10, Value: ""}
-	json := sym.GetJSON()
+	sym := &symbol{DataType: "STRING", Length: 10, Value: ""}
+	json := sym.getJSON()
 	if json != `""` {
 		t.Errorf("got %q, want %q", json, `""`)
 	}
@@ -675,13 +675,13 @@ func TestGetJSON_EmptyValue(t *testing.T) {
 
 // Validates: NO-SPEC.
 func TestGetJSON_WSTRINGAsString(t *testing.T) {
-	sym := &Symbol{
+	sym := &symbol{
 		Name:     "MyWString",
 		FullName: "GVL.MyWString",
 		DataType: "WSTRING",
 		Value:    "Hello World",
 	}
-	got := sym.GetJSON()
+	got := sym.getJSON()
 	if got != `"Hello World"` {
 		t.Errorf("expected WSTRING as JSON string, got %s", got)
 	}
@@ -773,7 +773,7 @@ func TestParseUploadSymbolInfoSymbols_TruncatedEntry(t *testing.T) {
 func TestSymbolSumAddress_PrefersHandleOverDirect(t *testing.T) {
 	// Handle-based addressing preferred for sum commands because direct
 	// process image addressing (0x4040) fails inside sum reads on some PLCs.
-	sym := &Symbol{
+	sym := &symbol{
 		Group:  0x4020,
 		Offset: 0x1234,
 		Handle: 0xABCD,
@@ -791,7 +791,7 @@ func TestSymbolSumAddress_PrefersHandleOverDirect(t *testing.T) {
 // Validates: R-SUM-008.
 func TestSymbolSumAddress_HandleOnlyNoGroup(t *testing.T) {
 	// Handle-based when Group is 0
-	sym := &Symbol{
+	sym := &symbol{
 		Group:  0,
 		Offset: 0,
 		Handle: 0xABCD,
@@ -809,7 +809,7 @@ func TestSymbolSumAddress_HandleOnlyNoGroup(t *testing.T) {
 // Validates: R-SUM-008.
 func TestSymbolSumAddress_DirectFallbackNoHandle(t *testing.T) {
 	// Falls back to direct group/offset when no handle is available
-	sym := &Symbol{
+	sym := &symbol{
 		Group:  0x4020,
 		Offset: 0x0100,
 		Handle: 0,
@@ -827,13 +827,13 @@ func TestSymbolSumAddress_DirectFallbackNoHandle(t *testing.T) {
 // Validates: R-SUM-008.
 func TestSymbolSumAddress_DirectFallbackChildAccumulatesOffset(t *testing.T) {
 	// Without handles, child symbols accumulate offsets from parent chain.
-	parent := &Symbol{
+	parent := &symbol{
 		Group:  0x4040,
 		Offset: 0x1000, // absolute offset in PLC memory
 		Handle: 0,
 		Length: 100,
 	}
-	child := &Symbol{
+	child := &symbol{
 		Group:  0x4040,
 		Offset: 0x0010, // relative offset within parent struct
 		Handle: 0,
@@ -852,20 +852,20 @@ func TestSymbolSumAddress_DirectFallbackChildAccumulatesOffset(t *testing.T) {
 // Validates: R-SUM-008.
 func TestSymbolSumAddress_DirectFallbackNestedChild(t *testing.T) {
 	// Deeply nested symbol without handles: grandparent → parent → child
-	grandparent := &Symbol{
+	grandparent := &symbol{
 		Group:  0x4040,
 		Offset: 0x2000, // absolute
 		Handle: 0,
 		Length: 200,
 	}
-	parent := &Symbol{
+	parent := &symbol{
 		Group:  0x4040,
 		Offset: 0x0080, // relative within grandparent
 		Handle: 0,
 		Length: 50,
 		Parent: grandparent,
 	}
-	child := &Symbol{
+	child := &symbol{
 		Group:  0x4040,
 		Offset: 0x0004, // relative within parent
 		Handle: 0,
@@ -907,7 +907,7 @@ func TestAddOffsetDepthCap(t *testing.T) {
 		"MyStruct": cyclic,
 	}
 
-	parent := &Symbol{Name: "root", FullName: "root", Length: 4}
+	parent := &symbol{Name: "root", FullName: "root", Length: 4}
 	// Should NOT stack-overflow even though the cycle would otherwise recurse
 	// indefinitely.
 	children := cyclic.addOffset(parent, datatypes, 0x4020)

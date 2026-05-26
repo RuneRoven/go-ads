@@ -9,7 +9,7 @@ import (
 )
 
 // notificationManager owns the connection-level notification state:
-// the per-handle Symbol map, the saved configs for reconnect re-subscribe,
+// the per-handle symbol map, the saved configs for reconnect re-subscribe,
 // the user-supplied channel that all notifications are dispatched to, and
 // the timestamp of the most recent successful subscribe (used to suppress
 // "unknown handle" warnings during the first-sample race window).
@@ -17,7 +17,7 @@ import (
 // Lock ordering: NEVER hold both cache.lock and notifications.lock simultaneously.
 type notificationManager struct {
 	lock                sync.Mutex
-	activeNotifications map[uint32]*Symbol
+	activeNotifications map[uint32]*symbol
 	// pending holds the resubscribe-aware copy of every active user
 	// subscription. Internal type — exposed via NotificationConfig in public
 	// API. configsByKey mirrors pending for O(1) duplicate-subscribe probes
@@ -172,10 +172,10 @@ func (sess *Session) AddSymbolNotification(symbolName string, maxDelay time.Dura
 		"handle", handle,
 		"symbol", symbolName,
 		"mode", actualMode.String())
-	// Re-fetch *Symbol from cache before commit. The pointer obtained
+	// Re-fetch *symbol from cache before commit. The pointer obtained
 	// pre-roundtrip may be orphaned if loadSymbols swapped the cache during
 	// the network call; using the stranded pointer would write notifications
-	// into a Symbol no longer reachable via ReadFromSymbol. Take cache.lock
+	// into a symbol no longer reachable via ReadFromSymbol. Take cache.lock
 	// FIRST and release before taking notifications.lock (lock-ordering rule).
 	// Capture epoch under the lock; re-check it under notifications.lock
 	// (atomic Load is lock-free) to close the residual race window where a
@@ -282,7 +282,7 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 	type symbolInfo struct {
 		configIndex int // index into configs/results
 		config      NotificationConfig
-		symbol      *Symbol
+		symbol      *symbol
 	}
 	var infos []symbolInfo
 	var requests []SumNotificationRequest
@@ -363,16 +363,16 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 		}
 	}
 
-	// Re-fetch *Symbol pointers under cache.lock before commit. Defends
+	// Re-fetch *symbol pointers under cache.lock before commit. Defends
 	// against a concurrent loadSymbols / online-change reload that swapped
 	// cache.symbols while we did the PLC roundtrip - the originally-resolved
 	// pointer would be orphaned (Handle=0, Value=""), and later
-	// handleNotification would parse into the stranded Symbol while
+	// handleNotification would parse into the stranded symbol while
 	// ReadFromSymbol would see a different fresh entry.
 	// Capture epoch under the lock; re-check it under notifications.lock
 	// to close the residual race where a third loadSymbols runs between
 	// cache.lock release and notifications.lock acquire.
-	freshSymbols := make([]*Symbol, len(infos))
+	freshSymbols := make([]*symbol, len(infos))
 	sess.cache.lock.Lock()
 	for i, info := range infos {
 		freshSymbols[i] = sess.cache.symbols[symbolKey(info.config.SymbolName)]
@@ -430,7 +430,7 @@ func (sess *Session) AddSymbolNotifications(configs []NotificationConfig, ch cha
 		}
 		fresh := freshSymbols[i]
 		if fresh == nil {
-			// Symbol vanished from cache between resolve and commit.
+			// symbol vanished from cache between resolve and commit.
 			results[info.configIndex].Skipped = fmt.Errorf("symbol %q removed from cache during batch (likely online change or LoadSymbols)", info.config.SymbolName)
 			results[info.configIndex].Handle = r.Handle
 			sess.logger.Warn("batch entry symbol vanished mid-flight; surfacing PLC handle for caller cleanup",

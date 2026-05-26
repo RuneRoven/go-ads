@@ -21,7 +21,7 @@ import (
 //   ADS_TARGET_PORT  - PLC AMS port (default: 851)
 //   ADS_LOCAL_AMS    - Local AMS NetID (default: auto-derived from local IP)
 //   ADS_HOST_IP      - Local IP the PLC should use to reach us (default: auto-derived)
-//   ADS_SYMBOL_NAME  - Symbol to read (default: first found)
+//   ADS_SYMBOL_NAME  - symbol to read (default: first found)
 //   ADS_ROUTE_USER   - PLC admin username for auto-creating AMS route (optional)
 //   ADS_ROUTE_PASS   - PLC admin password for auto-creating AMS route (optional)
 
@@ -1354,7 +1354,7 @@ func TestIntegrationProbeSumCommands(t *testing.T) {
 	// Build requests for 2 symbols
 	type symReq struct {
 		name   string
-		symbol *Symbol
+		symbol *symbol
 		group  uint32
 		offset uint32
 	}
@@ -3089,7 +3089,7 @@ func TestIntegrationDP3HandleLeak(t *testing.T) {
 
 // TestIntegrationDP3LoadOrderEquivalence validates R-CACHE-015: LoadSymbolList
 // and LoadDataTypes are commutative — calling one then the other yields the
-// same Symbol.Children tree as the reverse order. Compares structural fields
+// same symbol.Children tree as the reverse order. Compares structural fields
 // (Name, DataType, Length) recursively; Value is excluded because live PLC
 // values change between the two connections.
 func TestIntegrationDP3LoadOrderEquivalence(t *testing.T) {

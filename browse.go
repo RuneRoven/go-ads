@@ -40,7 +40,7 @@ func (sess *Session) BrowseSymbols(path string) ([]SymbolBrowseEntry, error) {
 // Must be called with cache.lock held.
 func (sess *Session) browseRoot() []SymbolBrowseEntry {
 	// Two-pass to preserve original PLC casing for virtual groupings.
-	// symbolKey() lowercases for cache lookup, but Symbol.FullName retains
+	// symbolKey() lowercases for cache lookup, but symbol.FullName retains
 	// original case — derive display from any child symbol's FullName.
 	// Map key = lowercased prefix, value = original-case prefix.
 	roots := make(map[string]string)
@@ -168,7 +168,7 @@ func (sess *Session) browseChildren(path string) []SymbolBrowseEntry {
 		} else {
 			// Virtual middle-grouping. Recover original case for the segment
 			// from the child symbol's FullName (cache key is lowercased, but
-			// Symbol.FullName retains PLC case). sym.FullName aligns with the
+			// symbol.FullName retains PLC case). sym.FullName aligns with the
 			// lowercased key, so we slice at the same offsets.
 			origSegment := segment
 			origFullName := childFullName
@@ -204,7 +204,7 @@ func (sess *Session) browseChildren(path string) []SymbolBrowseEntry {
 
 // symbolHasChildren determines if a symbol likely has children.
 // Must be called with cache.lock held.
-func (sess *Session) symbolHasChildren(sym *Symbol) bool {
+func (sess *Session) symbolHasChildren(sym *symbol) bool {
 	// If we already have expanded children, yes
 	if len(sym.Children) > 0 {
 		return true

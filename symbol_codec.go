@@ -12,38 +12,38 @@ import (
 	"unicode/utf16"
 )
 
-func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]SymbolUploadDataType) (string, error) {
+func (s *symbol) parse(data []byte, offset int, datatypes map[string]SymbolUploadDataType) (string, error) {
 	start := offset
-	// reject oversized symbol.Length before arithmetic. uint32 → int
+	// reject oversized s.Length before arithmetic. uint32 → int
 	// conversion wraps on 32-bit Go; an attacker-controlled or buggy symbol
 	// entry with Length = 0xFFFFFFFF produces a negative int that bypasses
 	// the bounds guard and panics on slice. Compare in uint64 space to dodge
 	// the wrap entirely.
-	if uint64(symbol.Length) > uint64(len(data)) {
-		return "", fmt.Errorf("parse %s: symbol.Length %d exceeds data buffer size %d", symbol.DataType, symbol.Length, len(data))
+	if uint64(s.Length) > uint64(len(data)) {
+		return "", fmt.Errorf("parse %s: s.Length %d exceeds data buffer size %d", s.DataType, s.Length, len(data))
 	}
-	stop := start + int(symbol.Length)
-	if start+int(symbol.Length) > len(data) {
+	stop := start + int(s.Length)
+	if start+int(s.Length) > len(data) {
 		stop = len(data)
 	}
 
 	var newValue string
-	if len(symbol.Children) > 0 {
-		for _, value := range symbol.Children {
+	if len(s.Children) > 0 {
+		for _, value := range s.Children {
 			if _, err := value.parse(data[offset:stop], int(value.Offset), datatypes); err != nil {
 				return "", fmt.Errorf("parsing child %q: %w", value.Name, err)
 			}
 		}
-		newValue = symbol.GetJSON()
-		symbol.updateValue(newValue)
-		return symbol.Value, nil
+		newValue = s.getJSON()
+		s.updateValue(newValue)
+		return s.Value, nil
 	}
 
-	if start+int(symbol.Length) > len(data) {
-		return "", fmt.Errorf("data too short for %s at offset %d: need %d bytes, got %d", symbol.DataType, start, symbol.Length, len(data)-start)
+	if start+int(s.Length) > len(data) {
+		return "", fmt.Errorf("data too short for %s at offset %d: need %d bytes, got %d", s.DataType, start, s.Length, len(data)-start)
 	}
 
-	switch symbol.DataType {
+	switch s.DataType {
 	case "BOOL":
 		if stop-start != 1 {
 			return "", fmt.Errorf("BOOL Size Wrong")
@@ -170,61 +170,61 @@ func (symbol *Symbol) parse(data []byte, offset int, datatypes map[string]Symbol
 	default:
 		// Try resolving type alias via datatype table (enums, type aliases)
 		if datatypes != nil {
-			if dt, ok := datatypes[symbol.DataType]; ok {
+			if dt, ok := datatypes[s.DataType]; ok {
 				if slices.Contains(parseableTypes, dt.DataType) {
-					resolved := *symbol
+					resolved := *s
 					resolved.DataType = dt.DataType
 					val, err := resolved.parse(data, offset, nil)
 					if err != nil {
 						return "", err
 					}
-					symbol.updateValue(val)
-					return symbol.Value, nil
+					s.updateValue(val)
+					return s.Value, nil
 				}
 			}
 		}
 		// Use ADST_ numeric type code from protocol (authoritative).
 		// The PLC sends the correct base type (e.g., ADSTReal32=4 for a REAL-based alias).
-		if resolved := adsTypeToString(symbol.BaseType); resolved != "" {
-			copy := *symbol
-			copy.DataType = resolved
-			val, err := copy.parse(data, offset, nil)
+		if resolved := adsTypeToString(s.BaseType); resolved != "" {
+			cp := *s
+			cp.DataType = resolved
+			val, err := cp.parse(data, offset, nil)
 			if err != nil {
 				return "", err
 			}
-			symbol.updateValue(val)
-			return symbol.Value, nil
+			s.updateValue(val)
+			return s.Value, nil
 		}
 		// Last resort: infer base type from symbol size when ADST_ code is
 		// unavailable (BaseType=0 or BIGTYPE) and the datatype table didn't
 		// resolve. Only 1- and 2-byte widths are inferred — see
 		// inferBaseType doc for why 4/8 are refused.
-		if inferred := inferBaseType(symbol.Length, symbol.BaseType); inferred != "" {
+		if inferred := inferBaseType(s.Length, s.BaseType); inferred != "" {
 			getDefaultLogger().Warn("inferring base type from size (no datatype table loaded; LoadSymbols() recommended for user-defined types)",
-				"symbol", symbol.DataType, "size", symbol.Length, "baseType", symbol.BaseType, "inferred", inferred)
-			resolved := *symbol
+				"symbol", s.DataType, "size", s.Length, "baseType", s.BaseType, "inferred", inferred)
+			resolved := *s
 			resolved.DataType = inferred
 			val, err := resolved.parse(data, offset, nil)
 			if err != nil {
 				return "", err
 			}
-			symbol.updateValue(val)
-			return symbol.Value, nil
+			s.updateValue(val)
+			return s.Value, nil
 		}
-		return "", fmt.Errorf("unknown format cannot parse: %s", symbol.DataType)
+		return "", fmt.Errorf("unknown format cannot parse: %s", s.DataType)
 	}
 
-	symbol.updateValue(newValue)
-	return symbol.Value, nil
+	s.updateValue(newValue)
+	return s.Value, nil
 }
 
-func (symbol *Symbol) updateValue(newValue string) {
-	if symbol.Value != newValue &&
-		(!symbol.ValueParsed || time.Since(symbol.LastUpdateTime) > symbol.MinUpdateInterval) {
-		symbol.LastUpdateTime = time.Now()
-		symbol.Value = newValue
-		symbol.Valid = true
-		symbol.ValueParsed = true
+func (s *symbol) updateValue(newValue string) {
+	if s.Value != newValue &&
+		(!s.ValueParsed || time.Since(s.LastUpdateTime) > s.MinUpdateInterval) {
+		s.LastUpdateTime = time.Now()
+		s.Value = newValue
+		s.Valid = true
+		s.ValueParsed = true
 	}
 }
 
@@ -301,14 +301,14 @@ func inferBaseType(size uint32, baseType ADSDataType) string {
 	}
 }
 
-func (symbol *Symbol) writeToNode(value string, datatypes map[string]SymbolUploadDataType) (data []byte, err error) {
-	if len(symbol.Children) > 0 {
+func (s *symbol) writeToNode(value string, datatypes map[string]SymbolUploadDataType) (data []byte, err error) {
+	if len(s.Children) > 0 {
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(value), &fields); err != nil {
 			return nil, fmt.Errorf("struct write requires JSON input: %w", err)
 		}
-		buf := make([]byte, symbol.Length)
-		for name, child := range symbol.Children {
+		buf := make([]byte, s.Length)
+		for name, child := range s.Children {
 			raw, ok := fields[name]
 			if !ok {
 				continue
@@ -339,7 +339,7 @@ func (symbol *Symbol) writeToNode(value string, datatypes map[string]SymbolUploa
 	}
 
 	buf := new(bytes.Buffer)
-	dt := symbol.DataType
+	dt := s.DataType
 
 	if !slices.Contains(parseableTypes, dt) {
 		// Try datatype-table lookup first. If that fails or yields a non-parseable
@@ -356,15 +356,15 @@ func (symbol *Symbol) writeToNode(value string, datatypes map[string]SymbolUploa
 		// Only 1/2 byte widths are inferred (signed-int) — see inferBaseType
 		// doc for why 4/8 are refused (REAL/LREAL ambiguity).
 		if !slices.Contains(parseableTypes, dt) {
-			if inferred := inferBaseType(symbol.Length, symbol.BaseType); inferred != "" {
+			if inferred := inferBaseType(s.Length, s.BaseType); inferred != "" {
 				getDefaultLogger().Warn("inferring base type from size for write (no datatype table loaded; LoadSymbols() recommended)",
-					"symbol", symbol.DataType,
-					"size", symbol.Length,
-					"baseType", symbol.BaseType,
+					"symbol", s.DataType,
+					"size", s.Length,
+					"baseType", s.BaseType,
 					"inferred", inferred)
 				dt = inferred
 			} else {
-				return nil, fmt.Errorf("data type %q not parseable and size %d not inferable (only 1/2 byte sizes auto-inferred to avoid REAL/LREAL ambiguity); call LoadSymbols() first or use a known type", symbol.DataType, symbol.Length)
+				return nil, fmt.Errorf("data type %q not parseable and size %d not inferable (only 1/2 byte sizes auto-inferred to avoid REAL/LREAL ambiguity); call LoadSymbols() first or use a known type", s.DataType, s.Length)
 			}
 		}
 	}
@@ -518,12 +518,12 @@ func (symbol *Symbol) writeToNode(value string, datatypes map[string]SymbolUploa
 		// refuse to write to a STRING declared with Length=0. The PLC
 		// expects at least 1 byte for the null terminator; a 0-byte payload
 		// is silently truncating and indistinguishable from caller error.
-		if symbol.Length < 1 {
-			return nil, fmt.Errorf("STRING write requires symbol.Length >= 1, got %d", symbol.Length)
+		if s.Length < 1 {
+			return nil, fmt.Errorf("STRING write requires s.Length >= 1, got %d", s.Length)
 		}
-		newBuf := make([]byte, symbol.Length)
+		newBuf := make([]byte, s.Length)
 		// Reserve last byte for null terminator — PLC expects null-terminated strings.
-		maxLen := int(symbol.Length) - 1
+		maxLen := int(s.Length) - 1
 		src := []byte(value)
 		if len(src) > maxLen {
 			src = src[:maxLen]
@@ -532,12 +532,12 @@ func (symbol *Symbol) writeToNode(value string, datatypes map[string]SymbolUploa
 		buf.Write(newBuf)
 	case "WSTRING":
 		// WSTRING needs at least 2 bytes for the UTF-16 null terminator.
-		if symbol.Length < 2 {
-			return nil, fmt.Errorf("WSTRING write requires symbol.Length >= 2, got %d", symbol.Length)
+		if s.Length < 2 {
+			return nil, fmt.Errorf("WSTRING write requires s.Length >= 2, got %d", s.Length)
 		}
 		encoded := utf16.Encode([]rune(value))
-		newBuf := make([]byte, symbol.Length)
-		maxChars := (int(symbol.Length) - 2) / 2 // reserve 2 bytes for null terminator
+		newBuf := make([]byte, s.Length)
+		maxChars := (int(s.Length) - 2) / 2 // reserve 2 bytes for null terminator
 		if len(encoded) > maxChars {
 			encoded = encoded[:maxChars]
 			// If truncation lands inside a UTF-16 surrogate pair (high
@@ -555,7 +555,7 @@ func (symbol *Symbol) writeToNode(value string, datatypes map[string]SymbolUploa
 		}
 		buf.Write(newBuf)
 	default:
-		return nil, fmt.Errorf("datatype %q write is not implemented yet", symbol.DataType)
+		return nil, fmt.Errorf("datatype %q write is not implemented yet", s.DataType)
 	}
 	return buf.Bytes(), nil
 }
