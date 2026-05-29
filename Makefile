@@ -1,4 +1,4 @@
-.PHONY: all all-log lint fmt vet test test-race test-cover build build-examples hardware hardware-log test-docker test-docker-tc3 test-docker-tc2 clean
+.PHONY: all all-log lint fmt vet test test-race test-cover build build-examples hardware hardware-log test-docker test-docker-tc3 test-docker-tc2 test-native-tc3 test-native-tc2 clean
 
 # Software tests (CI-safe, no PLC needed)
 all: fmt lint vet test
@@ -54,6 +54,14 @@ test-docker-tc2:
 	docker/run-tests.sh .env.integration.70
 
 test-docker: test-docker-tc3 test-docker-tc2
+
+# Native hardware integration tests (run on host, not Docker)
+# Requires PLC reachable from host network. macOS may prompt for firewall on first run.
+test-native-tc3:
+	set -a && . ./.env.integration.224 && set +a && go test -v -tags integration -timeout 10m -run 'TestIntegration' .
+
+test-native-tc2:
+	set -a && . ./.env.integration.70 && set +a && go test -v -tags integration -timeout 10m -run 'TestIntegration' .
 
 clean:
 	rm -f coverage.out coverage.html
