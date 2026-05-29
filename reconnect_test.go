@@ -22,7 +22,7 @@ import (
 func newReconnectTestSession() *Session {
 	return &Session{
 		tx:            &transport{},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{})},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{}), orphanSeen: make(map[uint32]time.Time), orphanSem: make(chan struct{}, orphanDeleteMaxConcurrency)},
 		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 		lifecycle: &sessionLifecycle{
@@ -213,7 +213,7 @@ func TestReconnectExhaustsMaxAttemptsTransitionsToClosed(t *testing.T) {
 			recvQueue:      make(chan []byte, recvQueueSize),
 			activeRequests: map[uint32]chan []byte{},
 		},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{})},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{}), orphanSeen: make(map[uint32]time.Time), orphanSem: make(chan struct{}, orphanDeleteMaxConcurrency)},
 		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 		lifecycle: &sessionLifecycle{
@@ -280,7 +280,7 @@ func TestReconnectExhaustConcurrentClose_NoPanic(t *testing.T) {
 				recvQueue:      make(chan []byte, recvQueueSize),
 				activeRequests: map[uint32]chan []byte{},
 			},
-			notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{})},
+			notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{}), orphanSeen: make(map[uint32]time.Time), orphanSem: make(chan struct{}, orphanDeleteMaxConcurrency)},
 			cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 			logger:        getDefaultLogger(),
 			lifecycle: &sessionLifecycle{
@@ -365,7 +365,7 @@ func TestReconnect_FlapDetection_AccumulatesAcrossCycles(t *testing.T) {
 			recvQueue:      make(chan []byte, recvQueueSize),
 			activeRequests: map[uint32]chan []byte{},
 		},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{})},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{}), orphanSeen: make(map[uint32]time.Time), orphanSem: make(chan struct{}, orphanDeleteMaxConcurrency)},
 		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 		lifecycle: &sessionLifecycle{
@@ -432,7 +432,7 @@ func TestReconnect_WipesActiveNotificationsBeforeRetryLoop(t *testing.T) {
 			recvQueue:      make(chan []byte, recvQueueSize),
 			activeRequests: map[uint32]chan []byte{},
 		},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{})},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{}), orphanSeen: make(map[uint32]time.Time), orphanSem: make(chan struct{}, orphanDeleteMaxConcurrency)},
 		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 		lifecycle: &sessionLifecycle{

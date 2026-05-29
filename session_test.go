@@ -281,7 +281,7 @@ func TestSession_OnDisconnectFiresOnceOnConcurrentTrigger(t *testing.T) {
 	// require a live transport).
 	sess := &Session{
 		tx:            &transport{},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{})},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{}), orphanSeen: make(map[uint32]time.Time), orphanSem: make(chan struct{}, orphanDeleteMaxConcurrency)},
 		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 		lifecycle: &sessionLifecycle{

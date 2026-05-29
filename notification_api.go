@@ -40,6 +40,14 @@ type notificationManager struct {
 	configsByKey        map[string]struct{}
 	notificationChannel chan *Update
 	lastSubscribeNs     atomic.Int64
+
+	// orphanDelete tracks unknown-handle Delete attempts so we don't spam
+	// the PLC when a previously-leaked subscription keeps firing. Guarded
+	// by orphanMu (separate from notifications.lock so the throttle check
+	// doesn't serialize against the dispatch hot path).
+	orphanMu   sync.Mutex
+	orphanSeen map[uint32]time.Time
+	orphanSem  chan struct{} // bounded concurrency: cap = orphanDeleteMaxConcurrency
 }
 
 // addConfig wraps cfg into a fresh pendingNotification (resubscribeAttempts=0)

@@ -211,7 +211,12 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 		target:         remote.AMS,
 		requestTimeout: 5 * time.Second,
 		route:          &routeManager{},
-		notifications:  &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{})},
+		notifications: &notificationManager{
+			activeNotifications: make(map[uint32]activeNotification),
+			configsByKey:        make(map[string]struct{}),
+			orphanSeen:          make(map[uint32]time.Time),
+			orphanSem:           make(chan struct{}, orphanDeleteMaxConcurrency),
+		},
 		cache: &symbolCache{
 			symbols:         map[string]*symbol{},
 			onDemandSymbols: map[string]bool{},
