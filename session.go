@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"os"
 	"strconv"
@@ -15,6 +16,21 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// randomAMSPort returns a random AMS source port in the IANA dynamic/private
+// range (32768-49151). Sessions get a unique port at construction so multiple
+// processes from the same host (same source NetID) appear as distinct clients
+// to the PLC and so a process restart doesn't reuse a prior process's port.
+// The PLC's notification handle table is keyed by {source NetID, source AMS
+// port, handle}, so a new port = new identity = old subscriptions auto-age
+// via route-idle-timeout rather than competing with the new connection.
+//
+// WithLocalAMS(AMSAddress{Port: N}) overrides for deployments that need a
+// stable port (e.g. firewalled environments with port allow-lists).
+func randomAMSPort() uint16 {
+	const minPort, span = 32768, 49151 - 32768 + 1
+	return uint16(minPort + rand.IntN(span)) //nolint:gosec // non-cryptographic port selection
+}
 
 // sessionLifecycle owns Session's lifecycle plumbing: cancellation context,
 // goroutine waitgroup, single-flight reconnect signaling, the explicit FSM
@@ -164,9 +180,12 @@ type AMSEndpoint struct {
 // no I/O until Connect; ctx is captured for the long-lived session
 // lifecycle and cancelling it shuts the session down.
 //
-// Local AMS NetID + port default to auto-derivation from the local TCP
-// address and port 10500. Override with WithLocalAMS / WithRequestTimeout
-// / other options.
+// Local AMS NetID defaults to auto-derivation from the local TCP source IP.
+// Local AMS port defaults to a random value in the IANA dynamic range
+// (32768-49151) so each Session instance — including each process restart —
+// appears as a distinct AMS client to the PLC, preventing notification-handle
+// table collisions between concurrent or successive sessions sharing a host.
+// Override either with WithLocalAMS(AMSAddress{NetID:..., Port:...}).
 //
 // Use sess.Close() to shut down the session.
 func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) (sess *Session, err error) {
@@ -219,8 +238,11 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 	// callers can override.
 	sess.maxReloadAttempts = 3
 	sess.reloadWindow = 60 * time.Second
-	// Default local AMS port; WithLocalAMS may override.
-	sess.source.Port = 10500
+	// Default local AMS port: random in IANA dynamic range so each process /
+	// each session presents a distinct AMS source identity to the PLC. See
+	// randomAMSPort doc for the rationale. WithLocalAMS overrides for stable-
+	// port deployments (firewalled environments, container port allow-lists).
+	sess.source.Port = randomAMSPort()
 	for _, opt := range opts {
 		opt(sess)
 	}
