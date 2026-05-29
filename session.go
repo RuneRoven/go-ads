@@ -1003,8 +1003,20 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 	sess.tx.disconnected.Store(true)
 	// State is already Reconnecting (transitionToOnce above).
 
-	// Clear active notifications (old handles invalid after reconnect).
+	// Clear active notifications (old handles invalid after reconnect) but
+	// snapshot the handle list first. After dialAndStart brings up a new
+	// transport with the same source NetID + port (Fix 4 makes the port
+	// stable per-session), the PLC's notification handle table may still
+	// hold these handles if the TCP drop was transient (within route-idle
+	// timeout). Issue an explicit bestEffortDelete on the new transport so
+	// the PLC table doesn't carry orphans across our reconnect — without
+	// this cleanup, repeated TCP flaps accumulate handle slots and
+	// eventually crash the TwinCAT AMS router (Beckhoff issue #268).
 	sess.notifications.lock.Lock()
+	savedHandles := make([]uint32, 0, len(sess.notifications.activeNotifications))
+	for h := range sess.notifications.activeNotifications {
+		savedHandles = append(savedHandles, h)
+	}
 	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
 	sess.notifications.lock.Unlock()
 
@@ -1080,6 +1092,21 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 				return err
 			}
 			continue
+		}
+
+		// Transport is fully restored. Before re-subscribing, issue a best-
+		// effort delete for the pre-reconnect handles snapshotted above.
+		// PLC may already have reaped them (route-idle-timeout or PLC reboot)
+		// — bestEffortDelete treats 0x745 NotifyHandleInvalid as success-
+		// equivalent, so already-aged handles don't error. Clear savedHandles
+		// after the first successful pass so a later retry iteration (after
+		// resubscribe failure → resetForRetry → loop) doesn't re-fire on an
+		// already-cleaned PLC table.
+		if len(savedHandles) > 0 {
+			deleted := sess.bestEffortDeleteNotifications(sess.lifecycle.ctx, savedHandles)
+			sess.logger.Info("reconnect: cleaned up pre-reconnect notification handles",
+				"requested", len(savedHandles), "deleted", deleted)
+			savedHandles = nil
 		}
 
 		// Re-subscribe notifications using stored configs.

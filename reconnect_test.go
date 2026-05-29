@@ -408,3 +408,69 @@ func TestReconnect_FlapDetection_AccumulatesAcrossCycles(t *testing.T) {
 		t.Errorf("flapCount = %d after a within-flapWindow Reconnect, want >= 1", gotCount)
 	}
 }
+
+// TestReconnect_WipesActiveNotificationsBeforeRetryLoop verifies Fix 3 of the
+// v2.2.1 PLC-flood patch: Reconnect must capture the pre-reconnect handle
+// list and wipe activeNotifications atomically before entering the retry
+// loop, so a later successful dialAndStart can issue a bestEffortDelete
+// against the saved handles (preventing TwinCAT AMS router handle-table
+// accumulation across reconnect cycles).
+//
+// This test uses the refused-port session to force Reconnect into the
+// exhaustion path; we only assert that the wipe ran. Full delete-RPC
+// integration is exercised via hardware tests (TestIntegrationReconnect on
+// TC3/TC2) where a real PLC accepts the SumDelete on the reconnected socket.
+func TestReconnect_WipesActiveNotificationsBeforeRetryLoop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	sess := &Session{
+		ip:   "127.0.0.1",
+		port: 1, // refused on loopback — Reconnect exhausts attempts
+		tx: &transport{
+			sendChannel:    make(chan []byte),
+			systemResponse: make(chan []byte, 1),
+			recvQueue:      make(chan []byte, recvQueueSize),
+			activeRequests: map[uint32]chan []byte{},
+		},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{})},
+		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
+		logger:        getDefaultLogger(),
+		lifecycle: &sessionLifecycle{
+			closedCh:             make(chan struct{}),
+			autoReconnect:        false,
+			maxReconnectAttempts: 1,
+			backoffConfig: BackoffConfig{
+				InitialInterval: 1 * time.Millisecond,
+				InitialAttempts: 10,
+				MidInterval:     1 * time.Millisecond,
+				MidAttempts:     10,
+				SlowInterval:    1 * time.Millisecond,
+				SlowAttempts:    10,
+				MaxInterval:     1 * time.Millisecond,
+			},
+			ctx:      ctx,
+			shutdown: cancel,
+		},
+		requestTimeout: 200 * time.Millisecond,
+	}
+	sess.lifecycle.state.transitionTo(SessionStateConstructed)
+	sess.lifecycle.state.transitionTo(SessionStateConnecting)
+	sess.lifecycle.state.transitionTo(SessionStateConnected)
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+
+	// Stage pre-reconnect handles. Fix 3's snapshot+wipe must capture these
+	// before the retry loop starts.
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[0xAAAA] = activeNotification{Sym: &symbol{FullName: "MAIN.x"}}
+	sess.notifications.activeNotifications[0xBBBB] = activeNotification{Sym: &symbol{FullName: "MAIN.y"}}
+	sess.notifications.lock.Unlock()
+
+	_ = sess.Reconnect(ctx)
+
+	sess.notifications.lock.Lock()
+	postLen := len(sess.notifications.activeNotifications)
+	sess.notifications.lock.Unlock()
+	if postLen != 0 {
+		t.Errorf("activeNotifications len = %d post-Reconnect, want 0 (Fix 3 must wipe under same lock as snapshot)", postLen)
+	}
+}
