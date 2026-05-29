@@ -668,8 +668,42 @@ func (sess *Session) autoReloadOnStaleDetection(reason Reason) {
 }
 
 // reloadSymbolsAndResubscribe re-runs symbol discovery + notification
-// resub. Re-uses existing reconnect-path helpers (R-NOT-013).
+// resub after an online-change detection. Re-uses existing reconnect-path
+// helpers (R-NOT-013).
+//
+// Before resubscribing, explicitly Delete the old PLC notification handles.
+// The PLC's per-source-NetID handle table indexes subscriptions by handle
+// ID — without this cleanup, AddSymbolNotifications below would allocate a
+// fresh handle for every symbol while the old handles remain consuming
+// table slots until route-idle-timeout (~10 min). Under repeated online
+// changes this floods the TwinCAT AMS router (Beckhoff issue #268).
+//
+// Transport is alive at this point — PLC just sent us a stale-cache code
+// (0x711/0x705/0x710/...) over the active connection. bestEffortDelete
+// treats 0x745 (NotifyHandleInvalid) as success-equivalent so any handles
+// the PLC already auto-invalidated from the online-change don't error.
 func (sess *Session) reloadSymbolsAndResubscribe() error {
+	// Snapshot old handles + bump lastSubscribeNs so concurrent
+	// handleNotification dispatches arriving for these handles during the
+	// delete window log as Debug (first-sample-race branch) rather than Warn.
+	// Clear activeNotifications under the same lock so AddSymbolNotifications
+	// below sees a fresh map and the orphan-delete-on-unknown-handle path
+	// (Fix 1) treats lingering samples as race-window noise, not orphans.
+	sess.notifications.lock.Lock()
+	oldHandles := make([]uint32, 0, len(sess.notifications.activeNotifications))
+	for h := range sess.notifications.activeNotifications {
+		oldHandles = append(oldHandles, h)
+	}
+	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
+	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
+	sess.notifications.lock.Unlock()
+
+	if len(oldHandles) > 0 {
+		deleted := sess.bestEffortDeleteNotifications(sess.lifecycle.ctx, oldHandles)
+		sess.logger.Info("auto-reload: deleted old PLC notification handles before resubscribe",
+			"requested", len(oldHandles), "deleted", deleted)
+	}
+
 	if err := sess.LoadSymbols(sess.lifecycle.ctx); err != nil {
 		return fmt.Errorf("LoadSymbols: %w", err)
 	}

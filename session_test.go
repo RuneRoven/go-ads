@@ -938,3 +938,94 @@ func TestNewSession_WithLocalAMS_ZeroPort_KeepsRandomDefault(t *testing.T) {
 		t.Errorf("NetID override lost: got %v", sess.source.NetID)
 	}
 }
+
+// TestAutoReload_DeletesOldHandlesBeforeResubscribe verifies Fix 2 of the
+// v2.2.1 PLC-flood patch: reloadSymbolsAndResubscribe must issue a
+// SumDeleteDeviceNotification for every pre-reload handle BEFORE attempting
+// to re-subscribe, so the PLC's notification handle table doesn't accumulate
+// orphan entries across online-change cycles.
+//
+// We pre-populate activeNotifications with two synthetic handles, intercept
+// the SumDelete RPC via the scriptable server, then drive
+// reloadSymbolsAndResubscribe. LoadSymbols is expected to fail (no upload
+// handler registered) — we only validate the pre-delete step ran and that
+// activeNotifications was wiped under the same lock.
+func TestAutoReload_DeletesOldHandlesBeforeResubscribe(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var mu sync.Mutex
+	var deletedHandles []uint32
+	srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(req []byte) []byte {
+		n := len(req) / 4
+		mu.Lock()
+		for i := 0; i < n; i++ {
+			deletedHandles = append(deletedHandles, binary.LittleEndian.Uint32(req[i*4:]))
+		}
+		mu.Unlock()
+		codes := make([]ReturnCode, n)
+		for i := range codes {
+			codes[i] = ReturnCodeNoErrors
+		}
+		return buildSumDeleteNotifPayload(codes)
+	})
+
+	sess, _ := newWiredTestSession(t, srv)
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[0xA1A1] = activeNotification{Sym: &symbol{FullName: "MAIN.x"}, Ch: nil}
+	sess.notifications.activeNotifications[0xB2B2] = activeNotification{Sym: &symbol{FullName: "MAIN.y"}, Ch: nil}
+	sess.notifications.lock.Unlock()
+
+	// LoadSymbols is expected to fail (no upload-info handler registered).
+	// The pre-delete step runs unconditionally before LoadSymbols, so we
+	// don't care about the returned error.
+	_ = sess.reloadSymbolsAndResubscribe()
+
+	mu.Lock()
+	got := append([]uint32{}, deletedHandles...)
+	mu.Unlock()
+
+	if len(got) != 2 {
+		t.Fatalf("Delete RPC received %d handles, want 2: got=%v", len(got), got)
+	}
+	seen := map[uint32]bool{0xA1A1: false, 0xB2B2: false}
+	for _, h := range got {
+		if _, ok := seen[h]; ok {
+			seen[h] = true
+		}
+	}
+	for h, found := range seen {
+		if !found {
+			t.Errorf("handle 0x%X not in Delete RPC payload", h)
+		}
+	}
+
+	sess.notifications.lock.Lock()
+	postLen := len(sess.notifications.activeNotifications)
+	sess.notifications.lock.Unlock()
+	if postLen != 0 {
+		t.Errorf("activeNotifications len = %d after reload, want 0 (must be wiped under lock with snapshot)", postLen)
+	}
+}
+
+// TestAutoReload_NoOldHandles_SkipsDelete validates the empty-snapshot path:
+// when reloadSymbolsAndResubscribe runs with no pre-existing handles, no
+// SumDelete RPC must fire (avoids a useless wire round-trip on first reload).
+func TestAutoReload_NoOldHandles_SkipsDelete(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var deleteCalls atomic.Int32
+	srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(_ []byte) []byte {
+		deleteCalls.Add(1)
+		return buildSumDeleteNotifPayload([]ReturnCode{ReturnCodeNoErrors})
+	})
+
+	sess, _ := newWiredTestSession(t, srv)
+	// activeNotifications is empty by construction.
+	_ = sess.reloadSymbolsAndResubscribe()
+
+	if got := deleteCalls.Load(); got != 0 {
+		t.Errorf("SumDelete called %d times with empty active set, want 0", got)
+	}
+}
