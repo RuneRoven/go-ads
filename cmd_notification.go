@@ -461,6 +461,14 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 			return
 		}
 
+		// Lifecycle ctx may be canceled before FSM state transitions to Closed
+		// (ungraceful teardown). Skip RPC instead of firing into a stub/torn-down
+		// transport.
+		if err := sess.lifecycle.ctx.Err(); err != nil {
+			sess.logger.Debug("orphan delete aborted: lifecycle context done", "handle", handle, "error", err)
+			return
+		}
+
 		ctx, cancel := context.WithTimeout(sess.lifecycle.ctx, orphanDeleteRPCTimeout)
 		defer cancel()
 		if err := c.DeleteDeviceNotification(ctx, handle); err != nil {
