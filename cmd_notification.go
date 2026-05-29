@@ -241,7 +241,15 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 		case time.Now().UnixNano()-sess.notifications.lastSubscribeNs.Load() < subscribeRaceWindowNs:
 			sess.logger.Debug("received notification for unknown handle (likely first-sample race)", "handle", handle)
 		default:
+			// Genuine orphan sample — handle is registered on the PLC but
+			// not in our client-side map. Most likely cause: a prior process
+			// (us or another go-ads client with same source NetID+port) left
+			// the subscription behind on crash/restart. Schedule a Delete
+			// on the PLC so the orphan handle table slot is freed; without
+			// this cleanup the TwinCAT AMS router accumulates entries
+			// across restarts until it crashes (Beckhoff issue #268).
 			sess.logger.Warn("received notification for unknown handle", "handle", handle)
+			sess.tryOrphanDelete(handle)
 		}
 		return
 	}
@@ -339,4 +347,133 @@ func (sess *Session) deliverNotification(ctx context.Context, ch chan<- *Update,
 			"handle", handle,
 			"symbol", fullName)
 	}
+}
+
+// Orphan-Delete: when handleNotification receives a sample for a handle that
+// is not in activeNotifications (and we are past the first-sample-race
+// window), the handle is most likely a leftover subscription from a prior
+// process that shared our source NetID+port. The PLC's notification handle
+// table is finite per source identity; without explicit cleanup repeated
+// process restarts accumulate orphan entries until the TwinCAT AMS router
+// runs out of slots and starts rejecting new Adds or crashes outright
+// (Beckhoff issue #268).
+//
+// Mitigation: issue an asynchronous DeleteDeviceNotification for the orphan
+// handle. Constraints:
+//   - Throttle per-handle so a high-rate orphan stream (PLC re-firing every
+//     PLC cycle on a still-live subscription) doesn't spam Delete RPCs.
+//   - Bound concurrency so a burst of N orphans on session resume doesn't
+//     spawn N goroutines simultaneously.
+//   - Re-check that the handle is STILL absent from activeNotifications
+//     immediately before sending the RPC: between scheduling and firing,
+//     a concurrent AddSymbolNotification could legitimately have received
+//     the same handle ID back from the PLC (PLC reuses IDs from a freed
+//     table slot). Deleting our own just-acquired subscription would
+//     produce a permanent orphan-loop. The re-check eliminates that race.
+//   - Track the goroutine via lifecycle.waitGroup so Close waits for any
+//     in-flight Delete to complete instead of leaving zombie goroutines.
+//   - panic recover defensively — an unexpected panic here must not kill
+//     the listen goroutine that called handleNotification.
+const (
+	orphanDeleteThrottle       = 60 * time.Second
+	orphanDeleteMaxConcurrency = 10
+	orphanDeleteSeenMaxAge     = 5 * time.Minute
+	orphanDeleteRPCTimeout     = 5 * time.Second
+)
+
+// tryOrphanDelete schedules an async best-effort Delete of an unknown
+// notification handle. All skip paths log Debug; only the actual RPC and
+// its outcome log Info/Warn so operators can confirm cleanup is running.
+func (sess *Session) tryOrphanDelete(handle uint32) {
+	// Lifecycle guards: never fire during shutdown or active reconnect.
+	if sess.isClosed() || sess.isReconnecting() {
+		sess.logger.Debug("orphan delete skipped: session closing or reconnecting", "handle", handle)
+		return
+	}
+
+	// Throttle map + bounded sem may be uninitialised on Session{} struct
+	// literals used in some tests. Skip silently — these tests don't
+	// exercise the orphan path.
+	mgr := sess.notifications
+	if mgr.orphanSeen == nil || mgr.orphanSem == nil {
+		return
+	}
+
+	// Throttle check + GC old entries under orphanMu.
+	mgr.orphanMu.Lock()
+	now := time.Now()
+	cutoff := now.Add(-orphanDeleteSeenMaxAge)
+	for h, t := range mgr.orphanSeen {
+		if t.Before(cutoff) {
+			delete(mgr.orphanSeen, h)
+		}
+	}
+	if last, seen := mgr.orphanSeen[handle]; seen && now.Sub(last) < orphanDeleteThrottle {
+		mgr.orphanMu.Unlock()
+		sess.logger.Debug("orphan delete throttled (recent attempt for same handle)",
+			"handle", handle,
+			"last_attempt_ago", now.Sub(last))
+		return
+	}
+	mgr.orphanSeen[handle] = now
+	mgr.orphanMu.Unlock()
+
+	// Bounded concurrency: non-blocking acquire. If sem full, drop this
+	// attempt; the next orphan sample (past throttle window) will retry.
+	select {
+	case mgr.orphanSem <- struct{}{}:
+	default:
+		sess.logger.Debug("orphan delete skipped: max concurrent deletes in flight",
+			"handle", handle,
+			"max_concurrent", orphanDeleteMaxConcurrency)
+		return
+	}
+
+	// Track goroutine so Close waits for in-flight orphan deletes.
+	sess.lifecycle.waitGroup.Add(1)
+	go func() {
+		defer sess.lifecycle.waitGroup.Done()
+		defer func() { <-mgr.orphanSem }()
+		defer func() {
+			if r := recover(); r != nil {
+				sess.logger.Error("orphan delete goroutine panic recovered",
+					"handle", handle, "panic", r)
+			}
+		}()
+
+		// Race guard: between scheduling and firing, a concurrent
+		// AddSymbolNotification may have legitimately received this
+		// handle from the PLC. If so, DO NOT delete it — we'd kill our
+		// own just-established subscription. Re-check under
+		// notifications.lock to close the window.
+		mgr.lock.Lock()
+		_, present := mgr.activeNotifications[handle]
+		mgr.lock.Unlock()
+		if present {
+			sess.logger.Debug("orphan delete aborted: handle reappeared in activeNotifications between scheduling and firing",
+				"handle", handle)
+			return
+		}
+
+		c := sess.client.Load()
+		if c == nil {
+			sess.logger.Debug("orphan delete aborted: client not initialised", "handle", handle)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(sess.lifecycle.ctx, orphanDeleteRPCTimeout)
+		defer cancel()
+		if err := c.DeleteDeviceNotification(ctx, handle); err != nil {
+			// PLC may return 0x745 (NotifyHandleInvalid) for handles that
+			// already aged out — that's the expected outcome on a PLC
+			// reboot or after route-idle-timeout. Log at Debug so it
+			// doesn't flood under high-rate orphan streams; the success
+			// log below makes the productive cleanup visible regardless.
+			sess.logger.Debug("orphan delete RPC failed (PLC may have already reaped the handle)",
+				"handle", handle, "error", err)
+			return
+		}
+		sess.logger.Info("orphan PLC notification handle deleted (was leaked by prior session/process)",
+			"handle", handle)
+	}()
 }

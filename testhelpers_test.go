@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf16"
 )
 
@@ -173,7 +174,7 @@ func newTestConnection() *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := &Session{
 		lifecycle:     &sessionLifecycle{ctx: ctx, shutdown: cancel},
-		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{})},
+		notifications: &notificationManager{activeNotifications: make(map[uint32]activeNotification), configsByKey: make(map[string]struct{}), orphanSeen: make(map[uint32]time.Time), orphanSem: make(chan struct{}, orphanDeleteMaxConcurrency)},
 		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},
 		logger:        getDefaultLogger(),
 	}
