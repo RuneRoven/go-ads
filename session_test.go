@@ -105,8 +105,11 @@ func TestNewSession_TotalConstruction(t *testing.T) {
 	if sess.requestTimeout != 5*time.Second {
 		t.Errorf("requestTimeout = %v, want 5s default", sess.requestTimeout)
 	}
-	if sess.source.Port != 10500 {
-		t.Errorf("localPort = %d, want 10500 default", sess.source.Port)
+	// Default local AMS port is random in [32768, 49151] so each Session is
+	// a distinct AMS client identity to the PLC. WithLocalAMS overrides for
+	// stable-port deployments.
+	if sess.source.Port < 32768 || sess.source.Port > 49151 {
+		t.Errorf("localPort = %d, want random in [32768, 49151]", sess.source.Port)
 	}
 	if state := sess.lifecycle.state.load(); state != SessionStateConstructed {
 		t.Errorf("FSM state = %v, want Constructed", state)
@@ -876,5 +879,62 @@ func TestHandleStaleDetection_Ignore_FiresCallbackPerTrigger(t *testing.T) {
 	}
 	if got := callbacks.Load(); got != int32(N) {
 		t.Errorf("Ignore strategy: %d callbacks for %d triggers, want %d (every detection must be observable)", got, N, N)
+	}
+}
+
+// TestNewSession_DefaultRandomLocalPort_InRange asserts that every NewSession
+// picks a local AMS source port within the IANA dynamic range [32768, 49151].
+// Random selection (vs fixed 10500) prevents notification-handle table
+// collisions on the PLC across concurrent / restarted sessions sharing a
+// host (Beckhoff InfoSys: PLC indexes notifications by source NetID + port).
+func TestNewSession_DefaultRandomLocalPort_InRange(t *testing.T) {
+	for i := 0; i < 10; i++ {
+		sess, err := NewSession(context.Background(), testEndpoint())
+		if err != nil {
+			t.Fatalf("iter %d: NewSession: %v", i, err)
+		}
+		if sess.source.Port < 32768 || sess.source.Port > 49151 {
+			t.Errorf("iter %d: port=%d, want [32768, 49151]", i, sess.source.Port)
+		}
+		_ = sess.Close()
+	}
+}
+
+// TestNewSession_DefaultRandomLocalPort_Distribution catches a regression
+// where the random source is mis-seeded and produces a constant port across
+// constructions. 100 sessions should observe at least 50 distinct ports.
+func TestNewSession_DefaultRandomLocalPort_Distribution(t *testing.T) {
+	seen := map[uint16]struct{}{}
+	const N = 100
+	for i := 0; i < N; i++ {
+		sess, err := NewSession(context.Background(), testEndpoint())
+		if err != nil {
+			t.Fatalf("iter %d: NewSession: %v", i, err)
+		}
+		seen[sess.source.Port] = struct{}{}
+		_ = sess.Close()
+	}
+	if len(seen) < 50 {
+		t.Errorf("only %d distinct ports across %d sessions — random source may be constant-seeded", len(seen), N)
+	}
+}
+
+// TestNewSession_WithLocalAMS_ZeroPort_KeepsRandomDefault verifies that
+// WithLocalAMS(AMSAddress{Port: 0}) does NOT clobber the random default port.
+// Port == 0 is the zero value; treating it as "explicit override to 0" would
+// produce an invalid AMS source. WithLocalAMS guards Port != 0 explicitly.
+func TestNewSession_WithLocalAMS_ZeroPort_KeepsRandomDefault(t *testing.T) {
+	sess, err := NewSession(context.Background(), testEndpoint(),
+		WithLocalAMS(AMSAddress{NetID: [6]byte{10, 20, 30, 40, 1, 1}, Port: 0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+	if sess.source.Port < 32768 || sess.source.Port > 49151 {
+		t.Errorf("port=%d, want random default (Port=0 in WithLocalAMS must not override)", sess.source.Port)
+	}
+	if sess.source.NetID != ([6]byte{10, 20, 30, 40, 1, 1}) {
+		t.Errorf("NetID override lost: got %v", sess.source.NetID)
 	}
 }
