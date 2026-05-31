@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -382,8 +383,11 @@ const (
 )
 
 // tryOrphanDelete schedules an async best-effort Delete of an unknown
-// notification handle. All skip paths log Debug; only the actual RPC and
-// its outcome log Info/Warn so operators can confirm cleanup is running.
+// notification handle. Skip paths log Debug. RPC outcome:
+//   - success         → Info (operators see productive cleanup)
+//   - 0x714 NotifyHandleInvalid → Debug (PLC already reaped, expected)
+//   - any other error → Warn (real failure: transport, auth, timeout,
+//     marshaling, protocol mismatch)
 func (sess *Session) tryOrphanDelete(handle uint32) {
 	// Lifecycle guards: never fire during shutdown or active reconnect.
 	if sess.isClosed() || sess.isReconnecting() {
@@ -399,7 +403,10 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 		return
 	}
 
-	// Throttle check + GC old entries under orphanMu.
+	// Throttle check + GC old entries under orphanMu. Don't write the
+	// throttle entry yet — only commit it after we've successfully
+	// acquired a sem slot, otherwise a sem-full drop would 60s-lock the
+	// handle even though no RPC fired.
 	mgr.orphanMu.Lock()
 	now := time.Now()
 	cutoff := now.Add(-orphanDeleteSeenMaxAge)
@@ -415,11 +422,11 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 			"last_attempt_ago", now.Sub(last))
 		return
 	}
-	mgr.orphanSeen[handle] = now
 	mgr.orphanMu.Unlock()
 
 	// Bounded concurrency: non-blocking acquire. If sem full, drop this
-	// attempt; the next orphan sample (past throttle window) will retry.
+	// attempt without writing throttle entry; the next orphan sample
+	// retries immediately rather than waiting out a 60s throttle window.
 	select {
 	case mgr.orphanSem <- struct{}{}:
 	default:
@@ -428,6 +435,11 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 			"max_concurrent", orphanDeleteMaxConcurrency)
 		return
 	}
+
+	// Commit throttle entry now that the slot is reserved.
+	mgr.orphanMu.Lock()
+	mgr.orphanSeen[handle] = now
+	mgr.orphanMu.Unlock()
 
 	// Track goroutine so Close waits for in-flight orphan deletes.
 	sess.lifecycle.waitGroup.Add(1)
@@ -461,23 +473,33 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 			return
 		}
 
-		// Lifecycle ctx may be canceled before FSM state transitions to Closed
-		// (ungraceful teardown). Skip RPC instead of firing into a stub/torn-down
-		// transport.
-		if err := sess.lifecycle.ctx.Err(); err != nil {
+		// Snapshot lifecycle.ctx under ctxMu.RLock — Reconnect replaces it
+		// via tearDownAndReset under ctxMu.Lock, so a raw read races with
+		// the swap. RLock + snapshot matches the pattern at session.go's
+		// Close/triggerReconnect call sites.
+		sess.lifecycle.ctxMu.RLock()
+		parentCtx := sess.lifecycle.ctx
+		sess.lifecycle.ctxMu.RUnlock()
+		if err := parentCtx.Err(); err != nil {
 			sess.logger.Debug("orphan delete aborted: lifecycle context done", "handle", handle, "error", err)
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(sess.lifecycle.ctx, orphanDeleteRPCTimeout)
+		ctx, cancel := context.WithTimeout(parentCtx, orphanDeleteRPCTimeout)
 		defer cancel()
 		if err := c.DeleteDeviceNotification(ctx, handle); err != nil {
-			// PLC may return 0x745 (NotifyHandleInvalid) for handles that
-			// already aged out — that's the expected outcome on a PLC
-			// reboot or after route-idle-timeout. Log at Debug so it
-			// doesn't flood under high-rate orphan streams; the success
-			// log below makes the productive cleanup visible regardless.
-			sess.logger.Debug("orphan delete RPC failed (PLC may have already reaped the handle)",
+			// 0x714 NotifyHandleInvalid = expected (PLC already reaped via
+			// route-idle-timeout, reboot, or prior cleanup pass). Log Debug
+			// so it doesn't flood under high-rate orphan streams.
+			// Every other code (transport, auth, timeout, marshaling,
+			// protocol mismatch) is a real failure operators need to see;
+			// surface at Warn.
+			if errors.Is(err, ReturnCodeDeviceNotifyHandleInvalid) {
+				sess.logger.Debug("orphan delete RPC: handle already invalid (expected after PLC reap)",
+					"handle", handle, "error", err)
+				return
+			}
+			sess.logger.Warn("orphan delete RPC failed",
 				"handle", handle, "error", err)
 			return
 		}
