@@ -107,3 +107,52 @@ func TestWithOnSymbolVersionChanged(t *testing.T) {
 		t.Errorf("callback received %q, want %q", got, ReasonSymbolVersionInvalid)
 	}
 }
+
+func TestWithSkipRouteRegistration(t *testing.T) {
+	s := &Session{route: &routeManager{}}
+
+	// Without the option: shouldSkip is true only because name is empty.
+	if !s.route.shouldSkip() {
+		t.Fatal("zero-value routeManager should skip (empty name)")
+	}
+
+	// With WithRoute set, shouldSkip becomes false.
+	WithRoute("name", "user", "pass")(s)
+	if s.route.shouldSkip() {
+		t.Errorf("after WithRoute, shouldSkip = true, want false")
+	}
+
+	// WithSkipRouteRegistration overrides — still skip even with WithRoute.
+	WithSkipRouteRegistration()(s)
+	if !s.route.skipRegistration {
+		t.Errorf("skipRegistration = false, want true")
+	}
+	if !s.route.shouldSkip() {
+		t.Errorf("shouldSkip = false after WithSkipRouteRegistration, want true")
+	}
+	if s.route.name != "name" {
+		t.Errorf("WithSkipRouteRegistration should not clear name, got %q", s.route.name)
+	}
+}
+
+func TestRouteManager_ShouldSkip(t *testing.T) {
+	tests := []struct {
+		name             string
+		routeName        string
+		skipRegistration bool
+		want             bool
+	}{
+		{"empty name → skip", "", false, true},
+		{"name set, no skip → register", "myroute", false, false},
+		{"name set + explicit skip → skip", "myroute", true, true},
+		{"empty name + explicit skip → skip", "", true, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &routeManager{name: tc.routeName, skipRegistration: tc.skipRegistration}
+			if got := r.shouldSkip(); got != tc.want {
+				t.Errorf("shouldSkip() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
