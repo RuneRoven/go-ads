@@ -63,10 +63,14 @@ func isLikelyMissingRoute(err error) bool {
 	return errors.Is(err, syscall.ECONNRESET)
 }
 
-// notificationHandler is the callback the recvWorker invokes when it decodes
+// NotificationHandler is the callback the recvWorker invokes when it decodes
 // a DeviceNotification packet. Session installs its handleNotification here;
-// raw Client consumers (web ADS browser, CLI tools) install their own.
-type notificationHandler func(ctx context.Context, handle uint32, timestamp uint64, content []byte)
+// raw Client consumers (web ADS browser, CLI tools, AMS routers) install
+// their own. ctx is the Client's internal worker context — observe Done()
+// to abort long-running handler work on Close. handle, timestamp, content
+// are the parsed notification fields (handle = PLC-assigned ID, timestamp =
+// Windows FILETIME, content = raw payload bytes).
+type NotificationHandler func(ctx context.Context, handle uint32, timestamp uint64, content []byte)
 
 // Client is the Beckhoff-equivalent thin RPC layer. One TCP connection, raw
 // AMS framing, request multiplexing via InvokeID, listen + transmit + recv
@@ -93,7 +97,7 @@ type Client struct {
 	// arrives. nil means raw Client (no dispatch). Session installs a
 	// closure pointing at its handleNotification method.
 	notifyMu sync.RWMutex
-	notify   notificationHandler
+	notify   NotificationHandler
 
 	// ondrop is invoked once on listen / transmitWorker error. nil means
 	// raw Client (no auto-recovery — caller observes via ErrTransportClosed
@@ -201,7 +205,7 @@ func WithClientRequestTimeout(d time.Duration) ClientOption {
 // packets. Session installs its own handler internally; raw Client consumers
 // (CLI, web ADS browser) install their own to receive notifications, or
 // leave nil to drop them silently.
-func WithNotificationHandler(fn notificationHandler) ClientOption {
+func WithNotificationHandler(fn NotificationHandler) ClientOption {
 	return func(c *Client) {
 		c.notify = fn
 	}
@@ -210,7 +214,7 @@ func WithNotificationHandler(fn notificationHandler) ClientOption {
 // SetNotificationHandler installs (or replaces) the callback for inbound
 // DeviceNotification packets. nil disables dispatch (packets dropped after
 // a Debug log entry). Concurrent-safe; the recvWorker reads under RLock.
-func (c *Client) SetNotificationHandler(fn notificationHandler) {
+func (c *Client) SetNotificationHandler(fn NotificationHandler) {
 	c.notifyMu.Lock()
 	c.notify = fn
 	c.notifyMu.Unlock()
