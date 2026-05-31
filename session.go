@@ -433,7 +433,8 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	// Route registration is UDP-based but needs goroutines running for the probe
 	// (which sends an ADS command over TCP). If route is registered, TCP reconnect
 	// is needed because PLC may close connections from previously-unknown NetIDs.
-	if sess.route.name != "" {
+	// shouldSkip() covers both "no WithRoute set" and explicit WithSkipRouteRegistration.
+	if !sess.route.shouldSkip() {
 		registered, err := sess.ensureRouteOnConnect(ctx)
 		if err != nil {
 			// WithRoute is an explicit caller requirement — silently swallowing
@@ -1169,7 +1170,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 // Returns a non-nil error only if registration was attempted and failed critically
 // (requiring a TCP reset / retry).
 func (sess *Session) ensureRoute() error {
-	if sess.route.name == "" {
+	if sess.route.shouldSkip() {
 		return nil
 	}
 	if sess.isClosed() {

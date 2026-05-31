@@ -221,5 +221,13 @@ type routeManager struct {
 	username               string
 	password               secret
 	forceRouteRegistration bool
+	skipRegistration       bool // set via WithSkipRouteRegistration — caller manages routes externally
 	routeProbeFailures     atomic.Int32
+}
+
+// shouldSkip reports whether route registration must be bypassed entirely.
+// True when no route name was configured (default) or when the caller
+// explicitly opted out via WithSkipRouteRegistration.
+func (r *routeManager) shouldSkip() bool {
+	return r.skipRegistration || r.name == ""
 }

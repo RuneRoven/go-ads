@@ -90,6 +90,22 @@ func WithRoute(routeName, username, password string) SessionOption {
 	}
 }
 
+// WithSkipRouteRegistration explicitly disables AMS route registration during
+// Connect() and Reconnect(). Use when routes are managed externally:
+//   - Pre-registered on the PLC via TC3 UI / TC2 properties or AdsTool
+//   - Owned by a local AMS router daemon (AmsRouterDaemon) that the Session
+//     connects to instead of the PLC directly
+//
+// Equivalent to omitting WithRoute, but explicit: callers may still invoke
+// WithRoute for documentation/auditing yet override here without changing
+// the rest of the option chain. Bypasses both probe and AddRoute so no UDP
+// traffic to port 48899 is generated.
+func WithSkipRouteRegistration() SessionOption {
+	return func(s *Session) {
+		s.route.skipRegistration = true
+	}
+}
+
 // BackoffConfig controls reconnect timing behavior.
 // Reconnection uses stepped intervals: fast retries first (for network blips),
 // then progressively slower intervals to avoid overwhelming the PLC.
