@@ -239,6 +239,29 @@ If you see `"notification dropped (channel full)"` warnings, either:
 2. Consume notifications faster (dedicated drain goroutine)
 3. Reduce the notification cycle time on the PLC side
 
+## Limitations
+
+### One Session per source IP per target PLC
+
+TwinCAT PLCs enforce a **single active TCP connection per source IP** on their ADS server (TCP/48898). This is a server-side constraint outside the library's control. Documented in [Beckhoff/ADS#49](https://github.com/Beckhoff/ADS/issues/49), [Beckhoff/ADS#72](https://github.com/Beckhoff/ADS/issues/72), [jisotalo/ads-client#47](https://github.com/jisotalo/ads-client/issues/47).
+
+What this means concretely:
+
+- ✅ **One process, one Session to one PLC** — supported, the normal case.
+- ✅ **One process, multiple Sessions to *different* PLCs** — supported (each PLC sees one client).
+- ❌ **Multiple Sessions to the *same* PLC from the same host IP** — second Session's TCP gets reset; if it sends `AddRoute` UDP, the first Session's existing TCP also gets closed by the PLC. This holds regardless of distinct AMS NetIDs, distinct AMS ports, distinct route names, or whether routes are pre-registered.
+- ❌ **Multiple processes on the same host, each opening a Session to the same PLC** — same constraint; whichever process connects last wins.
+
+Workarounds for multi-process / multi-Session-same-PLC:
+
+1. **Distinct source IPs.** Deploy each process behind its own network namespace / container with bridge networking, so each has a unique IP from the PLC's perspective.
+2. **`WithLocalBindIP(ip)`** if the host has multiple NICs or IP aliases — pin each Session to a distinct local IP. Requires admin-configured network setup.
+3. **Local AMS router daemon** (Beckhoff's recommended pattern) — run [`Beckhoff.TwinCAT.Ads.TcpRouter`](https://www.nuget.org/packages/Beckhoff.TwinCAT.Ads.TcpRouter) or the open-source [AmsRouterDaemon](https://github.com/Beckhoff/ADS) on the host; client processes connect to `127.0.0.1:48898` and the daemon multiplexes a single connection to the PLC. The library does not bundle a router — it is a separate sidecar.
+
+### Notification handle limits
+
+Beckhoff documents ~550 notification handles per AMS port. The library does not enforce this cap; subscribing beyond it will fail at the PLC with `0x70F NotificationClient` or similar. Coalesce subscriptions per process or split across distinct AMS ports if you need more.
+
 ## Process image I/O (experimental)
 
 > **Warning:** Direct process image access bypasses the symbol table and writes raw bytes to I/O memory. Writing to the wrong offset can cause unexpected physical output changes (motors, valves, actuators). The PLC runtime may overwrite your changes on the next scan cycle. **For normal operation, use symbol-based access (`sess.ReadFromSymbol`/`sess.WriteToSymbol`).**
