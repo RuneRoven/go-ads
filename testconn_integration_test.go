@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -37,7 +38,11 @@ func setupConnectionWithDefaults(t *testing.T, d connDefaults) *Session {
 	}
 	routeUser := os.Getenv("ADS_ROUTE_USER")
 	routePass := os.Getenv("ADS_ROUTE_PASS")
-	if routeUser != "" && routePass != "" {
+	// ADS_SKIP_ROUTE_REGISTER=true → don't pass WithRoute → ensureRoute no-op.
+	// Requires route to be pre-registered on PLC. Used for multi-session tests
+	// where AddRoute UDP would terminate sibling TCP connections.
+	skipRouteReg := strings.EqualFold(os.Getenv("ADS_SKIP_ROUTE_REGISTER"), "true")
+	if !skipRouteReg && routeUser != "" && routePass != "" {
 		opts = append(opts, WithRoute(d.routeName, routeUser, routePass))
 	}
 
