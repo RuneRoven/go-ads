@@ -29,10 +29,28 @@ func WithHostIP(ip string) SessionOption {
 	}
 }
 
+// WithLocalBindIP forces the outbound TCP source IP. Default behavior (when
+// unset) lets the OS pick source IP via the routing table — usual case.
+// Used for multi-Session deployments on a host with IP aliases: each Session
+// pins to a distinct local IP so the PLC sees them as separate hosts and
+// allocates a TCP slot per source IP (TwinCAT enforces 1 TCP slot per
+// source IP, regardless of source AMS NetID — see Beckhoff/ADS #49 / #72).
+// The aliased IP must exist on a local interface before NewSession.
+func WithLocalBindIP(ip string) SessionOption {
+	return func(s *Session) {
+		s.localBindIP = ip
+	}
+}
+
 // WithLocalAMS sets the local (source) AMSAddress carried in outgoing ADS
 // headers. NetID defaults to auto-derivation from the local TCP source IP
-// when this option is omitted; Port defaults to 10500. AMS port semantics
-// match the wire protocol — any non-conflicting value works for a client.
+// when this option is omitted; Port defaults to a random value in the IANA
+// dynamic range 32768-49151 (see randomAMSPort). The AMS port is a logical
+// identifier inside the AMS header — it is NOT the TCP source port (which
+// the OS assigns ephemerally) and NOT the TCP destination port (always
+// 48898). Override with WithLocalAMS(AMSAddress{Port: N}) only when a
+// deployment needs a stable, predictable AMS port (e.g. PLC-side route
+// table pinning).
 func WithLocalAMS(local AMSAddress) SessionOption {
 	return func(s *Session) {
 		if local.NetID != [6]byte{} {

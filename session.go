@@ -32,6 +32,26 @@ func randomAMSPort() uint16 {
 	return uint16(minPort + rand.IntN(span)) //nolint:gosec // non-cryptographic port selection
 }
 
+// dialTCP opens the outbound TCP connection to sess.ip:sess.port honoring
+// sess.localBindIP if set. Used by Connect() and Reconnect() so both paths
+// share the same source-IP binding semantics. Default behavior (empty
+// localBindIP) lets the OS pick source IP via routing table — usual case.
+// Setting localBindIP supports multi-Session deployments on hosts with
+// IP aliases, where each Session pins to a distinct local IP so the PLC
+// sees them as separate hosts (one TCP slot per source IP — see Beckhoff
+// ADS #49 / #72).
+func (sess *Session) dialTCP() (net.Conn, error) {
+	dialer := net.Dialer{Timeout: sess.requestTimeout}
+	if sess.localBindIP != "" {
+		ip := net.ParseIP(sess.localBindIP)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid localBindIP %q", sess.localBindIP)
+		}
+		dialer.LocalAddr = &net.TCPAddr{IP: ip}
+	}
+	return dialer.Dial("tcp", net.JoinHostPort(sess.ip, strconv.Itoa(sess.port)))
+}
+
 // sessionLifecycle owns Session's lifecycle plumbing: cancellation context,
 // goroutine waitgroup, single-flight reconnect signaling, the explicit FSM
 // state + unified epoch counter, and the retry policy. Folded into session.go
@@ -128,9 +148,10 @@ type Session struct {
 	// TCP socket + request multiplexing + listen/transmit channels.
 	tx *transport
 
-	target     AMSAddress
-	source     AMSAddress
-	callbackIP string // IP PLC uses to reach us (for Docker/VPN; set via WithHostIP)
+	target       AMSAddress
+	source       AMSAddress
+	callbackIP   string // IP PLC uses to reach us (for Docker/VPN; set via WithHostIP)
+	localBindIP  string // Force outbound TCP source IP (multi-session per host; set via WithLocalBindIP)
 
 	// symbol cache + data-type table + discovery-mode flags.
 	cache *symbolCache
@@ -284,7 +305,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		sess.target.NetID = [6]byte{127, 0, 0, 1, 1, 1}
 		sess.ip = "127.0.0.1"
 	}
-	tcpConn, err := net.DialTimeout("tcp", net.JoinHostPort(sess.ip, strconv.Itoa(sess.port)), sess.requestTimeout)
+	tcpConn, err := sess.dialTCP()
 	if err != nil {
 		sess.logger.Error("Error connecting", "error", err)
 		return err
@@ -1342,7 +1363,7 @@ func (sess *Session) tearDownAndReset(resetFeatureFlags bool) {
 // Re-checks closed before waitGroup.Add(2) to prevent the sync.WaitGroup
 // misuse race.
 func (sess *Session) dialAndStart() error {
-	newConn, err := net.DialTimeout("tcp", net.JoinHostPort(sess.ip, strconv.Itoa(sess.port)), sess.requestTimeout)
+	newConn, err := sess.dialTCP()
 	if err != nil {
 		return err
 	}
