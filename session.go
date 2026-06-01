@@ -524,6 +524,26 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		return false, fmt.Errorf("connection closed")
 	}
 
+	// Disarm ondrop for the entire ensureRouteOnConnect call. PLC RST
+	// during the probe (typical when the route is missing or stale) would
+	// otherwise fire sess.triggerReconnect via the listen goroutine's
+	// callOnDrop, spawning a Reconnect goroutine that races our own
+	// AddRoute/redial path on sess.client / tx.connection / lifecycle.ctx
+	// (observed as concurrent "registering route" + "FSM invalid
+	// transition" log noise during cold-start when the PLC route doesn't
+	// yet match the current source IP). Re-armed at the end of the
+	// function via defer; intermediate dialAndStart calls in the retry
+	// path also re-arm on each new Client they create, but we override
+	// those back to nil for the duration of this routine.
+	if oldClient := sess.client.Load(); oldClient != nil {
+		oldClient.SetOnDrop(nil)
+	}
+	defer func() {
+		if c := sess.client.Load(); c != nil {
+			c.SetOnDrop(sess.triggerReconnect)
+		}
+	}()
+
 	// Force mode → always register
 	if sess.route.forceRouteRegistration {
 		sess.logger.Info("registering route (force mode)")
@@ -549,14 +569,6 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 	if isProbeRetryable(probeErr) {
 		sess.logger.Info("route probe failed at transport layer, retrying once before AddRoute",
 			"error", probeErr, "delay", routeProbeRetryDelay)
-		// Disarm ondrop on the old Client before tearing down its TCP.
-		// Otherwise listen's RST handler races to fire sess.triggerReconnect
-		// (the registered ondrop) and spawns a Reconnect goroutine that
-		// then competes with this retry path on sess.client / tx state.
-		// dialAndStart re-wires ondrop on the new Client before startWorkers.
-		if oldClient := sess.client.Load(); oldClient != nil {
-			oldClient.SetOnDrop(nil)
-		}
 		// ctx-aware sleep: honor caller cancellation. Plain time.Sleep
 		// would block the full delay even if the caller has given up.
 		select {
@@ -567,6 +579,12 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		sess.tearDownAndReset(false)
 		if dialErr := sess.dialAndStart(); dialErr != nil {
 			return false, fmt.Errorf("redial during route probe retry: %w", dialErr)
+		}
+		// dialAndStart re-armed ondrop on the new Client; disarm again
+		// for the remainder of ensureRouteOnConnect (the deferred
+		// re-arm at function exit restores the production handler).
+		if c := sess.client.Load(); c != nil {
+			c.SetOnDrop(nil)
 		}
 		if sess.isClosed() {
 			return false, fmt.Errorf("connection closed during route probe retry")
