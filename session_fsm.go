@@ -8,7 +8,7 @@ import (
 )
 
 // SessionState is the explicit FSM state for a Session. See
-// specs/09-fsm-design.md for the full state diagram, event taxonomy, and
+// docs/archive/specs/09-fsm-design.md for the full state diagram, event taxonomy, and
 // transition table.
 //
 // The FSM is the source of truth for closed and reconnecting concerns.
@@ -48,7 +48,7 @@ func (s SessionState) String() string {
 	}
 }
 
-// allowedTransitions encodes the transition table from specs/09-fsm-design.md.
+// allowedTransitions encodes the transition table from docs/archive/specs/09-fsm-design.md.
 // A nil entry means the from-state has no legal transitions out (terminal).
 var allowedTransitions = map[SessionState]map[SessionState]struct{}{
 	SessionStateConstructed: {

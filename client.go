@@ -12,7 +12,7 @@
 //   - Session (session.go): a managed wrapper that adds the symbol cache,
 //     name-based read/write, persistent notifications with auto-resubscribe
 //     after a reconnect, auto-reconnect with backoff, lifecycle callbacks,
-//     and an explicit FSM (specs/09-fsm-design.md). Construct via
+//     and an explicit FSM (docs/archive/specs/09-fsm-design.md). Construct via
 //     NewSession + Connect.
 //
 // Session does NOT embed *Client; pick a layer at construction time. Raw
@@ -116,7 +116,7 @@ type Client struct {
 
 // Dial opens one TCP connection to ip:port, configures TCP keepalive, and
 // spawns the listen / transmit / recvWorker goroutines. Returns a usable
-// Client. See specs/09-fsm-design.md "Layer 2: Client (raw RPC)".
+// Client. See docs/archive/specs/09-fsm-design.md "Layer 2: Client (raw RPC)".
 func Dial(
 	ip string,
 	port int,

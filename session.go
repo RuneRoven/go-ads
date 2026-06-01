@@ -68,7 +68,7 @@ type sessionLifecycle struct {
 	closedOnce sync.Once // guards close(closedCh) so Close() and Reconnect-exhaustion can both fire safely
 
 	// state is the explicit FSM state plus the unified epoch counter
-	// (specs/09-fsm-design.md). FSM is the source of truth for closed and
+	// (docs/archive/specs/09-fsm-design.md). FSM is the source of truth for closed and
 	// reconnecting. epoch replaces the previous cache.generation and
 	// reconnectGeneration counters and bumps on every Connected entry plus
 	// on user-driven cache swaps that don't (yet) transition through
@@ -133,7 +133,7 @@ func (s secret) LogValue() slog.Value {
 // LoadDataTypes, RefreshSymbols, CheckSymbolVersion, AddRoute, Connect,
 // Close, Reconnect, IsDisconnected.
 //
-// See specs/09-fsm-design.md for the full layered architecture.
+// See docs/archive/specs/09-fsm-design.md for the full layered architecture.
 type Session struct {
 	ip   string
 	port int
