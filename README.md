@@ -260,7 +260,7 @@ Workarounds for multi-process / multi-Session-same-PLC:
 
 ### Notification handle limits
 
-Beckhoff documents ~550 notification handles per AMS port. The library does not enforce this cap; subscribing beyond it will fail at the PLC with `0x70F NotificationClient` or similar. Coalesce subscriptions per process or split across distinct AMS ports if you need more.
+Beckhoff documents ~550 notification handles per AMS port. The library does not enforce this cap; subscribing beyond it will fail at the PLC with `0x716 NoMoreHandles` ("no more notification handles available"). Coalesce subscriptions per process or split across distinct AMS ports if you need more.
 
 ## Process image I/O (experimental)
 

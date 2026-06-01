@@ -339,7 +339,7 @@ func TestSymbolVersionAutoReload_CapExhaustion(t *testing.T) {
 // Strategy: SymbolVersionClose
 // =============================================================================
 
-// TestSymbolVersionClose_OnDetection — any 0x711/0x720/0x745 closes session immediately.
+// TestSymbolVersionClose_OnDetection — any stale-detect code (0x710/0x711/0x714/0x705/...) closes session immediately.
 //
 // Expected: onDisconnect fires, notification channel closes, subsequent ops
 // return ErrDisconnected.
