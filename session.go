@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -471,9 +473,55 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	return nil
 }
 
+// routeProbeRetryDelay is how long we wait between the first probe attempt
+// and the redial-retry. Picked to give a TwinCAT PLC time to release a TCP
+// slot held by a recently-closed connection from the same source IP
+// (~500ms is empirically enough on TC3 4024.x; tunable if needed).
+const routeProbeRetryDelay = 500 * time.Millisecond
+
+// isProbeRetryable reports whether a route-probe error is transient enough
+// to warrant a TCP redial + probe retry before falling back to AddRoute.
+//
+// PLC RST mid-probe can mean either "route is actually missing" (PLC's
+// AmsRouter rejects unknown source NetID) OR "PLC slot is still bound to
+// a previous TCP from same source IP" (transient — clears once the stale
+// slot times out). Both surface identically as ErrTransportClosed /
+// wrapped io.EOF / ECONNRESET / context deadline. Without retry, the
+// transient case spuriously fires AddRoute, which on TC3 also evicts any
+// concurrent sibling TCP from the same source IP (see README §Limitations,
+// Beckhoff/ADS #49). One retry distinguishes:
+//
+//   - retry succeeds → route exists, slot conflict was transient → skip AddRoute
+//   - retry also fails → real missing route → register
+//
+// Returns false for ADS-level errors (e.g., ReturnCodeRouterNotInitialized,
+// concrete protocol-level rejection), since those indicate something more
+// specific than transport flap and re-dial won't change the outcome.
+func isProbeRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrTransportClosed) || errors.Is(err, io.EOF) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) && errors.Is(netErr.Err, syscall.ECONNRESET) {
+		return true
+	}
+	return false
+}
+
 // ensureRouteOnConnect probes the PLC and registers a route if needed during Connect().
 // Returns (registered bool, err error) where registered=true means a route was added
 // and the caller should TCP-reconnect.
+//
+// On transport-level probe failure (RST/EOF/timeout), redials the TCP
+// connection and retries the probe once before falling back to AddRoute.
+// This avoids spurious route registration when the PLC RST'd due to a
+// transient slot conflict rather than a missing route.
 func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool, err error) {
 	if sess.isClosed() {
 		return false, fmt.Errorf("connection closed")
@@ -486,8 +534,8 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		return err == nil, err
 	}
 
-	// Probe: try a lightweight ADS command to see if route exists
-	_, probeErr := sess.client.Load().GetSymbolVersion(ctx)
+	// First probe attempt
+	probeErr := sess.probeRoute(ctx)
 	if probeErr == nil {
 		sess.logger.Info("route already exists on PLC, skipping registration")
 		sess.route.routeProbeFailures.Store(0)
@@ -498,7 +546,30 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		return false, fmt.Errorf("connection closed during route probe")
 	}
 
-	// Probe failed → register with credentials
+	// Transport-level failure may be transient (PLC slot conflict from
+	// previous TCP not yet released). Redial + retry probe once before
+	// concluding the route is missing.
+	if isProbeRetryable(probeErr) {
+		sess.logger.Info("route probe failed at transport layer, retrying once before AddRoute",
+			"error", probeErr, "delay", routeProbeRetryDelay)
+		time.Sleep(routeProbeRetryDelay)
+		sess.tearDownAndReset(false)
+		if dialErr := sess.dialAndStart(); dialErr != nil {
+			return false, fmt.Errorf("redial during route probe retry: %w", dialErr)
+		}
+		if sess.isClosed() {
+			return false, fmt.Errorf("connection closed during route probe retry")
+		}
+		retryErr := sess.probeRoute(ctx)
+		if retryErr == nil {
+			sess.logger.Info("route already exists on PLC (confirmed after retry)")
+			sess.route.routeProbeFailures.Store(0)
+			return false, nil
+		}
+		probeErr = fmt.Errorf("probe failed after retry: %w", retryErr)
+	}
+
+	// Definite probe failure → register
 	sess.route.routeProbeFailures.Add(1)
 	sess.logger.Info("route probe failed, registering route", "error", probeErr)
 	err = sess.AddRoute(ctx, sess.route.name, sess.route.username, string(sess.route.password))
@@ -506,6 +577,14 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		return false, err
 	}
 	return true, nil
+}
+
+// probeRoute sends a lightweight ADS command (GetSymbolVersion) to verify
+// the PLC accepts our source NetID. Returns nil if the round-trip succeeds
+// (route is valid) or the underlying error otherwise.
+func (sess *Session) probeRoute(ctx context.Context) error {
+	_, err := sess.client.Load().GetSymbolVersion(ctx)
+	return err
 }
 
 // handleStaleDetection runs the configured online-change strategy when a

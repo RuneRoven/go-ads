@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1027,5 +1031,41 @@ func TestAutoReload_NoOldHandles_SkipsDelete(t *testing.T) {
 
 	if got := deleteCalls.Load(); got != 0 {
 		t.Errorf("SumDelete called %d times with empty active set, want 0", got)
+	}
+}
+
+// TestIsProbeRetryable_TransportLevel verifies the predicate identifies
+// transport-level probe errors (RST/EOF/timeout/closed) as retryable, so
+// ensureRouteOnConnect's redial-retry path engages on transient PLC slot
+// conflicts instead of spuriously firing AddRoute.
+func TestIsProbeRetryable_TransportLevel(t *testing.T) {
+	connResetOp := &net.OpError{
+		Op:  "read",
+		Net: "tcp",
+		Err: &net.OpError{Err: syscall.ECONNRESET},
+	}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil → not retryable", nil, false},
+		{"ErrTransportClosed", ErrTransportClosed, true},
+		{"wrapped ErrTransportClosed", fmt.Errorf("send: %w", ErrTransportClosed), true},
+		{"bare io.EOF", io.EOF, true},
+		{"wrapped io.EOF", fmt.Errorf("recv: %w", io.EOF), true},
+		{"context.DeadlineExceeded", context.DeadlineExceeded, true},
+		{"wrapped DeadlineExceeded", fmt.Errorf("probe: %w", context.DeadlineExceeded), true},
+		{"bare ECONNRESET", syscall.ECONNRESET, true},
+		{"wrapped net.OpError with ECONNRESET", fmt.Errorf("listen: %w", connResetOp), true},
+		{"unrelated error → not retryable", errors.New("ads: ReturnCodeRouterNotInitialized"), false},
+		{"context.Canceled → not retryable", context.Canceled, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isProbeRetryable(tc.err); got != tc.want {
+				t.Errorf("isProbeRetryable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
