@@ -371,7 +371,7 @@ func TestAddSymbolNotification_TOCTOURecheck(t *testing.T) {
 // when the last subscription dies notificationChannel is reset to nil.
 //
 // Variant (handle_invalid): when the PLC returns ReturnCodeDeviceNotifyHandleInvalid
-// (0x745), Session.DeleteDeviceNotification surfaces the error to the caller
+// (0x714), Session.DeleteDeviceNotification surfaces the error to the caller
 // and does NOT clean up state — only the success path clears state. This
 // preserves caller signal that something was wrong.
 //
@@ -436,7 +436,7 @@ func TestDeleteDeviceNotification_ClearsState(t *testing.T) {
 		// a non-success code, the wrapper returns the error before running
 		// activeNotifications cleanup. So state survives the call.
 		// This is what production does today; if the contract changes to
-		// treat 0x745 as success-equivalent (matching SumDeleteDeviceNotification),
+		// treat 0x714 as success-equivalent (matching SumDeleteDeviceNotification),
 		// this assertion will surface the divergence.
 		srv := startScriptableServer(t)
 		defer srv.stop()
@@ -459,7 +459,7 @@ func TestDeleteDeviceNotification_ClearsState(t *testing.T) {
 		}
 		err = sess.DeleteDeviceNotification(context.Background(), h)
 		if err == nil {
-			t.Errorf("DeleteDeviceNotification with 0x745: err = nil, want non-nil (Session wrapper surfaces RPC error)")
+			t.Errorf("DeleteDeviceNotification with 0x714: err = nil, want non-nil (Session wrapper surfaces RPC error)")
 		}
 	})
 }
@@ -644,7 +644,7 @@ func TestResubscribeRetry_UpToMax(t *testing.T) {
 // counting + logging behavior with mixed PLC return codes. The helper
 // relies on Session.SumDeleteDeviceNotification → Client.SumDeleteDeviceNotification
 // for the actual PLC call; without a stub we cannot drive the mixed
-// success/0x745/error response.
+// success/0x714/error response.
 //
 // We at least exercise the empty-handles path here (zero items returns 0).
 //

@@ -786,7 +786,7 @@ func (sess *Session) autoReloadOnStaleDetection(reason Reason) {
 //
 // Transport is alive at this point — PLC just sent us a stale-cache code
 // (0x711/0x705/0x710/...) over the active connection. bestEffortDelete
-// treats 0x745 (NotifyHandleInvalid) as success-equivalent so any handles
+// treats 0x714 (NotifyHandleInvalid) as success-equivalent so any handles
 // the PLC already auto-invalidated from the online-change don't error.
 func (sess *Session) reloadSymbolsAndResubscribe() error {
 	// Snapshot old handles + bump lastSubscribeNs so concurrent
@@ -1203,7 +1203,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		// Transport is fully restored. Before re-subscribing, issue a best-
 		// effort delete for the pre-reconnect handles snapshotted above.
 		// PLC may already have reaped them (route-idle-timeout or PLC reboot)
-		// — bestEffortDelete treats 0x745 NotifyHandleInvalid as success-
+		// — bestEffortDelete treats 0x714 NotifyHandleInvalid as success-
 		// equivalent, so already-aged handles don't error. Clear savedHandles
 		// after the first successful pass so a later retry iteration (after
 		// resubscribe failure → resetForRetry → loop) doesn't re-fire on an
