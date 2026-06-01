@@ -160,31 +160,48 @@ func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32
 
 // SumDeleteDeviceNotification on Session wraps the raw Client RPC with
 // notifications.lock cleanup. Returns the per-handle ReturnCode slice from the
-// PLC. Successfully deleted handles (or handle-invalid, treated as
-// success-equivalent) are removed from activeNotifications.
+// PLC. Successfully deleted handles (or handle-invalid / client-unknown,
+// treated as success-equivalent per isBestEffortDeleteSuccess) are removed
+// from activeNotifications.
+//
+// When the underlying Client returns a partial-codes-plus-error result —
+// e.g., the per-handle fallback short-circuits on transport failure mid-
+// batch — the codes processed so far ARE still flushed from
+// activeNotifications, and both the partial slice and the error are
+// surfaced to the caller. This keeps in-memory state coherent with what
+// the PLC actually saw, rather than leaving phantom entries that would
+// trigger duplicate-cleanup loops on the next reconnect.
 func (sess *Session) SumDeleteDeviceNotification(ctx context.Context, handles []uint32) ([]ReturnCode, error) {
-	errors, err := sess.client.Load().SumDeleteDeviceNotification(ctx, handles)
-	if err != nil {
-		return nil, err
-	}
-	if len(errors) == 0 {
-		return errors, nil
+	codes, rpcErr := sess.client.Load().SumDeleteDeviceNotification(ctx, handles)
+	if len(codes) == 0 {
+		return codes, rpcErr
 	}
 	sess.notifications.lock.Lock()
-	for i, h := range handles {
-		if isBestEffortDeleteSuccess(errors[i]) {
-			if entry, ok := sess.notifications.activeNotifications[h]; ok && entry.Sym != nil {
-				sess.removeNotificationConfig(entry.Sym.FullName)
-			}
-			delete(sess.notifications.activeNotifications, h)
-			sess.logger.Info("batch deleted notification handle", "handle", h, "errorCode", uint32(errors[i]))
+	// Flush only handles for which we have a code. On partial-codes-plus-
+	// error, len(codes) < len(handles) — leave the untried handles in
+	// activeNotifications; the caller's retry / reconnect path picks them
+	// up. min() guards against any future signature change where codes
+	// might exceed handles.
+	limit := len(codes)
+	if len(handles) < limit {
+		limit = len(handles)
+	}
+	for i := 0; i < limit; i++ {
+		if !isBestEffortDeleteSuccess(codes[i]) {
+			continue
 		}
+		h := handles[i]
+		if entry, ok := sess.notifications.activeNotifications[h]; ok && entry.Sym != nil {
+			sess.removeNotificationConfig(entry.Sym.FullName)
+		}
+		delete(sess.notifications.activeNotifications, h)
+		sess.logger.Info("batch deleted notification handle", "handle", h, "errorCode", uint32(codes[i]))
 	}
 	if len(sess.notifications.activeNotifications) == 0 {
 		sess.notifications.notificationChannel = nil
 	}
 	sess.notifications.lock.Unlock()
-	return errors, nil
+	return codes, rpcErr
 }
 
 const (
@@ -392,10 +409,31 @@ const (
 //                               handles we had are implicitly gone too.
 // In all three cases the handle is no longer consuming PLC resources,
 // which is the only goal of best-effort cleanup paths.
+//
+// Note: Beckhoff's official AdsLib does NOT treat 0x715 as cleanup-success.
+// This library does, because go-ads's reconnect path frequently hits
+// 0x715 when PLC drops the client identity tied to the just-severed TCP,
+// and treating it as failure produces misleading WARN spam during normal
+// recovery. Net effect on cleanup correctness is identical: in both cases
+// the PLC handle is gone.
 func isBestEffortDeleteSuccess(code ReturnCode) bool {
 	return code == ReturnCodeNoErrors ||
 		code == ReturnCodeDeviceNotifyHandleInvalid ||
 		code == ReturnCodeDeviceClientUnknown
+}
+
+// isBestEffortDeleteSuccessErr is the error-wrapped variant of
+// isBestEffortDeleteSuccess for call sites that receive a Go error rather
+// than a bare ReturnCode (e.g., orphan-Delete's RPC return). Unwraps the
+// error chain via errors.Is for ReturnCodeDeviceNotifyHandleInvalid and
+// ReturnCodeDeviceClientUnknown — the two codes that mean "PLC has
+// nothing of yours to free".
+func isBestEffortDeleteSuccessErr(err error) bool {
+	if err == nil {
+		return true
+	}
+	return errors.Is(err, ReturnCodeDeviceNotifyHandleInvalid) ||
+		errors.Is(err, ReturnCodeDeviceClientUnknown)
 }
 
 // tryOrphanDelete schedules an async best-effort Delete of an unknown
@@ -515,7 +553,7 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 			// Every other code (transport, auth, timeout, marshaling,
 			// protocol mismatch) is a real failure operators need to see;
 			// surface at Warn.
-			if errors.Is(err, ReturnCodeDeviceNotifyHandleInvalid) || errors.Is(err, ReturnCodeDeviceClientUnknown) {
+			if isBestEffortDeleteSuccessErr(err) {
 				sess.logger.Debug("orphan delete RPC: handle already gone PLC-side (expected)",
 					"handle", handle, "error", err)
 				return

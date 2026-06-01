@@ -118,3 +118,33 @@ func TestEncodeAMSHeader_WireFormat(t *testing.T) {
 		t.Errorf("invokeID bytes wrong: %x %x %x %x", b[28], b[29], b[30], b[31])
 	}
 }
+
+func TestParseAMSHeader_RejectsOversizedLength(t *testing.T) {
+	h := AMSHeader{
+		Target:   AMSAddress{NetID: [6]byte{1, 2, 3, 4, 1, 1}, Port: 851},
+		Source:   AMSAddress{NetID: [6]byte{5, 6, 7, 8, 1, 1}, Port: 40000},
+		Command:  CommandIDRead,
+		State:    4,
+		Length:   MaxAMSPayloadSize + 1, // one byte over the cap
+		InvokeID: 1,
+	}
+	bad := EncodeAMSHeader(h)
+	if _, err := ParseAMSHeader(bad); err == nil {
+		t.Errorf("ParseAMSHeader should reject Length=%d > MaxAMSPayloadSize=%d", h.Length, MaxAMSPayloadSize)
+	}
+}
+
+func TestParseAMSHeader_AcceptsExactCapLength(t *testing.T) {
+	h := AMSHeader{
+		Target:   AMSAddress{NetID: [6]byte{1, 2, 3, 4, 1, 1}, Port: 851},
+		Source:   AMSAddress{NetID: [6]byte{5, 6, 7, 8, 1, 1}, Port: 40000},
+		Command:  CommandIDRead,
+		State:    4,
+		Length:   MaxAMSPayloadSize, // exact cap is allowed
+		InvokeID: 1,
+	}
+	ok := EncodeAMSHeader(h)
+	if _, err := ParseAMSHeader(ok); err != nil {
+		t.Errorf("ParseAMSHeader rejected exact-cap Length=%d: %v", h.Length, err)
+	}
+}
