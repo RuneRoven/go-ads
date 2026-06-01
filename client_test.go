@@ -563,7 +563,7 @@ func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 	conn.tx.activeRequestLock.Unlock()
 
 	// Build AMS header + data
-	header := amsHeader{
+	header := AMSHeader{
 		Target:    AMSAddress{},
 		Source:    AMSAddress{},
 		Command:   CommandIDRead,
@@ -599,7 +599,7 @@ func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
 
 	// No registered channels — should not panic
-	header := amsHeader{
+	header := AMSHeader{
 		Command:  CommandIDRead,
 		State:    5,
 		Length:   2,
