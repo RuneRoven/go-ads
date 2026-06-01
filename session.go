@@ -479,20 +479,25 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 // (~500ms is empirically enough on TC3 4024.x; tunable if needed).
 const routeProbeRetryDelay = 500 * time.Millisecond
 
-// isProbeRetryable reports whether a route-probe error is transient enough
-// to warrant a TCP redial + probe retry before falling back to AddRoute.
+// isProbeRetryable reports whether a route-probe error is a transport-level
+// flap worth a TCP redial + probe retry before falling back to AddRoute.
 //
 // PLC RST mid-probe can mean either "route is actually missing" (PLC's
 // AmsRouter rejects unknown source NetID) OR "PLC slot is still bound to
 // a previous TCP from same source IP" (transient — clears once the stale
 // slot times out). Both surface identically as ErrTransportClosed /
-// wrapped io.EOF / ECONNRESET / context deadline. Without retry, the
-// transient case spuriously fires AddRoute, which on TC3 also evicts any
-// concurrent sibling TCP from the same source IP (see README §Limitations,
-// Beckhoff/ADS #49). One retry distinguishes:
+// wrapped io.EOF / ECONNRESET. Without retry, the transient case spuriously
+// fires AddRoute, which on TC3 also evicts any concurrent sibling TCP from
+// the same source IP (see README §Limitations, Beckhoff/ADS #49). One
+// retry distinguishes:
 //
 //   - retry succeeds → route exists, slot conflict was transient → skip AddRoute
 //   - retry also fails → real missing route → register
+//
+// context.DeadlineExceeded is INTENTIONALLY excluded: that signals the
+// caller's Connect ctx expired, not a transient PLC slot conflict. Retrying
+// would burn the caller's already-expired deadline through a 500ms sleep,
+// a redial, and a doomed second probe before surfacing the original error.
 //
 // Returns false for ADS-level errors (e.g., ReturnCodeRouterNotInitialized,
 // concrete protocol-level rejection), since those indicate something more
@@ -501,14 +506,10 @@ func isProbeRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, ErrTransportClosed) || errors.Is(err, io.EOF) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, ErrTransportClosed) || errors.Is(err, io.EOF) {
 		return true
 	}
 	if errors.Is(err, syscall.ECONNRESET) {
-		return true
-	}
-	var netErr *net.OpError
-	if errors.As(err, &netErr) && errors.Is(netErr.Err, syscall.ECONNRESET) {
 		return true
 	}
 	return false
@@ -552,7 +553,21 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 	if isProbeRetryable(probeErr) {
 		sess.logger.Info("route probe failed at transport layer, retrying once before AddRoute",
 			"error", probeErr, "delay", routeProbeRetryDelay)
-		time.Sleep(routeProbeRetryDelay)
+		// Disarm ondrop on the old Client before tearing down its TCP.
+		// Otherwise listen's RST handler races to fire sess.triggerReconnect
+		// (the registered ondrop) and spawns a Reconnect goroutine that
+		// then competes with this retry path on sess.client / tx state.
+		// dialAndStart re-wires ondrop on the new Client before startWorkers.
+		if oldClient := sess.client.Load(); oldClient != nil {
+			oldClient.SetOnDrop(nil)
+		}
+		// ctx-aware sleep: honor caller cancellation. Plain time.Sleep
+		// would block the full delay even if the caller has given up.
+		select {
+		case <-time.After(routeProbeRetryDelay):
+		case <-ctx.Done():
+			return false, fmt.Errorf("route probe retry aborted: %w", ctx.Err())
+		}
 		sess.tearDownAndReset(false)
 		if dialErr := sess.dialAndStart(); dialErr != nil {
 			return false, fmt.Errorf("redial during route probe retry: %w", dialErr)
