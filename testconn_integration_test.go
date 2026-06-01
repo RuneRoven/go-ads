@@ -42,8 +42,21 @@ func setupConnectionWithDefaults(t *testing.T, d connDefaults) *Session {
 	// Requires route to be pre-registered on PLC. Used for multi-session tests
 	// where AddRoute UDP would terminate sibling TCP connections.
 	skipRouteReg := strings.EqualFold(os.Getenv("ADS_SKIP_ROUTE_REGISTER"), "true")
+	// Resolve effective route name:
+	//   1. ADS_ROUTE_NAME explicit override → use as-is
+	//   2. ADS_HOST_IP set → derive "go-ads-<ip>" so each source IP creates a
+	//      distinct PLC route entry. Avoids the duplicate-name collision
+	//      observed when the same host's IP changes (wifi↔ethernet, DHCP
+	//      lease) and a stale entry blocks new registrations.
+	//   3. Fall back to the connDefaults.routeName supplied by the caller.
+	routeName := d.routeName
+	if envName := os.Getenv("ADS_ROUTE_NAME"); envName != "" {
+		routeName = envName
+	} else if hostIP != "" {
+		routeName = "go-ads-" + strings.ReplaceAll(hostIP, ".", "-")
+	}
 	if !skipRouteReg && routeUser != "" && routePass != "" {
-		opts = append(opts, WithRoute(d.routeName, routeUser, routePass))
+		opts = append(opts, WithRoute(routeName, routeUser, routePass))
 	}
 
 	target, err := NewAMSAddress(targetAMS, uint16(targetPort))
