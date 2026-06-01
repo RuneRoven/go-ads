@@ -44,12 +44,8 @@ func randomAMSPort() uint16 {
 // ADS #49 / #72).
 func (sess *Session) dialTCP() (net.Conn, error) {
 	dialer := net.Dialer{Timeout: sess.requestTimeout}
-	if sess.localBindIP != "" {
-		ip := net.ParseIP(sess.localBindIP)
-		if ip == nil {
-			return nil, fmt.Errorf("invalid localBindIP %q", sess.localBindIP)
-		}
-		dialer.LocalAddr = &net.TCPAddr{IP: ip}
+	if sess.localBindIP != nil {
+		dialer.LocalAddr = &net.TCPAddr{IP: sess.localBindIP}
 	}
 	return dialer.Dial("tcp", net.JoinHostPort(sess.ip, strconv.Itoa(sess.port)))
 }
@@ -153,7 +149,7 @@ type Session struct {
 	target       AMSAddress
 	source       AMSAddress
 	callbackIP   string // IP PLC uses to reach us (for Docker/VPN; set via WithHostIP)
-	localBindIP  string // Force outbound TCP source IP (multi-session per host; set via WithLocalBindIP)
+	localBindIP  net.IP // Force outbound TCP source IP (multi-session per host; set via WithLocalBindIP). nil = OS default routing.
 
 	// symbol cache + data-type table + discovery-mode flags.
 	cache *symbolCache

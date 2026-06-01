@@ -563,28 +563,42 @@ func (sess *Session) bestEffortDeleteNotifications(ctx context.Context, handles 
 }
 
 // sumDeleteNotificationFallback deletes notifications individually when sum commands are not supported.
+// Two distinct error paths:
+//
+//   - PLC returned an ADS-level ReturnCode (handle-invalid, client-unknown,
+//     device-error, etc.) → stored in codes[i], loop continues. Caller's
+//     isBestEffortDeleteSuccess() reduces success codes.
+//   - Non-ReturnCode error (transport closed, ctx canceled, marshaling
+//     failure) → loop SHORT-CIRCUITS and returns the partial codes plus
+//     the wrapped error. Subsequent handles would hit the same transport
+//     condition; pushing on would only multiply the failure log spam and
+//     mask the root cause behind synthesized ReturnCodeDeviceError values.
 func (c *Client) sumDeleteNotificationFallback(ctx context.Context, handles []uint32) ([]ReturnCode, error) {
 	codes := make([]ReturnCode, len(handles))
 	for i, h := range handles {
 		err := c.DeleteDeviceNotification(ctx, h)
-		if err != nil {
-			var rc ReturnCode
-			if errors.As(err, &rc) {
-				codes[i] = rc
-			} else {
-				codes[i] = ReturnCodeDeviceError
-			}
-			// 0x714 / 0x715 = handle already gone PLC-side (typical after
-			// reconnect or in best-effort cleanup paths). Log Debug; the
-			// caller's reduction via isBestEffortDeleteSuccess still counts
-			// these as cleanup wins. Other codes = real failure → Warn.
-			if isBestEffortDeleteSuccess(codes[i]) {
-				c.logger.Debug("individual DeleteDeviceNotification: handle already gone PLC-side", "error", err, "handle", h, "code", codes[i])
-			} else {
-				c.logger.Warn("individual DeleteDeviceNotification failed in fallback", "error", err, "handle", h)
-			}
-		} else {
+		if err == nil {
 			codes[i] = ReturnCodeNoErrors
+			continue
+		}
+		var rc ReturnCode
+		if !errors.As(err, &rc) {
+			// Transport / ctx / non-ADS failure: don't synthesize a
+			// ReturnCode that would lie about the cause downstream. Short-
+			// circuit with the partial codes processed so far.
+			c.logger.Warn("individual DeleteDeviceNotification: transport-level failure, aborting fallback",
+				"error", err, "handle", h, "processed", i, "remaining", len(handles)-i)
+			return codes[:i], fmt.Errorf("sumDeleteNotificationFallback aborted at handle index %d: %w", i, err)
+		}
+		codes[i] = rc
+		// 0x714 / 0x715 = handle already gone PLC-side (typical after
+		// reconnect or in best-effort cleanup paths). Log Debug; the
+		// caller's reduction via isBestEffortDeleteSuccess still counts
+		// these as cleanup wins. Other codes = real failure → Warn.
+		if isBestEffortDeleteSuccess(codes[i]) {
+			c.logger.Debug("individual DeleteDeviceNotification: handle already gone PLC-side", "error", err, "handle", h, "code", codes[i])
+		} else {
+			c.logger.Warn("individual DeleteDeviceNotification failed in fallback", "error", err, "handle", h, "code", codes[i])
 		}
 	}
 	return codes, nil

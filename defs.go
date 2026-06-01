@@ -7,6 +7,14 @@ import (
 
 // AMSAddress identifies an ADS endpoint by its 6-byte AMS NetID and 16-bit
 // AMS port.
+//
+// Wire layout: [6]byte NetID + uint16 Port = 8 contiguous bytes. The Go
+// encoding/binary package emits fields in declaration order with no
+// padding for fixed-size types, so binary.Size(AMSAddress{}) == 8 matches
+// Beckhoff's documented on-wire size. DO NOT reorder fields, insert
+// fields between NetID and Port, or change either type without also
+// updating AMSHeader and every binary.Read/Write site that depends on
+// the 8-byte encoding.
 type AMSAddress struct {
 	NetID [6]byte
 	Port  uint16

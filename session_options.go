@@ -3,6 +3,7 @@ package ads
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"time"
 )
 
@@ -35,10 +36,29 @@ func WithHostIP(ip string) SessionOption {
 // pins to a distinct local IP so the PLC sees them as separate hosts and
 // allocates a TCP slot per source IP (TwinCAT enforces 1 TCP slot per
 // source IP, regardless of source AMS NetID — see Beckhoff/ADS #49 / #72).
-// The aliased IP must exist on a local interface before NewSession.
+// The aliased IP must exist on a local interface before Connect; the OS
+// returns "address not available" from Dial if it doesn't.
+//
+// Invalid IP strings are rejected at option-application time with a Warn
+// log; the Session's localBindIP stays nil (OS-default routing). This
+// matches the WithBackoff precedent — option-time validation surfaces
+// configuration errors immediately rather than failing every Connect /
+// Reconnect attempt with the same parse error.
 func WithLocalBindIP(ip string) SessionOption {
 	return func(s *Session) {
-		s.localBindIP = ip
+		if ip == "" {
+			s.localBindIP = nil
+			return
+		}
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			if s.logger != nil {
+				s.logger.Warn("WithLocalBindIP: invalid IP, ignoring (using OS-default routing)",
+					"ip", ip)
+			}
+			return
+		}
+		s.localBindIP = parsed
 	}
 }
 

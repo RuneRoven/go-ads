@@ -3,6 +3,7 @@ package ads
 import (
 	"bytes"
 	"log/slog"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -155,4 +156,54 @@ func TestRouteManager_ShouldSkip(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWithLocalBindIP(t *testing.T) {
+	t.Run("valid IPv4", func(t *testing.T) {
+		s := &Session{}
+		WithLocalBindIP("192.168.3.52")(s)
+		if s.localBindIP == nil {
+			t.Fatal("localBindIP nil after valid IP")
+		}
+		if got := s.localBindIP.String(); got != "192.168.3.52" {
+			t.Errorf("localBindIP = %q, want 192.168.3.52", got)
+		}
+	})
+
+	t.Run("valid IPv6", func(t *testing.T) {
+		s := &Session{}
+		WithLocalBindIP("::1")(s)
+		if s.localBindIP == nil || !s.localBindIP.IsLoopback() {
+			t.Errorf("localBindIP = %v, want loopback", s.localBindIP)
+		}
+	})
+
+	t.Run("empty string clears", func(t *testing.T) {
+		s := &Session{localBindIP: net.ParseIP("192.168.1.1")}
+		WithLocalBindIP("")(s)
+		if s.localBindIP != nil {
+			t.Errorf("localBindIP = %v after empty, want nil", s.localBindIP)
+		}
+	})
+
+	t.Run("invalid IP ignored with Warn", func(t *testing.T) {
+		handler := &testLogHandler{}
+		s := &Session{logger: slog.New(handler)}
+		WithLocalBindIP("not-an-ip-address")(s)
+		if s.localBindIP != nil {
+			t.Errorf("invalid IP should leave localBindIP nil, got %v", s.localBindIP)
+		}
+		if rec := handler.findByMessage("WithLocalBindIP: invalid IP"); rec == nil {
+			t.Error("expected Warn log for invalid IP, got none")
+		}
+	})
+
+	t.Run("invalid IP with nil logger does not panic", func(t *testing.T) {
+		s := &Session{logger: nil}
+		// Must not panic.
+		WithLocalBindIP("garbage")(s)
+		if s.localBindIP != nil {
+			t.Errorf("invalid IP should leave localBindIP nil, got %v", s.localBindIP)
+		}
+	})
 }

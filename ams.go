@@ -43,9 +43,20 @@ type AMSHeader struct {
 // AMSHeaderSize is the on-wire size of an AMSHeader in bytes.
 const AMSHeaderSize = 32
 
+// MaxAMSPayloadSize is a sanity bound on the Length field of a parsed
+// AMSHeader. The Beckhoff ADS protocol does not define a hard ceiling but
+// real-world frames stay under ~16MB (SumRead with thousands of items is
+// the typical upper bound). 32MB is a defensive cap that rejects corrupt
+// or hostile frames before they cause downstream slice-bounds panics in
+// the documented "b[AMSHeaderSize : AMSHeaderSize+h.Length]" pattern.
+const MaxAMSPayloadSize = 32 * 1024 * 1024 // 32 MiB
+
 // ParseAMSHeader decodes a 32-byte AMS header from the front of b. The
 // caller is responsible for stripping any preceding 6-byte AMS-over-TCP
-// length prefix. Returns an error if b is shorter than AMSHeaderSize.
+// length prefix. Returns an error if b is shorter than AMSHeaderSize or
+// if the decoded payload Length field exceeds MaxAMSPayloadSize (the
+// latter catches corrupt/hostile frames that would otherwise panic the
+// caller's "b[AMSHeaderSize : AMSHeaderSize+h.Length]" extraction).
 // The payload (Length bytes) follows directly after the header in b;
 // callers extract it as b[AMSHeaderSize : AMSHeaderSize+int(h.Length)].
 func ParseAMSHeader(b []byte) (AMSHeader, error) {
@@ -55,6 +66,9 @@ func ParseAMSHeader(b []byte) (AMSHeader, error) {
 	}
 	if err := binary.Read(bytes.NewReader(b[:AMSHeaderSize]), binary.LittleEndian, &h); err != nil {
 		return h, fmt.Errorf("ams: parse header: %w", err)
+	}
+	if h.Length > MaxAMSPayloadSize {
+		return h, fmt.Errorf("ams: declared payload length %d exceeds MaxAMSPayloadSize %d (corrupt or hostile frame)", h.Length, MaxAMSPayloadSize)
 	}
 	return h, nil
 }
@@ -132,7 +146,7 @@ func (c *Client) encode(command CommandID, data []byte, invokeID uint32) ([]byte
 	tcpHeader := &amsTCPHeader{
 		Unknown1: 0,
 		System:   0,
-		Length:   uint32(32 + len(data)),
+		Length:   uint32(AMSHeaderSize + len(data)),
 	}
 	header := &AMSHeader{
 		Target:    c.target,
