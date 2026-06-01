@@ -56,7 +56,13 @@ func (sess *Session) dialTCP() (net.Conn, error) {
 // because every field here is owned and mutated by Session methods only —
 // no other type touches it.
 type sessionLifecycle struct {
-	ctxMu     sync.RWMutex // protects ctx and shutdown against concurrent access during reconnect
+	ctxMu sync.RWMutex // protects ctx and shutdown against concurrent access during reconnect
+	// parentCtx is the original context.Context passed to NewSession. ctx
+	// (the active lifecycle ctx) is re-derived from parentCtx after every
+	// tearDownAndReset so cancelling the original NewSession ctx still
+	// shuts the session down — even across multiple Reconnect cycles. Set
+	// once at construction; never replaced.
+	parentCtx context.Context
 	ctx       context.Context
 	shutdown  context.CancelFunc
 	waitGroup sync.WaitGroup
@@ -146,10 +152,10 @@ type Session struct {
 	// TCP socket + request multiplexing + listen/transmit channels.
 	tx *transport
 
-	target       AMSAddress
-	source       AMSAddress
-	callbackIP   string // IP PLC uses to reach us (for Docker/VPN; set via WithHostIP)
-	localBindIP  net.IP // Force outbound TCP source IP (multi-session per host; set via WithLocalBindIP). nil = OS default routing.
+	target      AMSAddress
+	source      AMSAddress
+	callbackIP  string // IP PLC uses to reach us (for Docker/VPN; set via WithHostIP)
+	localBindIP net.IP // Force outbound TCP source IP (multi-session per host; set via WithLocalBindIP). nil = OS default routing.
 
 	// symbol cache + data-type table + discovery-mode flags.
 	cache *symbolCache
@@ -223,7 +229,7 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	sessCtx, cancel := context.WithCancel(ctx)
+	sessCtx, cancel := context.WithCancel(ctx) //nolint:gosec // cancel stored in lifecycle.shutdown, called from Close + tearDownAndReset
 	sess = &Session{
 		ip:             remote.IP,
 		port:           remote.Port,
@@ -251,6 +257,7 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 			maxReconnectAttempts: 0, // 0 = infinite retries
 			backoffConfig:        DefaultBackoffConfig(),
 			closedCh:             make(chan struct{}),
+			parentCtx:            ctx,
 			ctx:                  sessCtx,
 			shutdown:             cancel,
 		},
@@ -725,7 +732,9 @@ func (sess *Session) closeOnStaleDetection(reason Reason) {
 	if sess.onDisconnect != nil && !sess.isClosed() {
 		go sess.onDisconnect()
 	}
-	sess.Close()
+	if err := sess.Close(); err != nil {
+		sess.logger.Warn("Close error during stale-detection shutdown", "err", err)
+	}
 }
 
 // tryRecordReloadAttempt prunes attempts outside the sliding window then
@@ -1449,7 +1458,19 @@ func (sess *Session) tearDownAndReset(resetFeatureFlags bool) {
 	}
 	sess.lifecycle.waitGroup.Wait()
 	sess.lifecycle.ctxMu.Lock()
-	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(context.Background()) //nolint:gosec // cancel stored in lifecycle.shutdown, called from Close
+	// Re-derive lifecycle.ctx from the original NewSession parent so caller
+	// cancellation continues to shut the session down after Reconnect. Prior
+	// behaviour used context.Background() here, which detached the session
+	// from its constructor parent after the first tearDownAndReset.
+	parent := sess.lifecycle.parentCtx
+	if parent == nil {
+		// Defensive: test fixtures that build a Session literal directly
+		// without going through NewSession may leave parentCtx nil. Fall
+		// back to Background so tearDownAndReset stays panic-free; the
+		// production constructor always sets parentCtx.
+		parent = context.Background()
+	}
+	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(parent) //nolint:gosec // cancel stored in lifecycle.shutdown, called from Close
 	sess.lifecycle.ctxMu.Unlock()
 	sess.tx.chanMu.Lock()
 	sess.tx.sendChannel = make(chan []byte)
@@ -1748,7 +1769,20 @@ func (sess *Session) AddRoute(ctx context.Context, routeName, username, password
 			sess.source.NetID[0], sess.source.NetID[1],
 			sess.source.NetID[2], sess.source.NetID[3])
 	}
-	return AddRemoteRouteWithLogger(sess.logger, sess.ip, sess.source.NetID, routeName, hostIP, username, password)
+	// AddRemoteRouteWithLogger uses a fixed 5s UDP read deadline internally
+	// and has no context parameter. Wrap in goroutine + select so caller
+	// cancellation unblocks AddRoute promptly even though the underlying
+	// UDP socket keeps draining toward its own deadline in the background.
+	done := make(chan error, 1)
+	go func() {
+		done <- AddRemoteRouteWithLogger(sess.logger, sess.ip, sess.source.NetID, routeName, hostIP, username, password)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("AddRoute aborted: %w", ctx.Err())
+	}
 }
 
 // IsDisconnected returns whether the connection is currently in a disconnected state.

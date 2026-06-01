@@ -323,12 +323,10 @@ func TestReconnectExhaustConcurrentClose_NoPanic(t *testing.T) {
 			for i := 0; i < 5; i++ {
 				time.Sleep(time.Microsecond)
 			}
-			if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateClosed); ok {
-				sess.markClosed()
-			} else {
-				// Exhaustion path won; markClosed is idempotent.
-				sess.markClosed()
-			}
+			// transitionToOnce(Closed) may race with reconnect exhaustion;
+			// markClosed is idempotent either way.
+			sess.lifecycle.state.transitionToOnce(SessionStateClosed)
+			sess.markClosed()
 		}()
 		wg.Wait()
 

@@ -114,9 +114,9 @@ func TestDeviceNotification_SingleSample(t *testing.T) {
 	// Register a notification for handle 42
 	ch := make(chan *Update, 10)
 	sym := &symbol{
-		FullName:     "MAIN.testVar",
-		DataType:     "INT",
-		Length:       2,
+		FullName: "MAIN.testVar",
+		DataType: "INT",
+		Length:   2,
 	}
 	conn.notifications.activeNotifications[42] = activeNotification{Sym: sym, Ch: ch}
 	conn.cache.symbols[symbolKey(sym.FullName)] = sym
@@ -433,9 +433,9 @@ func TestWindowsFiletimeConversion(t *testing.T) {
 
 			ch := make(chan *Update, 1)
 			sym := &symbol{
-				FullName:     "MAIN.x",
-				DataType:     "INT",
-				Length:       2,
+				FullName: "MAIN.x",
+				DataType: "INT",
+				Length:   2,
 			}
 			conn.notifications.activeNotifications[7] = activeNotification{Sym: sym, Ch: ch}
 			conn.cache.symbols[symbolKey(sym.FullName)] = sym
@@ -490,9 +490,9 @@ func TestNotification_TerminalZeroByteSample_TriggersDetection(t *testing.T) {
 
 	ch := make(chan *Update, 4)
 	sym := &symbol{
-		FullName:     "MAIN.x",
-		DataType:     "DINT",
-		Length:       4,
+		FullName: "MAIN.x",
+		DataType: "DINT",
+		Length:   4,
 	}
 	conn.notifications.activeNotifications[42] = activeNotification{Sym: sym, Ch: ch}
 	conn.cache.symbols[symbolKey(sym.FullName)] = sym

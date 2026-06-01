@@ -4,9 +4,49 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"time"
 )
+
+// sleepCtx sleeps for d or returns early on ctx cancellation.
+// Returns ctx.Err() on cancellation, nil otherwise. Non-positive d
+// returns nil immediately without checking ctx (matches time.Sleep
+// semantics).
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// isChunkedDownloadUnsupportedErr reports whether err from the first
+// chunked-download Read indicates the PLC genuinely does not implement
+// offset-based reads on the upload groups (TwinCAT 2 behaviour).
+// Conservative: only ADS-level rejections that name the service / offset
+// as the cause count. Transport, context, marshaling, and arbitrary
+// device errors are deliberately excluded so a transient failure cannot
+// poison the session-wide ChunkedDownloadSupported flag.
+func isChunkedDownloadUnsupportedErr(err error) bool {
+	var rc ReturnCode
+	if !errors.As(err, &rc) {
+		return false
+	}
+	switch rc {
+	case ReturnCodeDeviceServiceNotSupported, // 0x701
+		ReturnCodeDeviceInvalidOffset: // 0x703
+		return true
+	default:
+		return false
+	}
+}
 
 // ListSymbols returns the full symbol table.
 // Requires LoadSymbols() or LoadSymbolsSlow() to have been called first.
@@ -89,10 +129,12 @@ func (sess *Session) LoadSymbolsSlow(ctx context.Context, cfg SlowDiscoveryConfi
 		return fmt.Errorf("failed to get symbol upload info: %w", err)
 	}
 
-	time.Sleep(cfg.ChunkDelay)
+	if err := sleepCtx(ctx, cfg.ChunkDelay); err != nil {
+		return err
+	}
 
 	// Step 3: Download datatypes in chunks
-	datatypesData, err := sess.client.Load().DownloadInChunks(ctx, 
+	datatypesData, err := sess.client.Load().DownloadInChunks(ctx,
 		uint32(GroupSymbolDataTypeUpload),
 		uploadInfo.DataTypeLength,
 		cfg.ChunkSize,
@@ -111,10 +153,12 @@ func (sess *Session) LoadSymbolsSlow(ctx context.Context, cfg SlowDiscoveryConfi
 		return fmt.Errorf("failed to parse datatypes: %w", err)
 	}
 
-	time.Sleep(cfg.ChunkDelay)
+	if err := sleepCtx(ctx, cfg.ChunkDelay); err != nil {
+		return err
+	}
 
 	// Step 4: Download symbols in chunks
-	symbolsData, err := sess.client.Load().DownloadInChunks(ctx, 
+	symbolsData, err := sess.client.Load().DownloadInChunks(ctx,
 		uint32(GroupSymbolUpload),
 		uploadInfo.SymbolLength,
 		cfg.ChunkSize,
@@ -179,7 +223,15 @@ func (c *Client) DownloadInChunks(ctx context.Context, group uint32, totalLength
 		}
 		chunk, err := c.Read(ctx, group, offset, readLen)
 		if err != nil {
-			if !c.capabilities.ChunkedDownloadCheckedLoad() {
+			// Only flip the "chunked-download unsupported" capability when
+			// the PLC's response unambiguously indicates this offset/service
+			// combination is not implemented — and only on the very first
+			// chunk attempt. Transient errors (transport closed, ctx
+			// cancellation, timeouts, intermittent transport hiccups) must
+			// NOT poison the session-wide capability flag, since the PLC
+			// may support chunking just fine and a subsequent call would
+			// then take the single-request fallback unnecessarily.
+			if offset == 0 && !c.capabilities.ChunkedDownloadCheckedLoad() && isChunkedDownloadUnsupportedErr(err) {
 				c.capabilities.ChunkedDownloadSupportedStore(false)
 				c.capabilities.ChunkedDownloadCheckedStore(true)
 			}
@@ -191,7 +243,9 @@ func (c *Client) DownloadInChunks(ctx context.Context, group uint32, totalLength
 		result = append(result, chunk...)
 		offset += uint32(len(chunk))
 		if offset < totalLength && delay > 0 {
-			time.Sleep(delay)
+			if err := sleepCtx(ctx, delay); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if !c.capabilities.ChunkedDownloadCheckedLoad() {
@@ -235,7 +289,26 @@ func (sess *Session) getSymbol(ctx context.Context, symbolName string) (*symbol,
 				return nil, err
 			}
 			sess.cache.lock.Lock()
-			if localSymbol.Handle != 0 {
+			// Re-check the cache map for our entry. LoadSymbols /
+			// reloadSymbolsAndResubscribe can swap sess.cache.symbols
+			// wholesale while GetHandleByName is in flight. If the swap
+			// happened, localSymbol now points to a stranded *symbol —
+			// writing the acquired handle into it would leak the PLC
+			// handle (no live cache entry tracks it) and leave the live
+			// entry with Handle=0.
+			currentEntry, stillInMap := sess.cache.symbols[symbolKey(symbolName)]
+			swapped := !stillInMap || currentEntry != localSymbol
+			switch {
+			case swapped:
+				sess.cache.lock.Unlock()
+				handleBytes := make([]byte, 4)
+				binary.LittleEndian.PutUint32(handleBytes, handle)
+				if err := sess.client.Load().Write(ctx, uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+					sess.logger.Warn("failed to release orphan symbol handle after cache swap",
+						"symbol", symbolName, "handle", handle, "error", err)
+				}
+				return nil, fmt.Errorf("symbol cache reloaded during handle acquisition for %q; retry", symbolName)
+			case localSymbol.Handle != 0:
 				// Another goroutine set the handle while we were waiting — release ours.
 				sess.cache.lock.Unlock()
 				handleBytes := make([]byte, 4)
@@ -244,7 +317,7 @@ func (sess *Session) getSymbol(ctx context.Context, symbolName string) (*symbol,
 					sess.logger.Warn("failed to release duplicate symbol handle",
 						"symbol", symbolName, "handle", handle, "error", err)
 				}
-			} else {
+			default:
 				localSymbol.Handle = handle
 				sess.cache.lock.Unlock()
 			}
@@ -518,7 +591,7 @@ func (sess *Session) LoadSymbolList(ctx context.Context, cfg SlowDiscoveryConfig
 	time.Sleep(cfg.ChunkDelay)
 
 	// Download symbols in chunks
-	symbolsData, err := sess.client.Load().DownloadInChunks(ctx, 
+	symbolsData, err := sess.client.Load().DownloadInChunks(ctx,
 		uint32(GroupSymbolUpload),
 		uploadInfo.SymbolLength,
 		cfg.ChunkSize,
@@ -572,7 +645,7 @@ func (sess *Session) LoadDataTypes(ctx context.Context, cfg SlowDiscoveryConfig)
 	time.Sleep(cfg.ChunkDelay)
 
 	// Download datatypes in chunks
-	datatypesData, err := sess.client.Load().DownloadInChunks(ctx, 
+	datatypesData, err := sess.client.Load().DownloadInChunks(ctx,
 		uint32(GroupSymbolDataTypeUpload),
 		uploadInfo.DataTypeLength,
 		cfg.ChunkSize,

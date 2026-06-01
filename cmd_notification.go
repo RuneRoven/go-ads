@@ -403,10 +403,14 @@ const (
 // return code counts as cleanup success for best-effort paths.
 // NoErrors                = actually deleted.
 // NotifyHandleInvalid (0x714) = handle already gone on PLC side
-//                               (route-idle-timeout, PLC reboot, prior cleanup).
+//
+//	(route-idle-timeout, PLC reboot, prior cleanup).
+//
 // DeviceClientUnknown  (0x715) = PLC dropped our client identity (typical
-//                               after TCP reset / reconnect); whatever
-//                               handles we had are implicitly gone too.
+//
+//	after TCP reset / reconnect); whatever
+//	handles we had are implicitly gone too.
+//
 // In all three cases the handle is no longer consuming PLC resources,
 // which is the only goal of best-effort cleanup paths.
 //

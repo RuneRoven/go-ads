@@ -72,7 +72,9 @@ func TestParseAMSHeader_IgnoresTrailingBytes(t *testing.T) {
 		InvokeID: 1,
 	}
 	header := EncodeAMSHeader(h)
-	withPayload := append(header, []byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}...)
+	withPayload := make([]byte, 0, len(header)+6)
+	withPayload = append(withPayload, header...)
+	withPayload = append(withPayload, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
 	got, err := ParseAMSHeader(withPayload)
 	if err != nil {
 		t.Fatalf("ParseAMSHeader with trailing payload: %v", err)
