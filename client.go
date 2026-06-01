@@ -361,7 +361,7 @@ func (c *Client) handleReceive(ctx context.Context, data []byte) {
 		return
 	}
 	buff := bytes.NewBuffer(data)
-	header := amsHeader{}
+	header := AMSHeader{}
 	if err := binary.Read(buff, binary.LittleEndian, &header); err != nil {
 		c.logger.Error("Error parsing header", "error", err)
 		return

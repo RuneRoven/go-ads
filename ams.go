@@ -15,7 +15,22 @@ type amsTCPHeader struct {
 	Length   uint32
 }
 
-type amsHeader struct {
+// AMSHeader is the 32-byte ADS frame header (per Beckhoff AMS/ADS spec).
+// Wire layout (little-endian):
+//
+//	offset 0  Target NetID(6) + Port(2)       = AMSAddress
+//	offset 8  Source NetID(6) + Port(2)       = AMSAddress
+//	offset 16 CommandID (2)
+//	offset 18 State flags (2)
+//	offset 20 Data length (4) — payload bytes following this header
+//	offset 24 ErrorCode (4)
+//	offset 28 InvokeID (4)
+//
+// Exported so router / proxy implementations can parse, mutate (e.g.
+// rewrite Source for client-isolated routing), and re-encode frames
+// without touching Client RPC plumbing. See ParseAMSHeader and
+// EncodeAMSHeader for the wire codec.
+type AMSHeader struct {
 	Target    AMSAddress
 	Source    AMSAddress
 	Command   CommandID
@@ -23,6 +38,35 @@ type amsHeader struct {
 	Length    uint32
 	ErrorCode uint32
 	InvokeID  uint32
+}
+
+// AMSHeaderSize is the on-wire size of an AMSHeader in bytes.
+const AMSHeaderSize = 32
+
+// ParseAMSHeader decodes a 32-byte AMS header from the front of b. The
+// caller is responsible for stripping any preceding 6-byte AMS-over-TCP
+// length prefix. Returns an error if b is shorter than AMSHeaderSize.
+// The payload (Length bytes) follows directly after the header in b;
+// callers extract it as b[AMSHeaderSize : AMSHeaderSize+int(h.Length)].
+func ParseAMSHeader(b []byte) (AMSHeader, error) {
+	var h AMSHeader
+	if len(b) < AMSHeaderSize {
+		return h, fmt.Errorf("ams: header too short: %d bytes, need %d", len(b), AMSHeaderSize)
+	}
+	if err := binary.Read(bytes.NewReader(b[:AMSHeaderSize]), binary.LittleEndian, &h); err != nil {
+		return h, fmt.Errorf("ams: parse header: %w", err)
+	}
+	return h, nil
+}
+
+// EncodeAMSHeader serializes an AMSHeader to its 32-byte wire form.
+// No length prefix is added; callers wrap with the 6-byte AMS-over-TCP
+// header (1 unknown + 1 system + 4 length) when sending over TCP.
+func EncodeAMSHeader(h AMSHeader) []byte {
+	buf := make([]byte, 0, AMSHeaderSize)
+	w := bytes.NewBuffer(buf)
+	_ = binary.Write(w, binary.LittleEndian, h)
+	return w.Bytes()
 }
 
 // ParseNetID converts a dotted-notation NetID string (e.g. "192.168.1.1.1.1")
@@ -90,7 +134,7 @@ func (c *Client) encode(command CommandID, data []byte, invokeID uint32) ([]byte
 		System:   0,
 		Length:   uint32(32 + len(data)),
 	}
-	header := &amsHeader{
+	header := &AMSHeader{
 		Target:    c.target,
 		Source:    source,
 		Command:   command,
