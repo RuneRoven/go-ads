@@ -375,7 +375,7 @@ Total attempts bounded by `WithMaxReconnectAttempts(n)` (R-RECON-005). Reaching 
 1. **Snapshot pre-reconnect notification handles** under `notifications.lock`,
    bump `lastSubscribeNs`, wipe the `activeNotifications` map (atomic
    under the lock). Snapshot lives on Reconnect's stack until step 7.
-   (v2.2.1 Fix 3 — prevents PLC handle-table accumulation; see
+   (v2.2.0 reconnect-cleanup — prevents PLC handle-table accumulation; see
    Beckhoff/ADS #268.)
 2. `tearDownAndReset(false)` — cancel lifecycle ctx, close old TCP,
    wait for listen/transmit/recvWorker goroutines.
@@ -423,7 +423,7 @@ Both `Connect()` and `Reconnect()` use a probe-first approach for route registra
    This catches the case where the PLC RST'd due to a transient slot
    conflict (previous TCP from same source IP not yet released) rather
    than a missing route. Retry-success → skip AddRoute entirely. Retry-fail
-   → register via UDP, TCP-reconnect, continue. (v2.2.2.)
+   → register via UDP, TCP-reconnect, continue. (v2.2.0.)
 5. Probe fails with a non-transport error → register immediately
    (re-dial wouldn't help an ADS-level rejection).
 6. After repeated probe failures (`probeFailures >= 3`), the library skips
@@ -431,7 +431,7 @@ Both `Connect()` and `Reconnect()` use a probe-first approach for route registra
 
 `WithSkipRouteRegistration()` bypasses BOTH probe and AddRoute entirely
 when callers manage the route lifecycle externally (pre-registered via
-TC3 UI, or fronted by a local AMS router daemon). (v2.2.2.)
+TC3 UI, or fronted by a local AMS router daemon). (v2.2.0.)
 
 `WithForceRouteRegistration()` bypasses probing — always registers with
 credentials. Requires `WithRoute(...)`.
@@ -444,7 +444,7 @@ During `ensureRouteOnConnect` the `ondrop` callback on the active
 fire `sess.triggerReconnect` via the listen goroutine, spawning a
 concurrent Reconnect goroutine that competes with our own
 AddRoute/redial path on `sess.client` / `tx.connection` /
-`lifecycle.ctx`. (v2.2.2 — observed in cold-start hardware tests when
+`lifecycle.ctx`. (v2.2.0 — observed in cold-start hardware tests when
 the PLC route was stale; symptom was duplicate "registering route" +
 "FSM invalid transition" log noise and intermittent test failure.)
 `dialAndStart` re-arms `ondrop` on each new Client it creates; the
@@ -482,7 +482,7 @@ By default, missing on-demand symbols after reconnect are skipped with a warning
 
 The library actively prevents PLC notification-handle accumulation
 (Beckhoff/ADS #268) via three complementary strategies introduced in
-v2.2.1:
+v2.2.0:
 
 ### 1. Orphan-Delete (`tryOrphanDelete`)
 

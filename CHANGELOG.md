@@ -191,6 +191,109 @@ for u := range ch {
 - `0xf010` → `0xF010` for consistency with surrounding hex constants.
 - CHANGELOG em-dashes replaced with ASCII punctuation.
 
+### Notification handle hygiene (PLC handle-table accumulation fix)
+
+Three complementary strategies prevent the PLC notification-handle
+table from growing without bound across reconnects, crashes, and
+online-change events. Beckhoff/ADS #268 root-cause: handles persist
+on the PLC for `routeIdleTimeout` (default 5 minutes) after the
+client's TCP slot evicts. Old clients hit the per-AMS-port soft cap
+(~550 handles) and `AddDeviceNotification` returns 0x716 `NoMoreHandles`.
+
+- **Orphan-Delete (`tryOrphanDelete`).** When the recvWorker decodes a
+  `DeviceNotification` packet whose handle is not in
+  `activeNotifications`, schedule a best-effort Delete RPC. Bounded
+  by `orphanSem` (max 10 concurrent), throttled per-handle
+  (`orphanSeen` map, 60s TTL), GC every 5 min. Re-checks
+  `activeNotifications` under lock before firing to guard against
+  handle-reuse races. Lifecycle-aware: skip if closed/reconnecting,
+  honor `lifecycle.ctx` cancellation.
+- **Reconnect pre-delete (Fix 3).** On Reconnect, snapshot
+  `activeNotifications` handle list under `notifications.lock`
+  before wiping. After the new transport is fully validated (dial +
+  handshake + ensureRoute + reloadSymbols) and BEFORE
+  resubscribeNotifications, fire `bestEffortDeleteNotifications` on
+  the new transport. Old handles freed before new ones replace them.
+- **Auto-reload pre-delete.** `reloadSymbolsAndResubscribe` snapshots
+  handles → bumps `lastSubscribeNs` → wipes map (single lock) →
+  best-effort-Delete on alive transport → LoadSymbols → re-subscribe.
+  Eliminates online-change-induced handle flood.
+
+Success-equivalent return codes (treated as cleanup wins by
+`isBestEffortDeleteSuccess`): `0x000`, `0x714 NotifyHandleInvalid`,
+`0x715 DeviceClientUnknown`. The 0x715 classification deliberately
+diverges from official Beckhoff AdsLib — confirmed against
+jisotalo/ads-client; documented in godoc.
+
+### Source AMS port randomisation
+
+`WithLocalAMS` default port no longer hard-coded to 10500. Each new
+session draws a random port in the IANA dynamic range 32768-49151
+(`randomAMSPort`). Prevents stale-slot collisions on the PLC when
+the same client reconnects after an ungraceful exit and the PLC has
+not yet aged out the old AMS port entry. AMS port is a logical
+identifier inside the AMS header — distinct from TCP source port
+(OS-assigned ephemeral) and TCP destination port (always 48898).
+
+### Smart route registration (probe-first)
+
+`Connect()` and `Reconnect()` no longer blindly register routes. A
+single cheap `GetSymbolVersion` probe on a fresh TCP connection
+classifies state:
+
+- Probe succeeds → route exists, skip credential-bearing UDP
+  `AddRoute` entirely.
+- Probe fails with transport-level error (`ErrTransportClosed`,
+  `io.EOF`, `syscall.ECONNRESET`) → redial + retry probe once.
+  Catches transient PLC RST due to slot conflict (previous TCP from
+  same source IP not yet released) rather than missing route.
+- Probe fails with non-transport error → register immediately
+  (re-dial would not help an ADS-level rejection).
+- After `probeFailures >= 3` cumulative probe failures, fall back
+  to always-register.
+
+`ondrop` callback on `*Client` is disarmed via `defer` for the
+entire `ensureRouteOnConnect` call, preventing a probe RST from
+spawning a competing Reconnect goroutine. Re-armed automatically
+in `dialAndStart`; retry block manually re-disarms after.
+
+New options:
+
+- **`WithSkipRouteRegistration()`** — bypass BOTH probe and
+  `AddRoute` entirely. Use when route is pre-registered via TC3 UI /
+  TC2 properties / AdsTool, or when fronted by a local AMS router
+  daemon. Equivalent to omitting `WithRoute` but explicit; both can
+  coexist (skip wins).
+- **`WithLocalBindIP(ip)`** — pin outbound TCP source IP via
+  `net.Dialer{LocalAddr: ...}`. Required for multi-Session
+  deployments on a host with IP aliases, since TwinCAT enforces 1
+  TCP slot per source IP regardless of source AMS NetID / port /
+  route name (Beckhoff/ADS #49, #72). Option-time validation: invalid
+  IPs log Warn and clear the binding (caller does not crash).
+
+Route-naming convention update: callers that change source IP
+across runs (DHCP, wifi↔ethernet, container vs bare metal) should
+use a route name unique per source IP (e.g., `go-ads-{source-ip}`).
+The integration test helper does this automatically when
+`ADS_HOST_IP` is set.
+
+### Router-subpackage preparation (additive exports)
+
+Internal types/functions promoted to package surface so a future
+in-process AMS router subpackage (planned for the next minor) can
+front multiple `Session`s without forking the lib:
+
+- `AMSHeader` struct + `AMSHeaderSize` (32) + `MaxAMSPayloadSize`
+  (32 MiB) constants.
+- `ParseAMSHeader(data []byte) (AMSHeader, error)` — bounds-checks
+  `Length` against `MaxAMSPayloadSize`.
+- `EncodeAMSHeader(h AMSHeader) []byte` — stdlib `binary.Write`
+  on `bytes.Buffer`, error swallow documented as safe.
+- `NotificationHandler` callback type (was unexported).
+
+These exports are additive; they do not change any existing
+signature.
+
 ### Test coverage additions
 
 - `TestFSM_AllowedTransitions`: table test pinning every legal and

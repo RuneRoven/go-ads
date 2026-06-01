@@ -19,9 +19,20 @@ have drifted from current behavior.
 
 Drift known since archive (non-exhaustive):
 
-- v2.2.1 added orphan-Delete (Fix 1), auto-reload handle cleanup
-  (Fix 2), reconnect post-dial Delete (Fix 3), random AMS port (Fix 4).
-- v2.2.2 added route-probe-retry, ondrop suppression during Connect,
-  0x715 ClientUnknown classified as cleanup-success, exported
-  `AMSHeader`/`NotificationHandler`/`WithLocalBindIP`/`WithSkipRouteRegistration`,
-  and route-name-per-source-IP test convention.
+- v2.2.0 release (post-v2.1.0) added:
+  - Notification-handle hygiene: orphan-Delete on unknown-handle
+    samples, reconnect snapshot+best-effort-Delete, auto-reload
+    pre-delete (the three strategies in IMPLEMENTATION.md
+    §Notification handle hygiene).
+  - Source-AMS-port randomisation in IANA dynamic range (32768-49151)
+    to avoid stale-slot collisions on PLC.
+  - Smart route registration: probe-first, single transport-RST
+    retry, ondrop suppression during Connect/Reconnect.
+  - `0x715 DeviceClientUnknown` classified as cleanup-success in
+    `isBestEffortDeleteSuccess`.
+  - New exports for router-prep: `AMSHeader` + codec,
+    `NotificationHandler` callback type, `WithLocalBindIP`,
+    `WithSkipRouteRegistration`.
+  - Test convention: route name per source IP
+    (`go-ads-{ip-with-dashes}`) to avoid PLC duplicate-name lookup
+    ambiguity.
