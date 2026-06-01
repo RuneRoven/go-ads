@@ -202,7 +202,9 @@ sess, _ := ads.NewSession(ctx, ads.AMSEndpoint{IP: ip, Port: 48898, AMS: target}
 | `WithMaxSymbolVersionReloadAttempts(n)` | `3` | Cap reload attempts within the sliding window (AutoReload only) |
 | `WithSymbolVersionReloadWindow(d)` | `60s` | Sliding window length for the reload-attempt cap |
 | `WithOnSymbolVersionChanged(fn)` | None | Callback fired once per online-change detection (`reason` is one of the `Reason*` constants) |
-| `WithLocalAMS(addr)` | NetID auto-derived, Port 10500 | Override local (source) AMSAddress for protocol headers |
+| `WithLocalAMS(addr)` | NetID auto-derived; Port random in 32768-49151 | Override source AMSAddress in outgoing ADS headers. The AMS port is a logical identifier inside the header, NOT the TCP source port (kernel-assigned) and NOT the TCP destination port (always 48898). Each Session randomizes by default so distinct Session instances present distinct AMS source identities to the PLC |
+| `WithLocalBindIP(ip)` | Unset — OS picks via routing table | Pin the outbound TCP source IP. Used for multi-Session deployments on hosts with IP aliases. Invalid IP → Warn + nil (OS routing). See §Limitations for the multi-Session constraint |
+| `WithSkipRouteRegistration()` | Off | Explicit opt-out from probe+AddRoute. Required when routes are managed externally (TC3 UI pre-registered, AmsRouterDaemon front-end). Equivalent to omitting `WithRoute` but explicit |
 | `WithLocalMode()` | Off | Target the in-process TwinCAT runtime at 127.0.0.1 |
 | `WithRequestTimeout(d)` | 5s | Per-request timeout for ADS commands and initial TCP dial |
 
@@ -218,6 +220,8 @@ All options are composable — no mutual exclusions. Some require others to have
 | `WithStrictReconnect()` | — | Only affects on-demand symbols (resolved via `GetSymbol` before reconnect) |
 | `WithOnDisconnect()` / `WithOnReconnect()` | — | Fire regardless of auto/manual reconnect mode |
 | `WithAutoReconnect(false)` | — | Backoff still applies when caller invokes `Reconnect()` manually |
+| `WithSkipRouteRegistration()` | — | Overrides `WithRoute`. Skip wins. Useful when an options chain is built uniformly across Sessions and only some opt out |
+| `WithLocalBindIP(ip)` | Host must have `ip` aliased on a local interface before `Connect` | OS returns "address not available" from Dial if alias missing |
 
 ## Notifications and backpressure
 
@@ -238,6 +242,27 @@ If you see `"notification dropped (channel full)"` warnings, either:
 1. Increase the channel buffer size
 2. Consume notifications faster (dedicated drain goroutine)
 3. Reduce the notification cycle time on the PLC side
+
+### Handle hygiene across reconnects and crashes
+
+The library actively prevents PLC notification-handle accumulation
+(Beckhoff/ADS #268) via three complementary strategies:
+
+1. **Orphan-Delete.** When a notification arrives for a handle the
+   Session no longer tracks (typically leaked by a prior process
+   crash), the library asynchronously issues a best-effort Delete RPC
+   for that handle. Throttled, sem-bounded, race-aware.
+2. **Auto-reload pre-delete.** On `SymbolVersionAutoReload`, the
+   library snapshots all current handles, wipes them locally, deletes
+   them PLC-side, then reloads and re-subscribes. Prevents handle
+   retention across online-change boundaries.
+3. **Reconnect pre-delete.** On TCP reconnect, the library snapshots
+   pre-reconnect handles, deletes them on the new transport, then
+   re-subscribes with fresh handles. `0x715 DeviceClientUnknown` (PLC
+   dropped client identity) is treated as cleanup-success.
+
+No user action needed; the strategies fire automatically. Documented
+in detail in [IMPLEMENTATION.md → Notification handle hygiene](IMPLEMENTATION.md#notification-handle-hygiene).
 
 ## Limitations
 
@@ -394,6 +419,7 @@ CI runs automatically on pull requests to `main` with 4 parallel jobs: lint, tes
 
 - **Enum string resolution**: Add an option to return enum constant names (e.g. `"RUNNING"`) instead of numeric values (e.g. `"2"`). Requires parsing enum constant values from the datatype table's extra data. Only possible for TC3 non-strict enums; TC3 strict enums and TC2 do not expose constant names in the datatype table.
 - **TCP-based route registration**: Investigate whether AMS routes can be created via ADS system service commands over the existing TCP connection (AMS port 10000) instead of the UDP protocol (port 48899). This would eliminate the UDP 48899 firewall requirement and simplify deployment in locked-down networks. The Beckhoff `TcAmsRemoteMgr` service handles UDP route requests — a TCP equivalent may exist via the ADS system service but is unconfirmed.
+- **In-process AMS router subpackage (`router/`)**: Embeddable Go AMS router that lets a single process host multiple `Session`s targeting the same PLC, and that doubles as a standalone daemon (`cmd/ads-router/`) front-end for multi-process deployments. Bypasses the TwinCAT 1-TCP-per-source-IP constraint (see §Limitations) without requiring Beckhoff's .NET `Beckhoff.TwinCAT.Ads.TcpRouter`. Lib internals already prepped: `AMSHeader` / `ParseAMSHeader` / `EncodeAMSHeader` wire codec exported, `NotificationHandler` callback type exported, `WithSkipRouteRegistration` option for router-fronted Sessions, `WithLocalBindIP` for multi-NIC host setups. Passthrough mode planned for v2.3.0 (no notification coalescing — each client gets its own PLC handle, matching Beckhoff's official TcpRouter behavior).
 
 ## License
 
