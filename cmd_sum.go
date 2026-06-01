@@ -542,17 +542,22 @@ func (sess *Session) bestEffortDeleteNotifications(ctx context.Context, handles 
 		return 0
 	}
 	errors, err := sess.SumDeleteDeviceNotification(ctx, handles)
-	if err != nil {
-		sess.logger.Warn("bestEffortDelete: SumDeleteDeviceNotification failed",
-			"error", err,
-			"handles", len(handles))
-		return 0
-	}
+	// Count successes from any returned codes — sumDeleteNotificationFallback
+	// returns partial codes alongside a non-nil error when it short-circuits
+	// on transport failure, so handles cleaned up before the failure are not
+	// "lost" from the operator's perspective.
 	deleted := 0
 	for _, code := range errors {
 		if isBestEffortDeleteSuccess(code) {
 			deleted++
 		}
+	}
+	if err != nil {
+		sess.logger.Warn("bestEffortDelete: SumDeleteDeviceNotification failed",
+			"error", err,
+			"partial_deleted", deleted,
+			"handles", len(handles))
+		return deleted
 	}
 	if deleted < len(handles) {
 		sess.logger.Warn("bestEffortDelete: some handles not cleaned up",

@@ -178,7 +178,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	// stored after the RPC, the previous-subscribe timestamp would falsely
 	// elevate a legitimate first-sample to Warn.
 	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
-	handle, err := sess.client.Load().AddDeviceNotification(ctx, 
+	handle, err := sess.client.Load().AddDeviceNotification(ctx,
 		uint32(GroupSymbolValueByHandle),
 		symbol.Handle,
 		symbol.Length,

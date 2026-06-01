@@ -673,6 +673,38 @@ func TestGetJSON_EmptyValue(t *testing.T) {
 	}
 }
 
+// LINT (int64) values above 2^53 must round-trip through GetJSON without
+// precision loss. Prior implementation parsed all non-bool/non-string
+// scalars as float64, silently rounding LINT values like 2^60.
+func TestGetJSON_LINTPrecision(t *testing.T) {
+	const big = "1152921504606846976" // 2^60, unrepresentable exactly in float64
+	sym := &symbol{DataType: "LINT", Length: 8, Value: big}
+	got := sym.getJSON()
+	if got != big {
+		t.Errorf("LINT precision lost: got %s, want %s", got, big)
+	}
+}
+
+// ULINT (uint64) values above 2^53 must round-trip through GetJSON
+// without precision loss.
+func TestGetJSON_ULINTPrecision(t *testing.T) {
+	const big = "18446744073709551615" // uint64 max
+	sym := &symbol{DataType: "ULINT", Length: 8, Value: big}
+	got := sym.getJSON()
+	if got != big {
+		t.Errorf("ULINT precision lost: got %s, want %s", got, big)
+	}
+}
+
+// REAL stays float64-encoded (decimal point in output).
+func TestGetJSON_REALAsFloat(t *testing.T) {
+	sym := &symbol{DataType: "REAL", Length: 4, Value: "3.5"}
+	got := sym.getJSON()
+	if got != "3.5" {
+		t.Errorf("REAL: got %s, want 3.5", got)
+	}
+}
+
 // Validates: NO-SPEC.
 func TestGetJSON_WSTRINGAsString(t *testing.T) {
 	sym := &symbol{

@@ -270,12 +270,26 @@ func (v SymbolView) GetJSON() string {
 		return ""
 	}
 	v.conn.cache.lock.Lock()
-	defer v.conn.cache.lock.Unlock()
 	sym := v.conn.cache.symbols[symbolKey(v.FullName)]
 	if sym == nil {
+		v.conn.cache.lock.Unlock()
 		return ""
 	}
-	return sym.getJSON()
+	// parseTree walks Children + reads Value; both require cache.lock.
+	// json.Marshal is the expensive part and operates on the produced
+	// interface tree, which has no further cache dependencies — run it
+	// outside the lock so notification handling + cache-backed APIs are
+	// not blocked on large struct/array marshaling.
+	data := sym.parseTree()
+	name := sym.Name
+	v.conn.cache.lock.Unlock()
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		getDefaultLogger().Warn("GetJSON marshal error", "symbol", name, "error", err)
+		return ""
+	}
+	return string(jsonData)
 }
 
 // Children returns SymbolViews for struct/array members captured at view
@@ -718,20 +732,64 @@ func (s *symbol) getJSON() string {
 
 var stringsList = map[string]struct{}{"STRING": {}, "WSTRING": {}, "TIME": {}, "TOD": {}, "TIME_OF_DAY": {}, "DATE": {}, "DT": {}, "DATE_AND_TIME": {}}
 
+// signedIntTypes / unsignedIntTypes / floatTypes are the IEC 61131-3 base
+// type names that symbol_codec.parse writes into s.Value as decimal
+// strings. parseTree dispatches on these so 64-bit integers (LINT/ULINT)
+// retain full precision in the resulting JSON instead of being rounded
+// through float64's 53-bit mantissa.
+var (
+	signedIntTypes = map[string]struct{}{
+		"SINT": {}, "INT": {}, "DINT": {}, "LINT": {},
+	}
+	unsignedIntTypes = map[string]struct{}{
+		"USINT": {}, "UINT": {}, "UDINT": {}, "ULINT": {},
+		"BYTE": {}, "WORD": {}, "DWORD": {}, "LWORD": {},
+	}
+	floatTypes = map[string]struct{}{
+		"REAL": {}, "LREAL": {},
+	}
+)
+
 // parseTree returns a JSON-marshallable interface for the symbol subtree.
 // Internal API — public access via SymbolView.GetJSON.
 func (s *symbol) parseTree() (rData interface{}) {
 	if len(s.Children) == 0 {
-		if s.DataType == "BOOL" {
+		switch {
+		case s.DataType == "BOOL":
 			v, err := strconv.ParseBool(s.Value)
 			if err != nil {
 				getDefaultLogger().Warn("parseTree: invalid BOOL value, defaulting to false",
 					"symbol", s.Name, "value", s.Value, "error", err)
 			}
 			rData = v
-		} else if _, ok := stringsList[s.DataType]; ok {
+		case isInSet(s.DataType, stringsList):
 			rData = s.Value
-		} else {
+		case isInSet(s.DataType, signedIntTypes):
+			v, err := strconv.ParseInt(s.Value, 10, 64)
+			if err != nil {
+				getDefaultLogger().Warn("parseTree: invalid signed integer value, defaulting to 0",
+					"symbol", s.Name, "dataType", s.DataType, "value", s.Value, "error", err)
+			}
+			rData = v
+		case isInSet(s.DataType, unsignedIntTypes):
+			v, err := strconv.ParseUint(s.Value, 10, 64)
+			if err != nil {
+				getDefaultLogger().Warn("parseTree: invalid unsigned integer value, defaulting to 0",
+					"symbol", s.Name, "dataType", s.DataType, "value", s.Value, "error", err)
+			}
+			rData = v
+		case isInSet(s.DataType, floatTypes):
+			v, err := strconv.ParseFloat(s.Value, 64)
+			if err != nil {
+				getDefaultLogger().Warn("parseTree: invalid float value, defaulting to 0",
+					"symbol", s.Name, "dataType", s.DataType, "value", s.Value, "error", err)
+			}
+			rData = v
+		default:
+			// Unknown / user-defined scalar (enum alias, TIME-derived,
+			// pointer, REFERENCE TO, etc.). Fall back to float64 to
+			// preserve prior behaviour for values that historically
+			// parsed cleanly under ParseFloat.
 			v, err := strconv.ParseFloat(s.Value, 64)
 			if err != nil {
 				getDefaultLogger().Warn("parseTree: invalid numeric value, defaulting to 0",
@@ -749,4 +807,9 @@ func (s *symbol) parseTree() (rData interface{}) {
 		rData = localMap
 	}
 	return
+}
+
+func isInSet(s string, set map[string]struct{}) bool {
+	_, ok := set[s]
+	return ok
 }
