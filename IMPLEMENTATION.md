@@ -2,7 +2,7 @@
 
 Library-specific implementation details, fallback strategies, and API reference for the go-ads library. For protocol-level documentation, see [PROTOCOL.md](PROTOCOL.md).
 
-This document is the source-of-truth for architectural detail. godoc comments stay short and point here; this file holds the longer explanation. Specs in `specs/` cite section anchors here — section headers are anchor targets and must not be renamed without updating those specs.
+This document is the source-of-truth for architectural detail. godoc comments stay short and point here; this file holds the longer explanation. Historical behavioral specs for the v2.0 → v2.2 redesign live in [`docs/archive/specs/`](docs/archive/specs/) — kept for design-rationale reference, not maintained for v2.2.1+.
 
 ## Table of Contents
 
@@ -13,6 +13,8 @@ This document is the source-of-truth for architectural detail. godoc comments st
 - [Symbol Discovery](#symbol-discovery)
 - [Online-Change Handling](#online-change-handling)
 - [Reconnection](#reconnection)
+- [Notification handle hygiene](#notification-handle-hygiene)
+- [Multi-Session on the same host (limitation)](#multi-session-on-the-same-host-limitation)
 - [API Reference](#api-reference)
 - [Connection Lifecycle](#connection-lifecycle)
 - [Data Types](#data-types)
@@ -370,19 +372,34 @@ Total attempts bounded by `WithMaxReconnectAttempts(n)` (R-RECON-005). Reaching 
 
 ### Reconnect sequence
 
-1. Close old TCP connection.
-2. Stop listen and transmitWorker goroutines (`waitGroup.Wait()` in `tearDownAndReset`).
-3. Reset capability flags (all per-command states back to 0=unchecked).
-4. Retry TCP dial with stepped backoff.
-5. Re-register AMS route if configured (probe-first; see [Smart route registration](#smart-route-registration)).
+1. **Snapshot pre-reconnect notification handles** under `notifications.lock`,
+   bump `lastSubscribeNs`, wipe the `activeNotifications` map (atomic
+   under the lock). Snapshot lives on Reconnect's stack until step 7.
+   (v2.2.1 Fix 3 — prevents PLC handle-table accumulation; see
+   Beckhoff/ADS #268.)
+2. `tearDownAndReset(false)` — cancel lifecycle ctx, close old TCP,
+   wait for listen/transmit/recvWorker goroutines.
+3. Retry TCP dial with stepped backoff (per `BackoffConfig`).
+4. Re-perform local-mode handshake if applicable (in-process TC runtime).
+5. Re-register AMS route if configured (probe-first; see
+   [Smart route registration](#smart-route-registration)).
 6. Reload symbols based on prior discovery mode:
    - Full discovery → re-download full symbol table
-   - On-demand only → re-resolve only previously accessed symbols (graceful skip on missing unless `WithStrictReconnect`)
+   - On-demand only → re-resolve only previously accessed symbols
+     (graceful skip on missing unless `WithStrictReconnect`)
    - No symbols → read symbol version only
-7. Filter `notificationConfigs` — drop entries for symbols no longer available.
-8. Re-subscribe remaining notifications.
-9. Bump epoch counter (`sess.lifecycle.epoch.Add(1)`).
-10. Fire `OnReconnect`.
+7. **Best-effort delete** the snapshot from step 1 via
+   `bestEffortDeleteNotifications` on the new TCP transport. Treats
+   `0x714 NotifyHandleInvalid` and `0x715 DeviceClientUnknown` as
+   success-equivalent (PLC already cleaned up on its side; see
+   `isBestEffortDeleteSuccess`). `savedHandles = nil` after the first
+   pass so a later retry-loop iteration doesn't re-fire.
+8. Filter `notificationConfigs` — drop entries for symbols no longer
+   available.
+9. Re-subscribe remaining notifications (fresh PLC-assigned handles
+   replace the deleted ones).
+10. Bump epoch counter (`sess.lifecycle.epoch.Add(1)`).
+11. Fire `OnReconnect`.
 
 ### Event callbacks
 
@@ -401,10 +418,48 @@ Both `Connect()` and `Reconnect()` use a probe-first approach for route registra
 1. TCP connect + start goroutines.
 2. **Probe:** send `GetSymbolVersion()` — a cheap ADS command.
 3. Probe OK → route exists, skip credential registration.
-4. Probe fails → register route over UDP, TCP-reconnect, retry probe.
-5. After repeated probe failures, the library skips probing and always registers (fallback).
+4. Probe fails with a transport-level error (`ErrTransportClosed`, `io.EOF`,
+   `syscall.ECONNRESET`) → **redial + retry probe once** before registering.
+   This catches the case where the PLC RST'd due to a transient slot
+   conflict (previous TCP from same source IP not yet released) rather
+   than a missing route. Retry-success → skip AddRoute entirely. Retry-fail
+   → register via UDP, TCP-reconnect, continue. (v2.2.2.)
+5. Probe fails with a non-transport error → register immediately
+   (re-dial wouldn't help an ADS-level rejection).
+6. After repeated probe failures (`probeFailures >= 3`), the library skips
+   probing entirely and always registers (fallback).
 
-`WithForceRouteRegistration()` bypasses probing entirely — always registers with credentials. Requires `WithRoute(...)`.
+`WithSkipRouteRegistration()` bypasses BOTH probe and AddRoute entirely
+when callers manage the route lifecycle externally (pre-registered via
+TC3 UI, or fronted by a local AMS router daemon). (v2.2.2.)
+
+`WithForceRouteRegistration()` bypasses probing — always registers with
+credentials. Requires `WithRoute(...)`.
+
+#### `ondrop` suppression during Connect
+
+During `ensureRouteOnConnect` the `ondrop` callback on the active
+`*Client` is disarmed (set to nil) and restored on function exit via
+`defer`. Reason: a probe RST during the probe-RPC call would otherwise
+fire `sess.triggerReconnect` via the listen goroutine, spawning a
+concurrent Reconnect goroutine that competes with our own
+AddRoute/redial path on `sess.client` / `tx.connection` /
+`lifecycle.ctx`. (v2.2.2 — observed in cold-start hardware tests when
+the PLC route was stale; symptom was duplicate "registering route" +
+"FSM invalid transition" log noise and intermittent test failure.)
+`dialAndStart` re-arms `ondrop` on each new Client it creates; the
+retry block manually re-disarms after that re-arm.
+
+#### Route naming convention
+
+Route names on the PLC are unique by `routeName` string. Two
+registrations with the same name but different (NetID, Address)
+parameters can produce duplicate-name entries that confuse PLC
+routing resolution (silent ADS RPC timeout). Callers that change
+source IP across runs (DHCP, wifi↔ethernet, container vs bare metal)
+SHOULD make the route name unique per source IP (e.g.,
+`go-ads-{source-ip}`). The integration test helper does this
+automatically when `ADS_HOST_IP` is set.
 
 > Security note: route credentials passed via `WithRoute` / `AddRemoteRoute` are transmitted in plaintext over UDP. Avoid hardcoding; load from env or secret store.
 
@@ -422,6 +477,111 @@ By default, missing on-demand symbols after reconnect are skipped with a warning
 - `maxAttempts = 0` → fail immediately on first missing symbol.
 - `maxAttempts = N` → retry up to N times, then close the connection.
 - Failure counter resets on a fully-successful reconnect (all symbols resolved).
+
+## Notification handle hygiene
+
+The library actively prevents PLC notification-handle accumulation
+(Beckhoff/ADS #268) via three complementary strategies introduced in
+v2.2.1:
+
+### 1. Orphan-Delete (`tryOrphanDelete`)
+
+When the recvWorker decodes a `DeviceNotification` packet whose handle
+is NOT in `activeNotifications`, the library schedules an asynchronous
+best-effort Delete RPC against that handle. Catches handles leaked by
+prior session/process crashes that the PLC is still firing for.
+
+Guard rails (`cmd_notification.go`):
+
+- **Lifecycle guards**: skip if Session is closing or actively reconnecting.
+- **Throttle**: per-handle 60-second window prevents repeated Delete
+  RPCs for the same noisy orphan. Throttle entry is committed only
+  after sem acquire (otherwise sem-full would silently 60-second-lock
+  a handle that never had an RPC attempted).
+- **Bounded concurrency**: semaphore-bounded to 10 in-flight orphan
+  Deletes (sized for Beckhoff's ~550-handle cap; one process should
+  never need more concurrent cleanups).
+- **GC**: orphanSeen map garbage-collects entries older than 5 minutes
+  on each invocation.
+- **Race re-check**: under `notifications.lock` immediately before
+  firing the RPC, re-check that the handle is still NOT in
+  `activeNotifications` — a concurrent `AddSymbolNotification` may
+  legitimately have received this handle from the PLC between
+  scheduling and firing. Skip the Delete if so.
+- **ctx snapshot**: `lifecycle.ctx` read under `ctxMu.RLock` because
+  Reconnect's `tearDownAndReset` replaces ctx under `ctxMu.Lock`.
+- **Per-RPC timeout**: 5 seconds via `context.WithTimeout`.
+- **Panic recover**: in the spawned goroutine — never crash the host.
+- **WaitGroup tracking**: registered on `lifecycle.waitGroup` so
+  `Close()` waits for in-flight orphan Deletes to complete.
+
+Logging:
+
+- Success (handle deleted PLC-side) → Info.
+- Skipped (any guard rail tripped) → Debug.
+- RPC failed with `0x714` / `0x715` (PLC already cleaned) → Debug.
+- RPC failed with any other code → Warn (real failure operators must
+  see).
+
+### 2. Auto-reload pre-delete
+
+`reloadSymbolsAndResubscribe` snapshots all current handles before the
+reload, bumps `lastSubscribeNs`, wipes `activeNotifications` (all
+atomically under `notifications.lock`), then `bestEffortDelete`s the
+snapshot before re-subscribing. Prevents PLC retaining stale handles
+across online-change boundaries.
+
+### 3. Reconnect pre-delete
+
+`Reconnect` performs the same snapshot+wipe+bestEffortDelete cycle on
+the new TCP transport before re-subscribing. See [Reconnect sequence](#reconnect-sequence)
+steps 1 and 7. `savedHandles` clears after the first cleanup pass so a
+retry-loop iteration doesn't re-fire.
+
+### Best-effort cleanup success codes
+
+`isBestEffortDeleteSuccess(code)` returns true for:
+
+| Code | Name | Meaning |
+|------|------|---------|
+| `0x000` | `NoErrors` | Actually deleted |
+| `0x714` | `NotifyHandleInvalid` | Handle already gone PLC-side (route-idle, PLC reboot, prior cleanup) |
+| `0x715` | `DeviceClientUnknown` | PLC dropped our client identity entirely (typical after TCP reset / reconnect); handles went with it |
+
+Treating `0x715` as cleanup-success is a deliberate divergence from
+Beckhoff's official AdsLib (which does not). The library's reconnect
+path hits `0x715` routinely when PLC clears the just-severed-TCP's
+endpoint; treating it as failure produces misleading WARN spam during
+normal recovery with no functional benefit (the handle is gone either
+way).
+
+## Multi-Session on the same host (limitation)
+
+TwinCAT PLCs enforce one active TCP slot per source IP, regardless of
+source AMS NetID, AMS port, or route name (see [README §Limitations](README.md#limitations)
+and Beckhoff/ADS #49, #72, jisotalo/ads-client #47). Two `Session`s
+opened from the same source IP to the same PLC will evict each other.
+
+The library provides three escape hatches:
+
+- `WithLocalBindIP(ip)` — pin Session's outbound TCP source IP. Each
+  Session pins to a distinct local IP via IP aliases on the host; PLC
+  sees them as separate hosts. Validated at option time; invalid IPs
+  log a Warn and fall through to OS-default routing.
+- `WithSkipRouteRegistration()` — explicit opt-out from AddRoute/probe.
+  Required when callers manage routes externally (TC3 UI pre-registered
+  routes, or a local AMS router daemon front-ends the connection).
+- `WithLocalAMS(AMSAddress{NetID, Port})` — override the source AMS
+  identity in outgoing ADS headers. NetID defaults to auto-derivation
+  from local TCP source IP; Port defaults to a random value in IANA
+  dynamic range 32768-49151 (each Session = distinct AMS source
+  identity, no manual coordination required).
+
+For multi-process scenarios on a single host needing the same target
+PLC, deploy a local AMS router daemon (Beckhoff's
+`Beckhoff.TwinCAT.Ads.TcpRouter` or open-source `AmsRouterDaemon`) and
+point all Sessions at `127.0.0.1:48898`. The library connects to any
+TCP endpoint; the router multiplexes a single PLC connection.
 
 ---
 
@@ -488,6 +648,17 @@ quick-start.
   sliding-window cap (`WithMaxSymbolVersionReloadAttempts`,
   `WithSymbolVersionReloadWindow`) — these options are no-ops under
   `Close` or `Ignore` strategies.
+- `WithLocalAMS(AMSAddress{Port:0})` keeps the default random AMS port
+  (each Session = distinct AMS source identity per process). Pass a
+  non-zero `Port` only when the deployment needs a stable AMS port
+  (firewalled environments with port allow-lists, PLC-side route
+  table pinning by exact port).
+- `WithLocalBindIP(ip)` is parsed and validated at option time; invalid
+  IPs log a Warn and leave the field nil (OS-default routing). The
+  parsed `net.IP` is reused for every dial — no per-dial parse cost.
+- `WithSkipRouteRegistration()` is an explicit alternative to omitting
+  `WithRoute(...)`. Useful when an options chain is built uniformly
+  for many Sessions and only one needs to opt out.
 
 ### Client (raw RPC, escape hatch)
 
