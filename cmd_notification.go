@@ -172,7 +172,7 @@ func (sess *Session) SumDeleteDeviceNotification(ctx context.Context, handles []
 	}
 	sess.notifications.lock.Lock()
 	for i, h := range handles {
-		if errors[i] == ReturnCodeNoErrors || errors[i] == ReturnCodeDeviceNotifyHandleInvalid {
+		if isBestEffortDeleteSuccess(errors[i]) {
 			if entry, ok := sess.notifications.activeNotifications[h]; ok && entry.Sym != nil {
 				sess.removeNotificationConfig(entry.Sym.FullName)
 			}
@@ -382,10 +382,28 @@ const (
 	orphanDeleteRPCTimeout     = 5 * time.Second
 )
 
+// isBestEffortDeleteSuccess reports whether a DeleteDeviceNotification
+// return code counts as cleanup success for best-effort paths.
+// NoErrors                = actually deleted.
+// NotifyHandleInvalid (0x714) = handle already gone on PLC side
+//                               (route-idle-timeout, PLC reboot, prior cleanup).
+// DeviceClientUnknown  (0x715) = PLC dropped our client identity (typical
+//                               after TCP reset / reconnect); whatever
+//                               handles we had are implicitly gone too.
+// In all three cases the handle is no longer consuming PLC resources,
+// which is the only goal of best-effort cleanup paths.
+func isBestEffortDeleteSuccess(code ReturnCode) bool {
+	return code == ReturnCodeNoErrors ||
+		code == ReturnCodeDeviceNotifyHandleInvalid ||
+		code == ReturnCodeDeviceClientUnknown
+}
+
 // tryOrphanDelete schedules an async best-effort Delete of an unknown
 // notification handle. Skip paths log Debug. RPC outcome:
 //   - success         → Info (operators see productive cleanup)
 //   - 0x714 NotifyHandleInvalid → Debug (PLC already reaped, expected)
+//   - 0x715 DeviceClientUnknown → Debug (PLC dropped client identity,
+//     handle implicitly gone)
 //   - any other error → Warn (real failure: transport, auth, timeout,
 //     marshaling, protocol mismatch)
 func (sess *Session) tryOrphanDelete(handle uint32) {
@@ -489,13 +507,16 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 		defer cancel()
 		if err := c.DeleteDeviceNotification(ctx, handle); err != nil {
 			// 0x714 NotifyHandleInvalid = expected (PLC already reaped via
-			// route-idle-timeout, reboot, or prior cleanup pass). Log Debug
-			// so it doesn't flood under high-rate orphan streams.
+			// route-idle-timeout, reboot, or prior cleanup pass).
+			// 0x715 DeviceClientUnknown = PLC dropped our client identity
+			// entirely (typical after TCP reset / reconnect); the handle
+			// went with it. Both Debug so they don't flood under high-rate
+			// orphan streams.
 			// Every other code (transport, auth, timeout, marshaling,
 			// protocol mismatch) is a real failure operators need to see;
 			// surface at Warn.
-			if errors.Is(err, ReturnCodeDeviceNotifyHandleInvalid) {
-				sess.logger.Debug("orphan delete RPC: handle already invalid (expected after PLC reap)",
+			if errors.Is(err, ReturnCodeDeviceNotifyHandleInvalid) || errors.Is(err, ReturnCodeDeviceClientUnknown) {
+				sess.logger.Debug("orphan delete RPC: handle already gone PLC-side (expected)",
 					"handle", handle, "error", err)
 				return
 			}

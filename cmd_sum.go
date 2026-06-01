@@ -531,7 +531,9 @@ func (c *Client) sumAddNotificationFallback(ctx context.Context, requests []SumN
 // paths where the caller cannot meaningfully react to a failure (e.g.
 // PLC unreachable during a reconnect retry). Returns the count of
 // successfully deleted handles. Treats ReturnCodeDeviceNotifyHandleInvalid
-// as success-equivalent (handle already gone PLC-side).
+// (0x714) and ReturnCodeDeviceClientUnknown (0x715) as success-equivalent
+// (handle already gone PLC-side / client identity dropped post-reconnect)
+// via isBestEffortDeleteSuccess.
 //
 // Lives on *Session because it routes through Session.SumDeleteDeviceNotification
 // to keep activeNotifications consistent with the PLC.
@@ -548,7 +550,7 @@ func (sess *Session) bestEffortDeleteNotifications(ctx context.Context, handles 
 	}
 	deleted := 0
 	for _, code := range errors {
-		if code == ReturnCodeNoErrors || code == ReturnCodeDeviceNotifyHandleInvalid {
+		if isBestEffortDeleteSuccess(code) {
 			deleted++
 		}
 	}
@@ -572,7 +574,15 @@ func (c *Client) sumDeleteNotificationFallback(ctx context.Context, handles []ui
 			} else {
 				codes[i] = ReturnCodeDeviceError
 			}
-			c.logger.Warn("individual DeleteDeviceNotification failed in fallback", "error", err, "handle", h)
+			// 0x714 / 0x715 = handle already gone PLC-side (typical after
+			// reconnect or in best-effort cleanup paths). Log Debug; the
+			// caller's reduction via isBestEffortDeleteSuccess still counts
+			// these as cleanup wins. Other codes = real failure → Warn.
+			if isBestEffortDeleteSuccess(codes[i]) {
+				c.logger.Debug("individual DeleteDeviceNotification: handle already gone PLC-side", "error", err, "handle", h, "code", codes[i])
+			} else {
+				c.logger.Warn("individual DeleteDeviceNotification failed in fallback", "error", err, "handle", h)
+			}
 		} else {
 			codes[i] = ReturnCodeNoErrors
 		}
