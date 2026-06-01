@@ -860,3 +860,25 @@ func TestResubscribeNotifications_RollbackOnError(t *testing.T) {
 	// is acceptable for the rollback contract — we care about the restoration.
 	_ = err
 }
+
+func TestIsBestEffortDeleteSuccess(t *testing.T) {
+	cases := []struct {
+		name string
+		code ReturnCode
+		want bool
+	}{
+		{"NoErrors", ReturnCodeNoErrors, true},
+		{"NotifyHandleInvalid", ReturnCodeDeviceNotifyHandleInvalid, true},
+		{"DeviceClientUnknown", ReturnCodeDeviceClientUnknown, true},
+		{"DeviceError", ReturnCodeDeviceError, false},
+		{"DeviceNotReady", ReturnCodeDeviceNotReady, false},
+		{"GlobalTargetNotFound", ReturnCodeGlobalTargetNotFound, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isBestEffortDeleteSuccess(tc.code); got != tc.want {
+				t.Errorf("isBestEffortDeleteSuccess(%v) = %v, want %v", tc.code, got, tc.want)
+			}
+		})
+	}
+}
