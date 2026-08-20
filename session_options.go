@@ -234,6 +234,43 @@ func WithRequestTimeout(d time.Duration) SessionOption {
 	}
 }
 
+// TargetCheck selects what NewSession does when the device at the target IP
+// reports a different NetID than the caller supplied. Set with WithTargetCheck.
+type TargetCheck int
+
+const (
+	// TargetCheckWarn logs a warning and continues. Default, because a mismatch
+	// is not proof of a mistake: pointed at a router, the NetID you want
+	// legitimately belongs to a device behind it.
+	TargetCheckWarn TargetCheck = iota + 1
+	// TargetCheckError refuses to construct the session. Right for a deployment
+	// that talks straight to its PLCs, where a mismatch is always a
+	// misconfiguration and failing at startup beats a session that connects and
+	// then answers nothing.
+	TargetCheckError
+	// TargetCheckOff skips the check, and with it the one UDP round-trip it
+	// costs. Also the way to stay silent on a host that is deliberately
+	// addressed through a router.
+	TargetCheckOff
+)
+
+// WithTargetCheck sets what happens when the target NetID disagrees with what
+// the device reports for itself (see TargetCheck). Default is TargetCheckWarn.
+//
+// The check costs one UDP round-trip during NewSession, measured at a few
+// milliseconds, and only runs when the caller supplied a complete target — an
+// incomplete one is resolved from the device instead, which is authoritative by
+// construction. A device that does not answer the identify service is never
+// treated as a mismatch: verification is skipped with a Debug line, because a
+// firewalled UDP port says nothing about whether the address is right.
+func WithTargetCheck(c TargetCheck) SessionOption {
+	return func(s *Session) {
+		if c != 0 {
+			s.targetCheck = c
+		}
+	}
+}
+
 // WithRouteActivationTimeout caps how long Connect waits, after registering a
 // route, for the PLC's AMS router to actually start serving it. The router
 // acknowledges the UDP registration before the entry is necessarily live, and

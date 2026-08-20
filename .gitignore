@@ -15,3 +15,8 @@ symbol-version-run-*.log
 
 # Self-review agent artifacts
 .self-review/
+
+# Local hardware-probe helpers (route-table admin, System Service probes).
+# Kept out of the repo because they lean on work-in-progress router code that
+# isn't committed yet, so committing them would break the integration build.
+zz_*_integration_test.go

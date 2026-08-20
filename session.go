@@ -189,6 +189,10 @@ type Session struct {
 	// Route registration config (populated by WithRoute / WithForceRouteRegistration).
 	route *routeManager
 
+	// targetCheck is the policy for a caller-supplied target NetID that the
+	// device disagrees with. Write-once at construction via WithTargetCheck.
+	targetCheck TargetCheck
+
 	logger *slog.Logger
 }
 
@@ -208,11 +212,20 @@ type AMSEndpoint struct {
 // Target address: remote.AMS may be left incomplete. A zero NetID and/or a
 // zero AMS port are resolved by asking the device for its own identity over
 // UDP (see IdentifyRemote) — one round-trip, read-only, no route or
-// credentials needed. That is the exception to "no I/O until Connect", and it
-// only happens when something is missing; a fully specified target does no I/O
-// here. The discovered port follows the TwinCAT-major-version convention (801
-// on TC2, 851 on TC3), so a project with several runtimes must still set the
-// port explicitly.
+// credentials needed. The resolved port follows the TwinCAT-major-version
+// convention (801 on TC2, 851 on TC3), so a project with several runtimes must
+// still set the port explicitly.
+//
+// A target that IS fully specified is verified against the same service, so a
+// wrong or stale NetID surfaces here instead of as a session that connects and
+// then answers nothing. The default only warns, because a mismatch is also
+// what a legitimate routed setup looks like; WithTargetCheck makes it an error
+// or turns it off. A device that does not answer the identify service is never
+// treated as a mismatch.
+//
+// Either way this is one UDP round-trip inside NewSession — the exception to
+// "no I/O until Connect" — costing a few milliseconds, and skippable entirely
+// with WithTargetCheck(TargetCheckOff) when the target is fully specified.
 //
 // Local AMS NetID defaults to auto-derivation from the local TCP source IP.
 // Local AMS port defaults to a random value in the IANA dynamic range
@@ -273,6 +286,9 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 	// callers can override.
 	sess.maxReloadAttempts = 3
 	sess.reloadWindow = 60 * time.Second
+	// Verify a caller-supplied target NetID against the device by default, but
+	// only warn on a mismatch — see TargetCheck for why it cannot be an error.
+	sess.targetCheck = TargetCheckWarn
 	// Default local AMS port: random in IANA dynamic range so each process /
 	// each session presents a distinct AMS source identity to the PLC. See
 	// randomAMSPort doc for the rationale. WithLocalAMS overrides for stable-
@@ -287,6 +303,11 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 	// specified target still reaches Connect without any I/O.
 	if needsDiscovery {
 		if err := sess.discoverTarget(ctx); err != nil {
+			cancel()
+			return nil, err
+		}
+	} else if sess.targetCheck != TargetCheckOff {
+		if err := sess.verifyTarget(ctx); err != nil {
 			cancel()
 			return nil, err
 		}
@@ -320,6 +341,60 @@ func (sess *Session) discoverTarget(ctx context.Context) error {
 		"port", sess.target.Port,
 		"hostName", id.HostName,
 		"twinCAT", id.Version())
+	return nil
+}
+
+// targetVerifyTimeout bounds the verification round-trip. Shorter than
+// identifyTimeout because verification is optional: a device that does not
+// answer must cost a caller who already knows the address almost nothing.
+const targetVerifyTimeout = time.Second
+
+// verifyTarget asks the device what NetID it has and compares it with the one
+// the caller supplied. Catching a wrong NetID here turns the worst failure mode
+// in ADS — the router accepts the socket and then silently drops every request
+// — into an immediate, named answer.
+func (sess *Session) verifyTarget(ctx context.Context) error {
+	verifyCtx, cancel := context.WithTimeout(ctx, targetVerifyTimeout)
+	defer cancel()
+	id, err := IdentifyRemoteWithLogger(verifyCtx, sess.logger, sess.ip)
+	if err != nil {
+		// Never let verification be why a session fails to start when the
+		// caller told us the address. A device can serve ADS on TCP 48898 with
+		// UDP 48899 firewalled off — observed on a Windows TwinCAT host — so an
+		// unanswered identify means "cannot verify", not "wrong".
+		sess.logger.Debug("target NetID not verified (device did not answer the identify service)",
+			"host", sess.ip, "target", sess.target.NetIDString(), "error", err)
+		return nil
+	}
+	return sess.applyTargetCheck(id)
+}
+
+// applyTargetCheck decides what a verification result means. Split from the
+// round-trip so the policy is testable without a device.
+func (sess *Session) applyTargetCheck(id RemoteIdentity) error {
+	if id.AMS.NetID == sess.target.NetID {
+		sess.logger.Debug("target NetID confirmed by device",
+			"host", sess.ip, "netID", sess.target.NetIDString(),
+			"hostName", id.HostName, "twinCAT", id.Version())
+		return nil
+	}
+	// A mismatch is usually a wrong or stale NetID, but it is also exactly what
+	// a legitimate routed setup looks like: point at a gateway and the NetID you
+	// want belongs to a device behind it, not to the responder. Nothing in the
+	// response separates the two, which is why the default warns rather than
+	// refusing — see WithTargetCheck.
+	const hint = "usually a wrong or stale target NetID; legitimate when this host is a router and the target sits behind it"
+	if sess.targetCheck == TargetCheckError {
+		return fmt.Errorf("ads: NewSession: target NetID %s does not match the NetID %s reported by %s (%s, TwinCAT %s): %s",
+			sess.target.NetIDString(), id.AMS.NetIDString(), sess.ip, id.HostName, id.Version(), hint)
+	}
+	sess.logger.Warn("target NetID differs from the NetID this device reports for itself",
+		"host", sess.ip,
+		"configured", sess.target.NetIDString(),
+		"reported", id.AMS.NetIDString(),
+		"hostName", id.HostName,
+		"twinCAT", id.Version(),
+		"hint", hint)
 	return nil
 }
 

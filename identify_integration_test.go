@@ -5,6 +5,7 @@ package ads
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -40,6 +41,64 @@ func TestIntegrationIdentifyRemote(t *testing.T) {
 	if envPort := os.Getenv("ADS_TARGET_PORT"); envPort == "801" && id.RuntimePort() != 801 {
 		t.Errorf("RuntimePort() = %d on a TwinCAT %s device configured for 801", id.RuntimePort(), id.Version())
 	}
+}
+
+// TestIntegrationTargetCheckCatchesWrongNetID is the payoff for verification: a
+// wrong target NetID normally produces a session that connects and then times
+// out on everything, with nothing pointing at the address. Under
+// TargetCheckError it fails at construction, naming both NetIDs.
+func TestIntegrationTargetCheckCatchesWrongNetID(t *testing.T) {
+	host := getEnvOrDefault("ADS_PLC_IP", "192.168.3.224")
+	real := os.Getenv("ADS_TARGET_AMS")
+	if real == "" {
+		t.Skip("ADS_TARGET_AMS not set")
+	}
+	wrong, err := NewAMSAddress("5.99.99.99.1.1", 851)
+	if err != nil {
+		t.Fatalf("wrong address: %v", err)
+	}
+
+	t.Run("error mode refuses", func(t *testing.T) {
+		_, err := NewSession(context.Background(),
+			AMSEndpoint{IP: host, AMS: wrong},
+			WithTargetCheck(TargetCheckError))
+		if err == nil {
+			t.Fatal("NewSession accepted a NetID the device disagrees with")
+		}
+		for _, want := range []string{"5.99.99.99.1.1", real} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error missing %q: %v", want, err)
+			}
+		}
+		t.Logf("refused as expected: %v", err)
+	})
+
+	t.Run("warn mode continues", func(t *testing.T) {
+		sess, err := NewSession(context.Background(),
+			AMSEndpoint{IP: host, AMS: wrong},
+			WithTargetCheck(TargetCheckWarn))
+		if err != nil {
+			t.Fatalf("warn mode must not refuse: %v", err)
+		}
+		t.Cleanup(func() { sess.Close() })
+		if sess.target.NetIDString() != "5.99.99.99.1.1" {
+			t.Errorf("warn mode altered the target: %s", sess.target.NetIDString())
+		}
+	})
+
+	t.Run("correct NetID passes error mode", func(t *testing.T) {
+		right, err := NewAMSAddress(real, 851)
+		if err != nil {
+			t.Fatalf("real address: %v", err)
+		}
+		sess, err := NewSession(context.Background(),
+			AMSEndpoint{IP: host, AMS: right},
+			WithTargetCheck(TargetCheckError))
+		if err != nil {
+			t.Fatalf("error mode rejected the correct NetID: %v", err)
+		}
+		t.Cleanup(func() { sess.Close() })
+	})
 }
 
 // TestIntegrationSessionDiscoversTarget leaves the target AMS address out
