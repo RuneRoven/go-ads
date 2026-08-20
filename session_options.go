@@ -234,6 +234,28 @@ func WithRequestTimeout(d time.Duration) SessionOption {
 	}
 }
 
+// WithRouteActivationTimeout caps how long Connect waits, after registering a
+// route, for the PLC's AMS router to actually start serving it. The router
+// acknowledges the UDP registration before the entry is necessarily live, and
+// until it is, requests are dropped with no reply — so Connect re-probes
+// rather than handing back a session where every command times out.
+//
+// The default (10s) covers every PLC observed so far, including TC/RTOS, which
+// is the slowest. Raise it for a PLC or router under heavy load; lower it when
+// the caller would rather fail fast than wait (CI, discovery tooling). The
+// per-probe timeout and retry cadence are derived from this value.
+//
+// Values <= 0 are ignored. Note a deadline on the context passed to Connect
+// also bounds this wait, so the option is only needed to wait LONGER than the
+// default.
+func WithRouteActivationTimeout(d time.Duration) SessionOption {
+	return func(s *Session) {
+		if d > 0 {
+			s.route.activationTimeout = d
+		}
+	}
+}
+
 // WithForceRouteRegistration disables route probing and always registers the route
 // with credentials on every Connect and Reconnect. Use this in environments where
 // routes are not persistent or must be refreshed on each connection.

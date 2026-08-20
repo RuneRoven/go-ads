@@ -37,7 +37,7 @@ func (c *Client) Read(ctx context.Context, group uint32, offset uint32, length u
 	// Try to send the request
 	resp, err := c.sendRequest(ctx, CommandIDRead, request.Bytes())
 	if err != nil {
-		c.logger.Error("send request failed", "error", err)
+		c.logger.Log(ctx, c.transportFaultLevel(), "send request failed", "error", err)
 		return
 	}
 

@@ -33,6 +33,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -104,6 +105,10 @@ type Client struct {
 	// from subsequent RPCs). Session installs s.triggerReconnect.
 	ondropMu sync.RWMutex
 	ondrop   func()
+
+	// handshaking is set while a route probe / registration is in flight; see
+	// SetHandshaking for why transport faults are demoted to Debug then.
+	handshaking atomic.Bool
 
 	// Internal cancellation for the worker goroutines. Independent of any
 	// caller context — Close cancels this to stop workers.
@@ -236,6 +241,29 @@ func (c *Client) SetOnDrop(fn func()) {
 	c.ondropMu.Unlock()
 }
 
+// SetHandshaking marks whether a route probe / registration handshake is in
+// flight. During the handshake a dropped connection and an unanswered request
+// are expected states, not faults: the normal cold-start flow is probe → PLC
+// rejects an unknown NetID → register route → redial → probe again. Logging
+// those at ERROR misreports a connect that is still progressing, and
+// downstream log-based health checks (umh-core's IsLogsFine fails a data-flow
+// component on any level=error line in its recent window) hold the component
+// in a starting state even though the PLC is connected and streaming.
+//
+// Errors are still returned to the caller unchanged — only the log level moves.
+func (c *Client) SetHandshaking(v bool) {
+	c.handshaking.Store(v)
+}
+
+// transportFaultLevel returns the level to log a transport fault at: Debug
+// while a handshake is in flight, Error otherwise.
+func (c *Client) transportFaultLevel() slog.Level {
+	if c.handshaking.Load() {
+		return slog.LevelDebug
+	}
+	return slog.LevelError
+}
+
 func (c *Client) callOnDrop() {
 	c.ondropMu.RLock()
 	fn := c.ondrop
@@ -281,11 +309,11 @@ func (c *Client) listen() {
 				hint = "PLC may not have an AMS route for this NetID — check route credentials or register route via WithRoute()"
 			}
 			if hint != "" {
-				c.logger.Error("PLC closed connection, transport down",
+				c.logger.Log(c.ctx, c.transportFaultLevel(), "PLC closed connection, transport down",
 					"error", err, "hint", hint,
 					"sourceNetID", c.source.NetIDString())
 			} else {
-				c.logger.Error("listen read error, transport down", "error", err)
+				c.logger.Log(c.ctx, c.transportFaultLevel(), "listen read error, transport down", "error", err)
 			}
 			c.callOnDrop()
 			return
@@ -554,7 +582,7 @@ func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte
 	select {
 	case <-ctx.Done():
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			c.logger.Error("sendRequest aborted due to timeout")
+			c.logger.Log(ctx, c.transportFaultLevel(), "sendRequest aborted due to timeout")
 		} else {
 			c.logger.Info("sendRequest aborted due to shutdown")
 		}
@@ -564,7 +592,7 @@ func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte
 	select {
 	case <-ctx.Done():
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			c.logger.Error("sendRequest aborted due to timeout")
+			c.logger.Log(ctx, c.transportFaultLevel(), "sendRequest aborted due to timeout")
 		} else {
 			c.logger.Info("sendRequest aborted due to shutdown")
 		}

@@ -456,6 +456,13 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 				return fmt.Errorf("TCP reconnect after route registration failed: %w", err)
 			}
 			sess.logger.Info("TCP reconnected after route registration")
+			// Don't report a working session until the PLC actually serves the
+			// new route. Returning here with the router still catching up hands
+			// the caller a Connect that succeeded and a session where every
+			// command times out.
+			if err := sess.awaitRouteActive(ctx); err != nil {
+				return fmt.Errorf("route registration during connect: %w", err)
+			}
 		}
 
 	}
@@ -542,11 +549,16 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 	// function via defer; intermediate dialAndStart calls in the retry
 	// path also re-arm on each new Client they create, but we override
 	// those back to nil for the duration of this routine.
+	// SetHandshaking rides along with the ondrop disarm: a probe that times out
+	// or gets RST is the expected first step of the cold-start flow, so it must
+	// not surface as ERROR. See Client.SetHandshaking.
 	if oldClient := sess.client.Load(); oldClient != nil {
 		oldClient.SetOnDrop(nil)
+		oldClient.SetHandshaking(true)
 	}
 	defer func() {
 		if c := sess.client.Load(); c != nil {
+			c.SetHandshaking(false)
 			c.SetOnDrop(sess.triggerReconnect)
 		}
 	}()
@@ -592,6 +604,7 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		// re-arm at function exit restores the production handler).
 		if c := sess.client.Load(); c != nil {
 			c.SetOnDrop(nil)
+			c.SetHandshaking(true)
 		}
 		if sess.isClosed() {
 			return false, fmt.Errorf("connection closed during route probe retry")
@@ -613,6 +626,110 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		return false, err
 	}
 	return true, nil
+}
+
+// Route activation: AddRoute is a UDP call to the PLC's AMS router, and the
+// router acknowledges the entry before it is necessarily serving it. Until it
+// does, ADS requests for our NetID are dropped with no reply at all — not an
+// error code, silence. Observed on TC/RTOS 3.1.4026 (192.168.3.224) as a
+// Connect that returned success followed by a session where ReadState,
+// ReadDeviceInfo and LoadSymbols all timed out; the route worked on the next
+// process start. Re-probe until the router answers so Connect either hands
+// back a session that works or fails honestly.
+// The default ceiling is generous on purpose: the wait ends on the first
+// successful probe, so the only case that pays it is a route that never comes
+// live, where taking 10s to report an honest failure beats reporting success.
+// Override with WithRouteActivationTimeout.
+const (
+	defaultRouteActivationTimeout = 10 * time.Second
+	routeActivationPollDelay      = 250 * time.Millisecond
+	minRouteActivationProbe       = 500 * time.Millisecond
+	maxRouteActivationProbe       = 2 * time.Second
+)
+
+// routeActivationBudget returns the total wait and the per-probe timeout
+// derived from it. Deriving the probe timeout keeps a shortened total
+// coherent — a fixed probe timeout larger than the total would allow exactly
+// one attempt, and that attempt would overrun the budget.
+func (sess *Session) routeActivationBudget() (total, probe time.Duration) {
+	total = sess.route.activationTimeout
+	if total <= 0 {
+		total = defaultRouteActivationTimeout
+	}
+	probe = total / 4
+	if probe < minRouteActivationProbe {
+		probe = minRouteActivationProbe
+	}
+	if probe > maxRouteActivationProbe {
+		probe = maxRouteActivationProbe
+	}
+	return total, probe
+}
+
+// awaitRouteActive re-probes the PLC after a route registration until one
+// probe round-trips, redialing when the PLC drops the connection mid-probe
+// (it does that for a source NetID it does not serve yet, so a redial is part
+// of waiting rather than a failure).
+//
+// Call immediately after a successful AddRoute. ondrop is disarmed for the
+// duration so a PLC-initiated RST cannot spawn a competing Reconnect
+// goroutine while we own the transport — same rationale as
+// ensureRouteOnConnect. Client.SetHandshaking keeps the expected faults off
+// the ERROR channel while we are still working.
+func (sess *Session) awaitRouteActive(ctx context.Context) error {
+	if c := sess.client.Load(); c != nil {
+		c.SetOnDrop(nil)
+		c.SetHandshaking(true)
+	}
+	defer func() {
+		if c := sess.client.Load(); c != nil {
+			c.SetHandshaking(false)
+			c.SetOnDrop(sess.triggerReconnect)
+		}
+	}()
+
+	total, probeTimeout := sess.routeActivationBudget()
+	deadline := time.Now().Add(total)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		if sess.isClosed() {
+			return fmt.Errorf("connection closed while waiting for route activation")
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		lastErr = sess.probeRoute(probeCtx)
+		cancel()
+		if lastErr == nil {
+			sess.route.routeProbeFailures.Store(0)
+			if attempt > 1 {
+				sess.logger.Info("route active after registration", "probeAttempts", attempt)
+			}
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		sess.logger.Debug("route not served by PLC yet, re-probing",
+			"attempt", attempt, "error", lastErr, "delay", routeActivationPollDelay)
+		if isProbeRetryable(lastErr) {
+			sess.tearDownAndReset(false)
+			if dialErr := sess.dialAndStart(); dialErr != nil {
+				return fmt.Errorf("redial while waiting for route activation: %w", dialErr)
+			}
+			// dialAndStart armed ondrop on the new Client; disarm again for the
+			// rest of the wait (the deferred restore handles function exit).
+			if c := sess.client.Load(); c != nil {
+				c.SetOnDrop(nil)
+				c.SetHandshaking(true)
+			}
+		}
+		select {
+		case <-time.After(routeActivationPollDelay):
+		case <-ctx.Done():
+			return fmt.Errorf("route activation wait aborted: %w", ctx.Err())
+		}
+	}
+	return fmt.Errorf("route %q was registered but the PLC did not serve it within %v: %w",
+		sess.route.name, total, lastErr)
 }
 
 // probeRoute sends a lightweight ADS command (GetSymbolVersion) to verify
@@ -1301,7 +1418,12 @@ func (sess *Session) ensureRoute() error {
 		if err := sess.AddRoute(sess.lifecycle.ctx, sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
 			return fmt.Errorf("route registration failed: %w", err)
 		}
-
+		// Same activation lag as on connect. Failing here feeds the reconnect
+		// loop's own retry rather than letting reloadSymbols be the first thing
+		// to discover the route isn't live yet.
+		if err := sess.awaitRouteActive(sess.lifecycle.ctx); err != nil {
+			return err
+		}
 		sess.route.routeProbeFailures.Store(0)
 		return nil
 	}
@@ -1324,8 +1446,7 @@ func (sess *Session) ensureRoute() error {
 	if err := sess.AddRoute(sess.lifecycle.ctx, sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
 		return fmt.Errorf("route registration failed after probe: %w", err)
 	}
-
-	return nil
+	return sess.awaitRouteActive(sess.lifecycle.ctx)
 }
 
 // filterValidPending returns only pending entries whose symbols still exist

@@ -221,8 +221,12 @@ type routeManager struct {
 	username               string
 	password               secret
 	forceRouteRegistration bool
-	skipRegistration       bool // set via WithSkipRouteRegistration — caller manages routes externally
-	routeProbeFailures     atomic.Int32
+	// activationTimeout caps the post-registration wait for the PLC's router
+	// to start serving the new route. 0 means use defaultRouteActivationTimeout;
+	// set via WithRouteActivationTimeout.
+	activationTimeout  time.Duration
+	skipRegistration   bool // set via WithSkipRouteRegistration — caller manages routes externally
+	routeProbeFailures atomic.Int32
 }
 
 // shouldSkip reports whether route registration must be bypassed entirely.
