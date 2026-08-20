@@ -205,6 +205,15 @@ type AMSEndpoint struct {
 // no I/O until Connect; ctx is captured for the long-lived session
 // lifecycle and cancelling it shuts the session down.
 //
+// Target address: remote.AMS may be left incomplete. A zero NetID and/or a
+// zero AMS port are resolved by asking the device for its own identity over
+// UDP (see IdentifyRemote) — one round-trip, read-only, no route or
+// credentials needed. That is the exception to "no I/O until Connect", and it
+// only happens when something is missing; a fully specified target does no I/O
+// here. The discovered port follows the TwinCAT-major-version convention (801
+// on TC2, 851 on TC3), so a project with several runtimes must still set the
+// port explicitly.
+//
 // Local AMS NetID defaults to auto-derivation from the local TCP source IP.
 // Local AMS port defaults to a random value in the IANA dynamic range
 // (32768-49151) so each Session instance — including each process restart —
@@ -220,12 +229,7 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 	if remote.Port <= 0 {
 		remote.Port = 48898 // TwinCAT TCP default
 	}
-	if remote.AMS.NetID == [6]byte{} {
-		return nil, fmt.Errorf("ads: NewSession: remote.AMS.NetID must be set")
-	}
-	if remote.AMS.Port == 0 {
-		return nil, fmt.Errorf("ads: NewSession: remote.AMS.Port must be set (e.g. PortR0PlcTc3 = 851)")
-	}
+	needsDiscovery := remote.AMS.NetID == [6]byte{} || remote.AMS.Port == 0
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -277,7 +281,46 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 	for _, opt := range opts {
 		opt(sess)
 	}
+	// Resolve whatever the caller left out of the target address by asking the
+	// PLC's router for its own identity. Done after opts so the caller's logger
+	// is in place, and only when something is actually missing — a fully
+	// specified target still reaches Connect without any I/O.
+	if needsDiscovery {
+		if err := sess.discoverTarget(ctx); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
 	return sess, nil
+}
+
+// discoverTarget fills in a missing target NetID and/or AMS port from the
+// remote's identify response. A wrong or absent NetID is the most common ADS
+// misconfiguration and the hardest to recognise — the router accepts the TCP
+// socket and then drops every request — so resolving it from the device beats
+// making the caller carry it.
+func (sess *Session) discoverTarget(ctx context.Context) error {
+	id, err := IdentifyRemoteWithLogger(ctx, sess.logger, sess.ip)
+	if err != nil {
+		return fmt.Errorf("ads: NewSession: target AMS address incomplete and discovery failed "+
+			"(set remote.AMS explicitly if the device does not answer the identify service): %w", err)
+	}
+	if sess.target.NetID == [6]byte{} {
+		sess.target.NetID = id.AMS.NetID
+	}
+	if sess.target.Port == 0 {
+		// The identify service reports the router's port, never a runtime's, so
+		// this is the TwinCAT-major-version convention. Logged because a
+		// multi-runtime project needs 811/852/... and must override it.
+		sess.target.Port = id.RuntimePort()
+	}
+	sess.logger.Info("discovered target AMS address",
+		"host", sess.ip,
+		"netID", sess.target.NetIDString(),
+		"port", sess.target.Port,
+		"hostName", id.HostName,
+		"twinCAT", id.Version())
+	return nil
 }
 
 // Connect dials the PLC and transitions the session to Connected. Local-mode
