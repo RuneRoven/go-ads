@@ -124,7 +124,7 @@ collect:
 
 	// The reaper firing on our own handles is the specific regression; catch it
 	// even in the (unexpected) case where every symbol still got through.
-	if rec := logs.findByMessage("orphan PLC notification handle deleted"); rec != nil {
+	if rec := logs.findByMessage("does not own"); rec != nil {
 		t.Errorf("orphan reaper deleted a handle created by this session: %q", rec.Message)
 	}
 	if rec := logs.findByMessage("received notification for unknown handle"); rec != nil {

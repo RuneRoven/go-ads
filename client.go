@@ -306,12 +306,22 @@ func (c *Client) listen() {
 			}
 			hint := ""
 			if isLikelyMissingRoute(err) {
-				hint = "PLC may not have an AMS route for this NetID — check route credentials or register route via WithRoute()"
+				// A reset straight after a successful TCP connect has three
+				// plausible causes, and naming only the route one has sent
+				// people down the wrong path for a mistyped target NetID.
+				// Report all three, and log both ends of the addressing so the
+				// reader can check them without reconstructing the config.
+				hint = "a reset right after TCP connect means one of: " +
+					"the target NetID does not exist on this PLC, " +
+					"the route credentials were rejected, " +
+					"or the AMS port addresses no running runtime (851 for TC3, 801 for TC2)"
 			}
 			if hint != "" {
 				c.logger.Log(c.ctx, c.transportFaultLevel(), "PLC closed connection, transport down",
 					"error", err, "hint", hint,
-					"sourceNetID", c.source.NetIDString())
+					"sourceNetID", c.source.NetIDString(),
+					"targetNetID", c.target.NetIDString(),
+					"targetPort", c.target.Port)
 			} else {
 				c.logger.Log(c.ctx, c.transportFaultLevel(), "listen read error, transport down", "error", err)
 			}

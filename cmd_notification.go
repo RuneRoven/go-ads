@@ -123,7 +123,10 @@ func (c *Client) DeleteDeviceNotification(ctx context.Context, handle uint32) er
 		c.logger.Warn("error deleting handle", "handle", handle, "errorCode", uint32(adsError))
 		return fmt.Errorf("ADS error in DeleteDeviceNotification: %w", adsError)
 	}
-	c.logger.Info("deleted handle", "handle", handle)
+	// Debug, not Info: at this layer there is no symbol name to report, and
+	// teardown of an N-symbol subscription would print N unhelpful lines. The
+	// Session wrappers log the named line and the summary.
+	c.logger.Debug("deleted notification handle", "handle", handle)
 	return nil
 }
 
@@ -155,6 +158,10 @@ func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32
 		sess.notifications.notificationChannel = nil
 	}
 	sess.notifications.lock.Unlock()
+	// Name the symbol: a handle alone cannot be tied back to a tag when
+	// reading a shutdown trace, and this layer is the only one that knows the
+	// mapping. Empty when the handle was not ours (raw-handle caller).
+	sess.logger.Info("notification deleted", "handle", handle, "symbol", symbolName)
 	return nil
 }
 
@@ -186,21 +193,36 @@ func (sess *Session) SumDeleteDeviceNotification(ctx context.Context, handles []
 	if len(handles) < limit {
 		limit = len(handles)
 	}
+	deleted := 0
 	for i := 0; i < limit; i++ {
 		if !isBestEffortDeleteSuccess(codes[i]) {
 			continue
 		}
 		h := handles[i]
+		// Resolve the name before dropping the entry — this is the only place
+		// it is still known, and a handle with no symbol is not traceable back
+		// to a tag by the consumer (NotifyResult carries no handle).
+		symbolName := ""
 		if entry, ok := sess.notifications.activeNotifications[h]; ok && entry.Sym != nil {
-			sess.removeNotificationConfig(entry.Sym.FullName)
+			symbolName = entry.Sym.FullName
+			sess.removeNotificationConfig(symbolName)
 		}
 		delete(sess.notifications.activeNotifications, h)
-		sess.logger.Info("batch deleted notification handle", "handle", h, "errorCode", uint32(codes[i]))
+		deleted++
+		// Debug per handle: routine teardown of an N-symbol subscription is not
+		// worth N Info lines. The summary below is the Info-worthy event.
+		sess.logger.Debug("batch deleted notification handle",
+			"handle", h, "symbol", symbolName, "errorCode", uint32(codes[i]))
 	}
 	if len(sess.notifications.activeNotifications) == 0 {
 		sess.notifications.notificationChannel = nil
 	}
+	remaining := len(sess.notifications.activeNotifications)
 	sess.notifications.lock.Unlock()
+	if deleted > 0 {
+		sess.logger.Info("notifications deleted",
+			"deleted", deleted, "requested", len(handles), "remaining", remaining)
+	}
 	return codes, rpcErr
 }
 
@@ -702,7 +724,13 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 				"handle", handle, "error", err)
 			return
 		}
-		sess.logger.Info("orphan PLC notification handle deleted (was leaked by prior session/process)",
-			"handle", handle)
+		// State the observation, not a guess at the cause. The old wording
+		// claimed the handle "was leaked by a prior session/process" — during
+		// the v2.2.0 subscribe-race regression it was saying that about
+		// subscriptions this very session had created milliseconds earlier,
+		// which sent the diagnosis in the wrong direction for months.
+		sess.logger.Info("deleted a PLC notification handle this session does not own",
+			"handle", handle,
+			"hint", "usually a subscription left behind by an earlier process sharing this source NetID and port")
 	}()
 }
