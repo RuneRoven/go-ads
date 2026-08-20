@@ -427,6 +427,34 @@ type SumNotificationResult struct {
 // round-trip using GroupSumupAddDeviceNotification (0xF085). Falls back to
 // individual AddDeviceNotification calls on older PLCs.
 func (c *Client) SumAddDeviceNotification(ctx context.Context, requests []SumNotificationRequest) ([]SumNotificationResult, error) {
+	return c.SumAddDeviceNotificationFunc(ctx, requests, nil)
+}
+
+// SumAddDeviceNotificationFunc is SumAddDeviceNotification with a per-item
+// callback, invoked with each item's result as soon as that result is known.
+//
+// This exists for the PLC that rejects the sum command: the call then degrades
+// to one AddDeviceNotification per request, and the PLC starts streaming each
+// handle the moment it creates it. A caller that waits for the whole batch
+// cannot recognise the early handles for the rest of the batch — on TC2 a
+// 40-symbol batch leaves the first handle unaccounted for several hundred
+// milliseconds. With onItem the caller binds each handle as its own Add
+// returns, which narrows that window to one round-trip.
+//
+// onItem is called synchronously on the calling goroutine, exactly once per
+// request, in request order: progressively on the fallback path, and after
+// decode on the batched path (where the PLC created every handle before
+// answering, so there is nothing to report early). Callers therefore get one
+// commit path regardless of which path ran. The returned slice carries the
+// same results.
+func (c *Client) SumAddDeviceNotificationFunc(
+	ctx context.Context,
+	requests []SumNotificationRequest,
+	onItem func(index int, res SumNotificationResult),
+) ([]SumNotificationResult, error) {
+	// Set by the fallback closure so the batched-path emit below doesn't
+	// double-report items the fallback already reported.
+	fellBack := false
 	spec := sumCmdSpec[SumNotificationRequest, SumNotificationResult]{
 		stateLoad:             c.capabilities.SumAddNotifStateLoad,
 		stateCASToSupported:   func() bool { return c.capabilities.SumAddNotifStateCAS(0, 1) },
@@ -460,9 +488,19 @@ func (c *Client) SumAddDeviceNotification(ctx context.Context, requests []SumNot
 			}
 			return items, nil
 		},
-		fallback: c.sumAddNotificationFallback,
+		fallback: func(ctx context.Context, reqs []SumNotificationRequest) ([]SumNotificationResult, error) {
+			fellBack = true
+			return c.sumAddNotificationFallback(ctx, reqs, onItem)
+		},
 	}
-	return executeSumCommand(ctx, c, spec, requests)
+	results, err := executeSumCommand(ctx, c, spec, requests)
+	if err != nil || onItem == nil || fellBack {
+		return results, err
+	}
+	for i, r := range results {
+		onItem(i, r)
+	}
+	return results, nil
 }
 
 // SumDeleteDeviceNotification deletes multiple device notifications by handle
@@ -498,7 +536,11 @@ func (c *Client) SumDeleteDeviceNotification(ctx context.Context, handles []uint
 
 // sumAddNotificationFallback adds notifications individually when sum commands are not supported.
 // It also downgrades v2 transmission modes to v1 equivalents since older PLCs silently ignore v2 modes.
-func (c *Client) sumAddNotificationFallback(ctx context.Context, requests []SumNotificationRequest) ([]SumNotificationResult, error) {
+//
+// onItem, when non-nil, is called with each result as that Add returns — before
+// the remaining requests are sent. The PLC is already streaming that handle by
+// then, so reporting it now is what lets the caller bind it in time.
+func (c *Client) sumAddNotificationFallback(ctx context.Context, requests []SumNotificationRequest, onItem func(int, SumNotificationResult)) ([]SumNotificationResult, error) {
 	results := make([]SumNotificationResult, len(requests))
 	for i, req := range requests {
 		// Downgrade v2 modes for older PLCs that don't support them
@@ -520,6 +562,9 @@ func (c *Client) sumAddNotificationFallback(ctx context.Context, requests []SumN
 			c.logger.Warn("individual AddDeviceNotification failed in fallback", "error", err, "index", i)
 		} else {
 			results[i].Handle = h
+		}
+		if onItem != nil {
+			onItem(i, results[i])
 		}
 	}
 	return results, nil

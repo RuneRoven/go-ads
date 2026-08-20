@@ -204,6 +204,78 @@ func TestSubscribeRace_BatchOnSumUnsupportedPLC(t *testing.T) {
 	}
 }
 
+// TestSubscribeRace_BatchBindsEachHandleBeforeNextAdd pins the per-item bind:
+// on a PLC that rejects the sum command, each handle must be in
+// activeNotifications before the next AddDeviceNotification is issued. Binding
+// the whole batch at the end instead leaves the early handles unrecognisable
+// for the rest of the batch, which is what the PLC is streaming into.
+func TestSubscribeRace_BatchBindsEachHandleBeforeNextAdd(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, c := newWiredTestSession(t, srv)
+	c.SetNotificationHandler(sess.handleNotification)
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumAddNotif into the unsupported state")
+	}
+
+	const symbolCount = 4
+	names := make([]string, symbolCount)
+	configs := make([]NotificationConfig, symbolCount)
+	for i := range names {
+		names[i] = "MAIN.bind" + string(rune('A'+i))
+		preSeedTypedSymbol(sess, names[i], uint32(0xD000+i))
+		configs[i] = NotificationConfig{SymbolName: names[i], TransmissionMode: TransModeServerOnChange}
+	}
+
+	var mu sync.Mutex
+	var issued []uint32 // handles already returned by a previous Add
+	var unboundAtNextAdd []uint32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0x200)
+
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		// Every handle handed out earlier in this batch must be bound by now.
+		mu.Lock()
+		prior := append([]uint32(nil), issued...)
+		mu.Unlock()
+		sess.notifications.lock.Lock()
+		for _, h := range prior {
+			if _, ok := sess.notifications.activeNotifications[h]; !ok {
+				unboundAtNextAdd = append(unboundAtNextAdd, h)
+			}
+		}
+		sess.notifications.lock.Unlock()
+
+		h := nextHandle.Add(1)
+		mu.Lock()
+		issued = append(issued, h)
+		mu.Unlock()
+		return addNotifResponse{Handle: h}
+	})
+
+	ch := make(chan *Update, 4*symbolCount)
+	results, err := sess.AddSymbolNotifications(context.Background(), configs, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotifications: %v", err)
+	}
+	for i, r := range results {
+		if r.Skipped != nil || r.Error != ReturnCodeNoErrors {
+			t.Fatalf("results[%d] (%s): Skipped=%v Error=0x%X", i, names[i], r.Skipped, uint32(r.Error))
+		}
+	}
+	if len(unboundAtNextAdd) != 0 {
+		t.Errorf("handles still unbound when the next Add was issued: %v", unboundAtNextAdd)
+	}
+
+	sess.notifications.lock.Lock()
+	active := len(sess.notifications.activeNotifications)
+	sess.notifications.lock.Unlock()
+	if active != symbolCount {
+		t.Errorf("activeNotifications = %d, want %d", active, symbolCount)
+	}
+}
+
 // TestOrphanDelete_SuppressedWhileSubscribeInFlight is the narrow regression
 // guard: lastSubscribeNs is stale (a long batch), yet a subscribe is still in
 // flight, so an unknown handle must not be reaped. Pre-fix this is precisely
