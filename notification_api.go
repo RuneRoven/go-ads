@@ -41,6 +41,27 @@ type notificationManager struct {
 	notificationChannel chan *Update
 	lastSubscribeNs     atomic.Int64
 
+	// subscribeInFlight counts subscribe operations (single or batch) that
+	// have issued the PLC-side Add but have not yet committed every handle
+	// into activeNotifications. lastSubscribeNs alone cannot express this:
+	// it records the last *started* subscribe, so a batch that takes longer
+	// than subscribeRaceWindow to register (TC2 falls back to one Add per
+	// symbol, so a 40-symbol batch takes hundreds of ms) leaves its own
+	// early handles looking like leaked ones. While this counter is
+	// non-zero an unknown handle is presumed ours: the sample is buffered
+	// (see earlySamples) and the orphan reaper stays out.
+	subscribeInFlight atomic.Int64
+
+	// earlySamples holds samples that arrived for a handle before its
+	// activeNotifications insert landed, keyed by handle. Guarded by
+	// earlyMu (separate from lock so buffering never serializes against
+	// the dispatch hot path). Only the most recent sample per handle is
+	// kept — the point is not to replay history but to not lose the ONLY
+	// sample a static symbol ever emits, and a live symbol's later samples
+	// arrive on the normal path anyway.
+	earlyMu      sync.Mutex
+	earlySamples map[uint32]earlySample
+
 	// orphanDelete tracks unknown-handle Delete attempts so we don't spam
 	// the PLC when a previously-leaked subscription keeps firing. Guarded
 	// by orphanMu (separate from notifications.lock so the throttle check
@@ -48,6 +69,13 @@ type notificationManager struct {
 	orphanMu   sync.Mutex
 	orphanSeen map[uint32]time.Time
 	orphanSem  chan struct{} // bounded concurrency: cap = orphanDeleteMaxConcurrency
+}
+
+// earlySample is one buffered notification sample awaiting its handle's
+// activeNotifications insert.
+type earlySample struct {
+	timestamp uint64
+	content   []byte
 }
 
 // addConfig wraps cfg into a fresh pendingNotification (resubscribeAttempts=0)
@@ -172,12 +200,15 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 			"flags", fmt.Sprintf("0x%04X", uint32(symbol.Flags)))
 	}
 
-	// Record subscribe time BEFORE the RPC so any first-sample arriving in the
-	// race window between PLC handle return and our map insert sees a fresh
-	// timestamp in handleNotification's unknown-handle log-level decision. If
-	// stored after the RPC, the previous-subscribe timestamp would falsely
-	// elevate a legitimate first-sample to Warn.
-	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
+	// Open the subscribe window BEFORE the RPC: the PLC-side handle exists as
+	// soon as Add returns, so a first sample can arrive before the commit
+	// below. endSubscribe replays anything buffered for the handle we commit
+	// and closes the window. Deferred here so it runs after the
+	// notifications.lock unlock defer registered further down (LIFO).
+	sess.beginSubscribe()
+	committed := make([]uint32, 0, 1)
+	defer func() { sess.endSubscribe(ctx, committed) }()
+
 	handle, err := sess.client.Load().AddDeviceNotification(ctx,
 		uint32(GroupSymbolValueByHandle),
 		symbol.Handle,
@@ -242,6 +273,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	}
 	defer sess.notifications.lock.Unlock()
 	sess.notifications.activeNotifications[handle] = activeNotification{Sym: fresh, Ch: updateReceiver}
+	committed = append(committed, handle)
 
 	// Save config for reconnect re-subscribe
 	sess.notifications.addConfig(NotificationConfig{
@@ -353,10 +385,16 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		return results, nil
 	}
 
-	// Record subscribe time BEFORE the batch RPC so first-sample arrivals
-	// during PLC-roundtrip + map-insert race window log at Debug not Warn.
-	// See AddSymbolNotification for the same ordering rationale.
-	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
+	// Open the subscribe window BEFORE the batch RPC. This matters far more
+	// here than in the single-symbol path: on a PLC without sum-command
+	// support (TC2 answers 0x0701) SumAddDeviceNotification degrades to one
+	// Add per symbol, so the earliest handles stream for the whole duration
+	// of the remaining registrations. See AddSymbolNotification for the
+	// defer-ordering rationale.
+	sess.beginSubscribe()
+	var committed []uint32
+	defer func() { sess.endSubscribe(ctx, committed) }()
+
 	subResults, err := sess.client.Load().SumAddDeviceNotification(ctx, requests)
 	if err != nil {
 		// Transport-aborted batch: every entry that was about to be sent must
@@ -458,6 +496,7 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		}
 		results[info.configIndex] = r
 		sess.notifications.activeNotifications[r.Handle] = activeNotification{Sym: fresh, Ch: ch}
+		committed = append(committed, r.Handle)
 		// addConfig wraps in a fresh pendingNotification with
 		// resubscribeAttempts=0, so a successful subscribe naturally resets
 		// any prior retry counter that may have been on this symbol.

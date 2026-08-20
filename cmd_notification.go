@@ -239,6 +239,14 @@ type NotificationSample struct {
 // Session.Connect.
 
 func (sess *Session) handleNotification(ctx context.Context, handle uint32, timestamp uint64, content []byte) {
+	sess.dispatchSample(ctx, handle, timestamp, content, true)
+}
+
+// dispatchSample is the body of handleNotification. buffer controls whether an
+// unknown handle may be parked in earlySamples: true on the live path, false
+// when replayEarlySamples is re-dispatching a buffered sample, so a handle
+// whose subscribe never committed cannot bounce between buffer and replay.
+func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestamp uint64, content []byte, buffer bool) {
 	// notifications.lock: handle lookup + symbol pointer/channel snapshot.
 	sess.notifications.lock.Lock()
 	entry, ok := sess.notifications.activeNotifications[handle]
@@ -247,17 +255,20 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 		// Stale notifications are expected during:
 		// - Close(): handles deleted from activeNotifications while listen() still drains
 		// - Reconnect: Session.Reconnect clears activeNotifications before new subscriptions
-		// - first-sample race — PLC fires the first notification before our
-		//   activeNotifications map insert completes (sub-millisecond window for
-		//   fast PLCs and zero-MaxDelay subscriptions). Suppress within ~100ms of
-		//   the most recent successful subscribe.
-		const subscribeRaceWindow = 100 * time.Millisecond
-		subscribeRaceWindowNs := subscribeRaceWindow.Nanoseconds()
+		// - first-sample race — the PLC fires the first notification before our
+		//   activeNotifications insert completes. The PLC-side handle exists the
+		//   moment Add returns, so this window is unavoidable; it is wide enough
+		//   to matter whenever a subscribe is still in flight.
 		switch {
 		case sess.isClosed() || sess.isReconnecting():
 			sess.logger.Debug("received notification for deleted handle (expected during close/reconnect)", "handle", handle)
-		case time.Now().UnixNano()-sess.notifications.lastSubscribeNs.Load() < subscribeRaceWindowNs:
-			sess.logger.Debug("received notification for unknown handle (likely first-sample race)", "handle", handle)
+		case buffer && sess.subscribeRaceActive():
+			// Our own subscribe is mid-flight, so this handle is almost
+			// certainly one we are about to commit. Park the sample instead of
+			// dropping it: a static symbol (constant string/bool) emits exactly
+			// one sample, at subscribe time, and dropping it means the consumer
+			// never sees that tag at all.
+			sess.bufferEarlySample(handle, timestamp, content)
 		default:
 			// Genuine orphan sample — handle is registered on the PLC but
 			// not in our client-side map. Most likely cause: a prior process
@@ -364,6 +375,123 @@ func (sess *Session) deliverNotification(ctx context.Context, ch chan<- *Update,
 		sess.logger.Warn("notification dropped (channel full, receiver too slow)",
 			"handle", handle,
 			"symbol", fullName)
+	}
+}
+
+// Subscribe race window: the PLC-side notification handle exists from the
+// moment AddDeviceNotification returns, but our activeNotifications insert
+// happens afterwards — and on TC2, which answers 0x0701 to the sum command,
+// AddSymbolNotifications degrades to one Add per symbol, so the last symbol
+// of a 40-entry batch commits hundreds of milliseconds after the first
+// symbol started streaming. Samples arriving in that window must be neither
+// dropped nor mistaken for leaked handles.
+const (
+	// subscribeRaceWindow extends the guard past the last commit, covering
+	// the gap between the insert and the in-flight counter reaching zero.
+	subscribeRaceWindow = 100 * time.Millisecond
+	// earlySampleMaxHandles bounds the buffer. Reaching it means far more
+	// unknown handles are in flight than any real subscribe produces.
+	earlySampleMaxHandles = 4096
+)
+
+// subscribeRaceActive reports whether an unknown handle should be presumed to
+// be one of ours mid-registration rather than a leaked one.
+func (sess *Session) subscribeRaceActive() bool {
+	mgr := sess.notifications
+	if mgr.subscribeInFlight.Load() > 0 {
+		return true
+	}
+	return time.Now().UnixNano()-mgr.lastSubscribeNs.Load() < subscribeRaceWindow.Nanoseconds()
+}
+
+// beginSubscribe marks a subscribe operation as in flight. Every call must be
+// paired with endSubscribe, which is why callers defer it immediately.
+func (sess *Session) beginSubscribe() {
+	sess.notifications.subscribeInFlight.Add(1)
+	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
+}
+
+// endSubscribe closes a subscribe operation: it replays samples buffered for
+// the handles that were committed, then — once no subscribe is left in flight
+// — discards what remains. A leftover entry belongs to a handle whose commit
+// never happened (rejected item, stranded cache, TOCTOU loss); if it really is
+// leaked PLC-side it keeps firing, and its next sample takes the orphan path
+// normally.
+//
+// MUST be called after notifications.lock is released: the replay path takes
+// cache.lock, and holding both is forbidden. Deferring it before the
+// lock.Unlock defer gives that ordering for free (defers run LIFO).
+func (sess *Session) endSubscribe(ctx context.Context, committed []uint32) {
+	mgr := sess.notifications
+	mgr.lastSubscribeNs.Store(time.Now().UnixNano())
+	sess.replayEarlySamples(ctx, committed)
+	inFlight := mgr.subscribeInFlight.Add(-1)
+	if inFlight > 0 {
+		return
+	}
+	mgr.earlyMu.Lock()
+	dropped := len(mgr.earlySamples)
+	if dropped > 0 {
+		mgr.earlySamples = nil
+	}
+	mgr.earlyMu.Unlock()
+	if dropped > 0 {
+		sess.logger.Debug("discarded buffered samples for handles that never committed", "count", dropped)
+	}
+}
+
+// bufferEarlySample parks the most recent sample for an uncommitted handle.
+func (sess *Session) bufferEarlySample(handle uint32, timestamp uint64, content []byte) {
+	mgr := sess.notifications
+	// Copy: content is freshly allocated per sample today, but the handler
+	// signature is exported and this buffer outlives the dispatch call.
+	buf := make([]byte, len(content))
+	copy(buf, content)
+
+	mgr.earlyMu.Lock()
+	if mgr.earlySamples == nil {
+		mgr.earlySamples = make(map[uint32]earlySample)
+	}
+	_, known := mgr.earlySamples[handle]
+	full := !known && len(mgr.earlySamples) >= earlySampleMaxHandles
+	if !full {
+		mgr.earlySamples[handle] = earlySample{timestamp: timestamp, content: buf}
+	}
+	mgr.earlyMu.Unlock()
+
+	if full {
+		sess.logger.Warn("early notification sample dropped (buffer full)",
+			"handle", handle, "max_handles", earlySampleMaxHandles)
+		return
+	}
+	sess.logger.Debug("buffered early notification sample (handle registration still in flight)", "handle", handle)
+}
+
+// replayEarlySamples re-dispatches buffered samples for handles that have since
+// been committed to activeNotifications.
+func (sess *Session) replayEarlySamples(ctx context.Context, handles []uint32) {
+	if len(handles) == 0 {
+		return
+	}
+	mgr := sess.notifications
+	type replay struct {
+		handle uint32
+		sample earlySample
+	}
+	var pending []replay
+
+	mgr.earlyMu.Lock()
+	for _, h := range handles {
+		if s, ok := mgr.earlySamples[h]; ok {
+			delete(mgr.earlySamples, h)
+			pending = append(pending, replay{handle: h, sample: s})
+		}
+	}
+	mgr.earlyMu.Unlock()
+
+	for _, p := range pending {
+		sess.logger.Debug("replaying buffered early notification sample", "handle", p.handle)
+		sess.dispatchSample(ctx, p.handle, p.sample.timestamp, p.sample.content, false)
 	}
 }
 
@@ -524,6 +652,14 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 		if present {
 			sess.logger.Debug("orphan delete aborted: handle reappeared in activeNotifications between scheduling and firing",
 				"handle", handle)
+			return
+		}
+		// Second guard for the same window: a subscribe that started after
+		// this Delete was scheduled may hold this handle and simply not have
+		// committed it yet, so absence from activeNotifications is not proof
+		// the handle is leaked.
+		if mgr.subscribeInFlight.Load() > 0 {
+			sess.logger.Debug("orphan delete aborted: a subscribe is in flight", "handle", handle)
 			return
 		}
 
