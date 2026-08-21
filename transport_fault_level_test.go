@@ -24,11 +24,11 @@ func TestTransportFaultLevel(t *testing.T) {
 	if got := c.transportFaultLevel(); got != slog.LevelError {
 		t.Errorf("level outside a handshake = %v, want Error", got)
 	}
-	c.setHandshaking(true)
+	c.beginHandshake()
 	if got := c.transportFaultLevel(); got != slog.LevelDebug {
 		t.Errorf("level during a handshake = %v, want Debug", got)
 	}
-	c.setHandshaking(false)
+	c.endHandshake()
 	if got := c.transportFaultLevel(); got != slog.LevelError {
 		t.Errorf("level after the handshake = %v, want Error", got)
 	}
@@ -49,7 +49,7 @@ func TestHandshakeDropLogsBelowError(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	c.setHandshaking(true)
+	c.beginHandshake()
 	// Answer nothing and drop the connection on the first request, the shape of
 	// a PLC rejecting an unrouted NetID mid-probe.
 	srv.dropConnAfter(CommandIDRead, 1)

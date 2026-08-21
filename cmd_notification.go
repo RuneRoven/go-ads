@@ -417,6 +417,10 @@ const (
 	// subscribeRaceMaxOpen caps how long an in-flight subscribe may keep the
 	// reaper suppressed, so a wedged one cannot disable it indefinitely.
 	subscribeRaceMaxOpen = 30 * time.Second
+	// earlySampleMaxBytes bounds the buffer in memory as well as in entries.
+	// Generous for its purpose — one sample per symbol being subscribed — while
+	// keeping a flood of large unknown-handle samples from growing without limit.
+	earlySampleMaxBytes = 8 << 20
 )
 
 // subscribeRaceActive reports whether an unknown handle should be presumed to
@@ -471,6 +475,7 @@ func (sess *Session) endSubscribe(ctx context.Context, committed []uint32) {
 		dropped = len(mgr.earlySamples)
 		if dropped > 0 {
 			mgr.earlySamples = nil
+			mgr.earlyBytes = 0
 		}
 	}
 	mgr.earlyMu.Unlock()
@@ -492,16 +497,25 @@ func (sess *Session) bufferEarlySample(ctx context.Context, handle uint32, times
 	if mgr.earlySamples == nil {
 		mgr.earlySamples = make(map[uint32]earlySample)
 	}
-	_, known := mgr.earlySamples[handle]
-	full := !known && len(mgr.earlySamples) >= earlySampleMaxHandles
+	prev, known := mgr.earlySamples[handle]
+	// Replacing an entry frees its bytes, so only the delta counts.
+	delta := len(buf)
+	if known {
+		delta -= len(prev.content)
+	}
+	full := (!known && len(mgr.earlySamples) >= earlySampleMaxHandles) ||
+		mgr.earlyBytes+delta > earlySampleMaxBytes
 	if !full {
 		mgr.earlySamples[handle] = earlySample{timestamp: timestamp, content: buf}
+		mgr.earlyBytes += delta
 	}
+	held := mgr.earlyBytes
 	mgr.earlyMu.Unlock()
 
 	if full {
 		sess.logger.Warn("early notification sample dropped (buffer full)",
-			"handle", handle, "max_handles", earlySampleMaxHandles)
+			"handle", handle, "max_handles", earlySampleMaxHandles,
+			"max_bytes", earlySampleMaxBytes, "held_bytes", held)
 		return
 	}
 	sess.logger.Debug("buffered early notification sample (handle registration still in flight)", "handle", handle)
@@ -552,6 +566,7 @@ func (sess *Session) replayEarlySamples(ctx context.Context, handles []uint32) {
 		}
 		if s, ok := mgr.earlySamples[h]; ok {
 			delete(mgr.earlySamples, h)
+			mgr.earlyBytes -= len(s.content)
 			pending = append(pending, replay{handle: h, sample: s})
 		}
 	}
@@ -644,6 +659,31 @@ func isBestEffortDeleteSuccessErr(err error) bool {
 //     handle implicitly gone)
 //   - any other error → Warn (real failure: transport, auth, timeout,
 //     marshaling, protocol mismatch)
+//
+// orphanDeleteAbortReason re-checks, immediately before the RPC, whether this
+// handle might be ours after all. Both windows it covers open between scheduling
+// the delete and firing it, and deleting our own live subscription is the
+// failure this whole area exists to prevent — so the checks are a named function
+// that can be tested directly rather than inline in a goroutine that a test can
+// only race against.
+func (sess *Session) orphanDeleteAbortReason(handle uint32) (string, bool) {
+	mgr := sess.notifications
+	// A concurrent subscribe may legitimately have been handed this same handle
+	// by the PLC (it reuses freed slot IDs).
+	mgr.lock.Lock()
+	_, present := mgr.activeNotifications[handle]
+	mgr.lock.Unlock()
+	if present {
+		return "handle reappeared in activeNotifications", true
+	}
+	// Or a subscribe started after we scheduled this and simply has not
+	// committed its handles yet, so absence is not proof of a leak.
+	if mgr.subscribeInFlight.Load() > 0 {
+		return "a subscribe is in flight", true
+	}
+	return "", false
+}
+
 func (sess *Session) tryOrphanDelete(handle uint32) {
 	// Lifecycle guards: never fire during shutdown or active reconnect.
 	if sess.isClosed() || sess.isReconnecting() {
@@ -692,6 +732,14 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 		return
 	}
 
+	// Record the attempt now, before scheduling: a high-rate orphan stream would
+	// otherwise slip several deletes through the gap before the goroutine runs.
+	// The goroutine clears it again if it aborts, so an attempt that sends no RPC
+	// does not lock the handle out for the throttle window.
+	mgr.orphanMu.Lock()
+	mgr.orphanSeen[handle] = now
+	mgr.orphanMu.Unlock()
+
 	// Track goroutine so Close waits for in-flight orphan deletes.
 	sess.lifecycle.waitGroup.Add(1)
 	go func() {
@@ -704,25 +752,14 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 			}
 		}()
 
-		// Race guard: between scheduling and firing, a concurrent
-		// AddSymbolNotification may have legitimately received this
-		// handle from the PLC. If so, DO NOT delete it — we'd kill our
-		// own just-established subscription. Re-check under
-		// notifications.lock to close the window.
-		mgr.lock.Lock()
-		_, present := mgr.activeNotifications[handle]
-		mgr.lock.Unlock()
-		if present {
-			sess.logger.Debug("orphan delete aborted: handle reappeared in activeNotifications between scheduling and firing",
-				"handle", handle)
-			return
-		}
-		// Second guard for the same window: a subscribe that started after
-		// this Delete was scheduled may hold this handle and simply not have
-		// committed it yet, so absence from activeNotifications is not proof
-		// the handle is leaked.
-		if mgr.subscribeInFlight.Load() > 0 {
-			sess.logger.Debug("orphan delete aborted: a subscribe is in flight", "handle", handle)
+		if reason, abort := sess.orphanDeleteAbortReason(handle); abort {
+			// No RPC went out, so do not hold the throttle: a genuinely leaked
+			// handle would otherwise go unreaped for the whole window because it
+			// happened to fire while someone was subscribing.
+			mgr.orphanMu.Lock()
+			delete(mgr.orphanSeen, handle)
+			mgr.orphanMu.Unlock()
+			sess.logger.Debug("orphan delete aborted", "handle", handle, "reason", reason)
 			return
 		}
 
@@ -743,14 +780,6 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 			sess.logger.Debug("orphan delete aborted: lifecycle context done", "handle", handle, "error", err)
 			return
 		}
-
-		// Commit the throttle entry here, not before the guards: an attempt that
-		// aborts sends no RPC, and recording it anyway locked a genuinely leaked
-		// handle out for the full throttle window. Same reasoning as the sem-full
-		// path, which already declines to write one.
-		mgr.orphanMu.Lock()
-		mgr.orphanSeen[handle] = time.Now()
-		mgr.orphanMu.Unlock()
 
 		ctx, cancel := context.WithTimeout(parentCtx, orphanDeleteRPCTimeout)
 		defer cancel()

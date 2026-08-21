@@ -62,6 +62,11 @@ type notificationManager struct {
 	// arrive on the normal path anyway.
 	earlyMu      sync.Mutex
 	earlySamples map[uint32]earlySample
+	// earlyBytes is the total content held in earlySamples. The handle cap alone
+	// does not bound memory: a sample is network-sized, and struct or array
+	// symbols run to tens of KB, so 4096 of them is hundreds of MB decided
+	// entirely by what the PLC sends for handles we do not recognise.
+	earlyBytes int
 
 	// orphanDelete tracks unknown-handle Delete attempts so we don't spam
 	// the PLC when a previously-leaked subscription keeps firing. Guarded

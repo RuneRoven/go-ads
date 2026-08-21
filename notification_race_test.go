@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -511,11 +512,62 @@ func TestSubscribeRace_ConnectionDropsMidBatchAtScale(t *testing.T) {
 	}
 }
 
-// TestOrphanDelete_SuppressedWhileSubscribeInFlight is the narrow regression
-// guard: lastSubscribeNs is stale (a long batch), yet a subscribe is still in
-// flight, so an unknown handle must not be reaped. Pre-fix this is precisely
-// the state in which the reaper deleted valid subscriptions.
-func TestOrphanDelete_SuppressedWhileSubscribeInFlight(t *testing.T) {
+// TestOrphanDeleteAbortReason covers the reaper's last-moment guards directly.
+// The previous pair of tests for this did not: one set subscribeInFlight and
+// asserted no Delete RPC, but with the counter set dispatch takes the buffer
+// branch and never reaches the reaper at all, so the assertion held for the
+// wrong reason; the other raced an unsynchronised goroutine against a Store and
+// would flake on a loaded machine.
+func TestOrphanDeleteAbortReason(t *testing.T) {
+	tests := []struct {
+		name       string
+		setup      func(sess *Session)
+		wantAbort  bool
+		wantReason string
+	}{
+		{
+			name:      "unknown handle, nothing in flight",
+			setup:     func(*Session) {},
+			wantAbort: false,
+		},
+		{
+			name: "handle reappeared in activeNotifications",
+			setup: func(sess *Session) {
+				sess.notifications.lock.Lock()
+				sess.notifications.activeNotifications[0x4242] = activeNotification{Sym: &symbol{FullName: "MAIN.x"}}
+				sess.notifications.lock.Unlock()
+			},
+			wantAbort:  true,
+			wantReason: "reappeared",
+		},
+		{
+			name: "a subscribe is in flight",
+			setup: func(sess *Session) {
+				sess.notifications.subscribeInFlight.Store(1)
+			},
+			wantAbort:  true,
+			wantReason: "in flight",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := newNotifTestSession()
+			tt.setup(sess)
+			reason, abort := sess.orphanDeleteAbortReason(0x4242)
+			if abort != tt.wantAbort {
+				t.Fatalf("abort = %v, want %v (reason %q)", abort, tt.wantAbort, reason)
+			}
+			if tt.wantReason != "" && !strings.Contains(reason, tt.wantReason) {
+				t.Errorf("reason = %q, want it to mention %q", reason, tt.wantReason)
+			}
+		})
+	}
+}
+
+// TestOrphanDelete_BuffersRatherThanReapsWhileSubscribing keeps the behavioural
+// half of what the old test was really checking: with a subscribe in flight an
+// unknown sample is parked, so the reaper is never even consulted.
+func TestOrphanDelete_BuffersRatherThanReapsWhileSubscribing(t *testing.T) {
 	srv := startScriptableServer(t)
 	defer srv.stop()
 
@@ -527,8 +579,8 @@ func TestOrphanDelete_SuppressedWhileSubscribeInFlight(t *testing.T) {
 
 	sess, c := newWiredTestSession(t, srv)
 	c.SetNotificationHandler(sess.handleNotification)
-	// Stale timestamp: the old 100ms-window guard would let the reaper through.
-	sess.notifications.lastSubscribeNs.Store(time.Now().Add(-1 * time.Second).UnixNano())
+	// Stale timestamp: the old 100ms-window guard alone would let the reaper through.
+	sess.notifications.lastSubscribeNs.Store(time.Now().Add(-time.Second).UnixNano())
 	sess.notifications.subscribeInFlight.Store(1)
 
 	if err := sess.drivePacket(sess.lifecycle.ctx, buildNotificationPacket(0x7777, 0, intSample(1))); err != nil {
@@ -537,41 +589,10 @@ func TestOrphanDelete_SuppressedWhileSubscribeInFlight(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 	if got := deleted.Load(); got != 0 {
-		t.Errorf("Delete RPC calls = %d, want 0 (in-flight subscribe must suppress the reaper)", got)
+		t.Errorf("Delete RPC calls = %d, want 0 while a subscribe is in flight", got)
 	}
 	if got := earlySampleCount(sess); got != 1 {
-		t.Errorf("buffered samples = %d, want 1 (sample must be parked, not dropped)", got)
-	}
-}
-
-// TestOrphanDelete_AbortsWhenSubscribeStartsAfterScheduling covers the second
-// half of the reaper's race guard: the sample looked like an orphan when it
-// arrived, but a subscribe started before the async Delete fired, so the
-// handle may be one we are about to commit and must be left alone.
-func TestOrphanDelete_AbortsWhenSubscribeStartsAfterScheduling(t *testing.T) {
-	srv := startScriptableServer(t)
-	defer srv.stop()
-
-	var deleted atomic.Int32
-	srv.delayBefore(CommandIDDeleteDeviceNotification, 0, 200*time.Millisecond)
-	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode {
-		deleted.Add(1)
-		return ReturnCodeNoErrors
-	})
-
-	sess, c := newWiredTestSession(t, srv)
-	c.SetNotificationHandler(sess.handleNotification)
-	sess.notifications.lastSubscribeNs.Store(time.Now().Add(-1 * time.Second).UnixNano())
-
-	if err := sess.drivePacket(sess.lifecycle.ctx, buildNotificationPacket(0xFEED, 0, intSample(1))); err != nil {
-		t.Fatalf("drivePacket: %v", err)
-	}
-	// Open a subscribe window while the Delete goroutine is still queued.
-	sess.notifications.subscribeInFlight.Store(1)
-
-	time.Sleep(500 * time.Millisecond)
-	if got := deleted.Load(); got != 0 {
-		t.Errorf("Delete RPC calls = %d, want 0 (subscribe started before the Delete fired)", got)
+		t.Errorf("buffered samples = %d, want 1 (the sample must be parked, not dropped)", got)
 	}
 }
 
@@ -793,5 +814,68 @@ func TestEndSubscribe_NestedSubscribesKeepWindowOpen(t *testing.T) {
 	}
 	if n := sess.notifications.subscribeInFlight.Load(); n != 0 {
 		t.Errorf("subscribeInFlight = %d, want 0", n)
+	}
+}
+
+// TestBufferEarlySample_ByteBudgetEnforced: the handle cap alone does not bound
+// memory. A sample is network-sized — struct and array symbols run to tens of KB
+// — so the buffer also has to stop counting bytes, and replacing an entry must
+// release the bytes it held rather than leaking them.
+func TestBufferEarlySample_ByteBudgetEnforced(t *testing.T) {
+	sess := newNotifTestSession()
+	sess.notifications.subscribeInFlight.Store(1)
+
+	big := make([]byte, 1<<20) // 1 MiB per sample
+	for i := 0; i < (earlySampleMaxBytes/len(big))+4; i++ {
+		sess.bufferEarlySample(context.Background(), uint32(i), 0, big)
+	}
+
+	sess.notifications.earlyMu.Lock()
+	held := sess.notifications.earlyBytes
+	entries := len(sess.notifications.earlySamples)
+	sess.notifications.earlyMu.Unlock()
+
+	if held > earlySampleMaxBytes {
+		t.Errorf("held %d bytes, over the %d budget", held, earlySampleMaxBytes)
+	}
+	if entries == 0 {
+		t.Error("budget rejected everything; it should admit samples up to the cap")
+	}
+
+	// Replacing an entry must not double-count: same handle, same size, so the
+	// total has to stay put.
+	before := held
+	sess.bufferEarlySample(context.Background(), 0, 0, big)
+	sess.notifications.earlyMu.Lock()
+	after := sess.notifications.earlyBytes
+	sess.notifications.earlyMu.Unlock()
+	if after != before {
+		t.Errorf("byte count moved from %d to %d when replacing an entry of equal size", before, after)
+	}
+}
+
+// TestReplayEarlySamples_ReleasesBytes: taking a sample out of the buffer has to
+// give its bytes back, or a long-lived session leaks the budget one replay at a
+// time until nothing can be buffered.
+func TestReplayEarlySamples_ReleasesBytes(t *testing.T) {
+	sess := newNotifTestSession()
+	sess.notifications.subscribeInFlight.Store(1)
+
+	const handle = 0x555
+	sym := preSeedTypedSymbol(sess, "MAIN.x", 0xC0DE)
+	ch := make(chan *Update, 1)
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[handle] = activeNotification{Sym: sym, Ch: ch}
+	sess.notifications.lock.Unlock()
+
+	// bufferEarlySample self-heals when the handle is already bound, so the
+	// sample is consumed and its bytes must be released with it.
+	sess.bufferEarlySample(context.Background(), handle, 0, intSample(7))
+
+	sess.notifications.earlyMu.Lock()
+	held := sess.notifications.earlyBytes
+	sess.notifications.earlyMu.Unlock()
+	if held != 0 {
+		t.Errorf("earlyBytes = %d after the sample was consumed, want 0", held)
 	}
 }

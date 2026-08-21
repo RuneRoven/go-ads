@@ -714,16 +714,16 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 	// function via defer; intermediate dialAndStart calls in the retry
 	// path also re-arm on each new Client they create, but we override
 	// those back to nil for the duration of this routine.
-	// setHandshaking rides along with the ondrop disarm: a probe that times out
+	// beginHandshake rides along with the ondrop disarm: a probe that times out
 	// or gets RST is the expected first step of the cold-start flow, so it must
-	// not surface as ERROR. See Client.setHandshaking.
+	// not surface as ERROR. See Client.beginHandshake.
 	if oldClient := sess.client.Load(); oldClient != nil {
 		oldClient.SetOnDrop(nil)
-		oldClient.setHandshaking(true)
+		oldClient.beginHandshake()
 	}
 	defer func() {
 		if c := sess.client.Load(); c != nil {
-			c.setHandshaking(false)
+			c.endHandshake()
 			c.SetOnDrop(sess.triggerReconnect)
 		}
 	}()
@@ -769,7 +769,7 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		// re-arm at function exit restores the production handler).
 		if c := sess.client.Load(); c != nil {
 			c.SetOnDrop(nil)
-			c.setHandshaking(true)
+			c.beginHandshake()
 		}
 		if sess.isClosed() {
 			return false, fmt.Errorf("connection closed during route probe retry")
@@ -860,16 +860,16 @@ func (sess *Session) currentLifecycleCtx() context.Context {
 // Call immediately after a successful AddRoute. ondrop is disarmed for the
 // duration so a PLC-initiated RST cannot spawn a competing Reconnect
 // goroutine while we own the transport — same rationale as
-// ensureRouteOnConnect. Client.setHandshaking keeps the expected faults off
+// ensureRouteOnConnect. Client.beginHandshake keeps the expected faults off
 // the ERROR channel while we are still working.
 func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, error) {
 	if c := sess.client.Load(); c != nil {
 		c.SetOnDrop(nil)
-		c.setHandshaking(true)
+		c.beginHandshake()
 	}
 	defer func() {
 		if c := sess.client.Load(); c != nil {
-			c.setHandshaking(false)
+			c.endHandshake()
 			c.SetOnDrop(sess.triggerReconnect)
 		}
 	}()
@@ -907,7 +907,7 @@ func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, err
 			// rest of the wait (the deferred restore handles function exit).
 			if c := sess.client.Load(); c != nil {
 				c.SetOnDrop(nil)
-				c.setHandshaking(true)
+				c.beginHandshake()
 			}
 		}
 		select {

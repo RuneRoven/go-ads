@@ -106,9 +106,12 @@ type Client struct {
 	ondropMu sync.RWMutex
 	ondrop   func()
 
-	// handshaking is set while a route probe / registration is in flight; see
-	// setHandshaking for why transport faults are demoted to Debug then.
-	handshaking atomic.Bool
+	// handshaking counts route probe / registration regions in flight; see
+	// beginHandshake for why transport faults are demoted to Debug then. A
+	// counter rather than a flag so overlapping regions cannot have the inner
+	// one re-enable ERROR logging while the outer is still running — the same
+	// reason subscribeInFlight is a counter.
+	handshaking atomic.Int64
 
 	// dropped is closed when THIS client's connection is known to be gone.
 	// disconnected stops new requests; this releases the ones already blocked
@@ -266,8 +269,7 @@ func (c *Client) SetOnDrop(fn func()) {
 	c.ondropMu.Unlock()
 }
 
-// setHandshaking marks whether a route probe / registration handshake is in
-// flight. During the handshake a dropped connection and an unanswered request
+// beginHandshake marks a route probe / registration region as in flight. During the handshake a dropped connection and an unanswered request
 // are expected states, not faults: the normal cold-start flow is probe → PLC
 // rejects an unknown NetID → register route → redial → probe again. Logging
 // those at ERROR misreports a connect that is still progressing, and
@@ -276,8 +278,19 @@ func (c *Client) SetOnDrop(fn func()) {
 // in a starting state even though the PLC is connected and streaming.
 //
 // Errors are still returned to the caller unchanged — only the log level moves.
-func (c *Client) setHandshaking(v bool) {
-	c.handshaking.Store(v)
+func (c *Client) beginHandshake() {
+	c.handshaking.Add(1)
+}
+
+// endHandshake closes a region opened by beginHandshake. Pairs must match; a
+// count that never returns to zero would silence real faults for the life of
+// the client, so callers defer this immediately.
+func (c *Client) endHandshake() {
+	if c.handshaking.Add(-1) < 0 {
+		// Unbalanced: clamp rather than leave it negative, which would read as
+		// "not handshaking" only by accident.
+		c.handshaking.Store(0)
+	}
 }
 
 // transportFaultLevel returns the level to log a transport fault at: Debug
@@ -292,7 +305,7 @@ func (c *Client) setHandshaking(v bool) {
 // re-trip a downstream log-based health check, so new fault paths need this
 // distinction made deliberately.
 func (c *Client) transportFaultLevel() slog.Level {
-	if c.handshaking.Load() {
+	if c.handshaking.Load() > 0 {
 		return slog.LevelDebug
 	}
 	return slog.LevelError

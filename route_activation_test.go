@@ -112,8 +112,8 @@ func TestAwaitRouteActive_RestoresClientState(t *testing.T) {
 	if _, err := sess.awaitRouteActive(sess.currentLifecycleCtx); err != nil {
 		t.Fatalf("awaitRouteActive: %v", err)
 	}
-	if c.handshaking.Load() {
-		t.Error("handshaking still set after return — later real faults would log at Debug")
+	if c.handshaking.Load() != 0 {
+		t.Error("handshaking count non-zero after return — later real faults would log at Debug")
 	}
 	c.ondropMu.RLock()
 	restored := c.ondrop != nil
