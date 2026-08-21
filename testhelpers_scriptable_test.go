@@ -81,6 +81,13 @@ type scriptableServer struct {
 	dropAfter map[CommandID]int
 	dropSeen  map[CommandID]int
 
+	// closeAfterReply implements answerThenClose: answer the nth occurrence of a
+	// command normally, then close the connection. Models the PLC behaviour that
+	// matters most here — a reply followed immediately by a route-idle close, a
+	// runtime restart, or an RST.
+	closeAfterReply map[CommandID]int
+	replySeen       map[CommandID]int
+
 	// Recorded inbound frames (full bytes including TCP header).
 	frameBuf [][]byte
 }
@@ -258,7 +265,34 @@ func (s *scriptableServer) handle(c net.Conn) {
 		if err := writeResponse(c, body, cmd, invokeID, respPayload); err != nil {
 			return
 		}
+
+		// Answer-then-close: the reply is already on the wire; dropping the
+		// connection now races the client's own response delivery.
+		s.mu.Lock()
+		closeAt, armed2 := s.closeAfterReply[cmd]
+		if armed2 {
+			s.replySeen[cmd]++
+			if s.replySeen[cmd] >= closeAt {
+				delete(s.closeAfterReply, cmd)
+				s.mu.Unlock()
+				return // deferred c.Close()
+			}
+		}
+		s.mu.Unlock()
 	}
+}
+
+// answerThenClose answers the nth occurrence of cmd (1-based) and then closes
+// the connection, then disarms.
+func (s *scriptableServer) answerThenClose(cmd CommandID, n int) {
+	s.mu.Lock()
+	if s.closeAfterReply == nil {
+		s.closeAfterReply = map[CommandID]int{}
+		s.replySeen = map[CommandID]int{}
+	}
+	s.closeAfterReply[cmd] = n
+	s.replySeen[cmd] = 0
+	s.mu.Unlock()
 }
 
 // dropConnAfter closes the connection without answering the nth occurrence of

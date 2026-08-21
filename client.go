@@ -38,6 +38,21 @@ import (
 	"time"
 )
 
+// droppedResponseGrace is how long a request already waiting for a reply keeps
+// waiting after the transport is observed dead.
+//
+// A drop is detected on the listen goroutine, which closes the dropped channel
+// immediately — but a reply it parsed a moment earlier is still travelling
+// recvQueue to a recvWorker. Without this grace the drop signal wins that race
+// and an answer we already received is thrown away: measured at 40/40 replies
+// lost against a stub that answers and then closes, which is exactly what a PLC
+// does on a route-idle timeout, a runtime restart, or an RST after answering.
+//
+// Only a request with a reply in flight pays it, and only once — a multi-request
+// operation aborts on the first failure — so the fast-fail this exists to
+// support keeps almost all of its benefit.
+const droppedResponseGrace = 100 * time.Millisecond
+
 // ErrTransportClosed is returned by every Client method after the underlying
 // TCP transport has been closed (Close called, drop detected, dial failed).
 // Callers reconstruct a new *Client to re-establish.
@@ -604,7 +619,16 @@ func (c *Client) send(data []byte) ([]byte, error) {
 		c.logger.Log(ctx, c.transportFaultLevel(), "send aborted due to shutdown", "error", err)
 		return nil, err
 	case <-dropped:
-		return nil, ErrTransportClosed
+		grace := time.NewTimer(droppedResponseGrace)
+		defer grace.Stop()
+		select {
+		case response := <-sysCh:
+			return response, nil
+		case <-grace.C:
+			return nil, ErrTransportClosed
+		case <-ctx.Done():
+			return nil, ErrTransportClosed
+		}
 	case response := <-sysCh:
 		return response, nil
 	}
@@ -678,10 +702,19 @@ func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte
 		}
 		return nil, ctx.Err()
 	case <-dropped:
-		// The transport died while this request was in flight. Returning now
-		// instead of waiting out the timeout is what stops a multi-request
-		// operation from paying requestTimeout per remaining item.
-		return nil, ErrTransportClosed
+		// The transport died while this request was in flight. Give a reply that
+		// is already in the receive pipeline a bounded moment to land before
+		// giving up — see droppedResponseGrace.
+		grace := time.NewTimer(droppedResponseGrace)
+		defer grace.Stop()
+		select {
+		case response := <-responseCh:
+			return response, nil
+		case <-grace.C:
+			return nil, ErrTransportClosed
+		case <-ctx.Done():
+			return nil, ErrTransportClosed
+		}
 	case response := <-responseCh:
 		return response, nil
 	}
