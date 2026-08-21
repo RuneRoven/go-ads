@@ -324,8 +324,8 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 //     ByReload and ErrNotificationTransportFailure are worth retrying, the
 //     others are caller bugs. Error is not meaningful. Handle IS meaningful
 //     when non-zero: the PLC created that registration before the library
-//     refused it, so the caller must release it (Session.DeleteDeviceNotification)
-//     or it streams forever. resubscribeNotifications relies on this.
+//     refused it. The library releases it best-effort before returning, and
+//     surfaces it here so the caller can verify or retry that release.
 //   - Skipped == nil && Error != ReturnCodeNoErrors: PLC accepted the batch
 //     but rejected this item (e.g. invalid handle).
 //   - Skipped == nil && Error == ReturnCodeNoErrors: success; Handle is valid.
@@ -434,6 +434,9 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 	batchEpoch := sess.epoch()
 	committed := make([]uint32, 0, len(requests))
 	committedIdx := make([]int, 0, len(requests))
+	// Handles the PLC created but the library declined to bind. Released before
+	// returning so a refusal cannot leak a subscription streaming to nobody.
+	refused := make([]uint32, 0, len(requests))
 	defer func() { sess.endSubscribe(ctx, committed) }()
 
 	// Bind each handle the moment its own Add returns. On a PLC that rejects
@@ -474,7 +477,13 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		if skipErr := sess.commitNotification(info.config, r.Handle, ch, batchEpoch); skipErr != nil {
 			results[info.configIndex].Skipped = skipErr
 			results[info.configIndex].Handle = r.Handle
-			sess.logger.Warn("batch entry not committed; surfacing PLC handle for caller cleanup",
+			// The PLC created this registration before we refused it, so it is
+			// streaming to nobody. Release it after the batch rather than here:
+			// on a sum-unsupported PLC this callback runs between individual
+			// Adds, and a Delete wedged in there would serialize into the
+			// registration sequence.
+			refused = append(refused, r.Handle)
+			sess.logger.Warn("batch entry not committed; releasing the PLC handle",
 				"symbol", info.config.SymbolName, "handle", r.Handle, "reason", skipErr)
 			return
 		}
@@ -537,6 +546,21 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		}
 		sess.logger.Warn("symbol cache reloaded mid-batch; committed entries reported as stranded",
 			"entries", len(committedIdx))
+	}
+
+	// Release what we refused, plus anything the amendment just invalidated:
+	// both are registrations on the PLC that nothing on this side owns.
+	for _, idx := range committedIdx {
+		if results[idx].Skipped != nil && results[idx].Handle != 0 {
+			refused = append(refused, results[idx].Handle)
+		}
+	}
+	if len(refused) > 0 {
+		// Best-effort: 0x714 (already gone) counts as success, which covers the
+		// stranded-by-reload case where the reload deleted them first.
+		deleted := sess.bestEffortDeleteNotifications(ctx, refused)
+		sess.logger.Warn("released PLC notification handles the batch did not bind",
+			"handles", len(refused), "deleted", deleted)
 	}
 
 	// Everything else was already bound (or recorded as failed/skipped) by

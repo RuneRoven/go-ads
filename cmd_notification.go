@@ -692,11 +692,6 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 		return
 	}
 
-	// Commit throttle entry now that the slot is reserved.
-	mgr.orphanMu.Lock()
-	mgr.orphanSeen[handle] = now
-	mgr.orphanMu.Unlock()
-
 	// Track goroutine so Close waits for in-flight orphan deletes.
 	sess.lifecycle.waitGroup.Add(1)
 	go func() {
@@ -748,6 +743,14 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 			sess.logger.Debug("orphan delete aborted: lifecycle context done", "handle", handle, "error", err)
 			return
 		}
+
+		// Commit the throttle entry here, not before the guards: an attempt that
+		// aborts sends no RPC, and recording it anyway locked a genuinely leaked
+		// handle out for the full throttle window. Same reasoning as the sem-full
+		// path, which already declines to write one.
+		mgr.orphanMu.Lock()
+		mgr.orphanSeen[handle] = time.Now()
+		mgr.orphanMu.Unlock()
 
 		ctx, cancel := context.WithTimeout(parentCtx, orphanDeleteRPCTimeout)
 		defer cancel()

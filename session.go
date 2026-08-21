@@ -328,13 +328,29 @@ func (sess *Session) discoverTarget(ctx context.Context) error {
 		return fmt.Errorf("ads: NewSession: target AMS address incomplete and discovery failed "+
 			"(set remote.AMS explicitly if the device does not answer the identify service): %w", err)
 	}
+	return sess.applyDiscoveredIdentity(id)
+}
+
+// applyDiscoveredIdentity fills the missing halves of the target address from a
+// probe result. Split from the round-trip so the decisions are testable without
+// a device.
+func (sess *Session) applyDiscoveredIdentity(id RemoteIdentity) error {
 	if sess.target.NetID == [6]byte{} {
 		sess.target.NetID = id.AMS.NetID
 	}
 	if sess.target.Port == 0 {
-		// The identify service reports the router's port, never a runtime's, so
-		// this is the TwinCAT-major-version convention. Logged because a
-		// multi-runtime project needs 811/852/... and must override it.
+		// The port is a per-major-version convention, not a discovered value, so
+		// it needs a version to be a convention AT ALL. With none reported,
+		// planting the TwinCAT 3 default would silently address a runtime that
+		// may not exist — reproducing the very failure this feature removes.
+		// Refuse instead and say what to do.
+		if id.Major == 0 {
+			return fmt.Errorf("ads: NewSession: %s (%s) reported no TwinCAT version, so the runtime "+
+				"AMS port cannot be inferred; set remote.AMS.Port explicitly (801 on TwinCAT 2, 851 on TwinCAT 3)",
+				sess.ip, id.HostName)
+		}
+		// Logged because a multi-runtime project needs 811/852/... and must
+		// override it.
 		sess.target.Port = id.RuntimePort()
 	}
 	sess.logger.Info("discovered target AMS address",

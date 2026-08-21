@@ -3,6 +3,7 @@ package ads
 import (
 	"encoding/binary"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -300,5 +301,71 @@ func TestIdentifyResponseIsOurs(t *testing.T) {
 				t.Errorf("identifyResponseIsOurs() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestDiscoverTarget_RefusesPortWithoutVersion: the runtime port is a
+// per-major-version convention, so with no version reported there is nothing to
+// apply. Guessing would plant a port that may address no runtime — the exact
+// silent failure discovery exists to prevent.
+func TestDiscoverTarget_RefusesPortWithoutVersion(t *testing.T) {
+	// Responder that reports a NetID and host name but no version tag.
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	addr, ok := pc.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		_ = pc.Close()
+		t.Fatalf("unexpected addr type: %T", pc.LocalAddr())
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 2048)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = pc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			_, from, err := pc.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+			invokeID := binary.LittleEndian.Uint32(buf[4:8])
+			resp := buildIdentifyResponse(invokeID, [6]byte{5, 7, 7, 7, 1, 1}, 10000, [][2]any{
+				{int(tagComputerName), append([]byte("NO-VERSION-CX"), 0)},
+			})
+			_, _ = pc.WriteToUDP(resp, from)
+		}
+	}()
+	defer func() { close(done); _ = pc.Close(); wg.Wait() }()
+
+	id, err := identifyRemoteFrom(t.Context(), nil, nil, addr.IP.String(), addr.Port)
+	if err != nil {
+		t.Fatalf("identify: %v", err)
+	}
+	if id.Major != 0 {
+		t.Fatalf("setup: responder reported a version (%s)", id.Version())
+	}
+	// RuntimePort keeps its documented convention; discoverTarget must not lean
+	// on it when there is no version behind it.
+	if got := id.RuntimePort(); got != 851 {
+		t.Errorf("RuntimePort() = %d, want the documented 851 default", got)
+	}
+
+	sess := &Session{ip: addr.IP.String(), logger: getDefaultLogger()}
+	err = sess.applyDiscoveredIdentity(id)
+	if err == nil {
+		t.Fatal("discovery accepted a device that reported no version and left the port to be guessed")
+	}
+	for _, want := range []string{"no TwinCAT version", "801", "851"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q: %v", want, err)
+		}
 	}
 }
