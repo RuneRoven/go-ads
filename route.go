@@ -44,7 +44,7 @@ func AddRemoteRoute(remoteHost string, localNetID [6]byte, routeName string, com
 
 // AddRemoteRouteWithLogger is like AddRemoteRoute but accepts an explicit logger.
 func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
-	return addRemoteRouteFrom(logger, nil, remoteHost, localNetID, routeName, computerName, username, password)
+	return addRemoteRouteFrom(logger, nil, remoteHost, routePort, localNetID, routeName, computerName, username, password)
 }
 
 // addRemoteRouteFrom is AddRemoteRouteWithLogger with an explicit local source
@@ -56,7 +56,9 @@ func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID
 // the route for whichever NIC wins the route metric, and a session bound to the
 // other one is then reset by the PLC — the registration reports success and
 // nothing is ever served. localIP nil keeps OS-default routing.
-func addRemoteRouteFrom(logger *slog.Logger, localIP net.IP, remoteHost string, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
+// port is the router's UDP port; production passes the session's, which is
+// routePort unless the PLC sits behind NAT with port forwarding.
+func addRemoteRouteFrom(logger *slog.Logger, localIP net.IP, remoteHost string, port int, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
 	if logger == nil {
 		logger = getDefaultLogger()
 	}
@@ -66,7 +68,10 @@ func addRemoteRouteFrom(logger *slog.Logger, localIP net.IP, remoteHost string, 
 		"computerName", computerName,
 		"routeName", routeName,
 		"hasAuth", username != "")
-	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", remoteHost, routePort))
+	if port <= 0 {
+		port = routePort
+	}
+	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", remoteHost, port))
 	if err != nil {
 		return fmt.Errorf("failed to resolve remote host: %w", err)
 	}

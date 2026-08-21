@@ -193,6 +193,10 @@ type Session struct {
 	// device disagrees with. Write-once at construction via WithTargetCheck.
 	targetCheck TargetCheck
 
+	// routerPort is the UDP port for route registration and identify. Set from
+	// AMSEndpoint.RouterPort; 0 means the protocol default.
+	routerPort int
+
 	logger *slog.Logger
 }
 
@@ -200,9 +204,25 @@ type Session struct {
 // IP+Port locate the TwinCAT runtime over TCP (port 48898 by default);
 // AMS is the target AMSAddress carried in every ADS request header.
 type AMSEndpoint struct {
-	IP   string
+	// IP is the host or address of the PLC (or of the NAT that forwards to it).
+	IP string
+	// Port is the TCP port carrying AMS. Defaults to 48898, TwinCAT's own.
 	Port int
-	AMS  AMSAddress
+	// AMS is the target AMS address. A zero NetID and/or Port is resolved from
+	// the device — see NewSession.
+	AMS AMSAddress
+	// RouterPort is the UDP port of the AMS router, used to register a route and
+	// to identify the device. Defaults to 48899, TwinCAT's own.
+	//
+	// Set it when the PLC is reached through NAT with port forwarding. NAT maps
+	// one external port per internal port, so the forwarded UDP port is normally
+	// a different number than the forwarded TCP port and cannot be derived from
+	// Port — e.g. external TCP 5534 -> 48898 and external UDP 6499 -> 48899 give
+	// AMSEndpoint{IP: natHost, Port: 5534, RouterPort: 6499}.
+	//
+	// Only the two UDP calls use it. Notifications need no inbound forward: they
+	// arrive on the TCP connection this side opened.
+	RouterPort int
 }
 
 // NewSession creates a new ADS session targeting remote. The session does
@@ -237,6 +257,9 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 	if remote.Port <= 0 {
 		remote.Port = 48898 // TwinCAT TCP default
 	}
+	if remote.RouterPort <= 0 {
+		remote.RouterPort = routePort // TwinCAT UDP default
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -244,6 +267,7 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 	sess = &Session{
 		ip:             remote.IP,
 		port:           remote.Port,
+		routerPort:     remote.RouterPort,
 		target:         remote.AMS,
 		requestTimeout: 5 * time.Second,
 		route:          &routeManager{},
@@ -323,7 +347,7 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 // socket and then drops every request — so resolving it from the device beats
 // making the caller carry it.
 func (sess *Session) discoverTarget(ctx context.Context) error {
-	id, err := identifyRemoteFrom(ctx, sess.logger, sess.localBindIP, sess.ip, routePort)
+	id, err := identifyRemoteFrom(ctx, sess.logger, sess.localBindIP, sess.ip, sess.effectiveRouterPort())
 	if err != nil {
 		return fmt.Errorf("ads: NewSession: target AMS address incomplete and discovery failed "+
 			"(set remote.AMS explicitly if the device does not answer the identify service): %w", err)
@@ -380,7 +404,7 @@ const targetVerifyTimeout = time.Second
 func (sess *Session) verifyTarget(ctx context.Context) error {
 	verifyCtx, cancel := context.WithTimeout(ctx, targetVerifyTimeout)
 	defer cancel()
-	id, err := identifyRemoteFrom(verifyCtx, sess.logger, sess.localBindIP, sess.ip, routePort)
+	id, err := identifyRemoteFrom(verifyCtx, sess.logger, sess.localBindIP, sess.ip, sess.effectiveRouterPort())
 	if err != nil {
 		// Info, not Debug: the operator needs to know the guard did not run.
 		// Silence here would read as "verified" at default log level.
@@ -504,7 +528,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 
 		// NAT/Docker detection: compare TCP and UDP source IPs
 		if sess.callbackIP == "" && ip != nil {
-			udpConn, udpErr := net.DialTimeout("udp4", net.JoinHostPort(sess.ip, strconv.Itoa(routePort)), 2*time.Second)
+			udpConn, udpErr := net.DialTimeout("udp4", net.JoinHostPort(sess.ip, strconv.Itoa(sess.effectiveRouterPort())), 2*time.Second)
 			if udpErr == nil {
 				udpAddr, ok := udpConn.LocalAddr().(*net.UDPAddr)
 				udpConn.Close()
@@ -829,6 +853,16 @@ func (sess *Session) routeActivationBudget() (total, probe time.Duration) {
 		probe = maxRouteActivationProbe
 	}
 	return total, probe
+}
+
+// effectiveRouterPort is the UDP router port for this session, falling back to
+// the protocol default for a Session built without going through NewSession
+// (test helpers do this).
+func (sess *Session) effectiveRouterPort() int {
+	if sess.routerPort > 0 {
+		return sess.routerPort
+	}
+	return routePort
 }
 
 // currentLifecycleCtx returns the live lifecycle context.
@@ -2093,7 +2127,7 @@ func (sess *Session) AddRoute(ctx context.Context, routeName, username, password
 	// UDP socket keeps draining toward its own deadline in the background.
 	done := make(chan error, 1)
 	go func() {
-		done <- addRemoteRouteFrom(sess.logger, sess.localBindIP, sess.ip, sess.source.NetID, routeName, hostIP, username, password)
+		done <- addRemoteRouteFrom(sess.logger, sess.localBindIP, sess.ip, sess.effectiveRouterPort(), sess.source.NetID, routeName, hostIP, username, password)
 	}()
 	select {
 	case err := <-done:
