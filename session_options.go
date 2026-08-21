@@ -257,12 +257,16 @@ const (
 // WithTargetCheck sets what happens when the target NetID disagrees with what
 // the device reports for itself (see TargetCheck). Default is TargetCheckWarn.
 //
-// The check costs one UDP round-trip during NewSession, measured at a few
-// milliseconds, and only runs when the caller supplied a complete target — an
-// incomplete one is resolved from the device instead, which is authoritative by
-// construction. A device that does not answer the identify service is never
-// treated as a mismatch: verification is skipped with a Debug line, because a
-// firewalled UDP port says nothing about whether the address is right.
+// The check runs in Connect, costs one UDP round-trip, and only applies to a
+// caller-supplied target — an incomplete one is resolved from the device by
+// NewSession instead, which is authoritative by construction. TargetCheckOff
+// therefore disables verification of a complete target; it does not disable
+// that resolution.
+//
+// A device that does not answer the identify service is never treated as a
+// mismatch, in any mode: verification is skipped with an Info line and Connect
+// proceeds, because a firewalled UDP port says nothing about whether the
+// address is right.
 func WithTargetCheck(c TargetCheck) SessionOption {
 	return func(s *Session) {
 		if c != 0 {

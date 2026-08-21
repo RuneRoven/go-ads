@@ -427,10 +427,10 @@ type SumNotificationResult struct {
 // round-trip using GroupSumupAddDeviceNotification (0xF085). Falls back to
 // individual AddDeviceNotification calls on older PLCs.
 func (c *Client) SumAddDeviceNotification(ctx context.Context, requests []SumNotificationRequest) ([]SumNotificationResult, error) {
-	return c.SumAddDeviceNotificationFunc(ctx, requests, nil)
+	return c.sumAddDeviceNotificationFunc(ctx, requests, nil)
 }
 
-// SumAddDeviceNotificationFunc is SumAddDeviceNotification with a per-item
+// sumAddDeviceNotificationFunc is SumAddDeviceNotification with a per-item
 // callback, invoked with each item's result as soon as that result is known.
 //
 // This exists for the PLC that rejects the sum command: the call then degrades
@@ -447,7 +447,7 @@ func (c *Client) SumAddDeviceNotification(ctx context.Context, requests []SumNot
 // answering, so there is nothing to report early). Callers therefore get one
 // commit path regardless of which path ran. The returned slice carries the
 // same results.
-func (c *Client) SumAddDeviceNotificationFunc(
+func (c *Client) sumAddDeviceNotificationFunc(
 	ctx context.Context,
 	requests []SumNotificationRequest,
 	onItem func(index int, res SumNotificationResult),
@@ -554,11 +554,26 @@ func (c *Client) sumAddNotificationFallback(ctx context.Context, requests []SumN
 		h, err := c.AddDeviceNotification(ctx, req.Group, req.Offset, req.Length, transMode, req.MaxDelay, req.CycleTime)
 		if err != nil {
 			var rc ReturnCode
-			if errors.As(err, &rc) {
-				results[i].Error = rc
-			} else {
-				results[i].Error = ReturnCodeDeviceError
+			if !errors.As(err, &rc) {
+				// Not a PLC verdict — the transport or the context failed. Two
+				// reasons to stop here rather than carry on: labelling a link
+				// failure as a device error blames the PLC for something it never
+				// said, and every remaining item would burn its own timeout
+				// against a connection that is already gone.
+				results[i].Skipped = fmt.Errorf("%w: %w", ErrNotificationTransportFailure, err)
+				for j := i + 1; j < len(requests); j++ {
+					results[j].Skipped = fmt.Errorf("%w: batch aborted at item %d", ErrNotificationTransportFailure, i)
+				}
+				if onItem != nil {
+					for j := i; j < len(requests); j++ {
+						onItem(j, results[j])
+					}
+				}
+				c.logger.Warn("AddDeviceNotification fallback aborted: transport failed mid-batch",
+					"error", err, "index", i, "abandoned", len(requests)-i)
+				return results, err
 			}
+			results[i].Error = rc
 			c.logger.Warn("individual AddDeviceNotification failed in fallback", "error", err, "index", i)
 		} else {
 			results[i].Handle = h

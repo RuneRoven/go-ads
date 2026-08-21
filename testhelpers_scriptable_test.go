@@ -76,6 +76,11 @@ type scriptableServer struct {
 	// don't carry a group (AddDeviceNotification etc.) the group is 0.
 	delays map[delayKey]time.Duration
 
+	// dropAfter/dropSeen implement dropConnAfter: close the connection instead
+	// of answering the nth occurrence of a command.
+	dropAfter map[CommandID]int
+	dropSeen  map[CommandID]int
+
 	// Recorded inbound frames (full bytes including TCP header).
 	frameBuf [][]byte
 }
@@ -233,11 +238,41 @@ func (s *scriptableServer) handle(c net.Conn) {
 			s.mu.Unlock()
 		}
 
+		// Drop the connection instead of answering, once the configured number
+		// of this command has been seen. Models a PLC/link failure landing
+		// mid-operation, which no amount of canned error codes reproduces: the
+		// client sees EOF on a request it already sent.
+		s.mu.Lock()
+		dropAt, armed := s.dropAfter[cmd]
+		if armed {
+			s.dropSeen[cmd]++
+			if s.dropSeen[cmd] >= dropAt {
+				delete(s.dropAfter, cmd)
+				s.mu.Unlock()
+				return // deferred c.Close() drops it
+			}
+		}
+		s.mu.Unlock()
+
 		respPayload := s.dispatch(cmd, group, payload)
 		if err := writeResponse(c, body, cmd, invokeID, respPayload); err != nil {
 			return
 		}
 	}
+}
+
+// dropConnAfter closes the connection without answering the nth occurrence of
+// cmd (1-based), then disarms. Use to land a transport failure in the middle of
+// a multi-request operation.
+func (s *scriptableServer) dropConnAfter(cmd CommandID, n int) {
+	s.mu.Lock()
+	if s.dropAfter == nil {
+		s.dropAfter = map[CommandID]int{}
+		s.dropSeen = map[CommandID]int{}
+	}
+	s.dropAfter[cmd] = n
+	s.dropSeen[cmd] = 0
+	s.mu.Unlock()
 }
 
 func (s *scriptableServer) dispatch(cmd CommandID, group uint32, payload []byte) []byte {
@@ -506,7 +541,11 @@ func newWiredTestSession(t *testing.T, srv *scriptableServer, opts ...SessionOpt
 	sess.client.Store(c)
 	// Pre-init ctx/shutdown so sess.Close() is safe in test paths that
 	// exercise the close lifecycle (e.g. SymbolVersionClose strategy).
-	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(context.Background())
+	// parentCtx too, matching NewSession: tearDownAndReset re-derives
+	// lifecycle.ctx from it, so a helper that leaves it nil diverges from
+	// production on every path that redials.
+	sess.lifecycle.parentCtx = context.Background()
+	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(sess.lifecycle.parentCtx)
 	// Walk the FSM through Connecting → Connected so isClosed/isReconnecting
 	// readers see a live session. Direct atomic store keeps the test helper
 	// simple — production transitions go through transitionTo.

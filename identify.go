@@ -102,6 +102,14 @@ func IdentifyRemote(ctx context.Context, host string) (RemoteIdentity, error) {
 
 // IdentifyRemoteWithLogger is IdentifyRemote with an explicit logger.
 func IdentifyRemoteWithLogger(ctx context.Context, logger *slog.Logger, host string) (RemoteIdentity, error) {
+	return identifyRemoteFrom(ctx, logger, nil, host)
+}
+
+// identifyRemoteFrom is IdentifyRemoteWithLogger with an explicit local source
+// IP, so a session that pins its outbound interface probes over the same one.
+// Otherwise discovery and verification can traverse a different NIC than the
+// ADS traffic they are meant to describe. localIP nil keeps OS-default routing.
+func identifyRemoteFrom(ctx context.Context, logger *slog.Logger, localIP net.IP, host string) (RemoteIdentity, error) {
 	if logger == nil {
 		logger = getDefaultLogger()
 	}
@@ -116,7 +124,11 @@ func IdentifyRemoteWithLogger(ctx context.Context, logger *slog.Logger, host str
 	if err != nil {
 		return RemoteIdentity{}, fmt.Errorf("identify %s: resolve: %w", host, err)
 	}
-	conn, err := net.DialUDP("udp4", nil, addr)
+	var laddr *net.UDPAddr
+	if localIP != nil {
+		laddr = &net.UDPAddr{IP: localIP}
+	}
+	conn, err := net.DialUDP("udp4", laddr, addr)
 	if err != nil {
 		return RemoteIdentity{}, fmt.Errorf("identify %s: dial UDP: %w", host, err)
 	}

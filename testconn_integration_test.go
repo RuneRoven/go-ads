@@ -38,6 +38,13 @@ func setupConnectionWithDefaults(t *testing.T, d connDefaults, extra ...SessionO
 	if hostIP != "" {
 		opts = append(opts, WithHostIP(hostIP))
 	}
+	// ADS_LOCAL_BIND_IP forces the outbound source IP. Needed on a multi-homed
+	// host: with wifi and ethernet on the same subnet the OS picks one by route
+	// metric, so testing the other NIC deliberately means binding to it. Leaving
+	// it unset keeps OS-default routing, which is what production usually wants.
+	if bindIP := os.Getenv("ADS_LOCAL_BIND_IP"); bindIP != "" {
+		opts = append(opts, WithLocalBindIP(bindIP))
+	}
 	routeUser := os.Getenv("ADS_ROUTE_USER")
 	routePass := os.Getenv("ADS_ROUTE_PASS")
 	// ADS_SKIP_ROUTE_REGISTER=true → don't pass WithRoute → ensureRoute no-op.

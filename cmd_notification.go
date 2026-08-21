@@ -290,7 +290,7 @@ func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestam
 			// dropping it: a static symbol (constant string/bool) emits exactly
 			// one sample, at subscribe time, and dropping it means the consumer
 			// never sees that tag at all.
-			sess.bufferEarlySample(handle, timestamp, content)
+			sess.bufferEarlySample(ctx, handle, timestamp, content)
 		default:
 			// Genuine orphan sample — handle is registered on the PLC but
 			// not in our client-side map. Most likely cause: a prior process
@@ -414,16 +414,27 @@ const (
 	// earlySampleMaxHandles bounds the buffer. Reaching it means far more
 	// unknown handles are in flight than any real subscribe produces.
 	earlySampleMaxHandles = 4096
+	// subscribeRaceMaxOpen caps how long an in-flight subscribe may keep the
+	// reaper suppressed, so a wedged one cannot disable it indefinitely.
+	subscribeRaceMaxOpen = 30 * time.Second
 )
 
 // subscribeRaceActive reports whether an unknown handle should be presumed to
 // be one of ours mid-registration rather than a leaked one.
+//
+// The in-flight counter is authoritative but not unconditional: a subscribe that
+// wedges would otherwise disable the orphan reaper for the life of the session,
+// and the reaper exists to stop the PLC's handle table filling up. So the window
+// also expires. subscribeRaceMaxOpen is generous enough for any real batch —
+// hundreds of symbols registered one at a time on a slow PLC — while still
+// bounded.
 func (sess *Session) subscribeRaceActive() bool {
 	mgr := sess.notifications
+	sinceStart := time.Now().UnixNano() - mgr.lastSubscribeNs.Load()
 	if mgr.subscribeInFlight.Load() > 0 {
-		return true
+		return sinceStart < subscribeRaceMaxOpen.Nanoseconds()
 	}
-	return time.Now().UnixNano()-mgr.lastSubscribeNs.Load() < subscribeRaceWindow.Nanoseconds()
+	return sinceStart < subscribeRaceWindow.Nanoseconds()
 }
 
 // beginSubscribe marks a subscribe operation as in flight. Every call must be
@@ -447,23 +458,30 @@ func (sess *Session) endSubscribe(ctx context.Context, committed []uint32) {
 	mgr := sess.notifications
 	mgr.lastSubscribeNs.Store(time.Now().UnixNano())
 	sess.replayEarlySamples(ctx, committed)
-	inFlight := mgr.subscribeInFlight.Add(-1)
-	if inFlight > 0 {
-		return
-	}
+
+	// The decrement and the discard decision are one critical section. Split
+	// apart, a subscribe beginning between them would see the window still open,
+	// buffer a sample, and have this call throw it away. Holding earlyMu across
+	// both is enough: a newcomer can increment the counter freely, but it cannot
+	// insert until we are done, and if it incremented before our decrement we
+	// see a non-zero count and clear nothing.
 	mgr.earlyMu.Lock()
-	dropped := len(mgr.earlySamples)
-	if dropped > 0 {
-		mgr.earlySamples = nil
+	dropped := 0
+	if mgr.subscribeInFlight.Add(-1) == 0 {
+		dropped = len(mgr.earlySamples)
+		if dropped > 0 {
+			mgr.earlySamples = nil
+		}
 	}
 	mgr.earlyMu.Unlock()
+
 	if dropped > 0 {
 		sess.logger.Debug("discarded buffered samples for handles that never committed", "count", dropped)
 	}
 }
 
 // bufferEarlySample parks the most recent sample for an uncommitted handle.
-func (sess *Session) bufferEarlySample(handle uint32, timestamp uint64, content []byte) {
+func (sess *Session) bufferEarlySample(ctx context.Context, handle uint32, timestamp uint64, content []byte) {
 	mgr := sess.notifications
 	// Copy: content is freshly allocated per sample today, but the handler
 	// signature is exported and this buffer outlives the dispatch call.
@@ -487,10 +505,24 @@ func (sess *Session) bufferEarlySample(handle uint32, timestamp uint64, content 
 		return
 	}
 	sess.logger.Debug("buffered early notification sample (handle registration still in flight)", "handle", handle)
+
+	// The commit can land between the map miss that sent us here and the insert
+	// above. If it did, the replay that would have collected this sample has
+	// already run, and no later one will look for a handle that is already
+	// bound — so the sample would sit parked until some unrelated subscribe
+	// discarded it. For a static symbol that is the only sample it will ever
+	// send. Whoever loses that race cleans up after itself: replayEarlySamples
+	// takes the sample only if the handle is bound by now, so this is a no-op
+	// in the common case.
+	sess.replayEarlySamples(ctx, []uint32{handle})
 }
 
-// replayEarlySamples re-dispatches buffered samples for handles that have since
-// been committed to activeNotifications.
+// replayEarlySamples dispatches buffered samples for handles that are bound in
+// activeNotifications, removing them from the buffer as it goes.
+//
+// A handle that is NOT bound is left parked on purpose: its commit may still be
+// coming, and dispatching it would take the unknown-handle path and schedule an
+// orphan delete for a handle we may be about to own.
 func (sess *Session) replayEarlySamples(ctx context.Context, handles []uint32) {
 	if len(handles) == 0 {
 		return
@@ -502,8 +534,22 @@ func (sess *Session) replayEarlySamples(ctx context.Context, handles []uint32) {
 	}
 	var pending []replay
 
+	// notifications.lock first and released before earlyMu — the two are never
+	// held together, in either order, anywhere.
+	bound := make(map[uint32]struct{}, len(handles))
+	mgr.lock.Lock()
+	for _, h := range handles {
+		if _, ok := mgr.activeNotifications[h]; ok {
+			bound[h] = struct{}{}
+		}
+	}
+	mgr.lock.Unlock()
+
 	mgr.earlyMu.Lock()
 	for _, h := range handles {
+		if _, ok := bound[h]; !ok {
+			continue
+		}
 		if s, ok := mgr.earlySamples[h]; ok {
 			delete(mgr.earlySamples, h)
 			pending = append(pending, replay{handle: h, sample: s})

@@ -1068,7 +1068,10 @@ func TestWithOnDrop_RegistersCallback(t *testing.T) {
 	called := make(chan struct{}, 1)
 	opt := WithOnDrop(func() { called <- struct{}{} })
 
-	c := &Client{}
+	// A real transport: callOnDrop marks it down and releases waiters, so the
+	// zero-value Client this test used to build is not a shape that exists
+	// (Dial and NewSession both construct tx).
+	c := &Client{tx: &transport{}, dropped: make(chan struct{})}
 	opt(c)
 
 	c.callOnDrop()

@@ -1,9 +1,11 @@
 package ads
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newTargetCheckSession builds the minimum Session applyTargetCheck touches,
@@ -117,5 +119,29 @@ func TestWithTargetCheck(t *testing.T) {
 				t.Errorf("targetCheck = %d, want %d", sess.targetCheck, tt.want)
 			}
 		})
+	}
+}
+
+// TestNewSession_LocalModeSkipsDiscovery: local mode targets the in-process
+// runtime and Connect overwrites NetID and IP with loopback regardless, so
+// probing the caller-supplied address at construction is pointless — and its
+// failure must not sink the session. The address here is chosen to be
+// unroutable, so a probe would have to time out.
+func TestNewSession_LocalModeSkipsDiscovery(t *testing.T) {
+	start := time.Now()
+	sess, err := NewSession(context.Background(),
+		AMSEndpoint{IP: "192.0.2.1"}, // RFC 5737 TEST-NET-1: guaranteed unroutable
+		WithLocalMode())
+	if err != nil {
+		t.Fatalf("NewSession in local mode with no target AMS: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	// identifyTimeout is 3s; anything near it means a probe was attempted.
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("NewSession took %v — local mode probed the network", elapsed)
+	}
+	if sess.target.NetID != [6]byte{} {
+		t.Errorf("target NetID = %s, want zero (Connect assigns the loopback NetID)", sess.target.NetIDString())
 	}
 }

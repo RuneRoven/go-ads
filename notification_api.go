@@ -2,6 +2,7 @@ package ads
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -109,6 +110,31 @@ func (m *notificationManager) resetConfigs(p []pendingNotification) {
 		m.configsByKey[symbolKey(entry.Config.SymbolName)] = struct{}{}
 	}
 }
+
+// Reasons a batch subscribe refused to commit an entry, reported via
+// SumNotificationResult.Skipped. They are sentinels because the right response
+// differs per reason and callers should branch with errors.Is rather than on
+// message text: a stranded or transport-failed entry is worth retrying, a
+// duplicate or channel mismatch is a caller bug that retrying cannot fix.
+//
+// Each is wrapped with the symbol name, so errors.Is matches while the message
+// still says which symbol.
+var (
+	// ErrNotificationDuplicate — the symbol already has an active notification.
+	ErrNotificationDuplicate = errors.New("symbol already subscribed")
+	// ErrNotificationChannelMismatch — all notifications on one connection must
+	// share a single updateReceiver channel.
+	ErrNotificationChannelMismatch = errors.New("all notifications on a connection must use the same updateReceiver channel")
+	// ErrNotificationSymbolVanished — the symbol left the cache between resolve
+	// and commit (online change, or a concurrent LoadSymbols).
+	ErrNotificationSymbolVanished = errors.New("symbol removed from cache during subscribe")
+	// ErrNotificationStrandedByReload — the symbol cache was reloaded while the
+	// batch was in flight, so this entry's registration no longer exists.
+	// Retryable: the caller (or resubscribeNotifications) should re-subscribe.
+	ErrNotificationStrandedByReload = errors.New("symbol cache reloaded during batch subscribe")
+	// ErrNotificationTransportFailure — the batch could not be sent.
+	ErrNotificationTransportFailure = errors.New("batch transport failure")
+)
 
 // StaleInfo describes why a one-shot Stale Update was delivered. Non-nil iff
 // the corresponding Update's value MAY be from a pre-online-change cache
@@ -293,12 +319,21 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 // all (transport failure); per-item state is still in the result slice.
 //
 // Per-result state:
-//   - Skipped != nil: library refused to send (duplicate-subscribe, symbol
-//     resolution failure, or transport-aborted batch). Error/Handle are not
-//     meaningful.
+//   - Skipped != nil: the library did not commit this entry. Match it against
+//     the ErrNotification* sentinels to decide what to do; ErrNotificationStranded
+//     ByReload and ErrNotificationTransportFailure are worth retrying, the
+//     others are caller bugs. Error is not meaningful. Handle IS meaningful
+//     when non-zero: the PLC created that registration before the library
+//     refused it, so the caller must release it (Session.DeleteDeviceNotification)
+//     or it streams forever. resubscribeNotifications relies on this.
 //   - Skipped == nil && Error != ReturnCodeNoErrors: PLC accepted the batch
 //     but rejected this item (e.g. invalid handle).
 //   - Skipped == nil && Error == ReturnCodeNoErrors: success; Handle is valid.
+//
+// Partial outcomes are normal: a batch over a network is not atomic. In
+// particular a symbol-cache reload landing mid-batch invalidates entries this
+// call had already committed, and those are reported as Skipped with
+// ErrNotificationStrandedByReload rather than as successes.
 //
 // Channel ownership: the caller MUST NOT close ch while any notification is
 // active on this connection. To stop receiving notifications, call
@@ -342,12 +377,12 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 	for i, cfg := range configs {
 		key := symbolKey(cfg.SymbolName)
 		if _, dup := existing[key]; dup {
-			results[i].Skipped = fmt.Errorf("symbol %q already subscribed", cfg.SymbolName)
+			results[i].Skipped = fmt.Errorf("symbol %q: %w", cfg.SymbolName, ErrNotificationDuplicate)
 			sess.logger.Warn("duplicate notification rejected (already subscribed)", "symbol", cfg.SymbolName)
 			continue
 		}
 		if _, dup := batchSeen[key]; dup {
-			results[i].Skipped = fmt.Errorf("symbol %q duplicated within batch", cfg.SymbolName)
+			results[i].Skipped = fmt.Errorf("symbol %q duplicated within batch: %w", cfg.SymbolName, ErrNotificationDuplicate)
 			sess.logger.Warn("duplicate notification rejected (within batch)", "symbol", cfg.SymbolName)
 			continue
 		}
@@ -392,7 +427,13 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 	// of the remaining registrations. See AddSymbolNotification for the
 	// defer-ordering rationale.
 	sess.beginSubscribe()
+	// Batch-scoped epoch. Compared per item, this refuses any commit once the
+	// symbol cache has been reloaded since the batch began — which is what the
+	// removed bulk re-check used to enforce. A per-item snapshot cannot: it only
+	// sees a reload landing inside that one item's own commit.
+	batchEpoch := sess.epoch()
 	committed := make([]uint32, 0, len(requests))
+	committedIdx := make([]int, 0, len(requests))
 	defer func() { sess.endSubscribe(ctx, committed) }()
 
 	// Bind each handle the moment its own Add returns. On a PLC that rejects
@@ -401,7 +442,28 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 	// whole batch becoming recognisable at the end. Called synchronously on
 	// this goroutine, so results/committed need no extra guarding.
 	onItem := func(i int, r SumNotificationResult) {
+		if i < 0 || i >= len(infos) {
+			// Defensive: the index crosses a layer boundary. One bad index would
+			// otherwise panic inside the RPC call.
+			sess.logger.Error("notification batch callback got an out-of-range index",
+				"index", i, "items", len(infos))
+			return
+		}
 		info := infos[i]
+		if r.Skipped != nil {
+			// The Client layer already refused this one — e.g. the batch was
+			// abandoned after the transport failed. Never treat it as bindable:
+			// its Handle is zero and committing it would put a zero handle in
+			// activeNotifications.
+			results[info.configIndex] = r
+			return
+		}
+		if r.Handle == 0 && r.Error == ReturnCodeNoErrors {
+			results[info.configIndex].Skipped = fmt.Errorf("symbol %q: PLC reported success without a handle", info.config.SymbolName)
+			sess.logger.Error("notification batch: success with a zero handle",
+				"symbol", info.config.SymbolName)
+			return
+		}
 		if r.Error != ReturnCodeNoErrors {
 			results[info.configIndex] = r
 			sess.logger.Error("error adding notification in batch",
@@ -409,7 +471,7 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 				"errorCode", uint32(r.Error))
 			return
 		}
-		if skipErr := sess.commitNotification(info.config, r.Handle, ch); skipErr != nil {
+		if skipErr := sess.commitNotification(info.config, r.Handle, ch, batchEpoch); skipErr != nil {
 			results[info.configIndex].Skipped = skipErr
 			results[info.configIndex].Handle = r.Handle
 			sess.logger.Warn("batch entry not committed; surfacing PLC handle for caller cleanup",
@@ -418,6 +480,7 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		}
 		results[info.configIndex] = r
 		committed = append(committed, r.Handle)
+		committedIdx = append(committedIdx, info.configIndex)
 		// Deliver anything the PLC already sent for this handle before the bind
 		// landed. Must be outside commitNotification — replay takes cache.lock.
 		sess.replayEarlySamples(ctx, []uint32{r.Handle})
@@ -426,19 +489,21 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 			"symbol", info.config.SymbolName)
 	}
 
-	subResults, err := sess.client.Load().SumAddDeviceNotificationFunc(ctx, requests, onItem)
+	subResults, err := sess.client.Load().sumAddDeviceNotificationFunc(ctx, requests, onItem)
 	if err != nil {
 		// Transport-aborted batch: every entry that was about to be sent must
 		// be marked Skipped so callers can distinguish "lib didn't try" from
-		// "PLC rejected". An item onItem already bound is a live subscription
-		// and keeps its result — today no error path reaches here after a
-		// successful bind, but per-item commit makes that ordering worth
-		// stating rather than assuming.
+		// "PLC rejected". Anything onItem already reported keeps its own, more
+		// specific outcome — tested via Skipped rather than the Error/Handle
+		// pair, which also matches entries onItem refused (those carry a zero
+		// Error and a live Handle).
 		for _, info := range infos {
-			if r := results[info.configIndex]; r.Error == ReturnCodeNoErrors && r.Handle != 0 {
+			r := results[info.configIndex]
+			reported := r.Skipped != nil || r.Handle != 0 || r.Error != ReturnCodeNoErrors
+			if reported {
 				continue
 			}
-			results[info.configIndex].Skipped = fmt.Errorf("batch transport failure: %w", err)
+			results[info.configIndex].Skipped = fmt.Errorf("%w: %w", ErrNotificationTransportFailure, err)
 		}
 		return results, fmt.Errorf("batch add notification failed: %w", err)
 	}
@@ -457,8 +522,25 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		}
 	}
 
-	// Every item was already bound (or recorded as failed/skipped) by onItem as
-	// its result arrived; nothing left to commit here.
+	// Retroactive amendment. autoReloadOnStaleDetection bumps the epoch BEFORE
+	// it snapshots activeNotifications and swaps the map, so anything this batch
+	// committed successfully was in that snapshot and has since been deleted
+	// PLC-side by the reload. Reporting those as successes would hand the caller
+	// subscriptions that exist on neither side, silently. No unwinding is needed
+	// precisely because the reload already released them.
+	if len(committedIdx) > 0 && sess.epoch() != batchEpoch {
+		for _, idx := range committedIdx {
+			results[idx] = SumNotificationResult{
+				Handle:  results[idx].Handle,
+				Skipped: fmt.Errorf("symbol %q: %w", configs[idx].SymbolName, ErrNotificationStrandedByReload),
+			}
+		}
+		sess.logger.Warn("symbol cache reloaded mid-batch; committed entries reported as stranded",
+			"entries", len(committedIdx))
+	}
+
+	// Everything else was already bound (or recorded as failed/skipped) by
+	// onItem as its result arrived; nothing left to commit here.
 	return results, nil
 }
 
@@ -474,34 +556,35 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 // Caller must hold neither cache.lock nor notifications.lock: this takes
 // cache.lock first and releases it before taking notifications.lock, per the
 // never-both-held rule.
-func (sess *Session) commitNotification(cfg NotificationConfig, handle uint32, ch chan *Update) error {
+func (sess *Session) commitNotification(cfg NotificationConfig, handle uint32, ch chan *Update, batchEpoch uint64) error {
 	// Re-fetch the *symbol under cache.lock. The pointer resolved before the
 	// PLC round-trip may have been stranded by a concurrent loadSymbols /
-	// online-change reload that swapped cache.symbols. Capture the epoch here
-	// and re-check it under notifications.lock to close the residual window
-	// where another reload lands between the two acquisitions.
+	// online-change reload that swapped cache.symbols.
 	sess.cache.lock.Lock()
 	fresh := sess.cache.symbols[symbolKey(cfg.SymbolName)]
-	cacheGen := sess.epoch()
 	sess.cache.lock.Unlock()
 
 	sess.notifications.lock.Lock()
 	defer sess.notifications.lock.Unlock()
 
-	if sess.epoch() != cacheGen {
-		return fmt.Errorf("cache reload during batch subscribe stranded symbol %q", cfg.SymbolName)
+	// Compare against the epoch the BATCH started with, not one snapshotted
+	// moments ago: a reload that landed earlier in this batch must invalidate
+	// every remaining item, not just the one unlucky enough to straddle it.
+	// Unchanged epoch also means the `fresh` pointer read above is current.
+	if sess.epoch() != batchEpoch {
+		return fmt.Errorf("symbol %q: %w", cfg.SymbolName, ErrNotificationStrandedByReload)
 	}
 	if fresh == nil {
-		return fmt.Errorf("symbol %q removed from cache during batch (likely online change or LoadSymbols)", cfg.SymbolName)
+		return fmt.Errorf("symbol %q: %w", cfg.SymbolName, ErrNotificationSymbolVanished)
 	}
 	if sess.notifications.notificationChannel != nil && sess.notifications.notificationChannel != ch {
-		return fmt.Errorf("symbol %q: all notifications on a connection must use the same updateReceiver channel", cfg.SymbolName)
+		return fmt.Errorf("symbol %q: %w", cfg.SymbolName, ErrNotificationChannelMismatch)
 	}
 	// configsByKey is authoritative and already contains anything committed
 	// earlier in this same batch, so it doubles as the in-batch duplicate
 	// guard — no separate pre/post snapshot needed.
 	if sess.notifications.hasConfig(cfg.SymbolName) {
-		return fmt.Errorf("symbol %q subscribed concurrently during batch", cfg.SymbolName)
+		return fmt.Errorf("symbol %q subscribed concurrently during batch: %w", cfg.SymbolName, ErrNotificationDuplicate)
 	}
 
 	sess.notifications.activeNotifications[handle] = activeNotification{Sym: fresh, Ch: ch}

@@ -58,12 +58,34 @@ func TestIntegrationTargetCheckCatchesWrongNetID(t *testing.T) {
 		t.Fatalf("wrong address: %v", err)
 	}
 
-	t.Run("error mode refuses", func(t *testing.T) {
-		_, err := NewSession(context.Background(),
+	// NewSession must stay I/O-free for a fully specified target: the check
+	// belongs to Connect.
+	t.Run("NewSession does not verify", func(t *testing.T) {
+		sess, err := NewSession(context.Background(),
 			AMSEndpoint{IP: host, AMS: wrong},
 			WithTargetCheck(TargetCheckError))
+		if err != nil {
+			t.Fatalf("NewSession must not verify a supplied target: %v", err)
+		}
+		t.Cleanup(func() { sess.Close() })
+		if sess.target.NetIDString() != "5.99.99.99.1.1" {
+			t.Errorf("NewSession altered the target: %s", sess.target.NetIDString())
+		}
+	})
+
+	t.Run("Connect refuses in error mode", func(t *testing.T) {
+		sess, err := NewSession(context.Background(),
+			AMSEndpoint{IP: host, AMS: wrong},
+			WithTargetCheck(TargetCheckError))
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		t.Cleanup(func() { sess.Close() })
+		// Verification runs before the dial, so this costs one UDP round-trip
+		// and leaves no route or connection behind on the PLC.
+		err = sess.Connect(context.Background())
 		if err == nil {
-			t.Fatal("NewSession accepted a NetID the device disagrees with")
+			t.Fatal("Connect accepted a NetID the device disagrees with")
 		}
 		for _, want := range []string{"5.99.99.99.1.1", real} {
 			if !strings.Contains(err.Error(), want) {
@@ -73,16 +95,22 @@ func TestIntegrationTargetCheckCatchesWrongNetID(t *testing.T) {
 		t.Logf("refused as expected: %v", err)
 	})
 
-	t.Run("warn mode continues", func(t *testing.T) {
+	t.Run("warn mode passes verification", func(t *testing.T) {
 		sess, err := NewSession(context.Background(),
 			AMSEndpoint{IP: host, AMS: wrong},
 			WithTargetCheck(TargetCheckWarn))
 		if err != nil {
-			t.Fatalf("warn mode must not refuse: %v", err)
+			t.Fatalf("NewSession: %v", err)
 		}
 		t.Cleanup(func() { sess.Close() })
+		// Exercise the check itself rather than a full Connect: warn mode is
+		// defined by not blocking, and a genuinely wrong NetID cannot complete
+		// a connection anyway.
+		if err := sess.verifyTarget(context.Background()); err != nil {
+			t.Errorf("warn mode must not fail verification: %v", err)
+		}
 		if sess.target.NetIDString() != "5.99.99.99.1.1" {
-			t.Errorf("warn mode altered the target: %s", sess.target.NetIDString())
+			t.Errorf("verification altered the target: %s", sess.target.NetIDString())
 		}
 	})
 
@@ -95,9 +123,12 @@ func TestIntegrationTargetCheckCatchesWrongNetID(t *testing.T) {
 			AMSEndpoint{IP: host, AMS: right},
 			WithTargetCheck(TargetCheckError))
 		if err != nil {
-			t.Fatalf("error mode rejected the correct NetID: %v", err)
+			t.Fatalf("NewSession: %v", err)
 		}
 		t.Cleanup(func() { sess.Close() })
+		if err := sess.verifyTarget(context.Background()); err != nil {
+			t.Errorf("error mode rejected the correct NetID: %v", err)
+		}
 	})
 }
 

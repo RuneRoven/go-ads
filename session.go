@@ -214,18 +214,13 @@ type AMSEndpoint struct {
 // UDP (see IdentifyRemote) — one round-trip, read-only, no route or
 // credentials needed. The resolved port follows the TwinCAT-major-version
 // convention (801 on TC2, 851 on TC3), so a project with several runtimes must
-// still set the port explicitly.
+// still set the port explicitly. This is the only case where NewSession does
+// I/O, and it happens because omitting the address is itself a request to look
+// it up.
 //
-// A target that IS fully specified is verified against the same service, so a
-// wrong or stale NetID surfaces here instead of as a session that connects and
-// then answers nothing. The default only warns, because a mismatch is also
-// what a legitimate routed setup looks like; WithTargetCheck makes it an error
-// or turns it off. A device that does not answer the identify service is never
-// treated as a mismatch.
-//
-// Either way this is one UDP round-trip inside NewSession — the exception to
-// "no I/O until Connect" — costing a few milliseconds, and skippable entirely
-// with WithTargetCheck(TargetCheckOff) when the target is fully specified.
+// A target that IS fully specified is left alone here and checked against the
+// device by Connect, so a wrong or stale NetID surfaces as a named error rather
+// than as a session that connects and then answers nothing. See WithTargetCheck.
 //
 // Local AMS NetID defaults to auto-derivation from the local TCP source IP.
 // Local AMS port defaults to a random value in the IANA dynamic range
@@ -242,7 +237,6 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 	if remote.Port <= 0 {
 		remote.Port = 48898 // TwinCAT TCP default
 	}
-	needsDiscovery := remote.AMS.NetID == [6]byte{} || remote.AMS.Port == 0
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -298,16 +292,24 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 		opt(sess)
 	}
 	// Resolve whatever the caller left out of the target address by asking the
-	// PLC's router for its own identity. Done after opts so the caller's logger
-	// is in place, and only when something is actually missing — a fully
-	// specified target still reaches Connect without any I/O.
+	// PLC's router for its own identity. Decided from sess.target AFTER the
+	// options ran, not from the constructor argument: reading pre-option state
+	// to make a post-option decision is how the two silently diverge.
+	//
+	// Only when something is actually missing: omitting the address IS the
+	// request to look it up, so the I/O is what the caller asked for. A fully
+	// specified target reaches Connect without any I/O here — verifying one is
+	// Connect's job, not the constructor's.
+	//
+	// Never in local mode. There the target is loopback by definition and
+	// Connect overwrites NetID and IP regardless (see WithLocalMode), so a probe
+	// against the caller-supplied address is at best a wasted round-trip that
+	// logs a discovered address Connect is about to discard — and at worst it
+	// fails construction for a mode that needs no network to resolve anything.
+	needsDiscovery := !sess.isLocal &&
+		(sess.target.NetID == [6]byte{} || sess.target.Port == 0)
 	if needsDiscovery {
 		if err := sess.discoverTarget(ctx); err != nil {
-			cancel()
-			return nil, err
-		}
-	} else if sess.targetCheck != TargetCheckOff {
-		if err := sess.verifyTarget(ctx); err != nil {
 			cancel()
 			return nil, err
 		}
@@ -321,7 +323,7 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 // socket and then drops every request — so resolving it from the device beats
 // making the caller carry it.
 func (sess *Session) discoverTarget(ctx context.Context) error {
-	id, err := IdentifyRemoteWithLogger(ctx, sess.logger, sess.ip)
+	id, err := identifyRemoteFrom(ctx, sess.logger, sess.localBindIP, sess.ip)
 	if err != nil {
 		return fmt.Errorf("ads: NewSession: target AMS address incomplete and discovery failed "+
 			"(set remote.AMS explicitly if the device does not answer the identify service): %w", err)
@@ -353,16 +355,20 @@ const targetVerifyTimeout = time.Second
 // the caller supplied. Catching a wrong NetID here turns the worst failure mode
 // in ADS — the router accepts the socket and then silently drops every request
 // — into an immediate, named answer.
+//
+// An unanswered probe is never a failure, in ANY TargetCheck mode: a device can
+// serve ADS on TCP 48898 with UDP 48899 firewalled off, which was observed on a
+// Windows TwinCAT host during development. Blocking that host's sessions over a
+// check that could not run would trade a real capability for a diagnostic. Only
+// a definite mismatch is actionable, so only a definite mismatch is reported.
 func (sess *Session) verifyTarget(ctx context.Context) error {
 	verifyCtx, cancel := context.WithTimeout(ctx, targetVerifyTimeout)
 	defer cancel()
-	id, err := IdentifyRemoteWithLogger(verifyCtx, sess.logger, sess.ip)
+	id, err := identifyRemoteFrom(verifyCtx, sess.logger, sess.localBindIP, sess.ip)
 	if err != nil {
-		// Never let verification be why a session fails to start when the
-		// caller told us the address. A device can serve ADS on TCP 48898 with
-		// UDP 48899 firewalled off — observed on a Windows TwinCAT host — so an
-		// unanswered identify means "cannot verify", not "wrong".
-		sess.logger.Debug("target NetID not verified (device did not answer the identify service)",
+		// Info, not Debug: the operator needs to know the guard did not run.
+		// Silence here would read as "verified" at default log level.
+		sess.logger.Info("target NetID not verified — device did not answer the identify service on UDP 48899 (firewalled?); continuing",
 			"host", sess.ip, "target", sess.target.NetIDString(), "error", err)
 		return nil
 	}
@@ -385,7 +391,7 @@ func (sess *Session) applyTargetCheck(id RemoteIdentity) error {
 	// refusing — see WithTargetCheck.
 	const hint = "usually a wrong or stale target NetID; legitimate when this host is a router and the target sits behind it"
 	if sess.targetCheck == TargetCheckError {
-		return fmt.Errorf("ads: NewSession: target NetID %s does not match the NetID %s reported by %s (%s, TwinCAT %s): %s",
+		return fmt.Errorf("ads: target NetID %s does not match the NetID %s reported by %s (%s, TwinCAT %s): %s",
 			sess.target.NetIDString(), id.AMS.NetIDString(), sess.ip, id.HostName, id.Version(), hint)
 	}
 	sess.logger.Warn("target NetID differs from the NetID this device reports for itself",
@@ -427,6 +433,14 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	if local {
 		sess.target.NetID = [6]byte{127, 0, 0, 1, 1, 1}
 		sess.ip = "127.0.0.1"
+	}
+	// Check the target NetID against the device before spending a dial on it.
+	// Skipped in local mode, where the target was just overwritten with the
+	// loopback NetID and there is nothing to compare against.
+	if !local && sess.targetCheck != TargetCheckOff {
+		if err := sess.verifyTarget(ctx); err != nil {
+			return err
+		}
 	}
 	tcpConn, err := sess.dialTCP()
 	if err != nil {
@@ -523,6 +537,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		requestTimeout: sess.requestTimeout,
 		logger:         sess.logger,
 		tx:             sess.tx,
+		dropped:        make(chan struct{}),
 		ctx:            sess.lifecycle.ctx,
 		cancel:         sess.lifecycle.shutdown,
 	}
@@ -552,6 +567,12 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		sess.tx.connMu.Unlock()
 	}
 
+	// A successful route-activation probe already carries the symbol version, so
+	// track whether we have one and skip the duplicate read further down.
+	var (
+		symbolVersion uint8
+		haveVersion   bool
+	)
 	// Smart route registration: probe PLC first, register only if route missing.
 	// Route registration is UDP-based but needs goroutines running for the probe
 	// (which sends an ADS command over TCP). If route is registered, TCP reconnect
@@ -578,20 +599,30 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 			// new route. Returning here with the router still catching up hands
 			// the caller a Connect that succeeded and a session where every
 			// command times out.
-			if err := sess.awaitRouteActive(ctx); err != nil {
+			// Connect's own ctx: no teardown replaces it, so passing it for every
+			// attempt is safe. See awaitRouteActive on why this is a function.
+			probedVersion, err := sess.awaitRouteActive(func() context.Context { return ctx })
+			if err != nil {
 				return fmt.Errorf("route registration during connect: %w", err)
 			}
+			// The winning probe WAS a GetSymbolVersion, so seed the cache from it
+			// instead of issuing the identical request again below.
+			haveVersion, symbolVersion = true, probedVersion
 		}
 
 	}
 
 	// Read symbol version for later change detection (best-effort, don't fail connect)
-	version, err := sess.client.Load().GetSymbolVersion(ctx)
-	if err != nil {
-		sess.logger.Debug("could not read symbol version during connect", "error", err)
-	} else {
+	if !haveVersion {
+		symbolVersion, err = sess.client.Load().GetSymbolVersion(ctx)
+		haveVersion = err == nil
+		if err != nil {
+			sess.logger.Debug("could not read symbol version during connect", "error", err)
+		}
+	}
+	if haveVersion {
 		sess.cache.lock.Lock()
-		sess.cache.symbolVersion = version
+		sess.cache.symbolVersion = symbolVersion
 		sess.cache.lock.Unlock()
 	}
 	sess.transitionState(SessionStateConnected)
@@ -667,16 +698,16 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 	// function via defer; intermediate dialAndStart calls in the retry
 	// path also re-arm on each new Client they create, but we override
 	// those back to nil for the duration of this routine.
-	// SetHandshaking rides along with the ondrop disarm: a probe that times out
+	// setHandshaking rides along with the ondrop disarm: a probe that times out
 	// or gets RST is the expected first step of the cold-start flow, so it must
-	// not surface as ERROR. See Client.SetHandshaking.
+	// not surface as ERROR. See Client.setHandshaking.
 	if oldClient := sess.client.Load(); oldClient != nil {
 		oldClient.SetOnDrop(nil)
-		oldClient.SetHandshaking(true)
+		oldClient.setHandshaking(true)
 	}
 	defer func() {
 		if c := sess.client.Load(); c != nil {
-			c.SetHandshaking(false)
+			c.setHandshaking(false)
 			c.SetOnDrop(sess.triggerReconnect)
 		}
 	}()
@@ -722,7 +753,7 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		// re-arm at function exit restores the production handler).
 		if c := sess.client.Load(); c != nil {
 			c.SetOnDrop(nil)
-			c.SetHandshaking(true)
+			c.setHandshaking(true)
 		}
 		if sess.isClosed() {
 			return false, fmt.Errorf("connection closed during route probe retry")
@@ -784,24 +815,45 @@ func (sess *Session) routeActivationBudget() (total, probe time.Duration) {
 	return total, probe
 }
 
+// currentLifecycleCtx returns the live lifecycle context.
+//
+// tearDownAndReset cancels the old context and installs a fresh one under
+// ctxMu, so anything spanning a teardown must re-read it rather than capture
+// it — a captured one is cancelled out from underneath the caller. Reading it
+// bare also races the replacement.
+func (sess *Session) currentLifecycleCtx() context.Context {
+	sess.lifecycle.ctxMu.RLock()
+	defer sess.lifecycle.ctxMu.RUnlock()
+	return sess.lifecycle.ctx
+}
+
 // awaitRouteActive re-probes the PLC after a route registration until one
 // probe round-trips, redialing when the PLC drops the connection mid-probe
 // (it does that for a source NetID it does not serve yet, so a redial is part
-// of waiting rather than a failure).
+// of waiting rather than a failure). It returns the symbol version the winning
+// probe read, so the caller need not ask again.
+//
+// ctxFor supplies the context for each attempt and is called fresh every time,
+// which is the whole reason it is a function: this routine's own redial calls
+// tearDownAndReset, which cancels and replaces lifecycle.ctx. A caller on the
+// reconnect path that passed lifecycle.ctx by value would have the loop cancel
+// its own context on the first redial — every later probe born already dead,
+// reported as caller cancellation. Connect passes its own caller context, which
+// no teardown touches; the reconnect path passes sess.currentLifecycleCtx.
 //
 // Call immediately after a successful AddRoute. ondrop is disarmed for the
 // duration so a PLC-initiated RST cannot spawn a competing Reconnect
 // goroutine while we own the transport — same rationale as
-// ensureRouteOnConnect. Client.SetHandshaking keeps the expected faults off
+// ensureRouteOnConnect. Client.setHandshaking keeps the expected faults off
 // the ERROR channel while we are still working.
-func (sess *Session) awaitRouteActive(ctx context.Context) error {
+func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, error) {
 	if c := sess.client.Load(); c != nil {
 		c.SetOnDrop(nil)
-		c.SetHandshaking(true)
+		c.setHandshaking(true)
 	}
 	defer func() {
 		if c := sess.client.Load(); c != nil {
-			c.SetHandshaking(false)
+			c.setHandshaking(false)
 			c.SetOnDrop(sess.triggerReconnect)
 		}
 	}()
@@ -811,17 +863,19 @@ func (sess *Session) awaitRouteActive(ctx context.Context) error {
 	var lastErr error
 	for attempt := 1; ; attempt++ {
 		if sess.isClosed() {
-			return fmt.Errorf("connection closed while waiting for route activation")
+			return 0, fmt.Errorf("connection closed while waiting for route activation")
 		}
+		ctx := ctxFor()
 		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
-		lastErr = sess.probeRoute(probeCtx)
+		version, err := sess.probeRouteVersion(probeCtx)
 		cancel()
+		lastErr = err
 		if lastErr == nil {
 			sess.route.routeProbeFailures.Store(0)
 			if attempt > 1 {
 				sess.logger.Info("route active after registration", "probeAttempts", attempt)
 			}
-			return nil
+			return version, nil
 		}
 		if !time.Now().Before(deadline) {
 			break
@@ -831,23 +885,29 @@ func (sess *Session) awaitRouteActive(ctx context.Context) error {
 		if isProbeRetryable(lastErr) {
 			sess.tearDownAndReset(false)
 			if dialErr := sess.dialAndStart(); dialErr != nil {
-				return fmt.Errorf("redial while waiting for route activation: %w", dialErr)
+				return 0, fmt.Errorf("redial while waiting for route activation: %w", dialErr)
 			}
 			// dialAndStart armed ondrop on the new Client; disarm again for the
 			// rest of the wait (the deferred restore handles function exit).
 			if c := sess.client.Load(); c != nil {
 				c.SetOnDrop(nil)
-				c.SetHandshaking(true)
+				c.setHandshaking(true)
 			}
 		}
 		select {
 		case <-time.After(routeActivationPollDelay):
-		case <-ctx.Done():
-			return fmt.Errorf("route activation wait aborted: %w", ctx.Err())
+		case <-ctxFor().Done():
+			return 0, fmt.Errorf("route activation wait aborted: %w", ctxFor().Err())
 		}
 	}
-	return fmt.Errorf("route %q was registered but the PLC did not serve it within %v: %w",
+	return 0, fmt.Errorf("route %q was registered but the PLC did not serve it within %v: %w",
 		sess.route.name, total, lastErr)
+}
+
+// probeRouteVersion is probeRoute, returning the symbol version the probe read
+// so a caller that needs it can skip a second identical round-trip.
+func (sess *Session) probeRouteVersion(ctx context.Context) (uint8, error) {
+	return sess.client.Load().GetSymbolVersion(ctx)
 }
 
 // probeRoute sends a lightweight ADS command (GetSymbolVersion) to verify
@@ -1533,13 +1593,14 @@ func (sess *Session) ensureRoute() error {
 	probeFailures := sess.route.routeProbeFailures.Load()
 	if sess.route.forceRouteRegistration || probeFailures >= 3 {
 		sess.logger.Info("registering route (forced/fallback)", "probeFailures", probeFailures)
-		if err := sess.AddRoute(sess.lifecycle.ctx, sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
+		if err := sess.AddRoute(sess.currentLifecycleCtx(), sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
 			return fmt.Errorf("route registration failed: %w", err)
 		}
 		// Same activation lag as on connect. Failing here feeds the reconnect
 		// loop's own retry rather than letting reloadSymbols be the first thing
-		// to discover the route isn't live yet.
-		if err := sess.awaitRouteActive(sess.lifecycle.ctx); err != nil {
+		// to discover the route isn't live yet. currentLifecycleCtx, not a
+		// captured ctx: awaitRouteActive's redial replaces lifecycle.ctx.
+		if _, err := sess.awaitRouteActive(sess.currentLifecycleCtx); err != nil {
 			return err
 		}
 		sess.route.routeProbeFailures.Store(0)
@@ -1547,7 +1608,7 @@ func (sess *Session) ensureRoute() error {
 	}
 
 	// Probe: try a lightweight ADS command to see if route already exists
-	_, probeErr := sess.client.Load().GetSymbolVersion(sess.lifecycle.ctx)
+	_, probeErr := sess.client.Load().GetSymbolVersion(sess.currentLifecycleCtx())
 	if probeErr == nil {
 		sess.logger.Debug("route still valid, skipping re-registration")
 		sess.route.routeProbeFailures.Store(0)
@@ -1561,10 +1622,11 @@ func (sess *Session) ensureRoute() error {
 	// Probe failed → register with credentials
 	failuresAfter := sess.route.routeProbeFailures.Add(1)
 	sess.logger.Info("route probe failed, registering route", "error", probeErr, "probeFailures", failuresAfter)
-	if err := sess.AddRoute(sess.lifecycle.ctx, sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
+	if err := sess.AddRoute(sess.currentLifecycleCtx(), sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
 		return fmt.Errorf("route registration failed after probe: %w", err)
 	}
-	return sess.awaitRouteActive(sess.lifecycle.ctx)
+	_, err := sess.awaitRouteActive(sess.currentLifecycleCtx)
+	return err
 }
 
 // filterValidPending returns only pending entries whose symbols still exist
@@ -1762,6 +1824,7 @@ func (sess *Session) dialAndStart() error {
 		requestTimeout: sess.requestTimeout,
 		logger:         sess.logger,
 		tx:             sess.tx,
+		dropped:        make(chan struct{}),
 		ctx:            freshCtx,
 		cancel:         freshCancel,
 	}
@@ -2014,7 +2077,7 @@ func (sess *Session) AddRoute(ctx context.Context, routeName, username, password
 	// UDP socket keeps draining toward its own deadline in the background.
 	done := make(chan error, 1)
 	go func() {
-		done <- AddRemoteRouteWithLogger(sess.logger, sess.ip, sess.source.NetID, routeName, hostIP, username, password)
+		done <- addRemoteRouteFrom(sess.logger, sess.localBindIP, sess.ip, sess.source.NetID, routeName, hostIP, username, password)
 	}()
 	select {
 	case err := <-done:

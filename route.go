@@ -44,6 +44,19 @@ func AddRemoteRoute(remoteHost string, localNetID [6]byte, routeName string, com
 
 // AddRemoteRouteWithLogger is like AddRemoteRoute but accepts an explicit logger.
 func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
+	return addRemoteRouteFrom(logger, nil, remoteHost, localNetID, routeName, computerName, username, password)
+}
+
+// addRemoteRouteFrom is AddRemoteRouteWithLogger with an explicit local source
+// IP for the UDP socket.
+//
+// This matters on a multi-homed host: TwinCAT records the route against the UDP
+// SOURCE IP of the registration, not the computerName tag it carries (TC2 uses
+// the tag, TC3 does not). Letting the OS pick the interface therefore registers
+// the route for whichever NIC wins the route metric, and a session bound to the
+// other one is then reset by the PLC — the registration reports success and
+// nothing is ever served. localIP nil keeps OS-default routing.
+func addRemoteRouteFrom(logger *slog.Logger, localIP net.IP, remoteHost string, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
 	if logger == nil {
 		logger = getDefaultLogger()
 	}
@@ -58,7 +71,11 @@ func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID
 		return fmt.Errorf("failed to resolve remote host: %w", err)
 	}
 
-	conn, err := net.DialUDP("udp4", nil, addr)
+	var laddr *net.UDPAddr
+	if localIP != nil {
+		laddr = &net.UDPAddr{IP: localIP}
+	}
+	conn, err := net.DialUDP("udp4", laddr, addr)
 	if err != nil {
 		return fmt.Errorf("failed to dial UDP: %w", err)
 	}

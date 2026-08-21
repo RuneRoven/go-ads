@@ -107,8 +107,21 @@ type Client struct {
 	ondrop   func()
 
 	// handshaking is set while a route probe / registration is in flight; see
-	// SetHandshaking for why transport faults are demoted to Debug then.
+	// setHandshaking for why transport faults are demoted to Debug then.
 	handshaking atomic.Bool
+
+	// dropped is closed when THIS client's connection is known to be gone.
+	// disconnected stops new requests; this releases the ones already blocked
+	// on a response that will never come, which a flag cannot do.
+	//
+	// Per-Client, not per-transport, and immutable for the client's lifetime:
+	// a Session reuses one transport across reconnects but allocates a fresh
+	// Client each time, so "this connection died" is a client-scoped fact. Held
+	// on the transport it was signalled by a stale client's listen goroutine
+	// after the replacement had already re-armed it, which killed every request
+	// on the new connection.
+	dropped  chan struct{}
+	dropOnce sync.Once
 
 	// Internal cancellation for the worker goroutines. Independent of any
 	// caller context — Close cancels this to stop workers.
@@ -117,6 +130,16 @@ type Client struct {
 	waitGroup sync.WaitGroup
 
 	closeOnce sync.Once
+}
+
+// markDropped releases every request waiting on this client's connection.
+// Idempotent: a drop can be observed by listen and the transmit worker both.
+func (c *Client) markDropped() {
+	c.dropOnce.Do(func() {
+		if c.dropped != nil {
+			close(c.dropped)
+		}
+	})
 }
 
 // Dial opens one TCP connection to ip:port, configures TCP keepalive, and
@@ -139,6 +162,7 @@ func Dial(
 		source:         source,
 		requestTimeout: requestTimeout,
 		logger:         slog.Default(),
+		dropped:        make(chan struct{}),
 		tx: &transport{
 			sendChannel:    make(chan []byte),
 			systemResponse: make(chan []byte, 1),
@@ -173,6 +197,7 @@ func Dial(
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		c.tx.disconnected.Store(true)
+		c.markDropped()
 		c.cancel()
 		c.tx.connMu.Lock()
 		if c.tx.connection != nil {
@@ -241,7 +266,7 @@ func (c *Client) SetOnDrop(fn func()) {
 	c.ondropMu.Unlock()
 }
 
-// SetHandshaking marks whether a route probe / registration handshake is in
+// setHandshaking marks whether a route probe / registration handshake is in
 // flight. During the handshake a dropped connection and an unanswered request
 // are expected states, not faults: the normal cold-start flow is probe → PLC
 // rejects an unknown NetID → register route → redial → probe again. Logging
@@ -251,12 +276,21 @@ func (c *Client) SetOnDrop(fn func()) {
 // in a starting state even though the PLC is connected and streaming.
 //
 // Errors are still returned to the caller unchanged — only the log level moves.
-func (c *Client) SetHandshaking(v bool) {
+func (c *Client) setHandshaking(v bool) {
 	c.handshaking.Store(v)
 }
 
 // transportFaultLevel returns the level to log a transport fault at: Debug
 // while a handshake is in flight, Error otherwise.
+//
+// Use it for every TRANSPORT fault — the link went away, a request went
+// unanswered, a write failed — because all of those are expected states of the
+// probe → register → redial cold start. Do NOT use it for protocol or
+// programming faults (header/body parse, packet exceeds the sanity limit,
+// binary.Write failure): a handshake never legitimately produces those, and
+// demoting them would hide corruption. One un-gated transport site is enough to
+// re-trip a downstream log-based health check, so new fault paths need this
+// distinction made deliberately.
 func (c *Client) transportFaultLevel() slog.Level {
 	if c.handshaking.Load() {
 		return slog.LevelDebug
@@ -265,6 +299,21 @@ func (c *Client) transportFaultLevel() slog.Level {
 }
 
 func (c *Client) callOnDrop() {
+	// Release every request on THIS client — the ones already blocked as well as
+	// any issued later — so they fail fast with ErrTransportClosed instead of
+	// waiting out a timeout on a dead socket. Measured cost of not doing this: a
+	// 40-symbol notification batch that lost the link at symbol 3 took 3m10s to
+	// return, holding the subscribe window (and so disabling the orphan reaper)
+	// for all of it.
+	//
+	// Deliberately does NOT touch tx.disconnected. That flag lives on the
+	// transport, which a Session reuses across reconnects, and Session already
+	// owns it (triggerReconnect, Reconnect, resetForRetry, Close). Setting it
+	// here let a stale client's listen goroutine flip it back to true after the
+	// replacement had cleared it, which made every probe on the new connection
+	// fail instantly with ErrTransportClosed — route registration could then
+	// never complete.
+	c.markDropped()
 	c.ondropMu.RLock()
 	fn := c.ondrop
 	c.ondropMu.RUnlock()
@@ -352,7 +401,7 @@ func (c *Client) listen() {
 				return
 			default:
 			}
-			c.logger.Error("listen body read error, transport down", "error", err)
+			c.logger.Log(c.ctx, c.transportFaultLevel(), "listen body read error, transport down", "error", err)
 			c.callOnDrop()
 			return
 		}
@@ -454,12 +503,12 @@ func (c *Client) transmitWorker() {
 		case data := <-c.tx.sendChannel:
 			c.logger.Log(context.Background(), LevelTrace, fmt.Sprintf("Sending %d bytes", len(data)))
 			if _, err := writer.Write(data); err != nil {
-				c.logger.Error("error sending data on conn, transport down", "error", err)
+				c.logger.Log(c.ctx, c.transportFaultLevel(), "error sending data on conn, transport down", "error", err)
 				c.callOnDrop()
 				return
 			}
 			if err := writer.Flush(); err != nil {
-				c.logger.Error("error flushing data on conn, transport down", "error", err)
+				c.logger.Log(c.ctx, c.transportFaultLevel(), "error flushing data on conn, transport down", "error", err)
 				c.callOnDrop()
 				return
 			}
@@ -521,23 +570,28 @@ func (c *Client) send(data []byte) ([]byte, error) {
 	sendCh := c.tx.sendChannel
 	sysCh := c.tx.systemResponse
 	c.tx.chanMu.RUnlock()
+	dropped := c.dropped
 	ctx, cancel := context.WithTimeout(c.ctx, c.requestTimeout)
 	defer cancel()
 	select {
 	case <-ctx.Done():
 		return nil, fmt.Errorf("send aborted, context canceled: %w", ctx.Err())
+	case <-dropped:
+		return nil, ErrTransportClosed
 	case sendCh <- data:
 	}
 	select {
 	case <-ctx.Done():
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			err := fmt.Errorf("request aborted, deadline exceeded: %w", ctx.Err())
-			c.logger.Error("send aborted due to timeout", "error", err)
+			c.logger.Log(ctx, c.transportFaultLevel(), "send aborted due to timeout", "error", err)
 			return nil, err
 		}
 		err := fmt.Errorf("request aborted, shutdown initiated: %w", ctx.Err())
-		c.logger.Error("send aborted due to shutdown", "error", err)
+		c.logger.Log(ctx, c.transportFaultLevel(), "send aborted due to shutdown", "error", err)
 		return nil, err
+	case <-dropped:
+		return nil, ErrTransportClosed
 	case response := <-sysCh:
 		return response, nil
 	}
@@ -581,6 +635,7 @@ func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte
 	c.tx.chanMu.RLock()
 	sendCh := c.tx.sendChannel
 	c.tx.chanMu.RUnlock()
+	dropped := c.dropped
 	// Merge caller ctx with c.requestTimeout. ctx==nil falls back to the
 	// Client's own ctx so callers passing context.Background() still get
 	// the configured request timeout AND respect Close-driven cancel.
@@ -597,6 +652,8 @@ func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte
 			c.logger.Info("sendRequest aborted due to shutdown")
 		}
 		return nil, ctx.Err()
+	case <-dropped:
+		return nil, ErrTransportClosed
 	case sendCh <- pack:
 	}
 	select {
@@ -607,6 +664,11 @@ func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte
 			c.logger.Info("sendRequest aborted due to shutdown")
 		}
 		return nil, ctx.Err()
+	case <-dropped:
+		// The transport died while this request was in flight. Returning now
+		// instead of waiting out the timeout is what stops a multi-request
+		// operation from paying requestTimeout per remaining item.
+		return nil, ErrTransportClosed
 	case response := <-responseCh:
 		return response, nil
 	}

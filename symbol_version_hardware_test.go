@@ -20,8 +20,8 @@
 package ads
 
 import (
-	"context"
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strconv"

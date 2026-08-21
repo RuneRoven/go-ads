@@ -93,7 +93,7 @@ func (c *Client) Write(ctx context.Context, group uint32, offset uint32, data []
 	// Try to send the request
 	resp, err := c.sendRequest(ctx, CommandIDWrite, request.Bytes())
 	if err != nil {
-		c.logger.Error("error during send request for write", "error", err)
+		c.logger.Log(ctx, c.transportFaultLevel(), "error during send request for write", "error", err)
 		return err
 	}
 	respBuffer := bytes.NewBuffer(resp)
@@ -175,7 +175,7 @@ func (c *Client) ReadState(ctx context.Context) (response States, err error) {
 	// Try to send the request
 	resp, err := c.sendRequest(ctx, CommandIDReadState, []byte{})
 	if err != nil {
-		c.logger.Error("Error during read state", "error", err)
+		c.logger.Log(ctx, c.transportFaultLevel(), "error during read state", "error", err)
 		return
 	}
 	c.logger.Log(context.Background(), LevelTrace, "response from plc for state", "data", resp)

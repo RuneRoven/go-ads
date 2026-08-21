@@ -3,6 +3,8 @@ package ads
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -276,6 +278,239 @@ func TestSubscribeRace_BatchBindsEachHandleBeforeNextAdd(t *testing.T) {
 	}
 }
 
+// TestSubscribeRace_ReloadMidBatchStrandsWholeBatch: a symbol-cache reload
+// landing partway through a batch invalidates the entries committed before it
+// (the reload snapshots activeNotifications and deletes those handles PLC-side)
+// as well as everything after it. Both halves must come back Skipped with
+// ErrNotificationStrandedByReload — reporting the first half as success hands
+// the caller subscriptions that exist on neither side.
+//
+// The epoch is bumped from inside the Add handler, which is exactly where a
+// real reload lands: between two individual Adds of a sum-unsupported batch.
+func TestSubscribeRace_ReloadMidBatchStrandsWholeBatch(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, c := newWiredTestSession(t, srv)
+	c.SetNotificationHandler(sess.handleNotification)
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumAddNotif into the unsupported state")
+	}
+
+	const symbolCount = 4
+	names := make([]string, symbolCount)
+	configs := make([]NotificationConfig, symbolCount)
+	for i := range names {
+		names[i] = "MAIN.reload" + string(rune('A'+i))
+		preSeedTypedSymbol(sess, names[i], uint32(0xE000+i))
+		configs[i] = NotificationConfig{SymbolName: names[i], TransmissionMode: TransModeServerOnChange}
+	}
+
+	var adds atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0x300)
+	var reapedByReload []uint32
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		// After the second Add, do what autoReloadOnStaleDetection actually does
+		// to shared state, in its real order: bump the epoch FIRST, then
+		// snapshot activeNotifications and swap the map. The amendment's
+		// correctness depends on exactly that ordering, so the test has to
+		// reproduce it rather than just move the counter.
+		if adds.Add(1) == 2 {
+			sess.bumpEpoch()
+			sess.notifications.lock.Lock()
+			for h := range sess.notifications.activeNotifications {
+				reapedByReload = append(reapedByReload, h)
+			}
+			sess.notifications.activeNotifications = make(map[uint32]activeNotification)
+			sess.notifications.lock.Unlock()
+		}
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+
+	ch := make(chan *Update, symbolCount)
+	results, err := sess.AddSymbolNotifications(context.Background(), configs, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotifications: %v", err)
+	}
+
+	for i, r := range results {
+		if r.Skipped == nil {
+			t.Errorf("results[%d] (%s) reported success, but the reload invalidated it", i, names[i])
+			continue
+		}
+		if !errors.Is(r.Skipped, ErrNotificationStrandedByReload) {
+			t.Errorf("results[%d] (%s) Skipped = %v, want ErrNotificationStrandedByReload", i, names[i], r.Skipped)
+		}
+		// The PLC created the registration before the library refused it, so the
+		// handle has to reach the caller for cleanup.
+		if r.Handle == 0 {
+			t.Errorf("results[%d] (%s) Handle = 0; the caller cannot release what it is not told about", i, names[i])
+		}
+	}
+	// The entries the reload swept are precisely the ones reported as stranded:
+	// that equality is the invariant the amendment relies on.
+	if len(reapedByReload) == 0 {
+		t.Error("the simulated reload swept nothing — the test did not reproduce the interleaving it claims to")
+	}
+	sess.notifications.lock.Lock()
+	surviving := len(sess.notifications.activeNotifications)
+	sess.notifications.lock.Unlock()
+	if surviving != 0 {
+		t.Errorf("activeNotifications = %d, want 0 (nothing may be committed after the reload)", surviving)
+	}
+}
+
+// TestSubscribeRace_ConnectionDropsMidBatch is the realistic trigger: not an
+// engineer doing an online change, but the link failing while a sum-unsupported
+// PLC is being subscribed one Add at a time. The stub answers two Adds and then
+// drops the TCP connection outright.
+//
+// What must hold afterwards: every config has a verdict, nothing claims success
+// without a handle, and the reported successes match what is actually bound —
+// a result set that lies about the transport being alive is the failure mode
+// this whole branch exists to eliminate.
+func TestSubscribeRace_ConnectionDropsMidBatch(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, c := newWiredTestSession(t, srv)
+	c.SetNotificationHandler(sess.handleNotification)
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumAddNotif into the unsupported state")
+	}
+	// Don't let the drop spawn a reconnect that races the assertions.
+	c.SetOnDrop(nil)
+
+	const symbolCount = 5
+	names := make([]string, symbolCount)
+	configs := make([]NotificationConfig, symbolCount)
+	for i := range names {
+		names[i] = "MAIN.drop" + string(rune('A'+i))
+		preSeedTypedSymbol(sess, names[i], uint32(0xF000+i))
+		configs[i] = NotificationConfig{SymbolName: names[i], TransmissionMode: TransModeServerOnChange}
+	}
+
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0x400)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	// Answer two Adds, then vanish mid-request on the third.
+	srv.dropConnAfter(CommandIDAddDeviceNotification, 3)
+
+	ch := make(chan *Update, symbolCount)
+	results, err := sess.AddSymbolNotifications(context.Background(), configs, ch)
+	// An error is acceptable here and so is nil — what matters is the results.
+	t.Logf("AddSymbolNotifications returned err=%v", err)
+
+	if len(results) != symbolCount {
+		t.Fatalf("results len = %d, want %d", len(results), symbolCount)
+	}
+	successes := 0
+	for i, r := range results {
+		switch {
+		case r.Skipped != nil:
+			// fine: refused, with the handle surfaced if the PLC made one
+		case r.Error != ReturnCodeNoErrors:
+			// fine: PLC-side rejection
+		case r.Handle != 0:
+			successes++
+		default:
+			t.Errorf("results[%d] (%s) is a zero value: no verdict was recorded for it", i, names[i])
+		}
+	}
+
+	sess.notifications.lock.Lock()
+	bound := len(sess.notifications.activeNotifications)
+	sess.notifications.lock.Unlock()
+	if successes != bound {
+		t.Errorf("reported %d successes but %d handles are bound — the result set does not match reality", successes, bound)
+	}
+	t.Logf("after mid-batch link loss: %d reported success, %d bound", successes, bound)
+
+	// The subscribe window must have closed despite the failure, or the orphan
+	// reaper stays disabled for the life of the session.
+	if n := sess.notifications.subscribeInFlight.Load(); n != 0 {
+		t.Errorf("subscribeInFlight = %d, want 0 after the batch returned", n)
+	}
+}
+
+// TestSubscribeRace_ConnectionDropsMidBatchAtScale is the same failure at field
+// size. It pins the cost, because the cost IS the bug: a dead transport is not
+// marked dead (only Client.Close sets tx.disconnected — listen's drop path just
+// fires ondrop), so every remaining Add waits out its own request timeout on a
+// corpse. 40 symbols dropping early means the batch holds subscribeInFlight for
+// minutes, and the orphan reaper is disabled for every second of it.
+func TestSubscribeRace_ConnectionDropsMidBatchAtScale(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, c := newWiredTestSession(t, srv, WithRequestTimeout(300*time.Millisecond))
+	c.SetNotificationHandler(sess.handleNotification)
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumAddNotif into the unsupported state")
+	}
+	c.SetOnDrop(nil)
+
+	const symbolCount = 40
+	configs := make([]NotificationConfig, symbolCount)
+	for i := range configs {
+		name := fmt.Sprintf("MAIN.scale%02d", i)
+		preSeedTypedSymbol(sess, name, uint32(0xA000+i))
+		configs[i] = NotificationConfig{SymbolName: name, TransmissionMode: TransModeServerOnChange}
+	}
+
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0x500)
+	var adds atomic.Int32
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		adds.Add(1)
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	// Die after the third Add: 37 requests still to go.
+	srv.dropConnAfter(CommandIDAddDeviceNotification, 3)
+
+	ch := make(chan *Update, symbolCount)
+	start := time.Now()
+	results, err := sess.AddSymbolNotifications(context.Background(), configs, ch)
+	elapsed := time.Since(start)
+	t.Logf("40-symbol batch with the link dying at Add 3: took %v, err=%v (answered Adds=%d)",
+		elapsed.Round(time.Millisecond), err, adds.Load())
+
+	if len(results) != symbolCount {
+		t.Fatalf("results len = %d, want %d", len(results), symbolCount)
+	}
+	successes, transportFailures, other := 0, 0, 0
+	for _, r := range results {
+		switch {
+		case r.Skipped != nil && errors.Is(r.Skipped, ErrNotificationTransportFailure):
+			transportFailures++
+		case r.Skipped != nil:
+			other++
+		case r.Handle != 0 && r.Error == ReturnCodeNoErrors:
+			successes++
+		default:
+			other++
+		}
+	}
+	t.Logf("verdicts: %d success, %d transport-failure, %d other", successes, transportFailures, other)
+
+	// The batch must give up once the transport is confirmed dead rather than
+	// waiting out a timeout per remaining symbol. With a 300ms timeout, honest
+	// abort finishes in well under a second; the pre-fix behaviour is ~37 x 300ms.
+	if elapsed > 5*time.Second {
+		t.Errorf("batch took %v after the link died — it is timing out per symbol instead of aborting", elapsed)
+	}
+	// A link failure must not be reported as a PLC-side rejection.
+	if transportFailures == 0 {
+		t.Errorf("no entry reported ErrNotificationTransportFailure; %d 'other' verdicts hide a link failure as something else", other)
+	}
+	if n := sess.notifications.subscribeInFlight.Load(); n != 0 {
+		t.Errorf("subscribeInFlight = %d, want 0", n)
+	}
+}
+
 // TestOrphanDelete_SuppressedWhileSubscribeInFlight is the narrow regression
 // guard: lastSubscribeNs is stale (a long batch), yet a subscribe is still in
 // flight, so an unknown handle must not be reaped. Pre-fix this is precisely
@@ -374,25 +609,93 @@ func TestSubscribeRace_UncommittedSamplesDiscarded(t *testing.T) {
 	}
 }
 
-// TestReplayEarlySamples_DropsUncommittedHandle: replay must not re-park a
-// sample whose handle is still absent from activeNotifications — otherwise
-// buffer and replay bounce a sample forever.
-func TestReplayEarlySamples_DropsUncommittedHandle(t *testing.T) {
+// TestReplayEarlySamples_LeavesUnboundHandleParked: a handle still absent from
+// activeNotifications must stay in the buffer. Its commit may yet arrive, and
+// dispatching it would take the unknown-handle path and schedule an orphan
+// delete against a handle we may be about to own. endSubscribe's discard is
+// what clears it, not replay.
+func TestReplayEarlySamples_LeavesUnboundHandleParked(t *testing.T) {
 	sess := newNotifTestSession()
 	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(context.Background())
 	defer sess.lifecycle.shutdown()
 	// Keep the reaper out: it needs a client, which this session has none of.
 	sess.notifications.subscribeInFlight.Store(1)
 
-	sess.bufferEarlySample(0x42, 0, intSample(9))
+	sess.bufferEarlySample(context.Background(), 0x42, 0, intSample(9))
 	if got := earlySampleCount(sess); got != 1 {
 		t.Fatalf("buffered samples = %d, want 1", got)
 	}
 
 	sess.replayEarlySamples(context.Background(), []uint32{0x42})
 
+	if got := earlySampleCount(sess); got != 1 {
+		t.Errorf("buffered samples after replaying an unbound handle = %d, want 1 (must stay parked)", got)
+	}
+}
+
+// TestBufferEarlySample_SelfHealsWhenCommitLandedFirst is the regression for the
+// lost static-symbol sample. dispatchSample releases notifications.lock before
+// it buffers, so the commit and its replay can both complete in that gap —
+// leaving the sample parked after the only replay that would have collected it.
+// Buffering therefore re-checks, and delivers the sample itself if the handle is
+// bound by then. Constructed deterministically: the handle is already bound when
+// bufferEarlySample runs, which is exactly the state that interleaving produces.
+func TestBufferEarlySample_SelfHealsWhenCommitLandedFirst(t *testing.T) {
+	sess := newNotifTestSession()
+	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(context.Background())
+	defer sess.lifecycle.shutdown()
+	sess.notifications.subscribeInFlight.Store(1)
+
+	const handle = 0x99
+	sym := preSeedTypedSymbol(sess, "MAIN.sStaticName", 0xC0DE)
+	ch := make(chan *Update, 2)
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[handle] = activeNotification{Sym: sym, Ch: ch}
+	sess.notifications.lock.Unlock()
+
+	sess.bufferEarlySample(context.Background(), handle, 0, intSample(1234))
+
+	select {
+	case u := <-ch:
+		if u.Value != "1234" {
+			t.Errorf("Update.Value = %q, want %q", u.Value, "1234")
+		}
+		if u.Variable != "MAIN.sStaticName" {
+			t.Errorf("Update.Variable = %q, want %q", u.Variable, "MAIN.sStaticName")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sample never delivered: buffering did not notice the handle was already bound")
+	}
 	if got := earlySampleCount(sess); got != 0 {
-		t.Errorf("buffered samples after replay = %d, want 0 (replay must not re-buffer)", got)
+		t.Errorf("buffered samples = %d, want 0 (the sample must be consumed, not left parked)", got)
+	}
+}
+
+// TestEndSubscribe_DiscardIsAtomicWithDecrement: a subscribe that begins while
+// another is finishing must keep its buffered sample. The decrement and the
+// discard have to be one critical section, or the newcomer's sample is wiped by
+// the outgoing call.
+func TestEndSubscribe_DiscardIsAtomicWithDecrement(t *testing.T) {
+	sess := newNotifTestSession()
+	ctx := context.Background()
+
+	sess.beginSubscribe()
+	sess.beginSubscribe()
+	sess.bufferEarlySample(ctx, 0x1, 0, intSample(1))
+
+	// First subscribe finishes: still one in flight, so nothing may be dropped.
+	sess.endSubscribe(ctx, nil)
+	if got := earlySampleCount(sess); got != 1 {
+		t.Fatalf("buffered samples = %d, want 1 while a subscribe is still in flight", got)
+	}
+
+	// Last one finishes with nothing committed: now the parked sample goes.
+	sess.endSubscribe(ctx, nil)
+	if got := earlySampleCount(sess); got != 0 {
+		t.Errorf("buffered samples = %d, want 0 after the last subscribe finished", got)
+	}
+	if n := sess.notifications.subscribeInFlight.Load(); n != 0 {
+		t.Errorf("subscribeInFlight = %d, want 0", n)
 	}
 }
 
@@ -403,14 +706,14 @@ func TestBufferEarlySample_BoundEnforced(t *testing.T) {
 	sess.notifications.subscribeInFlight.Store(1)
 
 	for i := 0; i < earlySampleMaxHandles+16; i++ {
-		sess.bufferEarlySample(uint32(i), 0, intSample(uint16(i)))
+		sess.bufferEarlySample(context.Background(), uint32(i), 0, intSample(uint16(i)))
 	}
 	if got := earlySampleCount(sess); got != earlySampleMaxHandles {
 		t.Errorf("buffered samples = %d, want %d (cap)", got, earlySampleMaxHandles)
 	}
 
 	// A handle already in the buffer is still updatable at the cap.
-	sess.bufferEarlySample(0, 0, intSample(0xBEEF))
+	sess.bufferEarlySample(context.Background(), 0, 0, intSample(0xBEEF))
 	sess.notifications.earlyMu.Lock()
 	s, ok := sess.notifications.earlySamples[0]
 	sess.notifications.earlyMu.Unlock()
@@ -428,7 +731,7 @@ func TestBufferEarlySample_CopiesContent(t *testing.T) {
 	sess := newNotifTestSession()
 
 	content := intSample(1)
-	sess.bufferEarlySample(0x11, 0, content)
+	sess.bufferEarlySample(context.Background(), 0x11, 0, content)
 	binary.LittleEndian.PutUint16(content, 0xFFFF)
 
 	sess.notifications.earlyMu.Lock()
@@ -474,7 +777,7 @@ func TestEndSubscribe_NestedSubscribesKeepWindowOpen(t *testing.T) {
 
 	sess.beginSubscribe()
 	sess.beginSubscribe()
-	sess.bufferEarlySample(0xABC, 0, intSample(3))
+	sess.bufferEarlySample(context.Background(), 0xABC, 0, intSample(3))
 
 	sess.endSubscribe(ctx, nil)
 	if got := earlySampleCount(sess); got != 1 {
