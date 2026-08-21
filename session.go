@@ -323,7 +323,7 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 // socket and then drops every request — so resolving it from the device beats
 // making the caller carry it.
 func (sess *Session) discoverTarget(ctx context.Context) error {
-	id, err := identifyRemoteFrom(ctx, sess.logger, sess.localBindIP, sess.ip)
+	id, err := identifyRemoteFrom(ctx, sess.logger, sess.localBindIP, sess.ip, routePort)
 	if err != nil {
 		return fmt.Errorf("ads: NewSession: target AMS address incomplete and discovery failed "+
 			"(set remote.AMS explicitly if the device does not answer the identify service): %w", err)
@@ -364,7 +364,7 @@ const targetVerifyTimeout = time.Second
 func (sess *Session) verifyTarget(ctx context.Context) error {
 	verifyCtx, cancel := context.WithTimeout(ctx, targetVerifyTimeout)
 	defer cancel()
-	id, err := identifyRemoteFrom(verifyCtx, sess.logger, sess.localBindIP, sess.ip)
+	id, err := identifyRemoteFrom(verifyCtx, sess.logger, sess.localBindIP, sess.ip, routePort)
 	if err != nil {
 		// Info, not Debug: the operator needs to know the guard did not run.
 		// Silence here would read as "verified" at default log level.

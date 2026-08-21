@@ -2,7 +2,10 @@ package ads
 
 import (
 	"encoding/binary"
+	"net"
+	"sync"
 	"testing"
+	"time"
 )
 
 // buildIdentifyResponse assembles a response of the shape a TwinCAT router
@@ -165,5 +168,137 @@ func TestBuildIdentifyPacket(t *testing.T) {
 	}
 	if got := binary.LittleEndian.Uint32(pkt[20:]); got != 0 {
 		t.Errorf("tagCount = %d, want 0", got)
+	}
+}
+
+// startFlakyIdentifyResponder stands in for an AMS router on a lossy network.
+// It ignores the first `dropFirst` requests, then answers — optionally sending
+// an unrelated datagram first, which port 48899 really does carry (route
+// registration replies share it).
+func startFlakyIdentifyResponder(t *testing.T, dropFirst int, sendStray bool) (host string, port int, stop func()) {
+	t.Helper()
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	addr, ok := pc.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		_ = pc.Close()
+		t.Fatalf("unexpected addr type: %T", pc.LocalAddr())
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 2048)
+		seen := 0
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = pc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			n, from, err := pc.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+			seen++
+			if seen <= dropFirst {
+				continue // swallow it, as a lossy link would
+			}
+			invokeID := binary.LittleEndian.Uint32(buf[4:8])
+			if sendStray {
+				// Wrong invokeID: another exchange's late reply. Must be skipped,
+				// not mistaken for ours and not fatal.
+				stray := buildIdentifyResponse(invokeID^0xFFFF, [6]byte{9, 9, 9, 9, 1, 1}, 10000, nil)
+				_, _ = pc.WriteToUDP(stray, from)
+			}
+			resp := buildIdentifyResponse(invokeID, [6]byte{5, 1, 2, 3, 1, 1}, 10000, [][2]any{
+				{int(tagComputerName), append([]byte("FLAKY-CX"), 0)},
+				{int(tagSystemVersion), []byte{3, 1, 0xB8, 0x0F}},
+			})
+			_, _ = pc.WriteToUDP(resp, from)
+			_ = n
+		}
+	}()
+
+	return addr.IP.String(), addr.Port, func() {
+		close(done)
+		_ = pc.Close()
+		wg.Wait()
+	}
+}
+
+// TestIdentifyRemote_RetransmitsOnPacketLoss: one lost request must not fail the
+// call. This was observed for real — a dropped datagram failed NewSession
+// outright, which is a bad trade for a single packet on a plant network.
+func TestIdentifyRemote_RetransmitsOnPacketLoss(t *testing.T) {
+	host, port, stop := startFlakyIdentifyResponder(t, 1, false)
+	defer stop()
+	id, err := identifyRemoteFrom(t.Context(), nil, nil, host, port)
+	if err != nil {
+		t.Fatalf("identify with one dropped request: %v", err)
+	}
+	if got := id.AMS.NetIDString(); got != "5.1.2.3.1.1" {
+		t.Errorf("NetID = %s, want 5.1.2.3.1.1", got)
+	}
+}
+
+// TestIdentifyRemote_SkipsUnrelatedDatagram: a stray reply on the shared port
+// must be discarded, not consume the read and not be reported as malformed.
+func TestIdentifyRemote_SkipsUnrelatedDatagram(t *testing.T) {
+	host, port, stop := startFlakyIdentifyResponder(t, 0, true)
+	defer stop()
+	id, err := identifyRemoteFrom(t.Context(), nil, nil, host, port)
+	if err != nil {
+		t.Fatalf("identify with a stray datagram present: %v", err)
+	}
+	if got := id.HostName; got != "FLAKY-CX" {
+		t.Errorf("HostName = %q, want FLAKY-CX", got)
+	}
+}
+
+// TestIdentifyResponseIsOurs covers the discriminator used to tell our answer
+// from someone else's traffic.
+func TestIdentifyResponseIsOurs(t *testing.T) {
+	const invokeID = 0x11223344
+	good := buildIdentifyResponse(invokeID, [6]byte{5, 1, 2, 3, 1, 1}, 10000, nil)
+
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{name: "our answer", data: good, want: true},
+		{name: "too short", data: good[:20], want: false},
+		{
+			name: "another exchange's invokeID",
+			data: buildIdentifyResponse(invokeID+1, [6]byte{5, 1, 2, 3, 1, 1}, 10000, nil),
+			want: false,
+		},
+		{
+			name: "wrong cookie",
+			data: func() []byte { b := append([]byte(nil), good...); binary.LittleEndian.PutUint32(b[0:], 1); return b }(),
+			want: false,
+		},
+		{
+			name: "different service",
+			data: func() []byte {
+				b := append([]byte(nil), good...)
+				binary.LittleEndian.PutUint32(b[8:], 0x80000000|routeServiceAdd)
+				return b
+			}(),
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := identifyResponseIsOurs(tt.data, invokeID); got != tt.want {
+				t.Errorf("identifyResponseIsOurs() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
