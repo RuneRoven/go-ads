@@ -310,6 +310,9 @@ func TestSubscribeRace_ReloadMidBatchStrandsWholeBatch(t *testing.T) {
 	var adds atomic.Int32
 	var nextHandle atomic.Uint32
 	nextHandle.Store(0x300)
+	// Written on the stub's goroutine, read on the test's: guarded, because a
+	// data race here would be reported as a failure of the code under test.
+	var reapedMu sync.Mutex
 	var reapedByReload []uint32
 	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
 		// After the second Add, do what autoReloadOnStaleDetection actually does
@@ -321,9 +324,12 @@ func TestSubscribeRace_ReloadMidBatchStrandsWholeBatch(t *testing.T) {
 			sess.bumpEpoch()
 			sess.notifications.lock.Lock()
 			for h := range sess.notifications.activeNotifications {
+				reapedMu.Lock()
 				reapedByReload = append(reapedByReload, h)
+				reapedMu.Unlock()
 			}
 			sess.notifications.activeNotifications = make(map[uint32]activeNotification)
+			sess.notifications.sweepGen.Add(1)
 			sess.notifications.lock.Unlock()
 		}
 		return addNotifResponse{Handle: nextHandle.Add(1)}
@@ -351,7 +357,10 @@ func TestSubscribeRace_ReloadMidBatchStrandsWholeBatch(t *testing.T) {
 	}
 	// The entries the reload swept are precisely the ones reported as stranded:
 	// that equality is the invariant the amendment relies on.
-	if len(reapedByReload) == 0 {
+	reapedMu.Lock()
+	sweptCount := len(reapedByReload)
+	reapedMu.Unlock()
+	if sweptCount == 0 {
 		t.Error("the simulated reload swept nothing — the test did not reproduce the interleaving it claims to")
 	}
 	sess.notifications.lock.Lock()
@@ -360,6 +369,205 @@ func TestSubscribeRace_ReloadMidBatchStrandsWholeBatch(t *testing.T) {
 	if surviving != 0 {
 		t.Errorf("activeNotifications = %d, want 0 (nothing may be committed after the reload)", surviving)
 	}
+}
+
+// TestSubscribeRace_PlainSymbolReloadDoesNotStrandBatch: an epoch bump is not by
+// itself evidence that anything was stranded. A caller running LoadSymbols /
+// RefreshSymbols in parallel advances the epoch but never touches
+// activeNotifications, so entries this batch bound are alive on both sides. The
+// amendment used to key on the epoch and tore them down anyway: reported
+// Skipped, then deleted PLC-side — a working subscription destroyed by an
+// unrelated cache refresh. It must key on an actual notification sweep.
+func TestSubscribeRace_PlainSymbolReloadDoesNotStrandBatch(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, c := newWiredTestSession(t, srv)
+	c.SetNotificationHandler(sess.handleNotification)
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumAddNotif into the unsupported state")
+	}
+
+	const symbolCount = 3
+	names := make([]string, symbolCount)
+	configs := make([]NotificationConfig, symbolCount)
+	for i := range names {
+		names[i] = "MAIN.plain" + string(rune('A'+i))
+		preSeedTypedSymbol(sess, names[i], uint32(0xC100+i))
+		configs[i] = NotificationConfig{SymbolName: names[i], TransmissionMode: TransModeServerOnChange}
+	}
+
+	var deletedMu sync.Mutex
+	var deleted []uint32
+	srv.onDeleteDeviceNotification(func(h uint32) ReturnCode {
+		deletedMu.Lock()
+		deleted = append(deleted, h)
+		deletedMu.Unlock()
+		return ReturnCodeNoErrors
+	})
+
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0x800)
+	var adds atomic.Int32
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		// A concurrent LoadSymbols lands after the first commit: epoch moves,
+		// activeNotifications is untouched.
+		if adds.Add(1) == 2 {
+			sess.bumpEpoch()
+		}
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+
+	ch := make(chan *Update, symbolCount)
+	results, err := sess.AddSymbolNotifications(context.Background(), configs, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotifications: %v", err)
+	}
+
+	// Item 0 was committed before the bump and nothing swept it: it stays a
+	// success. (Items after the bump are legitimately refused — their symbol
+	// handles came from the pre-reload cache.)
+	if results[0].Skipped != nil {
+		t.Errorf("results[0] (%s) Skipped = %v; a plain symbol reload strands nothing", names[0], results[0].Skipped)
+	}
+	if results[0].Handle == 0 {
+		t.Errorf("results[0] (%s) has no handle despite committing", names[0])
+	}
+
+	sess.notifications.lock.Lock()
+	_, stillBound := sess.notifications.activeNotifications[results[0].Handle]
+	sess.notifications.lock.Unlock()
+	if !stillBound {
+		t.Errorf("handle %d is no longer bound; the batch unwound a live subscription", results[0].Handle)
+	}
+	deletedMu.Lock()
+	releasedFirst := containsHandle(deleted, results[0].Handle)
+	deletedMu.Unlock()
+	if releasedFirst {
+		t.Errorf("handle %d was released PLC-side; the caller still holds it", results[0].Handle)
+	}
+}
+
+// TestSubscribeRace_AbortedBatchStillAmendsAndReleases: a batch that gives up
+// part-way is exactly the case where the PLC has created handles nobody owns and
+// where a reload may have landed on the ones already bound. The abort path used
+// to return straight out, skipping both the reload amendment and the release —
+// so the caller was told a stranded entry had succeeded, and the handle stayed
+// registered, streaming into a channel nothing reads.
+//
+// The batch is aborted with an expiring context, which keeps the connection
+// alive so the cleanup delete is observable. That is also why the release runs on
+// a fresh context: on the caller's expired one it would fail before being sent.
+func TestSubscribeRace_AbortedBatchStillAmendsAndReleases(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, c := newWiredTestSession(t, srv)
+	c.SetNotificationHandler(sess.handleNotification)
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumAddNotif into the unsupported state")
+	}
+	// Sum-delete goes down the same fallback road, one Delete per handle, so the
+	// stub sees them individually.
+	if !c.capabilities.SumDeleteNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumDeleteNotif into the unsupported state")
+	}
+
+	const symbolCount = 3
+	names := make([]string, symbolCount)
+	configs := make([]NotificationConfig, symbolCount)
+	for i := range names {
+		names[i] = "MAIN.abort" + string(rune('A'+i))
+		preSeedTypedSymbol(sess, names[i], uint32(0xB000+i))
+		configs[i] = NotificationConfig{SymbolName: names[i], TransmissionMode: TransModeServerOnChange}
+	}
+
+	var deletedMu sync.Mutex
+	var deleted []uint32
+	srv.onDeleteDeviceNotification(func(h uint32) ReturnCode {
+		deletedMu.Lock()
+		deleted = append(deleted, h)
+		deletedMu.Unlock()
+		return ReturnCodeNoErrors
+	})
+
+	var adds atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0x700)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		if adds.Add(1) == 2 {
+			// Item 0 is bound by now, so the reload lands on a committed entry and
+			// the amendment — not commitNotification's own epoch check — is what has
+			// to strand it. Then outlast the caller's deadline so the batch aborts
+			// here, on a live connection.
+			sess.bumpEpoch()
+			sess.notifications.lock.Lock()
+			sess.notifications.activeNotifications = make(map[uint32]activeNotification)
+			sess.notifications.sweepGen.Add(1)
+			sess.notifications.lock.Unlock()
+			time.Sleep(600 * time.Millisecond)
+		}
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	ch := make(chan *Update, symbolCount)
+	results, err := sess.AddSymbolNotifications(ctx, configs, ch)
+	if err == nil {
+		t.Fatal("batch reported success despite the context expiring mid-batch")
+	}
+	if len(results) != symbolCount {
+		t.Fatalf("results len = %d, want %d", len(results), symbolCount)
+	}
+
+	// The amendment must have run on the abort path: item 0 was bound before the
+	// reload, so it cannot be reported as a success.
+	if results[0].Skipped == nil {
+		t.Errorf("results[0] (%s) reported success, but a reload invalidated it before the abort", names[0])
+	} else if !errors.Is(results[0].Skipped, ErrNotificationStrandedByReload) {
+		t.Errorf("results[0] Skipped = %v, want ErrNotificationStrandedByReload", results[0].Skipped)
+	}
+	if results[0].Handle == 0 {
+		t.Error("results[0] Handle = 0; the caller cannot release what it is not told about")
+	}
+
+	// The release must have run too, on a context the caller's expiry did not kill.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		deletedMu.Lock()
+		n := len(deleted)
+		deletedMu.Unlock()
+		if n > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	deletedMu.Lock()
+	got := append([]uint32(nil), deleted...)
+	deletedMu.Unlock()
+	if len(got) == 0 {
+		t.Error("no handle was released after the abort — the PLC keeps streaming a subscription nothing owns")
+	}
+	if results[0].Handle != 0 && !containsHandle(got, results[0].Handle) {
+		t.Errorf("stranded handle %d was not released; deletes seen: %v", results[0].Handle, got)
+	}
+
+	sess.notifications.lock.Lock()
+	bound := len(sess.notifications.activeNotifications)
+	sess.notifications.lock.Unlock()
+	if bound != 0 {
+		t.Errorf("activeNotifications = %d, want 0 after an aborted batch whose commits were stranded", bound)
+	}
+}
+
+func containsHandle(hs []uint32, want uint32) bool {
+	for _, h := range hs {
+		if h == want {
+			return true
+		}
+	}
+	return false
 }
 
 // TestSubscribeRace_ConnectionDropsMidBatch is the realistic trigger: not an
@@ -720,6 +928,49 @@ func TestEndSubscribe_DiscardIsAtomicWithDecrement(t *testing.T) {
 	}
 }
 
+// TestEndSubscribe_DiscardIsAtomicWithDecrement_Concurrent is the atomicity half
+// the test above cannot reach: single-threaded, it only shows the nesting count
+// is honoured. Here an outgoing endSubscribe runs on one goroutine while a
+// newcomer opens its own window and parks a sample on another. If the decrement
+// and the discard are not one critical section, the outgoing call observes zero
+// in flight after the newcomer has already buffered, and wipes its sample —
+// exactly the lost first update this whole mechanism exists to prevent.
+func TestEndSubscribe_DiscardIsAtomicWithDecrement_Concurrent(t *testing.T) {
+	ctx := context.Background()
+	const rounds = 300
+
+	for i := 0; i < rounds; i++ {
+		sess := newNotifTestSession()
+		sess.beginSubscribe() // the outgoing subscribe
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		start := make(chan struct{})
+		go func() {
+			defer wg.Done()
+			<-start
+			sess.endSubscribe(ctx, nil)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			sess.beginSubscribe()
+			sess.bufferEarlySample(ctx, 0x2, 0, intSample(7))
+		}()
+		close(start)
+		wg.Wait()
+
+		// The newcomer's window is still open, so its sample must still be there.
+		if got := earlySampleCount(sess); got != 1 {
+			t.Fatalf("round %d: buffered samples = %d, want 1 — the outgoing endSubscribe discarded a sample belonging to a window that was still open", i, got)
+		}
+		sess.endSubscribe(ctx, nil)
+		if n := sess.notifications.subscribeInFlight.Load(); n != 0 {
+			t.Fatalf("round %d: subscribeInFlight = %d, want 0", i, n)
+		}
+	}
+}
+
 // TestBufferEarlySample_BoundEnforced: the buffer is capped so a flood of
 // unknown handles during a subscribe cannot grow it without limit.
 func TestBufferEarlySample_BoundEnforced(t *testing.T) {
@@ -773,6 +1024,7 @@ func TestSubscribeRaceActive(t *testing.T) {
 		want      bool
 	}{
 		{name: "in flight, stale timestamp", inFlight: 1, lastSubAt: -1 * time.Second, want: true},
+		{name: "in flight, no opened clock", inFlight: 1, lastSubAt: -time.Hour, want: true},
 		{name: "idle, recent subscribe", inFlight: 0, lastSubAt: 0, want: true},
 		{name: "idle, stale subscribe", inFlight: 0, lastSubAt: -1 * time.Second, want: false},
 	}
@@ -786,6 +1038,46 @@ func TestSubscribeRaceActive(t *testing.T) {
 					got, tt.want, tt.inFlight, tt.lastSubAt)
 			}
 		})
+	}
+}
+
+// TestSubscribeRaceActive_WedgedSubscribeExpires: the cap on how long one
+// in-flight subscribe may suppress the orphan reaper has to be measured from
+// when that subscribe opened. It used to be measured from lastSubscribeNs, which
+// both beginSubscribe and endSubscribe refresh — so on a session doing any
+// subscribe traffic at all the deadline was pushed forward forever and the
+// reaper stayed off for the life of the session, which is precisely what fills
+// the PLC handle table.
+func TestSubscribeRaceActive_WedgedSubscribeExpires(t *testing.T) {
+	sess := newNotifTestSession()
+
+	sess.beginSubscribe() // the wedged one
+	if !sess.subscribeRaceActive() {
+		t.Fatal("subscribeRaceActive() = false with a subscribe just opened")
+	}
+
+	// Age it past the cap.
+	wedgedAt := time.Now().Add(-subscribeRaceMaxOpen - time.Second)
+	sess.notifications.subscribeOpenedNs.Store(wedgedAt.UnixNano())
+	if sess.subscribeRaceActive() {
+		t.Error("subscribeRaceActive() = true for a subscribe wedged past subscribeRaceMaxOpen — the reaper is disabled indefinitely")
+	}
+
+	// Healthy traffic alongside it must not resurrect the suppression.
+	sess.beginSubscribe()
+	sess.endSubscribe(context.Background(), nil)
+	if sess.subscribeRaceActive() {
+		t.Error("a later subscribe pushed the wedged one's deadline out again")
+	}
+
+	// Once the wedged call finally returns, the clock resets for the next one.
+	sess.endSubscribe(context.Background(), nil)
+	if got := sess.notifications.subscribeOpenedNs.Load(); got != 0 {
+		t.Errorf("subscribeOpenedNs = %d after the last subscribe closed, want 0", got)
+	}
+	sess.beginSubscribe()
+	if !sess.subscribeRaceActive() {
+		t.Error("a fresh subscribe inherited the wedged one's expired clock")
 	}
 }
 

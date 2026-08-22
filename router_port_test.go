@@ -57,21 +57,63 @@ func TestNewSession_RouterPortIndependentOfTCPPort(t *testing.T) {
 	}
 }
 
+// TestSplitHostRouterPort: the standalone IdentifyRemote / AddRemoteRoute
+// helpers take no port argument, so a NAT-forwarded router is only reachable
+// through them if they read the port off the host string. Anything that is not a
+// usable port must fall back to the protocol default rather than being silently
+// treated as part of the hostname.
+func TestSplitHostRouterPort(t *testing.T) {
+	tests := []struct {
+		in       string
+		wantHost string
+		wantPort int
+	}{
+		{in: "192.168.3.70", wantHost: "192.168.3.70", wantPort: routePort},
+		{in: "plc.local", wantHost: "plc.local", wantPort: routePort},
+		{in: "192.168.3.70:6499", wantHost: "192.168.3.70", wantPort: 6499},
+		{in: "plc.local:6499", wantHost: "plc.local", wantPort: 6499},
+		{in: "[fd00::1]:6499", wantHost: "fd00::1", wantPort: 6499},
+		{in: "192.168.3.70:0", wantHost: "192.168.3.70:0", wantPort: routePort},
+		{in: "192.168.3.70:99999", wantHost: "192.168.3.70:99999", wantPort: routePort},
+		{in: "192.168.3.70:notaport", wantHost: "192.168.3.70:notaport", wantPort: routePort},
+	}
+	for _, tt := range tests {
+		host, port := splitHostRouterPort(tt.in)
+		if host != tt.wantHost || port != tt.wantPort {
+			t.Errorf("splitHostRouterPort(%q) = (%q, %d), want (%q, %d)",
+				tt.in, host, port, tt.wantHost, tt.wantPort)
+		}
+	}
+}
+
 // TestSessionUsesRouterPortForIdentify proves the plumbing end to end for the
 // UDP half: a responder on an arbitrary port is found only if the session
 // actually probes RouterPort rather than the constant.
 func TestSessionUsesRouterPortForIdentify(t *testing.T) {
-	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatalf("listen udp: %v", err)
-	}
-	addr, ok := pc.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		_ = pc.Close()
-		t.Fatalf("unexpected addr type: %T", pc.LocalAddr())
-	}
-	if addr.Port == routePort {
-		t.Skip("stub happened to bind the protocol port; the test would prove nothing")
+	// Keep re-binding until the stub owns a port that is NOT the protocol
+	// default: on the default port the test would pass even if the session
+	// ignored RouterPort entirely. Skipping instead of retrying would silently
+	// turn the only end-to-end proof of this plumbing into a no-op.
+	var pc *net.UDPConn
+	var addr *net.UDPAddr
+	for attempt := 0; ; attempt++ {
+		if attempt == 10 {
+			t.Fatal("could not bind a UDP port other than the protocol default after 10 tries")
+		}
+		conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatalf("listen udp: %v", err)
+		}
+		local, ok := conn.LocalAddr().(*net.UDPAddr)
+		if !ok {
+			_ = conn.Close()
+			t.Fatalf("unexpected addr type: %T", conn.LocalAddr())
+		}
+		if local.Port != routePort {
+			pc, addr = conn, local
+			break
+		}
+		_ = conn.Close()
 	}
 
 	done := make(chan struct{})
