@@ -42,6 +42,14 @@ type notificationManager struct {
 	notificationChannel chan *Update
 	lastSubscribeNs     atomic.Int64
 
+	// subscribeOpenedNs is when the OLDEST currently in-flight subscribe began,
+	// i.e. set on the 0 -> 1 transition only. subscribeRaceMaxOpen is measured
+	// from here so it actually caps a wedged subscribe: measured from
+	// lastSubscribeNs it never fired, because both beginSubscribe and
+	// endSubscribe refresh that, so any healthy traffic alongside the wedged call
+	// kept pushing the deadline out and the orphan reaper stayed disabled.
+	subscribeOpenedNs atomic.Int64
+
 	// subscribeInFlight counts subscribe operations (single or batch) that
 	// have issued the PLC-side Add but have not yet committed every handle
 	// into activeNotifications. lastSubscribeNs alone cannot express this:
@@ -52,6 +60,15 @@ type notificationManager struct {
 	// non-zero an unknown handle is presumed ours: the sample is buffered
 	// (see earlySamples) and the orphan reaper stays out.
 	subscribeInFlight atomic.Int64
+
+	// sweepGen counts the times activeNotifications was wiped wholesale and the
+	// handles in it released PLC-side — the auto-reload and the reconnect paths.
+	// The session epoch cannot stand in for this: it also advances on a plain
+	// user-driven LoadSymbols, which touches no notification. A batch that used
+	// the epoch to decide its committed entries were stranded therefore tore down
+	// perfectly good subscriptions whenever a caller reloaded symbols in
+	// parallel. Bumped under lock, at the same moment the map is replaced.
+	sweepGen atomic.Uint64
 
 	// earlySamples holds samples that arrived for a handle before its
 	// activeNotifications insert landed, keyed by handle. Guarded by
@@ -187,6 +204,12 @@ type pendingNotification struct {
 // the config is dropped with a Warn log; the user must re-subscribe via
 // AddSymbolNotification to re-establish.
 const resubscribeMaxAttempts = 3
+
+// notificationReleaseTimeout bounds the cleanup delete a batch issues for
+// handles it declined to bind, when the caller's own context is already done.
+// Short on purpose: the caller has stopped waiting, and the handles die with the
+// connection anyway if this does not land.
+const notificationReleaseTimeout = 2 * time.Second
 
 // AddSymbolNotification registers a notification for a single symbol.
 // All notifications on one connection must share the same updateReceiver
@@ -437,6 +460,9 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 	// removed bulk re-check used to enforce. A per-item snapshot cannot: it only
 	// sees a reload landing inside that one item's own commit.
 	batchEpoch := sess.epoch()
+	// Separate from the epoch on purpose: only a sweep means the handles this
+	// batch committed have been deleted PLC-side. See notificationManager.sweepGen.
+	batchSweep := sess.notifications.sweepGen.Load()
 	committed := make([]uint32, 0, len(requests))
 	committedIdx := make([]int, 0, len(requests))
 	// Handles the PLC created but the library declined to bind. Released before
@@ -503,6 +529,60 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 			"symbol", info.config.SymbolName)
 	}
 
+	// settle runs the batch tail: the retroactive reload amendment, then the
+	// release of every PLC handle nothing on this side ended up owning. It has to
+	// run on the transport-abort path too — a batch that died mid-way is exactly
+	// the case where handles were created and not bound, and where a reload can
+	// have landed before the abort. Skipping it there leaked both the handles and
+	// the amendment. On a dead transport the delete short-circuits in
+	// sumDeleteNotificationFallback, so this costs one failed round trip, not one
+	// per handle.
+	settle := func() {
+		// A sweep (auto-reload or reconnect) snapshots activeNotifications, wipes
+		// it, and deletes those handles PLC-side. Anything this batch committed
+		// before that was in the snapshot, so it now exists on neither side, and
+		// reporting it as a success would be a silent lie. No unwinding is needed
+		// precisely because the sweep already released them. Keyed on sweepGen
+		// rather than the epoch: the epoch also moves for a plain LoadSymbols,
+		// which strands nothing.
+		if len(committedIdx) > 0 && sess.notifications.sweepGen.Load() != batchSweep {
+			for _, idx := range committedIdx {
+				results[idx] = SumNotificationResult{
+					Handle:  results[idx].Handle,
+					Skipped: fmt.Errorf("symbol %q: %w", configs[idx].SymbolName, ErrNotificationStrandedByReload),
+				}
+			}
+			sess.logger.Warn("symbol cache reloaded mid-batch; committed entries reported as stranded",
+				"entries", len(committedIdx))
+		}
+
+		// Release what we refused, plus anything the amendment just invalidated:
+		// both are registrations on the PLC that nothing on this side owns.
+		for _, idx := range committedIdx {
+			if results[idx].Skipped != nil && results[idx].Handle != 0 {
+				refused = append(refused, results[idx].Handle)
+			}
+		}
+		if len(refused) > 0 {
+			// A batch that aborted on a cancelled or expired ctx must still release
+			// what the PLC created: reusing the dead ctx would fail the delete
+			// before it was sent and leak a subscription streaming to nobody. The
+			// session lifetime bounds the replacement, so a closing session does
+			// not block here.
+			releaseCtx := ctx
+			if ctx.Err() != nil {
+				fresh, cancel := context.WithTimeout(sess.currentLifecycleCtx(), notificationReleaseTimeout)
+				defer cancel()
+				releaseCtx = fresh
+			}
+			// Best-effort: 0x714 (already gone) counts as success, which covers the
+			// stranded-by-reload case where the reload deleted them first.
+			deleted := sess.bestEffortDeleteNotifications(releaseCtx, refused)
+			sess.logger.Warn("released PLC notification handles the batch did not bind",
+				"handles", len(refused), "deleted", deleted)
+		}
+	}
+
 	subResults, err := sess.client.Load().sumAddDeviceNotificationFunc(ctx, requests, onItem)
 	if err != nil {
 		// Transport-aborted batch: every entry that was about to be sent must
@@ -519,6 +599,7 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 			}
 			results[info.configIndex].Skipped = fmt.Errorf("%w: %w", ErrNotificationTransportFailure, err)
 		}
+		settle()
 		return results, fmt.Errorf("batch add notification failed: %w", err)
 	}
 
@@ -536,37 +617,7 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		}
 	}
 
-	// Retroactive amendment. autoReloadOnStaleDetection bumps the epoch BEFORE
-	// it snapshots activeNotifications and swaps the map, so anything this batch
-	// committed successfully was in that snapshot and has since been deleted
-	// PLC-side by the reload. Reporting those as successes would hand the caller
-	// subscriptions that exist on neither side, silently. No unwinding is needed
-	// precisely because the reload already released them.
-	if len(committedIdx) > 0 && sess.epoch() != batchEpoch {
-		for _, idx := range committedIdx {
-			results[idx] = SumNotificationResult{
-				Handle:  results[idx].Handle,
-				Skipped: fmt.Errorf("symbol %q: %w", configs[idx].SymbolName, ErrNotificationStrandedByReload),
-			}
-		}
-		sess.logger.Warn("symbol cache reloaded mid-batch; committed entries reported as stranded",
-			"entries", len(committedIdx))
-	}
-
-	// Release what we refused, plus anything the amendment just invalidated:
-	// both are registrations on the PLC that nothing on this side owns.
-	for _, idx := range committedIdx {
-		if results[idx].Skipped != nil && results[idx].Handle != 0 {
-			refused = append(refused, results[idx].Handle)
-		}
-	}
-	if len(refused) > 0 {
-		// Best-effort: 0x714 (already gone) counts as success, which covers the
-		// stranded-by-reload case where the reload deleted them first.
-		deleted := sess.bestEffortDeleteNotifications(ctx, refused)
-		sess.logger.Warn("released PLC notification handles the batch did not bind",
-			"handles", len(refused), "deleted", deleted)
-	}
+	settle()
 
 	// Everything else was already bound (or recorded as failed/skipped) by
 	// onItem as its result arrived; nothing left to commit here.

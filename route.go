@@ -32,7 +32,8 @@ const (
 // Ensure this is only called on trusted networks.
 //
 // Parameters:
-//   - remoteHost: IP or hostname of the PLC
+//   - remoteHost: IP or hostname of the PLC, optionally with the router's UDP
+//     port ("10.0.0.5:6499") when the PLC is reached through NAT forwarding
 //   - localNetID: the AMS NetID this client will use as source
 //   - routeName: name for the route entry on the PLC
 //   - computerName: the IP/hostname the PLC should use to connect back to this client
@@ -44,7 +45,8 @@ func AddRemoteRoute(remoteHost string, localNetID [6]byte, routeName string, com
 
 // AddRemoteRouteWithLogger is like AddRemoteRoute but accepts an explicit logger.
 func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
-	return addRemoteRouteFrom(logger, nil, remoteHost, routePort, localNetID, routeName, computerName, username, password)
+	host, port := splitHostRouterPort(remoteHost)
+	return addRemoteRouteFrom(logger, nil, host, port, localNetID, routeName, computerName, username, password)
 }
 
 // addRemoteRouteFrom is AddRemoteRouteWithLogger with an explicit local source

@@ -408,8 +408,9 @@ func (sess *Session) verifyTarget(ctx context.Context) error {
 	if err != nil {
 		// Info, not Debug: the operator needs to know the guard did not run.
 		// Silence here would read as "verified" at default log level.
-		sess.logger.Info("target NetID not verified — device did not answer the identify service on UDP 48899 (firewalled?); continuing",
-			"host", sess.ip, "target", sess.target.NetIDString(), "error", err)
+		sess.logger.Info("target NetID not verified — device did not answer the identify service (UDP firewalled?); continuing",
+			"host", sess.ip, "router_port", sess.effectiveRouterPort(),
+			"target", sess.target.NetIDString(), "error", err)
 		return nil
 	}
 	return sess.applyTargetCheck(id)
@@ -563,6 +564,12 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		"target", sess.target.String())
 
 	sess.logger.Log(context.Background(), LevelTrace, "connected")
+	// Capture ctx + cancel under one RLock so a concurrent tearDownAndReset
+	// replacement cannot split the pair, and so the read does not race the swap.
+	sess.lifecycle.ctxMu.RLock()
+	clientCtx := sess.lifecycle.ctx
+	clientCancel := sess.lifecycle.shutdown
+	sess.lifecycle.ctxMu.RUnlock()
 	// Allocate the underlying Client and start its workers. Session and
 	// Client share the *transport pointer (no re-dial); the Client owns
 	// the listen / transmit / recvWorker goroutines. handleNotification is
@@ -578,8 +585,8 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		logger:         sess.logger,
 		tx:             sess.tx,
 		dropped:        make(chan struct{}),
-		ctx:            sess.lifecycle.ctx,
-		cancel:         sess.lifecycle.shutdown,
+		ctx:            clientCtx,
+		cancel:         clientCancel,
 	}
 	newClient.SetNotificationHandler(sess.handleNotification)
 	newClient.SetOnDrop(sess.triggerReconnect)
@@ -1185,15 +1192,18 @@ func (sess *Session) reloadSymbolsAndResubscribe() error {
 	}
 	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
 	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
+	// Tell any batch running concurrently that the entries it committed have
+	// been swept: their handles are about to be deleted below.
+	sess.notifications.sweepGen.Add(1)
 	sess.notifications.lock.Unlock()
 
 	if len(oldHandles) > 0 {
-		deleted := sess.bestEffortDeleteNotifications(sess.lifecycle.ctx, oldHandles)
+		deleted := sess.bestEffortDeleteNotifications(sess.currentLifecycleCtx(), oldHandles)
 		sess.logger.Info("auto-reload: deleted old PLC notification handles before resubscribe",
 			"requested", len(oldHandles), "deleted", deleted)
 	}
 
-	if err := sess.LoadSymbols(sess.lifecycle.ctx); err != nil {
+	if err := sess.LoadSymbols(sess.currentLifecycleCtx()); err != nil {
 		return fmt.Errorf("LoadSymbols: %w", err)
 	}
 	return sess.resubscribeNotifications()
@@ -1230,7 +1240,7 @@ func (sess *Session) releasePLCResources(wasDisconnected bool) {
 	}
 	sess.notifications.lock.Unlock()
 	if len(handles) > 0 {
-		deleted := sess.bestEffortDeleteNotifications(sess.lifecycle.ctx, handles)
+		deleted := sess.bestEffortDeleteNotifications(sess.currentLifecycleCtx(), handles)
 		sess.logger.Info("releasePLCResources: best-effort notification cleanup",
 			"requested", len(handles), "deleted", deleted,
 			"wasDisconnected", wasDisconnected)
@@ -1262,7 +1272,7 @@ func (sess *Session) releasePLCResources(wasDisconnected bool) {
 		}
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, h)
-		if err := sess.client.Load().Write(sess.lifecycle.ctx, uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+		if err := sess.client.Load().Write(sess.currentLifecycleCtx(), uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 			sess.logger.Warn("failed to release symbol handle", "error", err, "handle", h)
 		} else {
 			sess.logger.Info("handle deleted", "handle", h)
@@ -1391,7 +1401,7 @@ func (sess *Session) triggerReconnect() {
 	}
 
 	if sess.lifecycle.autoReconnect {
-		go func() { _ = sess.Reconnect(sess.lifecycle.ctx) }()
+		go func() { _ = sess.Reconnect(sess.currentLifecycleCtx()) }()
 	} else {
 		// No auto-reconnect: close reconnectDone immediately so sendRequest
 		// waiters unblock with ErrDisconnected instead of hanging forever.
@@ -1507,6 +1517,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		savedHandles = append(savedHandles, h)
 	}
 	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
+	sess.notifications.sweepGen.Add(1)
 	sess.notifications.lock.Unlock()
 
 	sess.tearDownAndReset(true)
@@ -1592,7 +1603,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		// resubscribe failure → resetForRetry → loop) doesn't re-fire on an
 		// already-cleaned PLC table.
 		if len(savedHandles) > 0 {
-			deleted := sess.bestEffortDeleteNotifications(sess.lifecycle.ctx, savedHandles)
+			deleted := sess.bestEffortDeleteNotifications(sess.currentLifecycleCtx(), savedHandles)
 			sess.logger.Info("reconnect: cleaned up pre-reconnect notification handles",
 				"requested", len(savedHandles), "deleted", deleted)
 			savedHandles = nil
@@ -1713,17 +1724,17 @@ func (sess *Session) reloadSymbols() error {
 	switch {
 	case fullyLoaded:
 		// Full discovery was done — redo it
-		return sess.loadSymbols(sess.lifecycle.ctx)
+		return sess.loadSymbols(sess.currentLifecycleCtx())
 
 	case listLoaded || dtLoaded:
 		// Partial discovery — re-download what was loaded
 		if listLoaded {
-			if err := sess.LoadSymbolList(sess.lifecycle.ctx, SlowDiscoveryConfig{}); err != nil {
+			if err := sess.LoadSymbolList(sess.currentLifecycleCtx(), SlowDiscoveryConfig{}); err != nil {
 				return fmt.Errorf("reload symbol list: %w", err)
 			}
 		}
 		if dtLoaded {
-			if err := sess.LoadDataTypes(sess.lifecycle.ctx, SlowDiscoveryConfig{}); err != nil {
+			if err := sess.LoadDataTypes(sess.currentLifecycleCtx(), SlowDiscoveryConfig{}); err != nil {
 				return fmt.Errorf("reload datatypes: %w", err)
 			}
 		}
@@ -1749,7 +1760,7 @@ func (sess *Session) reloadSymbols() error {
 		sess.cache.lock.Unlock()
 
 		for name := range oldSymbols {
-			if _, err := sess.getSymbol(sess.lifecycle.ctx, name); err != nil {
+			if _, err := sess.getSymbol(sess.currentLifecycleCtx(), name); err != nil {
 				if sess.lifecycle.strictReconnect {
 					sess.lifecycle.strictReconnectFailures++
 					if sess.lifecycle.strictReconnectMaxAttempts == 0 || sess.lifecycle.strictReconnectFailures > sess.lifecycle.strictReconnectMaxAttempts {
@@ -1764,7 +1775,7 @@ func (sess *Session) reloadSymbols() error {
 
 	default:
 		// No symbols were loaded — read symbol version for future use
-		version, err := sess.client.Load().GetSymbolVersion(sess.lifecycle.ctx)
+		version, err := sess.client.Load().GetSymbolVersion(sess.currentLifecycleCtx())
 		if err != nil {
 			sess.logger.Debug("could not read symbol version during reconnect", "error", err)
 		} else {
@@ -1950,7 +1961,7 @@ func (sess *Session) resubscribeNotifications() error {
 	}
 	sess.notifications.lock.Unlock()
 
-	subResults, err := sess.AddSymbolNotifications(sess.lifecycle.ctx, validConfigs, savedChannel)
+	subResults, err := sess.AddSymbolNotifications(sess.currentLifecycleCtx(), validConfigs, savedChannel)
 
 	// Collect Skipped+Handle entries: AddSymbolNotifications surfaces handles
 	// for items where the PLC accepted but the library refused to commit
@@ -1978,7 +1989,7 @@ func (sess *Session) resubscribeNotifications() error {
 		}
 	}
 	if len(orphanHandles) > 0 {
-		deleted := sess.bestEffortDeleteNotifications(sess.lifecycle.ctx, orphanHandles)
+		deleted := sess.bestEffortDeleteNotifications(sess.currentLifecycleCtx(), orphanHandles)
 		sess.logger.Warn("resubscribe: released PLC handles for Skipped+Handle entries",
 			"orphan_handles", len(orphanHandles),
 			"deleted", deleted)
@@ -2015,7 +2026,7 @@ func (sess *Session) resubscribeNotifications() error {
 		sess.notifications.notificationChannel = savedChannel
 		sess.notifications.lock.Unlock()
 		if len(newHandles) > 0 {
-			deleted := sess.bestEffortDeleteNotifications(sess.lifecycle.ctx, newHandles)
+			deleted := sess.bestEffortDeleteNotifications(sess.currentLifecycleCtx(), newHandles)
 			sess.logger.Warn("resubscribe rollback: deleted partial-success handles",
 				"new_handles", len(newHandles),
 				"deleted", deleted)

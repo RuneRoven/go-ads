@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"time"
 )
 
@@ -98,7 +99,9 @@ func (id RemoteIdentity) RuntimePort() uint16 {
 }
 
 // IdentifyRemote asks the device at host for its own AMS NetID and system
-// details. host is an IP or hostname; the UDP port is fixed by the protocol.
+// details. host is an IP or hostname, optionally with a port ("10.0.0.5:6499")
+// for a device reached through NAT port forwarding; bare hosts use the
+// protocol's own UDP port.
 //
 // Read-only — see the block comment above. Honors ctx's deadline if it is
 // sooner than the default 3s.
@@ -111,7 +114,25 @@ func IdentifyRemote(ctx context.Context, host string) (RemoteIdentity, error) {
 
 // IdentifyRemoteWithLogger is IdentifyRemote with an explicit logger.
 func IdentifyRemoteWithLogger(ctx context.Context, logger *slog.Logger, host string) (RemoteIdentity, error) {
-	return identifyRemoteFrom(ctx, logger, nil, host, routePort)
+	h, port := splitHostRouterPort(host)
+	return identifyRemoteFrom(ctx, logger, nil, h, port)
+}
+
+// splitHostRouterPort accepts either a bare host or host:port and returns the
+// host with the router UDP port to use. A PLC behind NAT answers on a forwarded
+// port that cannot be derived from anything else, and these standalone helpers
+// take no port argument — so they read it off the host string rather than
+// forcing callers into the Session API for a one-shot probe.
+func splitHostRouterPort(host string) (string, int) {
+	h, portStr, err := net.SplitHostPort(host)
+	if err != nil {
+		return host, routePort
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return host, routePort
+	}
+	return h, port
 }
 
 // identifyRemoteFrom is IdentifyRemoteWithLogger with an explicit local source

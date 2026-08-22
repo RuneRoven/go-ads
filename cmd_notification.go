@@ -434,18 +434,31 @@ const (
 // bounded.
 func (sess *Session) subscribeRaceActive() bool {
 	mgr := sess.notifications
-	sinceStart := time.Now().UnixNano() - mgr.lastSubscribeNs.Load()
+	now := time.Now().UnixNano()
 	if mgr.subscribeInFlight.Load() > 0 {
-		return sinceStart < subscribeRaceMaxOpen.Nanoseconds()
+		// Measured from the oldest open subscribe, not from the last event of any
+		// kind: the cap is there to bound one wedged call, and a clock that every
+		// healthy subscribe pushed forward bounded nothing.
+		opened := mgr.subscribeOpenedNs.Load()
+		if opened == 0 {
+			// Counter raised without going through beginSubscribe (tests, or a
+			// future caller): fall back to trusting it rather than reaping.
+			return true
+		}
+		return now-opened < subscribeRaceMaxOpen.Nanoseconds()
 	}
-	return sinceStart < subscribeRaceWindow.Nanoseconds()
+	return now-mgr.lastSubscribeNs.Load() < subscribeRaceWindow.Nanoseconds()
 }
 
 // beginSubscribe marks a subscribe operation as in flight. Every call must be
 // paired with endSubscribe, which is why callers defer it immediately.
 func (sess *Session) beginSubscribe() {
-	sess.notifications.subscribeInFlight.Add(1)
-	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	if sess.notifications.subscribeInFlight.Add(1) == 1 {
+		// First one in: this is the clock subscribeRaceMaxOpen runs against.
+		sess.notifications.subscribeOpenedNs.Store(now)
+	}
+	sess.notifications.lastSubscribeNs.Store(now)
 }
 
 // endSubscribe closes a subscribe operation: it replays samples buffered for
@@ -472,6 +485,9 @@ func (sess *Session) endSubscribe(ctx context.Context, committed []uint32) {
 	mgr.earlyMu.Lock()
 	dropped := 0
 	if mgr.subscribeInFlight.Add(-1) == 0 {
+		// Nothing open: clear the wedge clock so the next 0 -> 1 transition starts
+		// a fresh one instead of inheriting an hours-old timestamp.
+		mgr.subscribeOpenedNs.Store(0)
 		dropped = len(mgr.earlySamples)
 		if dropped > 0 {
 			mgr.earlySamples = nil
@@ -594,11 +610,14 @@ func (sess *Session) replayEarlySamples(ctx context.Context, handles []uint32) {
 //   - Bound concurrency so a burst of N orphans on session resume doesn't
 //     spawn N goroutines simultaneously.
 //   - Re-check that the handle is STILL absent from activeNotifications
-//     immediately before sending the RPC: between scheduling and firing,
-//     a concurrent AddSymbolNotification could legitimately have received
-//     the same handle ID back from the PLC (PLC reuses IDs from a freed
-//     table slot). Deleting our own just-acquired subscription would
-//     produce a permanent orphan-loop. The re-check eliminates that race.
+//     immediately before sending the RPC: between scheduling and firing, a
+//     concurrent AddSymbolNotification can have committed this very handle.
+//     Not because IDs get recycled — measured on TC2 and TC3, allocation is
+//     monotonic (+1 per Add, no reuse after a Delete, no restart from a low
+//     number for a fresh source NetID) — but because the sample that looked
+//     orphaned may simply have arrived before its own commit landed. Deleting
+//     our own just-acquired subscription would produce a permanent
+//     orphan-loop. The re-check eliminates that race.
 //   - Track the goroutine via lifecycle.waitGroup so Close waits for any
 //     in-flight Delete to complete instead of leaving zombie goroutines.
 //   - panic recover defensively — an unexpected panic here must not kill
@@ -668,8 +687,9 @@ func isBestEffortDeleteSuccessErr(err error) bool {
 // only race against.
 func (sess *Session) orphanDeleteAbortReason(handle uint32) (string, bool) {
 	mgr := sess.notifications
-	// A concurrent subscribe may legitimately have been handed this same handle
-	// by the PLC (it reuses freed slot IDs).
+	// A concurrent subscribe may have committed this very handle since the delete
+	// was scheduled: handle IDs are not recycled (allocation is monotonic on both
+	// TC2 and TC3), but a sample can arrive before its own commit lands.
 	mgr.lock.Lock()
 	_, present := mgr.activeNotifications[handle]
 	mgr.lock.Unlock()
