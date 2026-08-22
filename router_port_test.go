@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -59,30 +60,56 @@ func TestNewSession_RouterPortIndependentOfTCPPort(t *testing.T) {
 
 // TestSplitHostRouterPort: the standalone IdentifyRemote / AddRemoteRoute
 // helpers take no port argument, so a NAT-forwarded router is only reachable
-// through them if they read the port off the host string. Anything that is not a
-// usable port must fall back to the protocol default rather than being silently
-// treated as part of the hostname.
+// through them if they read the port off the host string.
+//
+// A port that is present but unusable has to be an error. Folding it back into
+// the hostname — the first shape of this helper — meant "10.0.0.5:99999" was
+// handed to LookupIPAddr as a hostname and surfaced as "no such host", naming an
+// address the user never typed and never mentioning the port. Worse for a NAT
+// feature: a mistyped forwarded port silently fell back to 48899, which on the
+// NAT host may well answer for a different device.
 func TestSplitHostRouterPort(t *testing.T) {
 	tests := []struct {
+		name     string
 		in       string
 		wantHost string
 		wantPort int
+		wantErr  bool
 	}{
-		{in: "192.168.3.70", wantHost: "192.168.3.70", wantPort: routePort},
-		{in: "plc.local", wantHost: "plc.local", wantPort: routePort},
-		{in: "192.168.3.70:6499", wantHost: "192.168.3.70", wantPort: 6499},
-		{in: "plc.local:6499", wantHost: "plc.local", wantPort: 6499},
-		{in: "[fd00::1]:6499", wantHost: "fd00::1", wantPort: 6499},
-		{in: "192.168.3.70:0", wantHost: "192.168.3.70:0", wantPort: routePort},
-		{in: "192.168.3.70:99999", wantHost: "192.168.3.70:99999", wantPort: routePort},
-		{in: "192.168.3.70:notaport", wantHost: "192.168.3.70:notaport", wantPort: routePort},
+		{name: "bare ip", in: "192.168.3.70", wantHost: "192.168.3.70", wantPort: routePort},
+		{name: "bare hostname", in: "plc.local", wantHost: "plc.local", wantPort: routePort},
+		{name: "ip with port", in: "192.168.3.70:6499", wantHost: "192.168.3.70", wantPort: 6499},
+		{name: "hostname with port", in: "plc.local:6499", wantHost: "plc.local", wantPort: 6499},
+		// Parsed, not supported: both callers dial udp4 and reject a non-IPv4
+		// address later with a message that says so. This pins the parse only.
+		{name: "bracketed ipv6 with port parses", in: "[fd00::1]:6499", wantHost: "fd00::1", wantPort: 6499},
+		{name: "bare ipv6 is not a host:port", in: "fd00::1", wantHost: "fd00::1", wantPort: routePort},
+		{name: "port zero", in: "192.168.3.70:0", wantErr: true},
+		{name: "port out of range", in: "192.168.3.70:99999", wantErr: true},
+		{name: "port not a number", in: "192.168.3.70:notaport", wantErr: true},
+		{name: "empty port", in: "192.168.3.70:", wantErr: true},
 	}
 	for _, tt := range tests {
-		host, port := splitHostRouterPort(tt.in)
-		if host != tt.wantHost || port != tt.wantPort {
-			t.Errorf("splitHostRouterPort(%q) = (%q, %d), want (%q, %d)",
-				tt.in, host, port, tt.wantHost, tt.wantPort)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			host, port, err := splitHostRouterPort(tt.in)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("splitHostRouterPort(%q) = (%q, %d, nil), want an error naming the bad port",
+						tt.in, host, port)
+				}
+				if !strings.Contains(err.Error(), tt.in) {
+					t.Errorf("error %q does not name the input %q", err, tt.in)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("splitHostRouterPort(%q): %v", tt.in, err)
+			}
+			if host != tt.wantHost || port != tt.wantPort {
+				t.Errorf("splitHostRouterPort(%q) = (%q, %d), want (%q, %d)",
+					tt.in, host, port, tt.wantHost, tt.wantPort)
+			}
+		})
 	}
 }
 

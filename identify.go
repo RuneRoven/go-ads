@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"strconv"
 	"time"
 )
 
@@ -114,34 +113,21 @@ func IdentifyRemote(ctx context.Context, host string) (RemoteIdentity, error) {
 
 // IdentifyRemoteWithLogger is IdentifyRemote with an explicit logger.
 func IdentifyRemoteWithLogger(ctx context.Context, logger *slog.Logger, host string) (RemoteIdentity, error) {
-	h, port := splitHostRouterPort(host)
-	return identifyRemoteFrom(ctx, logger, nil, h, port)
-}
-
-// splitHostRouterPort accepts either a bare host or host:port and returns the
-// host with the router UDP port to use. A PLC behind NAT answers on a forwarded
-// port that cannot be derived from anything else, and these standalone helpers
-// take no port argument — so they read it off the host string rather than
-// forcing callers into the Session API for a one-shot probe.
-func splitHostRouterPort(host string) (string, int) {
-	h, portStr, err := net.SplitHostPort(host)
+	h, port, err := splitHostRouterPort(host)
 	if err != nil {
-		return host, routePort
+		return RemoteIdentity{}, fmt.Errorf("identify: %w", err)
 	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port <= 0 || port > 65535 {
-		return host, routePort
-	}
-	return h, port
+	return identifyRemoteFrom(ctx, logger, nil, h, port)
 }
 
 // identifyRemoteFrom is IdentifyRemoteWithLogger with an explicit local source
 // IP, so a session that pins its outbound interface probes over the same one.
 // Otherwise discovery and verification can traverse a different NIC than the
 // ADS traffic they are meant to describe. localIP nil keeps OS-default routing.
-// port is the UDP port to probe; production always passes routePort. It exists
-// so tests can run a stub responder on an ephemeral port rather than needing the
-// protocol's fixed port to be free on the machine.
+// port is the router's UDP port to probe: routePort unless the session was given
+// AMSEndpoint.RouterPort (a NAT-forwarded PLC) or the caller embedded one in the
+// host string. Being a parameter also lets tests run a stub responder on an
+// ephemeral port instead of needing the protocol's fixed port to be free.
 func identifyRemoteFrom(ctx context.Context, logger *slog.Logger, localIP net.IP, host string, port int) (RemoteIdentity, error) {
 	if logger == nil {
 		logger = getDefaultLogger()

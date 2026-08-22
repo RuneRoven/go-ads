@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -23,6 +24,34 @@ const (
 	tagUsername      uint16 = 13
 	tagResponseError uint16 = 1
 )
+
+// splitHostRouterPort accepts either a bare host or host:port and returns the
+// host with the router UDP port to use. A PLC behind NAT answers on a forwarded
+// port that cannot be derived from anything else, and these standalone helpers
+// take no port argument — so they read it off the host string rather than
+// forcing callers into the Session API for a one-shot probe.
+//
+// A port that is present but unusable is an error, not a fallback. Folding it
+// back into the hostname made a mistyped port surface as a name-resolution
+// failure for an address nobody typed, and silently substituting 48899 for a
+// forwarded port can reach an entirely different device on a NAT host.
+func splitHostRouterPort(host string) (string, int, error) {
+	h, portStr, err := net.SplitHostPort(host)
+	if err != nil {
+		// No port in there at all (a bare host, or a bare IPv6 literal): use the
+		// protocol's own port. A genuinely malformed host is diagnosed by the
+		// resolver, which can say more about it than this can.
+		return host, routePort, nil
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("host %q: router port %q is not a number", host, portStr)
+	}
+	if port <= 0 || port > 65535 {
+		return "", 0, fmt.Errorf("host %q: router port %d is out of range", host, port)
+	}
+	return h, port, nil
+}
 
 // AddRemoteRoute registers a route on the remote PLC via the Beckhoff UDP protocol (port 48899).
 // This tells the PLC how to reach this client's AmsNetId.
@@ -45,7 +74,10 @@ func AddRemoteRoute(remoteHost string, localNetID [6]byte, routeName string, com
 
 // AddRemoteRouteWithLogger is like AddRemoteRoute but accepts an explicit logger.
 func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
-	host, port := splitHostRouterPort(remoteHost)
+	host, port, err := splitHostRouterPort(remoteHost)
+	if err != nil {
+		return fmt.Errorf("add route: %w", err)
+	}
 	return addRemoteRouteFrom(logger, nil, host, port, localNetID, routeName, computerName, username, password)
 }
 

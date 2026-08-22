@@ -301,18 +301,22 @@ func (c *Client) beginHandshake() {
 // count that never returns to zero would silence real faults for the life of
 // the client, so callers defer this immediately.
 func (c *Client) endHandshake() {
-	// Clamp with a CAS, not a Store: an unbalanced release racing a legitimate
-	// beginHandshake would otherwise store away that new region and log its
-	// expected faults at ERROR. Only ever moves the count from the exact negative
-	// value we observed back to zero.
 	if c.handshaking.Add(-1) >= 0 {
 		return
 	}
-	// Unbalanced: negative reads as "not handshaking" only by accident.
+	// Unbalanced release: a negative count reads as "not handshaking" only by
+	// accident, and would then need two begins to demote again. Clamp with a CAS
+	// rather than a Store so a region opened AFTER this decision is not erased —
+	// note the narrower claim: a begin that raced the decrement itself is already
+	// folded into it by the Add, and this cannot recover that. The branch is only
+	// reachable via a begin/end imbalance, which is a programming error, so say so
+	// once instead of silently repairing it forever.
+	c.logger.Warn("endHandshake without a matching beginHandshake; clamping",
+		"count", c.handshaking.Load())
 	for {
 		n := c.handshaking.Load()
 		if n >= 0 {
-			return // a concurrent begin already lifted it; leave that region alone
+			return
 		}
 		if c.handshaking.CompareAndSwap(n, 0) {
 			return

@@ -564,36 +564,9 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		"target", sess.target.String())
 
 	sess.logger.Log(context.Background(), LevelTrace, "connected")
-	// Capture ctx + cancel under one RLock so a concurrent tearDownAndReset
-	// replacement cannot split the pair, and so the read does not race the swap.
-	sess.lifecycle.ctxMu.RLock()
-	clientCtx := sess.lifecycle.ctx
-	clientCancel := sess.lifecycle.shutdown
-	sess.lifecycle.ctxMu.RUnlock()
-	// Allocate the underlying Client and start its workers. Session and
-	// Client share the *transport pointer (no re-dial); the Client owns
-	// the listen / transmit / recvWorker goroutines. handleNotification is
-	// installed via callback so cache-aware dispatch fires for inbound
-	// DeviceNotification packets, and triggerReconnect is installed as the
-	// on-drop hook so transport-down signals enter Session's reconnect FSM.
-	newClient := &Client{
-		ip:             sess.ip,
-		port:           sess.port,
-		target:         sess.target,
-		source:         sess.source,
-		requestTimeout: sess.requestTimeout,
-		logger:         sess.logger,
-		tx:             sess.tx,
-		dropped:        make(chan struct{}),
-		ctx:            clientCtx,
-		cancel:         clientCancel,
-	}
-	newClient.SetNotificationHandler(sess.handleNotification)
-	newClient.SetOnDrop(sess.triggerReconnect)
-	newClient.startWorkers()
-	// Publish only after handlers + workers are wired so concurrent readers
-	// never observe a half-initialized Client.
-	sess.client.Store(newClient)
+	// Session and Client share the *transport pointer (no re-dial); the Client
+	// owns the listen / transmit / recvWorker goroutines.
+	newClient := sess.publishWiredClient()
 	if local {
 		resp, err := newClient.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 		if err != nil {
@@ -1192,9 +1165,6 @@ func (sess *Session) reloadSymbolsAndResubscribe() error {
 	}
 	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
 	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
-	// Tell any batch running concurrently that the entries it committed have
-	// been swept: their handles are about to be deleted below.
-	sess.notifications.sweepGen.Add(1)
 	sess.notifications.lock.Unlock()
 
 	if len(oldHandles) > 0 {
@@ -1401,7 +1371,10 @@ func (sess *Session) triggerReconnect() {
 	}
 
 	if sess.lifecycle.autoReconnect {
-		go func() { _ = sess.Reconnect(sess.currentLifecycleCtx()) }()
+		// Reconnect ignores the context by design (see its doc) — passing
+		// Background states that rather than implying a cancellation that will not
+		// be honoured.
+		go func() { _ = sess.Reconnect(context.Background()) }()
 	} else {
 		// No auto-reconnect: close reconnectDone immediately so sendRequest
 		// waiters unblock with ErrDisconnected instead of hanging forever.
@@ -1418,7 +1391,14 @@ func (sess *Session) triggerReconnect() {
 // and re-subscribe to previously registered notifications.
 // Uses configurable backoff (see WithBackoff) with fast initial retries and
 // progressive slowdown. Backoff resets on each successful reconnect.
-func (sess *Session) Reconnect(ctx context.Context) error {
+//
+// ctx is NOT honoured: the first thing this does is tearDownAndReset, which
+// cancels and replaces the session's own context, so a caller's deadline could
+// not survive the first attempt anyway. The loop is bounded by
+// WithMaxReconnectAttempts and by Close — cancel a reconnect with Close, not with
+// a context. The parameter is kept for signature stability; honouring it would
+// mean re-checking it per attempt and is tracked in improvements.md.
+func (sess *Session) Reconnect(_ context.Context) error {
 	// closeReconnectDone closes the reconnectDone channel if still open and
 	// nils it. Mutex + nil-check is safe against concurrent callers — only
 	// the first observer of a non-nil channel closes it.
@@ -1517,7 +1497,6 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		savedHandles = append(savedHandles, h)
 	}
 	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
-	sess.notifications.sweepGen.Add(1)
 	sess.notifications.lock.Unlock()
 
 	sess.tearDownAndReset(true)
@@ -1871,13 +1850,31 @@ func (sess *Session) dialAndStart() error {
 		sess.tx.connMu.Unlock()
 		return fmt.Errorf("connection closed during dial")
 	}
-	// Allocate a fresh Client. Capture ctx + cancel under a single RLock so
-	// a concurrent tearDownAndReset replacement cannot split the pair.
+	sess.publishWiredClient()
+	// Clear disconnected AFTER the workers are up, so a user RPC that observes
+	// disconnected=false is guaranteed to find transmitWorker actually running.
+	sess.tx.disconnected.Store(false)
+	return nil
+}
+
+// publishWiredClient allocates the Client for the connection currently on
+// sess.tx, wires its handlers, starts its workers and publishes it.
+//
+// Both connect paths need exactly this, and the ctx/cancel pair must be captured
+// under one RLock: tearDownAndReset replaces them together, so reading them
+// separately can hand the Client a context from one generation and the cancel of
+// the next. Having one copy of that means the invariant lives with the code
+// rather than in two comments.
+//
+// The publish is last on purpose: concurrent readers must never see a
+// half-initialised Client.
+func (sess *Session) publishWiredClient() *Client {
 	sess.lifecycle.ctxMu.RLock()
-	freshCtx := sess.lifecycle.ctx
-	freshCancel := sess.lifecycle.shutdown
+	clientCtx := sess.lifecycle.ctx
+	clientCancel := sess.lifecycle.shutdown
 	sess.lifecycle.ctxMu.RUnlock()
-	newClient := &Client{
+
+	c := &Client{
 		ip:             sess.ip,
 		port:           sess.port,
 		target:         sess.target,
@@ -1886,19 +1883,17 @@ func (sess *Session) dialAndStart() error {
 		logger:         sess.logger,
 		tx:             sess.tx,
 		dropped:        make(chan struct{}),
-		ctx:            freshCtx,
-		cancel:         freshCancel,
+		ctx:            clientCtx,
+		cancel:         clientCancel,
 	}
-	newClient.SetNotificationHandler(sess.handleNotification)
-	newClient.SetOnDrop(sess.triggerReconnect)
-	newClient.startWorkers()
-	// Publish only after handlers + workers are wired so concurrent readers
-	// never observe a half-initialized Client. Clear disconnected AFTER
-	// startWorkers so a user RPC that observes disconnected=false is
-	// guaranteed to find transmitWorker actually running.
-	sess.client.Store(newClient)
-	sess.tx.disconnected.Store(false)
-	return nil
+	// handleNotification gives the Client cache-aware dispatch for inbound
+	// DeviceNotification packets; triggerReconnect routes transport-down into the
+	// Session's reconnect FSM.
+	c.SetNotificationHandler(sess.handleNotification)
+	c.SetOnDrop(sess.triggerReconnect)
+	c.startWorkers()
+	sess.client.Store(c)
+	return c
 }
 
 // localHandshake performs the local-mode AMSAddress probe used after dial when
