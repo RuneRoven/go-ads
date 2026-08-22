@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,6 +50,14 @@ func intSample(v uint16) []byte {
 	b := make([]byte, 2)
 	binary.LittleEndian.PutUint16(b, v)
 	return b
+}
+
+// ageOpenSubscribe backdates an open subscribe's start time, standing in for an
+// RPC that has been in flight for a long time without waiting for one.
+func ageOpenSubscribe(sess *Session, tok subscribeToken, start time.Time) {
+	sess.notifications.openMu.Lock()
+	defer sess.notifications.openMu.Unlock()
+	sess.notifications.openSubscribes[tok] = start.UnixNano()
 }
 
 // earlySampleCount reports how many handles currently hold a buffered sample.
@@ -329,7 +338,6 @@ func TestSubscribeRace_ReloadMidBatchStrandsWholeBatch(t *testing.T) {
 				reapedMu.Unlock()
 			}
 			sess.notifications.activeNotifications = make(map[uint32]activeNotification)
-			sess.notifications.sweepGen.Add(1)
 			sess.notifications.lock.Unlock()
 		}
 		return addNotifResponse{Handle: nextHandle.Add(1)}
@@ -441,10 +449,162 @@ func TestSubscribeRace_PlainSymbolReloadDoesNotStrandBatch(t *testing.T) {
 		t.Errorf("handle %d is no longer bound; the batch unwound a live subscription", results[0].Handle)
 	}
 	deletedMu.Lock()
-	releasedFirst := containsHandle(deleted, results[0].Handle)
+	releasedFirst := slices.Contains(deleted, results[0].Handle)
 	deletedMu.Unlock()
 	if releasedFirst {
 		t.Errorf("handle %d was released PLC-side; the caller still holds it", results[0].Handle)
+	}
+}
+
+// TestSubscribeRace_PostSweepCommitIsNotStranded: "a sweep happened" is not the
+// same question as "was MY entry swept". A batch item that commits AFTER the
+// sweep goes into the fresh activeNotifications map — nothing swept it, and its
+// handle is in no snapshot anyone will delete. Reporting it stranded is a double
+// failure: the caller is told a working subscription is gone, and the library
+// then deletes the handle out from under itself.
+//
+// The reconnect path is where this bites. Auto-reload bumps the epoch before it
+// sweeps, so commitNotification refuses late commits; Reconnect does not, so the
+// late commit succeeds and only the sweep-vs-batch comparison can catch it.
+func TestSubscribeRace_PostSweepCommitIsNotStranded(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, c := newWiredTestSession(t, srv)
+	c.SetNotificationHandler(sess.handleNotification)
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumAddNotif into the unsupported state")
+	}
+	if !c.capabilities.SumDeleteNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumDeleteNotif into the unsupported state")
+	}
+
+	const symbolCount = 2
+	names := make([]string, symbolCount)
+	configs := make([]NotificationConfig, symbolCount)
+	for i := range names {
+		names[i] = "MAIN.post" + string(rune('A'+i))
+		preSeedTypedSymbol(sess, names[i], uint32(0xD200+i))
+		configs[i] = NotificationConfig{SymbolName: names[i], TransmissionMode: TransModeServerOnChange}
+	}
+
+	var deletedMu sync.Mutex
+	var deleted []uint32
+	srv.onDeleteDeviceNotification(func(h uint32) ReturnCode {
+		deletedMu.Lock()
+		deleted = append(deleted, h)
+		deletedMu.Unlock()
+		return ReturnCodeNoErrors
+	})
+
+	var adds atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0x900)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		// Between item 0's commit and item 1's, wipe the map the way Reconnect
+		// does — and, like Reconnect, WITHOUT bumping the epoch, so item 1's
+		// commit legitimately lands in the new map.
+		if adds.Add(1) == 2 {
+			sess.notifications.lock.Lock()
+			sess.notifications.activeNotifications = make(map[uint32]activeNotification)
+			sess.notifications.lock.Unlock()
+		}
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+
+	ch := make(chan *Update, symbolCount)
+	results, err := sess.AddSymbolNotifications(context.Background(), configs, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotifications: %v", err)
+	}
+
+	// Item 0 was in the snapshot the sweep took: correctly stranded.
+	if results[0].Skipped == nil {
+		t.Errorf("results[0] (%s) reported success, but the sweep removed it", names[0])
+	}
+
+	// Item 1 committed after the sweep. It is bound, live, and owned by us.
+	if results[1].Skipped != nil {
+		t.Errorf("results[1] (%s) Skipped = %v; it committed after the sweep, so nothing stranded it",
+			names[1], results[1].Skipped)
+	}
+	if results[1].Handle == 0 {
+		t.Fatalf("results[1] (%s) has no handle despite committing", names[1])
+	}
+	sess.notifications.lock.Lock()
+	_, stillBound := sess.notifications.activeNotifications[results[1].Handle]
+	sess.notifications.lock.Unlock()
+	if !stillBound {
+		t.Errorf("handle %d is no longer bound; the batch tore down a live subscription", results[1].Handle)
+	}
+	deletedMu.Lock()
+	releasedLive := slices.Contains(deleted, results[1].Handle)
+	deletedMu.Unlock()
+	if releasedLive {
+		t.Errorf("handle %d was deleted PLC-side while the caller still owns it", results[1].Handle)
+	}
+}
+
+// TestSubscribeRace_StrandedSymbolCanBeResubscribed: ErrNotificationStrandedByReload
+// is documented as retryable, so a retry has to actually work. commitNotification
+// registers the symbol in configsByKey before the sweep takes it away, and the
+// cleanup delete cannot undo that — Session.SumDeleteDeviceNotification only
+// drops a config for a handle still present in activeNotifications, and the sweep
+// emptied that map. So the entry the caller was told to retry was rejected
+// ErrNotificationDuplicate forever, rescued only if an unrelated reconnect
+// happened to reset the config table.
+func TestSubscribeRace_StrandedSymbolCanBeResubscribed(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, c := newWiredTestSession(t, srv)
+	c.SetNotificationHandler(sess.handleNotification)
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumAddNotif into the unsupported state")
+	}
+	if !c.capabilities.SumDeleteNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumDeleteNotif into the unsupported state")
+	}
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	const symbolCount = 2
+	names := make([]string, symbolCount)
+	configs := make([]NotificationConfig, symbolCount)
+	for i := range names {
+		names[i] = "MAIN.retry" + string(rune('A'+i))
+		preSeedTypedSymbol(sess, names[i], uint32(0xD400+i))
+		configs[i] = NotificationConfig{SymbolName: names[i], TransmissionMode: TransModeServerOnChange}
+	}
+
+	var adds atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xA00)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		// Sweep after item 0 is bound, so item 0 comes back stranded.
+		if adds.Add(1) == 2 {
+			sess.notifications.lock.Lock()
+			sess.notifications.activeNotifications = make(map[uint32]activeNotification)
+			sess.notifications.lock.Unlock()
+		}
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+
+	ch := make(chan *Update, symbolCount)
+	results, err := sess.AddSymbolNotifications(context.Background(), configs, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotifications: %v", err)
+	}
+	if !errors.Is(results[0].Skipped, ErrNotificationStrandedByReload) {
+		t.Fatalf("results[0] Skipped = %v, want ErrNotificationStrandedByReload — the test did not reproduce the stranding it needs", results[0].Skipped)
+	}
+
+	// The documented response to a stranded entry: subscribe it again.
+	if _, err := sess.AddSymbolNotification(context.Background(), names[0], 0, 0, TransModeServerOnChange, ch); err != nil {
+		if errors.Is(err, ErrNotificationDuplicate) || strings.Contains(err.Error(), "already") {
+			t.Errorf("retry of a stranded symbol rejected as a duplicate: %v", err)
+		} else {
+			t.Errorf("retry of a stranded symbol failed: %v", err)
+		}
 	}
 }
 
@@ -503,7 +663,6 @@ func TestSubscribeRace_AbortedBatchStillAmendsAndReleases(t *testing.T) {
 			sess.bumpEpoch()
 			sess.notifications.lock.Lock()
 			sess.notifications.activeNotifications = make(map[uint32]activeNotification)
-			sess.notifications.sweepGen.Add(1)
 			sess.notifications.lock.Unlock()
 			time.Sleep(600 * time.Millisecond)
 		}
@@ -549,7 +708,7 @@ func TestSubscribeRace_AbortedBatchStillAmendsAndReleases(t *testing.T) {
 	if len(got) == 0 {
 		t.Error("no handle was released after the abort — the PLC keeps streaming a subscription nothing owns")
 	}
-	if results[0].Handle != 0 && !containsHandle(got, results[0].Handle) {
+	if results[0].Handle != 0 && !slices.Contains(got, results[0].Handle) {
 		t.Errorf("stranded handle %d was not released; deletes seen: %v", results[0].Handle, got)
 	}
 
@@ -559,15 +718,6 @@ func TestSubscribeRace_AbortedBatchStillAmendsAndReleases(t *testing.T) {
 	if bound != 0 {
 		t.Errorf("activeNotifications = %d, want 0 after an aborted batch whose commits were stranded", bound)
 	}
-}
-
-func containsHandle(hs []uint32, want uint32) bool {
-	for _, h := range hs {
-		if h == want {
-			return true
-		}
-	}
-	return false
 }
 
 // TestSubscribeRace_ConnectionDropsMidBatch is the realistic trigger: not an
@@ -751,7 +901,7 @@ func TestOrphanDeleteAbortReason(t *testing.T) {
 		{
 			name: "a subscribe is in flight",
 			setup: func(sess *Session) {
-				sess.notifications.subscribeInFlight.Store(1)
+				sess.beginSubscribe()
 			},
 			wantAbort:  true,
 			wantReason: "in flight",
@@ -789,7 +939,7 @@ func TestOrphanDelete_BuffersRatherThanReapsWhileSubscribing(t *testing.T) {
 	c.SetNotificationHandler(sess.handleNotification)
 	// Stale timestamp: the old 100ms-window guard alone would let the reaper through.
 	sess.notifications.lastSubscribeNs.Store(time.Now().Add(-time.Second).UnixNano())
-	sess.notifications.subscribeInFlight.Store(1)
+	sess.beginSubscribe()
 
 	if err := sess.drivePacket(sess.lifecycle.ctx, buildNotificationPacket(0x7777, 0, intSample(1))); err != nil {
 		t.Fatalf("drivePacket: %v", err)
@@ -848,7 +998,7 @@ func TestReplayEarlySamples_LeavesUnboundHandleParked(t *testing.T) {
 	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(context.Background())
 	defer sess.lifecycle.shutdown()
 	// Keep the reaper out: it needs a client, which this session has none of.
-	sess.notifications.subscribeInFlight.Store(1)
+	sess.beginSubscribe()
 
 	sess.bufferEarlySample(context.Background(), 0x42, 0, intSample(9))
 	if got := earlySampleCount(sess); got != 1 {
@@ -873,7 +1023,7 @@ func TestBufferEarlySample_SelfHealsWhenCommitLandedFirst(t *testing.T) {
 	sess := newNotifTestSession()
 	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(context.Background())
 	defer sess.lifecycle.shutdown()
-	sess.notifications.subscribeInFlight.Store(1)
+	sess.beginSubscribe()
 
 	const handle = 0x99
 	sym := preSeedTypedSymbol(sess, "MAIN.sStaticName", 0xC0DE)
@@ -908,18 +1058,18 @@ func TestEndSubscribe_DiscardIsAtomicWithDecrement(t *testing.T) {
 	sess := newNotifTestSession()
 	ctx := context.Background()
 
-	sess.beginSubscribe()
-	sess.beginSubscribe()
+	first := sess.beginSubscribe()
+	second := sess.beginSubscribe()
 	sess.bufferEarlySample(ctx, 0x1, 0, intSample(1))
 
 	// First subscribe finishes: still one in flight, so nothing may be dropped.
-	sess.endSubscribe(ctx, nil)
+	sess.endSubscribe(ctx, first, nil)
 	if got := earlySampleCount(sess); got != 1 {
 		t.Fatalf("buffered samples = %d, want 1 while a subscribe is still in flight", got)
 	}
 
 	// Last one finishes with nothing committed: now the parked sample goes.
-	sess.endSubscribe(ctx, nil)
+	sess.endSubscribe(ctx, second, nil)
 	if got := earlySampleCount(sess); got != 0 {
 		t.Errorf("buffered samples = %d, want 0 after the last subscribe finished", got)
 	}
@@ -929,45 +1079,55 @@ func TestEndSubscribe_DiscardIsAtomicWithDecrement(t *testing.T) {
 }
 
 // TestEndSubscribe_DiscardIsAtomicWithDecrement_Concurrent is the atomicity half
-// the test above cannot reach: single-threaded, it only shows the nesting count
-// is honoured. Here an outgoing endSubscribe runs on one goroutine while a
-// newcomer opens its own window and parks a sample on another. If the decrement
-// and the discard are not one critical section, the outgoing call observes zero
-// in flight after the newcomer has already buffered, and wipes its sample —
-// exactly the lost first update this whole mechanism exists to prevent.
+// the test above cannot reach: single-threaded, it only shows the count is
+// honoured. An outgoing endSubscribe runs on one goroutine while a newcomer opens
+// its own window and parks a sample on another; closing the subscribe and
+// deciding what may be discarded have to be one critical section, or the outgoing
+// call sees nothing in flight after the newcomer has already buffered and wipes
+// its sample.
+//
+// The ordering is forced rather than raced. An earlier version released both
+// goroutines together and asserted the same thing — but the outgoing side only
+// had to reach a mutex while the newcomer had to open a window AND allocate,
+// copy and insert a sample, so the outgoing side won essentially always, and when
+// it wins the buffer is still empty and every assertion holds for free. It passed
+// with the critical section split three different ways (measured, 15k rounds).
+// Sequencing it means one round is enough to kill a split.
 func TestEndSubscribe_DiscardIsAtomicWithDecrement_Concurrent(t *testing.T) {
 	ctx := context.Background()
-	const rounds = 300
 
-	for i := 0; i < rounds; i++ {
-		sess := newNotifTestSession()
-		sess.beginSubscribe() // the outgoing subscribe
+	sess := newNotifTestSession()
+	outgoing := sess.beginSubscribe()
 
-		var wg sync.WaitGroup
-		wg.Add(2)
-		start := make(chan struct{})
-		go func() {
-			defer wg.Done()
-			<-start
-			sess.endSubscribe(ctx, nil)
-		}()
-		go func() {
-			defer wg.Done()
-			<-start
-			sess.beginSubscribe()
-			sess.bufferEarlySample(ctx, 0x2, 0, intSample(7))
-		}()
-		close(start)
-		wg.Wait()
+	buffered := make(chan struct{})
+	var newcomer subscribeToken
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		// Only start closing once the newcomer's sample is parked — the state in
+		// which discarding it would be a bug.
+		<-buffered
+		sess.endSubscribe(ctx, outgoing, nil)
+	}()
+	go func() {
+		defer wg.Done()
+		newcomer = sess.beginSubscribe()
+		sess.bufferEarlySample(ctx, 0x2, 0, intSample(7))
+		close(buffered)
+	}()
+	wg.Wait()
 
-		// The newcomer's window is still open, so its sample must still be there.
-		if got := earlySampleCount(sess); got != 1 {
-			t.Fatalf("round %d: buffered samples = %d, want 1 — the outgoing endSubscribe discarded a sample belonging to a window that was still open", i, got)
-		}
-		sess.endSubscribe(ctx, nil)
-		if n := sess.notifications.subscribeInFlight.Load(); n != 0 {
-			t.Fatalf("round %d: subscribeInFlight = %d, want 0", i, n)
-		}
+	// The newcomer's window is still open, so its sample must still be there.
+	if got := earlySampleCount(sess); got != 1 {
+		t.Fatalf("buffered samples = %d, want 1 — the outgoing endSubscribe discarded a sample belonging to a window that was still open", got)
+	}
+	sess.endSubscribe(ctx, newcomer, nil)
+	if got := earlySampleCount(sess); got != 0 {
+		t.Errorf("buffered samples = %d, want 0 once nothing is in flight", got)
+	}
+	if n := sess.notifications.subscribeInFlight.Load(); n != 0 {
+		t.Errorf("subscribeInFlight = %d, want 0", n)
 	}
 }
 
@@ -975,7 +1135,7 @@ func TestEndSubscribe_DiscardIsAtomicWithDecrement_Concurrent(t *testing.T) {
 // unknown handles during a subscribe cannot grow it without limit.
 func TestBufferEarlySample_BoundEnforced(t *testing.T) {
 	sess := newNotifTestSession()
-	sess.notifications.subscribeInFlight.Store(1)
+	sess.beginSubscribe()
 
 	for i := 0; i < earlySampleMaxHandles+16; i++ {
 		sess.bufferEarlySample(context.Background(), uint32(i), 0, intSample(uint16(i)))
@@ -1014,66 +1174,84 @@ func TestBufferEarlySample_CopiesContent(t *testing.T) {
 	}
 }
 
-// TestSubscribeRaceActive covers the two independent triggers and the
-// negative case.
+// TestSubscribeRaceActive covers the two independent triggers and the negative
+// case. Cases go through beginSubscribe rather than poking the counter, so a case
+// that claims a subscribe is open has one that really is: an out-of-band counter
+// raise used to reach a fail-open branch that returned true unconditionally, and
+// the table pinned that as if it were the spec.
 func TestSubscribeRaceActive(t *testing.T) {
 	tests := []struct {
 		name      string
-		inFlight  int64
-		lastSubAt time.Duration // relative to now
+		openAt    *time.Duration // when an open subscribe began, nil = none open
+		lastSubAt time.Duration  // relative to now, used only when nothing is open
 		want      bool
 	}{
-		{name: "in flight, stale timestamp", inFlight: 1, lastSubAt: -1 * time.Second, want: true},
-		{name: "in flight, no opened clock", inFlight: 1, lastSubAt: -time.Hour, want: true},
-		{name: "idle, recent subscribe", inFlight: 0, lastSubAt: 0, want: true},
-		{name: "idle, stale subscribe", inFlight: 0, lastSubAt: -1 * time.Second, want: false},
+		{name: "in flight, recently opened", openAt: durPtr(-time.Second), want: true},
+		{name: "in flight, opened just inside the cap", openAt: durPtr(-subscribeRaceMaxOpen + 5*time.Second), want: true},
+		{name: "in flight, wedged past the cap", openAt: durPtr(-subscribeRaceMaxOpen - time.Second), want: false},
+		{name: "idle, recent subscribe", lastSubAt: 0, want: true},
+		{name: "idle, stale subscribe", lastSubAt: -time.Second, want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			sess := newNotifTestSession()
-			sess.notifications.subscribeInFlight.Store(tt.inFlight)
+			if tt.openAt != nil {
+				tok := sess.beginSubscribe()
+				ageOpenSubscribe(sess, tok, time.Now().Add(*tt.openAt))
+			}
 			sess.notifications.lastSubscribeNs.Store(time.Now().Add(tt.lastSubAt).UnixNano())
 			if got := sess.subscribeRaceActive(); got != tt.want {
-				t.Errorf("subscribeRaceActive() = %v, want %v (inFlight=%d lastSubAt=%v)",
-					got, tt.want, tt.inFlight, tt.lastSubAt)
+				t.Errorf("subscribeRaceActive() = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-// TestSubscribeRaceActive_WedgedSubscribeExpires: the cap on how long one
-// in-flight subscribe may suppress the orphan reaper has to be measured from
-// when that subscribe opened. It used to be measured from lastSubscribeNs, which
-// both beginSubscribe and endSubscribe refresh — so on a session doing any
-// subscribe traffic at all the deadline was pushed forward forever and the
-// reaper stayed off for the life of the session, which is precisely what fills
-// the PLC handle table.
+func durPtr(d time.Duration) *time.Duration { return &d }
+
+// TestSubscribeRaceActive_WedgedSubscribeExpires pins both directions of the cap,
+// which is why per-subscribe start times are tracked instead of one timestamp.
+//
+// A wedged subscribe alone must NOT hold the window open: measured from
+// lastSubscribeNs — refreshed by both begin and end — the deadline was pushed
+// forward forever by ordinary traffic and the reaper stayed off for the life of
+// the session, which is what fills the PLC handle table.
+//
+// A young subscribe running alongside a wedged one must hold it OPEN: judged on
+// the oldest open subscribe instead, the window closed while a freshly started
+// subscribe was still registering, and its first sample took the unknown-handle
+// path — not buffered, logged as a leak, an orphan delete scheduled. For a static
+// symbol that is the only sample the tag will ever emit.
 func TestSubscribeRaceActive_WedgedSubscribeExpires(t *testing.T) {
 	sess := newNotifTestSession()
 
-	sess.beginSubscribe() // the wedged one
+	wedged := sess.beginSubscribe()
 	if !sess.subscribeRaceActive() {
 		t.Fatal("subscribeRaceActive() = false with a subscribe just opened")
 	}
 
 	// Age it past the cap.
-	wedgedAt := time.Now().Add(-subscribeRaceMaxOpen - time.Second)
-	sess.notifications.subscribeOpenedNs.Store(wedgedAt.UnixNano())
+	ageOpenSubscribe(sess, wedged, time.Now().Add(-subscribeRaceMaxOpen-time.Second))
 	if sess.subscribeRaceActive() {
 		t.Error("subscribeRaceActive() = true for a subscribe wedged past subscribeRaceMaxOpen — the reaper is disabled indefinitely")
 	}
 
-	// Healthy traffic alongside it must not resurrect the suppression.
-	sess.beginSubscribe()
-	sess.endSubscribe(context.Background(), nil)
+	// A short subscribe running alongside it keeps the window open on its own
+	// merit, then closes — and must not have extended the wedged one's life.
+	healthy := sess.beginSubscribe()
+	if !sess.subscribeRaceActive() {
+		t.Error("window closed while a freshly opened subscribe was in flight")
+	}
+	sess.endSubscribe(context.Background(), healthy, nil)
 	if sess.subscribeRaceActive() {
 		t.Error("a later subscribe pushed the wedged one's deadline out again")
 	}
 
-	// Once the wedged call finally returns, the clock resets for the next one.
-	sess.endSubscribe(context.Background(), nil)
-	if got := sess.notifications.subscribeOpenedNs.Load(); got != 0 {
-		t.Errorf("subscribeOpenedNs = %d after the last subscribe closed, want 0", got)
+	// Once the wedged call finally returns, nothing is tracked and a fresh
+	// subscribe starts from its own clock.
+	sess.endSubscribe(context.Background(), wedged, nil)
+	if _, open := sess.notifications.newestOpenSubscribe(); open {
+		t.Error("a subscribe is still tracked after every one closed")
 	}
 	sess.beginSubscribe()
 	if !sess.subscribeRaceActive() {
@@ -1088,11 +1266,11 @@ func TestEndSubscribe_NestedSubscribesKeepWindowOpen(t *testing.T) {
 	sess := newNotifTestSession()
 	ctx := context.Background()
 
-	sess.beginSubscribe()
-	sess.beginSubscribe()
+	first := sess.beginSubscribe()
+	second := sess.beginSubscribe()
 	sess.bufferEarlySample(context.Background(), 0xABC, 0, intSample(3))
 
-	sess.endSubscribe(ctx, nil)
+	sess.endSubscribe(ctx, first, nil)
 	if got := earlySampleCount(sess); got != 1 {
 		t.Errorf("buffered samples with one subscribe still in flight = %d, want 1", got)
 	}
@@ -1100,7 +1278,7 @@ func TestEndSubscribe_NestedSubscribesKeepWindowOpen(t *testing.T) {
 		t.Error("subscribeRaceActive() = false while a subscribe is still in flight")
 	}
 
-	sess.endSubscribe(ctx, nil)
+	sess.endSubscribe(ctx, second, nil)
 	if got := earlySampleCount(sess); got != 0 {
 		t.Errorf("buffered samples after last subscribe finished = %d, want 0", got)
 	}
@@ -1115,7 +1293,7 @@ func TestEndSubscribe_NestedSubscribesKeepWindowOpen(t *testing.T) {
 // release the bytes it held rather than leaking them.
 func TestBufferEarlySample_ByteBudgetEnforced(t *testing.T) {
 	sess := newNotifTestSession()
-	sess.notifications.subscribeInFlight.Store(1)
+	sess.beginSubscribe()
 
 	big := make([]byte, 1<<20) // 1 MiB per sample
 	for i := 0; i < (earlySampleMaxBytes/len(big))+4; i++ {
@@ -1151,7 +1329,7 @@ func TestBufferEarlySample_ByteBudgetEnforced(t *testing.T) {
 // time until nothing can be buffered.
 func TestReplayEarlySamples_ReleasesBytes(t *testing.T) {
 	sess := newNotifTestSession()
-	sess.notifications.subscribeInFlight.Store(1)
+	sess.beginSubscribe()
 
 	const handle = 0x555
 	sym := preSeedTypedSymbol(sess, "MAIN.x", 0xC0DE)

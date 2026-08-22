@@ -40,35 +40,37 @@ type notificationManager struct {
 	pending             []pendingNotification
 	configsByKey        map[string]struct{}
 	notificationChannel chan *Update
-	lastSubscribeNs     atomic.Int64
 
-	// subscribeOpenedNs is when the OLDEST currently in-flight subscribe began,
-	// i.e. set on the 0 -> 1 transition only. subscribeRaceMaxOpen is measured
-	// from here so it actually caps a wedged subscribe: measured from
-	// lastSubscribeNs it never fired, because both beginSubscribe and
-	// endSubscribe refresh that, so any healthy traffic alongside the wedged call
-	// kept pushing the deadline out and the orphan reaper stayed disabled.
-	subscribeOpenedNs atomic.Int64
+	// lastSubscribeNs is the last time anything in the subscribe lifecycle
+	// happened — a subscribe started, a subscribe finished, or a sweep refreshed
+	// it. Deliberately all three: it drives only the short subscribeRaceWindow
+	// tail that covers the gap after the last commit, and that tail should extend
+	// past whichever of those happened most recently. It says nothing about what
+	// is in flight; openSubscribes answers that.
+	lastSubscribeNs atomic.Int64
 
-	// subscribeInFlight counts subscribe operations (single or batch) that
-	// have issued the PLC-side Add but have not yet committed every handle
-	// into activeNotifications. lastSubscribeNs alone cannot express this:
-	// it records the last *started* subscribe, so a batch that takes longer
-	// than subscribeRaceWindow to register (TC2 falls back to one Add per
-	// symbol, so a 40-symbol batch takes hundreds of ms) leaves its own
-	// early handles looking like leaked ones. While this counter is
-	// non-zero an unknown handle is presumed ours: the sample is buffered
-	// (see earlySamples) and the orphan reaper stays out.
+	// openSubscribes maps each in-flight subscribe to the time it began, so every
+	// one is bounded by subscribeRaceMaxOpen on its own age. Guarded by openMu,
+	// which is also the critical section that closes a subscribe — one shared
+	// counter plus one shared timestamp could not express this: the pair was not
+	// atomic across goroutines (an ending subscribe could clear a clock a starting
+	// one had just written, and "in flight with no clock" suppressed the orphan
+	// reaper permanently), and a single slot recorded when the last quiet period
+	// ended rather than when anything in flight began.
+	//
+	// Lock order where both are taken: openMu then earlyMu, never the reverse.
+	openMu             sync.Mutex
+	openSubscribes     map[subscribeToken]int64
+	nextSubscribeToken uint64
+
+	// subscribeInFlight mirrors len(openSubscribes) for lock-free reads on the
+	// dispatch path and in tests. Written under openMu; authoritative answers
+	// about the window come from oldestOpenSubscribe. A subscribe is in flight
+	// once it has issued the PLC-side Add and before it has committed every
+	// handle into activeNotifications: during that gap an unknown handle is
+	// presumed ours, so the sample is buffered (see earlySamples) and the orphan
+	// reaper stays out.
 	subscribeInFlight atomic.Int64
-
-	// sweepGen counts the times activeNotifications was wiped wholesale and the
-	// handles in it released PLC-side — the auto-reload and the reconnect paths.
-	// The session epoch cannot stand in for this: it also advances on a plain
-	// user-driven LoadSymbols, which touches no notification. A batch that used
-	// the epoch to decide its committed entries were stranded therefore tore down
-	// perfectly good subscriptions whenever a caller reloaded symbols in
-	// parallel. Bumped under lock, at the same moment the map is replaced.
-	sweepGen atomic.Uint64
 
 	// earlySamples holds samples that arrived for a handle before its
 	// activeNotifications insert landed, keyed by handle. Guarded by
@@ -93,6 +95,11 @@ type notificationManager struct {
 	orphanSeen map[uint32]time.Time
 	orphanSem  chan struct{} // bounded concurrency: cap = orphanDeleteMaxConcurrency
 }
+
+// subscribeToken identifies one in-flight subscribe. Returned by beginSubscribe
+// and handed back to endSubscribe so each subscribe closes its own entry rather
+// than sharing a counter with every other one.
+type subscribeToken uint64
 
 // earlySample is one buffered notification sample awaiting its handle's
 // activeNotifications insert.
@@ -211,6 +218,30 @@ const resubscribeMaxAttempts = 3
 // connection anyway if this does not land.
 const notificationReleaseTimeout = 2 * time.Second
 
+// releaseCleanupCtx picks the context for a best-effort release of PLC handles
+// the library declined to bind. A usable caller context is used as-is; a done one
+// is replaced, because the handles exist on the PLC either way and a context that
+// is already cancelled fails the delete before it is sent.
+// The replacement deliberately does NOT inherit cancellation: the batch may have
+// aborted precisely because the session is closing, and callers on that path
+// (resubscribeNotifications) pass the lifecycle context itself — deriving from it
+// would hand back a context that is already done. WithoutCancel keeps the values
+// and drops the Done channel, and the timeout is what keeps a closing session
+// from blocking here. A nil lifecycle context (Session struct literals) falls
+// back to Background rather than panicking inside WithTimeout.
+func (sess *Session) releaseCleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	parent := context.Background()
+	if sess.lifecycle != nil {
+		if live := sess.currentLifecycleCtx(); live != nil {
+			parent = context.WithoutCancel(live)
+		}
+	}
+	return context.WithTimeout(parent, notificationReleaseTimeout)
+}
+
 // AddSymbolNotification registers a notification for a single symbol.
 // All notifications on one connection must share the same updateReceiver
 // channel; subscribing the same symbol twice is rejected.
@@ -259,9 +290,9 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	// below. endSubscribe replays anything buffered for the handle we commit
 	// and closes the window. Deferred here so it runs after the
 	// notifications.lock unlock defer registered further down (LIFO).
-	sess.beginSubscribe()
+	subTok := sess.beginSubscribe()
 	committed := make([]uint32, 0, 1)
-	defer func() { sess.endSubscribe(ctx, committed) }()
+	defer func() { sess.endSubscribe(ctx, subTok, committed) }()
 
 	handle, err := sess.client.Load().AddDeviceNotification(ctx,
 		uint32(GroupSymbolValueByHandle),
@@ -454,21 +485,18 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 	// Add per symbol, so the earliest handles stream for the whole duration
 	// of the remaining registrations. See AddSymbolNotification for the
 	// defer-ordering rationale.
-	sess.beginSubscribe()
+	subTok := sess.beginSubscribe()
 	// Batch-scoped epoch. Compared per item, this refuses any commit once the
 	// symbol cache has been reloaded since the batch began — which is what the
 	// removed bulk re-check used to enforce. A per-item snapshot cannot: it only
 	// sees a reload landing inside that one item's own commit.
-	batchEpoch := sess.epoch()
-	// Separate from the epoch on purpose: only a sweep means the handles this
-	// batch committed have been deleted PLC-side. See notificationManager.sweepGen.
-	batchSweep := sess.notifications.sweepGen.Load()
+	batchCacheEpoch := sess.epoch()
 	committed := make([]uint32, 0, len(requests))
 	committedIdx := make([]int, 0, len(requests))
 	// Handles the PLC created but the library declined to bind. Released before
 	// returning so a refusal cannot leak a subscription streaming to nobody.
 	refused := make([]uint32, 0, len(requests))
-	defer func() { sess.endSubscribe(ctx, committed) }()
+	defer func() { sess.endSubscribe(ctx, subTok, committed) }()
 
 	// Bind each handle the moment its own Add returns. On a PLC that rejects
 	// the sum command this runs between the individual Adds, so symbol #1 is
@@ -505,7 +533,7 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 				"errorCode", uint32(r.Error))
 			return
 		}
-		if skipErr := sess.commitNotification(info.config, r.Handle, ch, batchEpoch); skipErr != nil {
+		if skipErr := sess.commitNotification(info.config, r.Handle, ch, batchCacheEpoch); skipErr != nil {
 			results[info.configIndex].Skipped = skipErr
 			results[info.configIndex].Handle = r.Handle
 			// The PLC created this registration before we refused it, so it is
@@ -529,31 +557,60 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 			"symbol", info.config.SymbolName)
 	}
 
-	// settle runs the batch tail: the retroactive reload amendment, then the
-	// release of every PLC handle nothing on this side ended up owning. It has to
-	// run on the transport-abort path too — a batch that died mid-way is exactly
-	// the case where handles were created and not bound, and where a reload can
-	// have landed before the abort. Skipping it there leaked both the handles and
-	// the amendment. On a dead transport the delete short-circuits in
+	// settle is the batch tail: the sweep amendment, then the release of every PLC
+	// handle nothing on this side ended up owning. Deferred rather than called at
+	// each return, because the bug it fixes was a return path that skipped it —
+	// the transport-abort path, which is exactly where handles get created and not
+	// bound. A defer covers every present and future exit, panics included. It is
+	// registered AFTER the endSubscribe defer so LIFO runs settle first: the
+	// amendment must decide what is stranded before the replay looks at what
+	// committed. On a dead transport the delete short-circuits in
 	// sumDeleteNotificationFallback, so this costs one failed round trip, not one
 	// per handle.
 	settle := func() {
-		// A sweep (auto-reload or reconnect) snapshots activeNotifications, wipes
-		// it, and deletes those handles PLC-side. Anything this batch committed
-		// before that was in the snapshot, so it now exists on neither side, and
-		// reporting it as a success would be a silent lie. No unwinding is needed
-		// precisely because the sweep already released them. Keyed on sweepGen
-		// rather than the epoch: the epoch also moves for a plain LoadSymbols,
-		// which strands nothing.
-		if len(committedIdx) > 0 && sess.notifications.sweepGen.Load() != batchSweep {
+		// A sweep (auto-reload, reconnect, resource release) snapshots
+		// activeNotifications, wipes it, and deletes those handles PLC-side.
+		// Anything this batch committed before that was in the snapshot, so it now
+		// exists on neither side, and reporting it as a success would be a silent
+		// lie. No unwinding is needed precisely because the sweep already released
+		// them.
+		//
+		// The question is per entry — "was MINE swept" — so it is asked of the map
+		// rather than inferred from a generation counter. A counter answers "a
+		// sweep happened", which is a different question: an item that commits
+		// AFTER the sweep lands in the fresh map, is owned by nobody else, and is
+		// in no snapshot anyone will delete. Stranding it reports a working
+		// subscription as gone and then deletes the handle out from under the
+		// caller. That is not hypothetical on the reconnect path, which sweeps
+		// without bumping the epoch, so commitNotification cannot refuse the late
+		// commit. Asking the map also needs no bump site to be remembered at every
+		// present and future place that sweeps.
+		if len(committedIdx) > 0 {
+			var stranded []int
+			sess.notifications.lock.Lock()
 			for _, idx := range committedIdx {
+				if _, bound := sess.notifications.activeNotifications[results[idx].Handle]; !bound {
+					stranded = append(stranded, idx)
+					// commitNotification registered this symbol; un-committing it has
+					// to unregister it too. The cleanup delete below cannot: it only
+					// drops a config whose handle is still in activeNotifications, and
+					// the sweep emptied that map. Left in place, the retry this entry's
+					// error documents is rejected as a duplicate forever.
+					sess.removeNotificationConfig(configs[idx].SymbolName)
+				}
+			}
+			sess.notifications.lock.Unlock()
+
+			for _, idx := range stranded {
 				results[idx] = SumNotificationResult{
 					Handle:  results[idx].Handle,
 					Skipped: fmt.Errorf("symbol %q: %w", configs[idx].SymbolName, ErrNotificationStrandedByReload),
 				}
 			}
-			sess.logger.Warn("symbol cache reloaded mid-batch; committed entries reported as stranded",
-				"entries", len(committedIdx))
+			if len(stranded) > 0 {
+				sess.logger.Warn("notifications swept mid-batch; committed entries reported as stranded",
+					"entries", len(stranded), "committed", len(committedIdx))
+			}
 		}
 
 		// Release what we refused, plus anything the amendment just invalidated:
@@ -569,12 +626,8 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 			// before it was sent and leak a subscription streaming to nobody. The
 			// session lifetime bounds the replacement, so a closing session does
 			// not block here.
-			releaseCtx := ctx
-			if ctx.Err() != nil {
-				fresh, cancel := context.WithTimeout(sess.currentLifecycleCtx(), notificationReleaseTimeout)
-				defer cancel()
-				releaseCtx = fresh
-			}
+			releaseCtx, cancel := sess.releaseCleanupCtx(ctx)
+			defer cancel()
 			// Best-effort: 0x714 (already gone) counts as success, which covers the
 			// stranded-by-reload case where the reload deleted them first.
 			deleted := sess.bestEffortDeleteNotifications(releaseCtx, refused)
@@ -582,6 +635,7 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 				"handles", len(refused), "deleted", deleted)
 		}
 	}
+	defer settle()
 
 	subResults, err := sess.client.Load().sumAddDeviceNotificationFunc(ctx, requests, onItem)
 	if err != nil {
@@ -599,7 +653,6 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 			}
 			results[info.configIndex].Skipped = fmt.Errorf("%w: %w", ErrNotificationTransportFailure, err)
 		}
-		settle()
 		return results, fmt.Errorf("batch add notification failed: %w", err)
 	}
 
@@ -616,8 +669,6 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 			break
 		}
 	}
-
-	settle()
 
 	// Everything else was already bound (or recorded as failed/skipped) by
 	// onItem as its result arrived; nothing left to commit here.
@@ -636,7 +687,7 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 // Caller must hold neither cache.lock nor notifications.lock: this takes
 // cache.lock first and releases it before taking notifications.lock, per the
 // never-both-held rule.
-func (sess *Session) commitNotification(cfg NotificationConfig, handle uint32, ch chan *Update, batchEpoch uint64) error {
+func (sess *Session) commitNotification(cfg NotificationConfig, handle uint32, ch chan *Update, batchCacheEpoch uint64) error {
 	// Re-fetch the *symbol under cache.lock. The pointer resolved before the
 	// PLC round-trip may have been stranded by a concurrent loadSymbols /
 	// online-change reload that swapped cache.symbols.
@@ -651,7 +702,7 @@ func (sess *Session) commitNotification(cfg NotificationConfig, handle uint32, c
 	// moments ago: a reload that landed earlier in this batch must invalidate
 	// every remaining item, not just the one unlucky enough to straddle it.
 	// Unchanged epoch also means the `fresh` pointer read above is current.
-	if sess.epoch() != batchEpoch {
+	if sess.epoch() != batchCacheEpoch {
 		return fmt.Errorf("symbol %q: %w", cfg.SymbolName, ErrNotificationStrandedByReload)
 	}
 	if fresh == nil {

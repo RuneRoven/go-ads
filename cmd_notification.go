@@ -435,30 +435,65 @@ const (
 func (sess *Session) subscribeRaceActive() bool {
 	mgr := sess.notifications
 	now := time.Now().UnixNano()
-	if mgr.subscribeInFlight.Load() > 0 {
-		// Measured from the oldest open subscribe, not from the last event of any
-		// kind: the cap is there to bound one wedged call, and a clock that every
-		// healthy subscribe pushed forward bounded nothing.
-		opened := mgr.subscribeOpenedNs.Load()
-		if opened == 0 {
-			// Counter raised without going through beginSubscribe (tests, or a
-			// future caller): fall back to trusting it rather than reaping.
-			return true
-		}
-		return now-opened < subscribeRaceMaxOpen.Nanoseconds()
+	// Judged on the MOST RECENTLY opened subscribe still in flight. That is the
+	// one whose handles the PLC may be streaming right now, so while it is inside
+	// the cap the window stays open — even if an older sibling has wedged. And a
+	// wedged subscribe on its own cannot hold the window open forever, because
+	// nothing younger is there to vouch for it.
+	//
+	// Neither half works with a single timestamp slot: written on the 0 -> 1
+	// transition it records when the last quiet period ended rather than when
+	// anything in flight began, so sustained overlap pinned it to a call that had
+	// already returned and the window closed under a subscribe that was still
+	// registering. Measuring from the oldest open subscribe has the same failure
+	// for the same reason. Only per-subscribe starts answer both questions.
+	if newest, open := mgr.newestOpenSubscribe(); open {
+		return now-newest < subscribeRaceMaxOpen.Nanoseconds()
 	}
+	// Nothing in flight: the short tail covers the gap between the last commit
+	// and the PLC's first sample for it.
 	return now-mgr.lastSubscribeNs.Load() < subscribeRaceWindow.Nanoseconds()
 }
 
-// beginSubscribe marks a subscribe operation as in flight. Every call must be
-// paired with endSubscribe, which is why callers defer it immediately.
-func (sess *Session) beginSubscribe() {
-	now := time.Now().UnixNano()
-	if sess.notifications.subscribeInFlight.Add(1) == 1 {
-		// First one in: this is the clock subscribeRaceMaxOpen runs against.
-		sess.notifications.subscribeOpenedNs.Store(now)
+// newestOpenSubscribe returns the start time of the most recently opened
+// subscribe that has not closed yet. open is false when none are in flight.
+func (m *notificationManager) newestOpenSubscribe() (int64, bool) {
+	m.openMu.Lock()
+	defer m.openMu.Unlock()
+	newest := int64(0)
+	for _, start := range m.openSubscribes {
+		if start > newest {
+			newest = start
+		}
 	}
-	sess.notifications.lastSubscribeNs.Store(now)
+	return newest, newest != 0
+}
+
+// beginSubscribe marks a subscribe operation as in flight and returns the token
+// that closes it. Every call must be paired with endSubscribe, which is why
+// callers defer it immediately.
+//
+// The token exists so each open subscribe is tracked individually. Sharing one
+// counter and one timestamp made the pair non-atomic across goroutines — an
+// ending subscribe could clear the clock a starting one had just written, and the
+// resulting "in flight but no clock" state suppressed the orphan reaper
+// permanently.
+func (sess *Session) beginSubscribe() subscribeToken {
+	mgr := sess.notifications
+	now := time.Now().UnixNano()
+
+	mgr.openMu.Lock()
+	mgr.nextSubscribeToken++
+	tok := subscribeToken(mgr.nextSubscribeToken)
+	if mgr.openSubscribes == nil {
+		mgr.openSubscribes = make(map[subscribeToken]int64)
+	}
+	mgr.openSubscribes[tok] = now
+	mgr.subscribeInFlight.Store(int64(len(mgr.openSubscribes)))
+	mgr.openMu.Unlock()
+
+	mgr.lastSubscribeNs.Store(now)
+	return tok
 }
 
 // endSubscribe closes a subscribe operation: it replays samples buffered for
@@ -471,23 +506,23 @@ func (sess *Session) beginSubscribe() {
 // MUST be called after notifications.lock is released: the replay path takes
 // cache.lock, and holding both is forbidden. Deferring it before the
 // lock.Unlock defer gives that ordering for free (defers run LIFO).
-func (sess *Session) endSubscribe(ctx context.Context, committed []uint32) {
+func (sess *Session) endSubscribe(ctx context.Context, tok subscribeToken, committed []uint32) {
 	mgr := sess.notifications
 	mgr.lastSubscribeNs.Store(time.Now().UnixNano())
 	sess.replayEarlySamples(ctx, committed)
 
-	// The decrement and the discard decision are one critical section. Split
-	// apart, a subscribe beginning between them would see the window still open,
-	// buffer a sample, and have this call throw it away. Holding earlyMu across
-	// both is enough: a newcomer can increment the counter freely, but it cannot
-	// insert until we are done, and if it incremented before our decrement we
-	// see a non-zero count and clear nothing.
+	// Closing this subscribe and deciding whether anything may be discarded is one
+	// critical section. Split apart, a subscribe beginning between them would see
+	// the window still open, buffer a sample, and have this call throw it away.
+	// Both locks are leaves and are always taken in this order, openMu first.
+	mgr.openMu.Lock()
+	delete(mgr.openSubscribes, tok)
+	remaining := len(mgr.openSubscribes)
+	mgr.subscribeInFlight.Store(int64(remaining))
+
 	mgr.earlyMu.Lock()
 	dropped := 0
-	if mgr.subscribeInFlight.Add(-1) == 0 {
-		// Nothing open: clear the wedge clock so the next 0 -> 1 transition starts
-		// a fresh one instead of inheriting an hours-old timestamp.
-		mgr.subscribeOpenedNs.Store(0)
+	if remaining == 0 {
 		dropped = len(mgr.earlySamples)
 		if dropped > 0 {
 			mgr.earlySamples = nil
@@ -495,6 +530,7 @@ func (sess *Session) endSubscribe(ctx context.Context, committed []uint32) {
 		}
 	}
 	mgr.earlyMu.Unlock()
+	mgr.openMu.Unlock()
 
 	if dropped > 0 {
 		sess.logger.Debug("discarded buffered samples for handles that never committed", "count", dropped)
