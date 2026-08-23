@@ -1423,6 +1423,14 @@ func (sess *Session) triggerReconnect() {
 	}
 }
 
+// preReconnectReleaseAttempts caps how many reconnect attempts will re-try the
+// best-effort delete of the handles held before the drop. Retrying matters — the
+// link is usually still down on the first attempt, so the delete cannot land —
+// but reconnect attempts are unbounded by default, so an unreleasable handle must
+// not buy a round trip on every one of them forever. The orphan reaper is the
+// backstop after that.
+const preReconnectReleaseAttempts = 3
+
 // Reconnect attempts to re-establish the TCP connection, reload symbols,
 // and re-subscribe to previously registered notifications.
 // Uses configurable backoff (see WithBackoff) with fast initial retries and
@@ -1550,6 +1558,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 
 	var lastErr error
 	attempts := 0
+	releaseTries := 0
 	for {
 		if sess.isClosed() {
 			return fmt.Errorf("connection closed during reconnect")
@@ -1607,11 +1616,33 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		// needs. Waiting until after reloadSymbols meant a session whose dial and
 		// route came up but whose reload kept failing never issued these deletes at
 		// all, and every retry cycle left another set of handles in the PLC's table.
+		//
+		// Only forget the snapshot once every handle is accounted for. Earlier than
+		// this the transport may look dialled without being usable — with route
+		// registration skipped there is no probe to prove otherwise — and clearing
+		// the snapshot on a release that did not land loses the only record of
+		// registrations the PLC still holds. Measured against a flapping TC2:
+		// "requested=3 deleted=0" on every cycle, three more entries stranded each
+		// time.
 		if len(savedHandles) > 0 {
+			releaseTries++
 			deleted := sess.bestEffortDeleteNotifications(sess.currentLifecycleCtx(), savedHandles)
 			sess.logger.Info("reconnect: cleaned up pre-reconnect notification handles",
 				"requested", len(savedHandles), "deleted", deleted)
-			savedHandles = nil
+			switch {
+			case deleted >= len(savedHandles):
+				savedHandles = nil
+			case releaseTries >= preReconnectReleaseAttempts:
+				// Bounded on purpose: reconnect attempts are unbounded by default,
+				// and a PLC that keeps refusing leaves the orphan reaper as the
+				// backstop — it deletes these if they ever stream again.
+				sess.logger.Warn("reconnect: giving up on releasing pre-reconnect notification handles",
+					"unreleased", len(savedHandles)-deleted, "attempts", releaseTries)
+				savedHandles = nil
+			default:
+				sess.logger.Warn("reconnect: keeping unreleased notification handles for the next attempt",
+					"unreleased", len(savedHandles)-deleted, "attempt", releaseTries)
+			}
 		}
 
 		// Re-load symbols based on discovery mode

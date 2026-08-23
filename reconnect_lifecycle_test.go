@@ -288,6 +288,116 @@ func TestReconnect_CleanupKeepsTheUserChannel(t *testing.T) {
 	}
 }
 
+// TestReconnect_FailedHandleReleaseIsRetried: the pre-reconnect snapshot is the
+// only record of handles that still exist on the PLC, so it must not be thrown
+// away on a release that did not land.
+//
+// Found by flapping the link against a real TC2 through the proxy: with route
+// registration skipped (a pre-registered route, which is common) the release
+// attempt runs before anything has proved the transport works, reports
+// "requested=3 deleted=0", and the snapshot is cleared anyway. Every flap then
+// leaves another three registrations in the PLC's notification table — the
+// accumulation this cleanup exists to prevent, reintroduced by moving the release
+// earlier.
+func TestReconnect_FailedHandleReleaseIsRetried(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	const attempts = 3
+	sess := newDialableTestSession(t, srv.host, srv.port, attempts)
+
+	var releaseAttempts atomic.Int32
+	// Refuse every delete with a code that is NOT success-equivalent, so no
+	// attempt ever lands and the snapshot must survive for the next one.
+	srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(req []byte) []byte {
+		releaseAttempts.Add(1)
+		codes := make([]ReturnCode, len(req)/4)
+		for i := range codes {
+			codes[i] = ReturnCodeDeviceError
+		}
+		return buildSumDeleteNotifPayload(codes)
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode {
+		releaseAttempts.Add(1)
+		return ReturnCodeDeviceError
+	})
+	// Route probe fine, reload always fails: the loop runs its full budget.
+	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeNoErrors, []byte{9}
+	})
+	srv.onRead(GroupSymbolUploadInfo, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeDeviceError, nil
+	})
+
+	sess.notifications.lock.Lock()
+	sym := &symbol{FullName: "MAIN.retryrelease", Name: "MAIN.retryrelease", DataType: "INT", Length: 2, Handle: 0xE400}
+	sess.notifications.activeNotifications[0xBE01] = activeNotification{Sym: sym, Ch: make(chan *Update, 1)}
+	sess.notifications.lock.Unlock()
+
+	// Full discovery had been done, so the reload path really runs — and fails
+	// against the stub above, which is what makes the loop take every attempt.
+	sess.cache.lock.Lock()
+	sess.cache.symbolsFullyLoaded = true
+	sess.cache.lock.Unlock()
+
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+	_ = sess.Reconnect(context.Background())
+
+	if got := releaseAttempts.Load(); got < 2 {
+		t.Errorf("release attempted %d time(s) across %d reconnect attempts; a release that did not land must be retried, not discarded",
+			got, attempts)
+	}
+}
+
+// TestReconnect_HandleReleaseRetryIsBounded: retrying is right, retrying forever
+// is not. Production runs with unbounded reconnect attempts by default, so a PLC
+// that keeps rejecting the delete would be asked once per attempt for the life of
+// the session. After a few rounds the handles are better left to the orphan
+// reaper, which deletes them if they ever stream again.
+func TestReconnect_HandleReleaseRetryIsBounded(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	// More reconnect attempts than release attempts, so the cap is what limits it.
+	sess := newDialableTestSession(t, srv.host, srv.port, preReconnectReleaseAttempts+4)
+
+	var releaseAttempts atomic.Int32
+	srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(req []byte) []byte {
+		releaseAttempts.Add(1)
+		codes := make([]ReturnCode, len(req)/4)
+		for i := range codes {
+			codes[i] = ReturnCodeDeviceError
+		}
+		return buildSumDeleteNotifPayload(codes)
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode {
+		releaseAttempts.Add(1)
+		return ReturnCodeDeviceError
+	})
+	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeNoErrors, []byte{9}
+	})
+	srv.onRead(GroupSymbolUploadInfo, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeDeviceError, nil
+	})
+
+	sess.notifications.lock.Lock()
+	sym := &symbol{FullName: "MAIN.bounded", Name: "MAIN.bounded", DataType: "INT", Length: 2, Handle: 0xE500}
+	sess.notifications.activeNotifications[0xBE02] = activeNotification{Sym: sym, Ch: make(chan *Update, 1)}
+	sess.notifications.lock.Unlock()
+	sess.cache.lock.Lock()
+	sess.cache.symbolsFullyLoaded = true
+	sess.cache.lock.Unlock()
+
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+	_ = sess.Reconnect(context.Background())
+
+	if got := int(releaseAttempts.Load()); got > preReconnectReleaseAttempts {
+		t.Errorf("release attempted %d times, want at most %d — an unreleasable handle must not be retried on every reconnect attempt forever",
+			got, preReconnectReleaseAttempts)
+	}
+}
+
 // TestReconnect_PreReconnectHandlesReleasedWhenTransportIsUp: Reconnect empties
 // activeNotifications up front and keeps the handles only in a local snapshot,
 // releasing them at a point reached only after BOTH the route probe and the
