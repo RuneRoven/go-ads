@@ -297,6 +297,48 @@ func WithRouteActivationTimeout(d time.Duration) SessionOption {
 	}
 }
 
+// WithAmsPeerListen makes the session listen for a connection the PLC opens back
+// to us, and use it for responses.
+//
+// Needed for devices that treat a registered route as a peer router: they accept
+// and process our requests on the connection we opened, then send every response
+// over a connection they open to us on port 48898. Measured on TC3.1.4026
+// (TC/RTOS); TC2 2.10 and TC3.1.4024/CE answer on our own connection and never
+// dial back. Without this, such a device looks exactly like a PLC that times out
+// on everything — the responses are being delivered to a socket nobody is
+// listening on.
+//
+// port is normally amsPeerListenPort (48898), which is where a TwinCAT peer
+// expects to find a router; it is a parameter so tests, containers and hosts that
+// already run a TwinCAT router can choose another. Binding failures are reported
+// by Connect rather than being silent, because a session that needs this and does
+// not have it will not work at all.
+//
+// Off by default: it binds a listening socket, which is not something a client
+// library should do unless asked.
+func WithAmsPeerListen(port int) SessionOption {
+	return func(s *Session) {
+		s.peerListenPort = port
+	}
+}
+
+// WithoutAmsPeerFallback disables the automatic peer-listener fallback.
+//
+// By default, a Connect that proves the PLC answers nothing at all will try to
+// bind the AMS port and see whether the device is answering there instead — see
+// WithAmsPeerListen for what that means and why devices do it. The fallback only
+// ever binds a socket for a session that would otherwise be dead, and it says so
+// at WARN when it rescues one.
+//
+// Use this where binding is unacceptable or must be explicit: a host already
+// running a TwinCAT router owns that port, and some environments do not permit a
+// client process to listen at all.
+func WithoutAmsPeerFallback() SessionOption {
+	return func(s *Session) {
+		s.peerFallbackDisabled = true
+	}
+}
+
 // WithForceRouteRegistration disables route probing and always registers the route
 // with credentials on every Connect and Reconnect. Use this in environments where
 // routes are not persistent or must be refreshed on each connection.

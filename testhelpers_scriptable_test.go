@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -90,6 +91,18 @@ type scriptableServer struct {
 
 	// Recorded inbound frames (full bytes including TCP header).
 	frameBuf [][]byte
+
+	// acceptCount is outside mu on purpose: a reconnect-storm test reads it while
+	// the accept loop is running.
+	acceptCount atomic.Int64
+
+	// peerAddr, when set, makes the stub answer on a connection IT opens to that
+	// address instead of on the client's connection — the behaviour measured on a
+	// TC/RTOS device, which treats a registered route as a peer router. Requests
+	// are still accepted on the client's connection.
+	peerAddr atomic.Pointer[string]
+	peerMu   sync.Mutex
+	peerConn net.Conn
 }
 
 type delayKey struct {
@@ -124,6 +137,12 @@ func startScriptableServer(t *testing.T) *scriptableServer {
 }
 
 func (s *scriptableServer) stop() {
+	s.peerMu.Lock()
+	if s.peerConn != nil {
+		_ = s.peerConn.Close()
+		s.peerConn = nil
+	}
+	s.peerMu.Unlock()
 	_ = s.ln.Close()
 	done := make(chan struct{})
 	go func() { s.wg.Wait(); close(done) }()
@@ -186,6 +205,12 @@ func (s *scriptableServer) frames() [][]byte {
 	return out
 }
 
+// accepts reports how many TCP connections the stub has accepted. A reconnect
+// loop that keeps dialing shows up here even when it never gets a reply.
+func (s *scriptableServer) accepts() int {
+	return int(s.acceptCount.Load())
+}
+
 func (s *scriptableServer) acceptLoop() {
 	defer s.wg.Done()
 	for {
@@ -193,6 +218,7 @@ func (s *scriptableServer) acceptLoop() {
 		if err != nil {
 			return
 		}
+		s.acceptCount.Add(1)
 		s.wg.Add(1)
 		go s.handle(c)
 	}
@@ -262,7 +288,16 @@ func (s *scriptableServer) handle(c net.Conn) {
 		s.mu.Unlock()
 
 		respPayload := s.dispatch(cmd, group, payload)
-		if err := writeResponse(c, body, cmd, invokeID, respPayload); err != nil {
+		out, werr := s.responseWriter(c)
+		if werr != nil {
+			// Faithful to the measured device: the request was accepted and
+			// processed, the answer simply goes somewhere we cannot reach right
+			// now. The client connection stays OPEN — closing it would look like a
+			// transport drop, which is a different failure entirely.
+			s.t.Logf("stub: no peer connection for the response yet (%v); leaving the request unanswered", werr)
+			continue
+		}
+		if err := writeResponse(out, body, cmd, invokeID, respPayload); err != nil {
 			return
 		}
 
@@ -280,6 +315,34 @@ func (s *scriptableServer) handle(c net.Conn) {
 		}
 		s.mu.Unlock()
 	}
+}
+
+// answerViaPeerConnection makes the stub deliver every response over a connection
+// it opens to addr, leaving the client's own connection silent.
+func (s *scriptableServer) answerViaPeerConnection(addr string) {
+	a := addr
+	s.peerAddr.Store(&a)
+}
+
+// responseWriter returns where a response should be written: the client's
+// connection normally, or the stub's own connection to the client when
+// answerViaPeerConnection is armed.
+func (s *scriptableServer) responseWriter(client net.Conn) (net.Conn, error) {
+	addr := s.peerAddr.Load()
+	if addr == nil {
+		return client, nil
+	}
+	s.peerMu.Lock()
+	defer s.peerMu.Unlock()
+	if s.peerConn != nil {
+		return s.peerConn, nil
+	}
+	c, err := net.DialTimeout("tcp4", *addr, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	s.peerConn = c
+	return c, nil
 }
 
 // answerThenClose answers the nth occurrence of cmd (1-based) and then closes

@@ -460,3 +460,153 @@ func TestReconnect_PreReconnectHandlesReleasedWhenTransportIsUp(t *testing.T) {
 		t.Errorf("pre-reconnect handle 0xBEEF was never released (deletes seen: %v) — it stays in the PLC notification table while the session keeps reconnecting", got)
 	}
 }
+
+// TestReconnect_UnservedPLCTriggersCooldown: a PLC that accepts the TCP
+// connection and then answers nothing must not be hammered.
+//
+// This is the .224 shape, seen in this lab for months: connect succeeds, the
+// route registers "successfully", and every request times out. Beckhoff's own
+// maintainer describes the mechanism — the TwinCAT router expects exactly one TCP
+// connection per remote IP and drops the older one whenever a new connection is
+// accepted (Beckhoff/ADS#85) — so a client that redials every backoff sustains
+// the fight rather than resolving it. Field observation matches: the device often
+// serves again once something stops trying entirely for a while.
+//
+// So after a few consecutive unserved attempts the loop must go quiet: no
+// sockets, no route registration, for a cooldown period. Distinguishing feature
+// of "unserved" is that the dial SUCCEEDS and the request then times out —
+// unreachable hosts (refused dials) are a different failure and keep their fast
+// retries.
+func TestReconnect_UnservedPLCTriggersCooldown(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	// Accept the connection, then answer nothing at all — the .224 shape. The
+	// silence has to land on a step AFTER the dial, so route registration is
+	// skipped (it is UDP and there is no responder here, which would be a
+	// different failure) and the symbol reload is what goes unanswered.
+	srv.delayBefore(CommandIDRead, uint32(GroupSymbolUploadInfo), time.Hour)
+	srv.delayBefore(CommandIDReadWrite, uint32(GroupSymbolUploadInfo), time.Hour)
+
+	sess := newDialableTestSession(t, srv.host, srv.port, 0) // unbounded attempts
+	sess.route = &routeManager{skipRegistration: true}
+	sess.requestTimeout = 200 * time.Millisecond
+	sess.cache.symbolsFullyLoaded = true
+	sess.lifecycle.unservedCooldown = 2 * time.Second
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+
+	done := make(chan struct{})
+	go func() { _ = sess.Reconnect(context.Background()); close(done) }()
+	t.Cleanup(func() { _ = sess.Close(); <-done })
+
+	// Let it burn through the unserved-attempt allowance, then watch it hold off.
+	time.Sleep(3 * time.Second)
+	duringCooldown := srv.accepts()
+	time.Sleep(1500 * time.Millisecond)
+	afterQuiet := srv.accepts()
+
+	t.Logf("dials: %d by the time the cooldown started, %d after a further 1.5s", duringCooldown, afterQuiet)
+	if afterQuiet-duringCooldown > 2 {
+		t.Errorf("%d further dials during a %v cooldown — an unserved PLC is being hammered, which is what keeps the router losing",
+			afterQuiet-duringCooldown, sess.lifecycle.unservedCooldown)
+	}
+	if duringCooldown == 0 {
+		t.Error("never dialed at all; the test did not exercise the path")
+	}
+}
+
+// TestReconnect_RefusedDialKeepsFastRetries: the cooldown must not slow down the
+// ordinary case. A refused dial means the PLC is down or unreachable, and the
+// router is not in a bad state, so retries stay on the configured backoff.
+func TestReconnect_RefusedDialKeepsFastRetries(t *testing.T) {
+	sess := unreachableSession(t, 0)            // port 1: instantly refused, unbounded attempts
+	sess.lifecycle.unservedCooldown = time.Hour // would be catastrophic if applied here
+
+	done := make(chan struct{})
+	go func() { _ = sess.Reconnect(context.Background()); close(done) }()
+	t.Cleanup(func() { _ = sess.Close(); <-done })
+
+	// fastBackoff is 50ms, so a second is worth many attempts.
+	time.Sleep(time.Second)
+	if got := sess.lifecycle.reconnectAttemptsForTest(); got < 5 {
+		t.Errorf("only %d attempts in 1s against a refused port; a refused dial must not enter the unserved cooldown", got)
+	}
+}
+
+// TestConnect_VerifiesTheLinkAnswersEvenWithoutRouteRegistration: Connect must
+// never report success against a PLC that accepts the socket and answers nothing.
+//
+// The liveness check used to live inside the route-registration branch, so a
+// caller with a pre-registered route (no WithRoute, or WithSkipRouteRegistration)
+// got no check at all. Measured against a TC/RTOS device in this state: Connect
+// returned nil in 5.01s, IsClosed() false, FSM Connected — and every subsequent
+// request timed out. That is the invisible-stuck state a consumer polling
+// IsClosed() cannot detect.
+func TestConnect_VerifiesTheLinkAnswersEvenWithoutRouteRegistration(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	// Accepts the connection; answers nothing.
+	srv.delayBefore(CommandIDRead, uint32(GroupSymbolVersion), time.Hour)
+
+	sess, err := NewSession(context.Background(),
+		AMSEndpoint{IP: srv.host, Port: srv.port, AMS: AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851}},
+		WithRequestTimeout(300*time.Millisecond),
+		WithTargetCheck(TargetCheckOff),
+		WithAutoReconnect(false),
+		// No WithRoute: the route is assumed to exist already, so registration —
+		// and with it the old liveness check — is skipped.
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	err = sess.Connect(context.Background())
+	if err == nil {
+		t.Error("Connect reported success against a PLC that answered nothing; the session is deaf but looks healthy")
+	}
+	if err == nil && !sess.IsClosed() {
+		t.Error("...and IsClosed() is false, so a consumer has no way to notice")
+	}
+}
+
+// TestReconnect_DoesNotReRegisterRouteEveryAttempt: registering the same route
+// again and again is how a device ends up with duplicate runtime entries.
+//
+// ensureRoute registers whenever its probe fails, and the probe fails on every
+// attempt against a PLC that answers nothing — so an unbounded reconnect loop
+// registered the same route dozens of times. On a TC/RTOS device in this lab that
+// left the runtime route table holding TWO entries for our NetID where the
+// persisted config has one, after which the router began answering on a
+// connection it opened to us instead of ours, and the session stopped working
+// entirely. Registering once is enough; if the route is registered and the PLC
+// still will not talk, more registrations cannot help.
+func TestReconnect_DoesNotReRegisterRouteEveryAttempt(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	router := startRouteResponder(t)
+
+	// The PLC accepts TCP and answers no ADS request, so every probe fails.
+	srv.delayBefore(CommandIDRead, uint32(GroupSymbolVersion), time.Hour)
+
+	sess := newDialableTestSession(t, srv.host, srv.port, 6)
+	sess.routerPort = router.port
+	sess.route = &routeManager{
+		name:              "go-ads-test",
+		username:          "Administrator",
+		password:          secret("1"),
+		activationTimeout: 300 * time.Millisecond,
+	}
+	sess.requestTimeout = 200 * time.Millisecond
+	sess.lifecycle.unservedCooldown = 300 * time.Millisecond
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+
+	_ = sess.Reconnect(context.Background())
+
+	if got := router.registrations(); got > 2 {
+		t.Errorf("route registered %d times across 6 reconnect attempts; repeated registration is what creates duplicate runtime entries", got)
+	} else {
+		t.Logf("route registered %d time(s) across 6 attempts", got)
+	}
+}

@@ -283,6 +283,37 @@ type routeManager struct {
 	activationTimeout  time.Duration
 	skipRegistration   bool // set via WithSkipRouteRegistration — caller manages routes externally
 	routeProbeFailures atomic.Int32
+
+	// lastRegisteredNs is when this session last registered the route, and the
+	// throttle behind reRegisterInterval.
+	//
+	// ensureRoute registers whenever its probe fails, and against a PLC that
+	// answers nothing the probe fails on every reconnect attempt — so an
+	// unbounded loop registered the same route over and over. Measured
+	// consequence on a TC/RTOS device: its RUNTIME route table ended up with two
+	// entries for our NetID where the persisted config has one, after which the
+	// router started answering on a connection it opened to us and the session
+	// stopped working at all. Registering the same route twice cannot fix
+	// anything the first registration did not, so it is throttled.
+	lastRegisteredNs atomic.Int64
+}
+
+// reRegisterInterval is the minimum gap between two route registrations from one
+// session. Long enough that a reconnect storm registers once, short enough that a
+// route genuinely removed on the PLC (someone editing the table, a device reset)
+// is re-created without needing a new Session.
+const reRegisterInterval = 2 * time.Minute
+
+// mayRegister reports whether enough time has passed since the last registration
+// by this session. Always true for the first one.
+func (r *routeManager) mayRegister() bool {
+	last := r.lastRegisteredNs.Load()
+	return last == 0 || time.Since(time.Unix(0, last)) >= reRegisterInterval
+}
+
+// markRegistered records a registration for the throttle.
+func (r *routeManager) markRegistered() {
+	r.lastRegisteredNs.Store(time.Now().UnixNano())
 }
 
 // shouldSkip reports whether route registration must be bypassed entirely.

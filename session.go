@@ -70,6 +70,24 @@ type sessionLifecycle struct {
 	reconnectMu   sync.Mutex // protects reconnectDone
 	reconnectDone chan struct{}
 
+	// unservedCooldown is how long the reconnect loop goes completely quiet — no
+	// sockets, no route registration — after unservedAttemptsBeforeCooldown
+	// consecutive attempts where the TCP dial SUCCEEDED but the PLC answered
+	// nothing.
+	//
+	// That combination is not "the PLC is down"; it is a router that has our IP
+	// in a state it will not serve. The TwinCAT router expects exactly one TCP
+	// connection per remote IP and drops the older one whenever a new connection
+	// arrives (Beckhoff/ADS#85), so redialing every backoff sustains the problem:
+	// each new dial costs the router the connection it just rebuilt. Observed on a
+	// TC/RTOS device in this lab for months, and it tends to serve again once
+	// something stops connecting for a while. Zero means the default.
+	unservedCooldown time.Duration
+
+	// reconnectAttempts counts dials made by the current reconnect loop. Exposed
+	// for tests only.
+	reconnectAttempts atomic.Int64
+
 	// reconnectOwner is the single-flight gate: the goroutine that flips it
 	// false -> true owns the reconnect and clears it on the way out.
 	//
@@ -182,6 +200,21 @@ type Session struct {
 
 	requestTimeout time.Duration
 	isLocal        bool
+
+	// peerListenPort, when non-zero, is the TCP port on which the session accepts
+	// a connection the PLC opens back to us, for devices that answer there rather
+	// than on the connection we opened. See WithAmsPeerListen.
+	peerListenPort int
+	peerLn         net.Listener
+	peerOnce       sync.Once
+	// peerWG tracks the accept loop. Deliberately NOT lifecycle.waitGroup: that
+	// one is waited on by tearDownAndReset, which runs on every reconnect, while
+	// this listener lives for the whole session and only closes in Close — so
+	// sharing the group deadlocks the first teardown.
+	peerWG sync.WaitGroup
+	// peerFallbackDisabled turns off the automatic attempt described in
+	// tryPeerFallback. See WithoutAmsPeerFallback.
+	peerFallbackDisabled bool
 
 	// Event callbacks (run in goroutine, must not block)
 	onDisconnect func()
@@ -481,6 +514,15 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 			sess.lifecycle.state.transitionTo(SessionStateDisconnected)
 		}
 	}()
+	// Before dialing: some devices answer only on a connection they open to us,
+	// so the listener has to be up before the first request goes out or its
+	// response has nowhere to land. See WithAmsPeerListen.
+	if sess.peerListenPort != 0 {
+		if lerr := sess.startPeerListener(); lerr != nil {
+			return lerr
+		}
+	}
+
 	var err error
 	sess.logger.Debug("dialing", "ip", sess.ip, "port", sess.port)
 	if local {
@@ -623,6 +665,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 			// TCP reconnect — PLC may reset connections from previously-unknown NetIDs.
 			// Shut down goroutines, close TCP, redial, restart.
 			sess.tearDownAndReset(false)
+			sess.lifecycle.reconnectAttempts.Add(1)
 			if err := sess.dialAndStart(); err != nil {
 				return fmt.Errorf("TCP reconnect after route registration failed: %w", err)
 			}
@@ -644,11 +687,51 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 
 	}
 
-	// Read symbol version for later change detection (best-effort, don't fail connect)
+	// Read symbol version for later change detection. Failing to read it is not
+	// fatal — a TC2 target can refuse this one service while being perfectly
+	// alive — but total SILENCE is: a PLC that accepts the socket and answers
+	// nothing must not yield a Session that reports Connected.
+	//
+	// That state is real and long-lived: measured on a TC/RTOS device, Connect
+	// returned nil in 5.01s, IsClosed() stayed false, and every request timed out
+	// afterwards. The liveness check used to live only inside the
+	// route-registration branch above, so a caller with a pre-registered route got
+	// no check at all.
 	if !haveVersion {
 		symbolVersion, err = sess.client.Load().GetSymbolVersion(ctx)
 		haveVersion = err == nil
-		if err != nil {
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrTransportClosed):
+			// The link died while we were connecting. Reporting success here hands
+			// the caller a Session whose transport is already gone.
+			sess.tearDownAndReset(false)
+			sess.transitionState(SessionStateDisconnected)
+			return fmt.Errorf("transport dropped during connect to %s: %w", sess.ip, err)
+		case isUnservedError(err):
+			// Second opinion before condemning the link: ReadState is the most
+			// universally supported service there is, so if THAT is also met with
+			// silence the device is not talking to us at all.
+			if _, serr := sess.client.Load().ReadState(ctx); isUnservedError(serr) {
+				// Total silence. Before giving up: the device may be answering on a
+				// connection it opens to us rather than on ours.
+				rescued, ferr := sess.tryPeerFallback(ctx)
+				if rescued {
+					haveVersion = false // the probe above never got a value
+					break
+				}
+				sess.tearDownAndReset(false)
+				sess.transitionState(SessionStateDisconnected)
+				hint := "a stale or duplicate route entry for source NetID " + sess.source.NetIDString() +
+					", or another client using this IP, can hold a TwinCAT router in this state"
+				if ferr != nil {
+					hint += "; the peer-route fallback could not run: " + ferr.Error()
+				}
+				return fmt.Errorf("PLC at %s accepted the connection but answered neither GetSymbolVersion nor ReadState: %w (%s)",
+					sess.ip, err, hint)
+			}
+			sess.logger.Debug("could not read symbol version during connect, but the PLC is answering", "error", err)
+		default:
 			sess.logger.Debug("could not read symbol version during connect", "error", err)
 		}
 	}
@@ -748,6 +831,9 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 	if sess.route.forceRouteRegistration {
 		sess.logger.Info("registering route (force mode)")
 		err = sess.AddRoute(ctx, sess.route.name, sess.route.username, string(sess.route.password))
+		if err == nil {
+			sess.route.markRegistered()
+		}
 		return err == nil, err
 	}
 
@@ -799,10 +885,18 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		probeErr = fmt.Errorf("probe failed after retry: %w", retryErr)
 	}
 
-	// Definite probe failure → register
+	// Definite probe failure → register, unless this session did so recently.
 	sess.route.routeProbeFailures.Add(1)
+	if !sess.route.mayRegister() {
+		sess.logger.Info("route probe failed but this session already registered the route; not registering again",
+			"error", probeErr)
+		return false, nil
+	}
 	sess.logger.Info("route probe failed, registering route", "error", probeErr)
 	err = sess.AddRoute(ctx, sess.route.name, sess.route.username, string(sess.route.password))
+	if err == nil {
+		sess.route.markRegistered()
+	}
 	if err != nil {
 		return false, err
 	}
@@ -1282,6 +1376,9 @@ func (sess *Session) Close() error {
 	}
 	sess.markClosed()
 	sess.logger.Info("Close called, shutting down")
+	// Stop accepting inbound PLC connections before tearing the transport down,
+	// so the accept loop cannot hand one to a Client that is going away.
+	sess.stopPeerListener()
 
 	sess.releasePLCResources(wasDisconnected)
 	// Capture cancel under RLock then release before invoking — see
@@ -1311,6 +1408,9 @@ func (sess *Session) Close() error {
 	}
 	sess.logger.Info("Waiting for workers to close")
 	if c := sess.client.Load(); c != nil {
+		// Adopted inbound connections have their own readers; closing the sockets
+		// is what lets those readers return, so it must happen BEFORE the wait.
+		c.closePeerConns()
 		c.waitGroup.Wait()
 	}
 	sess.lifecycle.waitGroup.Wait()
@@ -1355,6 +1455,60 @@ func (sess *Session) reconnectSleep(ctx context.Context, attempt int) error {
 		return sess.giveUpReconnecting(fmt.Errorf("reconnect aborted during backoff: %w", ctx.Err()))
 	case <-sess.lifecycle.closedCh:
 		return fmt.Errorf("connection closed during reconnect")
+	}
+}
+
+// unservedCooldownDuration is the configured quiet period, or the default.
+func (sess *Session) unservedCooldownDuration() time.Duration {
+	if d := sess.lifecycle.unservedCooldown; d > 0 {
+		return d
+	}
+	return defaultUnservedCooldown
+}
+
+// reconnectAttemptsForTest exposes the dial counter to tests in this package.
+func (l *sessionLifecycle) reconnectAttemptsForTest() int64 {
+	return l.reconnectAttempts.Load()
+}
+
+// isUnservedError reports whether err means "the PLC accepted our connection and
+// then said nothing", as opposed to a refused dial or a PLC-side verdict. A
+// timeout with no ADS return code is the signature: the request went out and
+// nothing came back.
+func isUnservedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rc ReturnCode
+	if errors.As(err, &rc) {
+		return false // the PLC answered, even if the answer was an error
+	}
+	// ErrTransportClosed means the link died under us, which is a drop rather
+	// than a refusal to serve — only a plain deadline counts here.
+	return errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, ErrTransportClosed)
+}
+
+// coolDownAfterUnserved holds the loop off with nothing open, so the router can
+// settle. Returns an error only if the session is closed or the caller gave up
+// while waiting.
+func (sess *Session) coolDownAfterUnserved(ctx context.Context, attempts int, cause error) error {
+	d := sess.unservedCooldownDuration()
+	sess.logger.Warn("PLC accepted the connection but answered nothing; backing off completely before trying again",
+		"unservedAttempts", attempts, "cooldown", d, "error", cause,
+		"hint", "a stale or duplicate route entry for this source NetID, or another client on this IP, can hold a TwinCAT router in this state")
+	// Nothing open while we wait: the point is to stop competing for the
+	// router's one-connection-per-IP slot.
+	sess.tearDownAndReset(false)
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return sess.giveUpReconnecting(fmt.Errorf("reconnect aborted during unserved cooldown: %w", ctx.Err()))
+	case <-sess.lifecycle.closedCh:
+		return fmt.Errorf("connection closed during unserved cooldown")
 	}
 }
 
@@ -1422,6 +1576,18 @@ func (sess *Session) triggerReconnect() {
 		sess.lifecycle.reconnectMu.Unlock()
 	}
 }
+
+// unservedAttemptsBeforeCooldown is how many consecutive dial-succeeds-then-
+// silence attempts are tolerated before the loop goes quiet. Small on purpose: a
+// PLC that accepts and does not answer will not change its mind within a few
+// hundred milliseconds, and every extra dial makes a router livelock worse.
+const unservedAttemptsBeforeCooldown = 3
+
+// defaultUnservedCooldown is long enough for the router to finish whatever it is
+// doing with our IP, and short enough that a session recovers on its own. The
+// field evidence is "it works again after you stop trying for a bit"; this is that
+// pause, made deliberate.
+const defaultUnservedCooldown = 30 * time.Second
 
 // preReconnectReleaseAttempts caps how many reconnect attempts will re-try the
 // best-effort delete of the handles held before the drop. Retrying matters — the
@@ -1570,6 +1736,33 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 	var lastErr error
 	attempts := 0
 	releaseTries := 0
+	unserved := 0
+
+	// retryAfter handles every post-dial failure identically: record it, tear the
+	// half-built connection down, then either wait out the backoff or — when the
+	// PLC has accepted us and then answered nothing several times running — go
+	// quiet altogether. Returning a non-nil error means the loop must exit.
+	//
+	// One helper rather than a copy per step, because the previous four copies
+	// were what let the unserved case be handled in one place and missed in the
+	// others.
+	retryAfter := func(err error, stage string) error {
+		lastErr = err
+		sess.logger.Warn("reconnect step failed, retrying",
+			"stage", stage, "error", err, "attempt", attempts)
+		sess.resetForRetry()
+		if isUnservedError(err) {
+			unserved++
+			if unserved >= unservedAttemptsBeforeCooldown {
+				unserved = 0
+				return sess.coolDownAfterUnserved(ctx, unservedAttemptsBeforeCooldown, err)
+			}
+		} else {
+			unserved = 0
+		}
+		return sess.reconnectSleep(ctx, attempts)
+	}
+
 	for {
 		if sess.isClosed() {
 			return fmt.Errorf("connection closed during reconnect")
@@ -1589,6 +1782,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 
 		// Dial TCP, configure keepalive, clear disconnected flag, start goroutines.
 		// dialAndStart re-checks closed.Load() before waitGroup.Add(2).
+		sess.lifecycle.reconnectAttempts.Add(1)
 		if err := sess.dialAndStart(); err != nil {
 			lastErr = err
 			sess.logger.Warn("reconnect dial/start failed, retrying", "error", err, "ip", sess.ip, "port", sess.port, "attempt", attempts)
@@ -1601,11 +1795,8 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		// Re-perform local-mode handshake if needed
 		if sess.isLocal {
 			if err := sess.localHandshake(); err != nil {
-				lastErr = err
-				sess.logger.Warn("reconnect local handshake failed, retrying", "error", err, "attempt", attempts)
-				sess.resetForRetry()
-				if err := sess.reconnectSleep(ctx, attempts); err != nil {
-					return err
+				if rerr := retryAfter(err, "local handshake"); rerr != nil {
+					return rerr
 				}
 				continue
 			}
@@ -1613,11 +1804,8 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 
 		// Smart route registration: probe first, register only if needed.
 		if err := sess.ensureRoute(); err != nil {
-			lastErr = err
-			sess.logger.Warn("route registration failed during reconnect, retrying", "error", err, "attempt", attempts)
-			sess.resetForRetry()
-			if err := sess.reconnectSleep(ctx, attempts); err != nil {
-				return err
+			if rerr := retryAfter(err, "route"); rerr != nil {
+				return rerr
 			}
 			continue
 		}
@@ -1658,22 +1846,16 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 
 		// Re-load symbols based on discovery mode
 		if err := sess.reloadSymbols(); err != nil {
-			lastErr = err
-			sess.logger.Warn("reconnect symbol reload failed, retrying", "error", err, "attempt", attempts)
-			sess.resetForRetry()
-			if err := sess.reconnectSleep(ctx, attempts); err != nil {
-				return err
+			if rerr := retryAfter(err, "symbol reload"); rerr != nil {
+				return rerr
 			}
 			continue
 		}
 
 		// Re-subscribe notifications using stored configs.
 		if err := sess.resubscribeNotifications(); err != nil {
-			lastErr = err
-			sess.logger.Warn("reconnect notification re-subscribe failed, retrying", "error", err, "attempt", attempts)
-			sess.resetForRetry()
-			if err := sess.reconnectSleep(ctx, attempts); err != nil {
-				return err
+			if rerr := retryAfter(err, "notification resubscribe"); rerr != nil {
+				return rerr
 			}
 			continue
 		}
@@ -1708,13 +1890,23 @@ func (sess *Session) ensureRoute() error {
 		return fmt.Errorf("connection closed")
 	}
 
-	// Force mode or too many probe failures → always register
+	// Force mode or too many probe failures → register, unless this session
+	// registered recently. See routeManager.lastRegisteredNs: re-registering the
+	// same route cannot fix anything, and on some firmware it leaves a duplicate
+	// runtime entry that breaks the device outright.
 	probeFailures := sess.route.routeProbeFailures.Load()
 	if sess.route.forceRouteRegistration || probeFailures >= 3 {
+		if !sess.route.mayRegister() {
+			sess.logger.Debug("route already registered by this session; not registering again",
+				"probeFailures", probeFailures)
+			_, err := sess.awaitRouteActive(sess.currentLifecycleCtx)
+			return err
+		}
 		sess.logger.Info("registering route (forced/fallback)", "probeFailures", probeFailures)
 		if err := sess.AddRoute(sess.currentLifecycleCtx(), sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
 			return fmt.Errorf("route registration failed: %w", err)
 		}
+		sess.route.markRegistered()
 		// Same activation lag as on connect. Failing here feeds the reconnect
 		// loop's own retry rather than letting reloadSymbols be the first thing
 		// to discover the route isn't live yet. currentLifecycleCtx, not a
@@ -1738,12 +1930,19 @@ func (sess *Session) ensureRoute() error {
 		return fmt.Errorf("connection closed during route probe")
 	}
 
-	// Probe failed → register with credentials
+	// Probe failed → register with credentials, unless we already did recently.
 	failuresAfter := sess.route.routeProbeFailures.Add(1)
+	if !sess.route.mayRegister() {
+		sess.logger.Debug("route probe failed but this session already registered the route; waiting for it to be served instead of registering again",
+			"error", probeErr, "probeFailures", failuresAfter)
+		_, err := sess.awaitRouteActive(sess.currentLifecycleCtx)
+		return err
+	}
 	sess.logger.Info("route probe failed, registering route", "error", probeErr, "probeFailures", failuresAfter)
 	if err := sess.AddRoute(sess.currentLifecycleCtx(), sess.route.name, sess.route.username, string(sess.route.password)); err != nil {
 		return fmt.Errorf("route registration failed after probe: %w", err)
 	}
+	sess.route.markRegistered()
 	_, err := sess.awaitRouteActive(sess.currentLifecycleCtx)
 	return err
 }
@@ -1872,8 +2071,12 @@ func (sess *Session) tearDownAndReset(resetFeatureFlags bool) {
 	sess.tx.connMu.Unlock()
 	// Wait for the previous batch of Client workers (listen, transmit,
 	// recvWorker) to exit. They share ctx with lifecycle.ctx; the cancel
-	// above plus the closed TCP socket trigger their exit.
+	// above plus the closed TCP socket trigger their exit. Adopted inbound
+	// connections are closed first: their readers block on a socket nothing else
+	// touches, so leaving them open deadlocks this wait — observed hanging a real
+	// session against a peer-route device.
 	if c := sess.client.Load(); c != nil {
+		c.closePeerConns()
 		c.waitGroup.Wait()
 	}
 	sess.lifecycle.waitGroup.Wait()
@@ -1973,6 +2176,133 @@ func (sess *Session) publishWiredClient() *Client {
 	c.startWorkers()
 	sess.client.Store(c)
 	return c
+}
+
+// peerFallbackProbes is how many requests the automatic fallback sends after
+// starting the listener. Each carries the session's own request timeout, and the
+// device has to dial in and answer one of them.
+const peerFallbackProbes = 3
+
+// tryPeerFallback is the automatic half of peer-route support: when a PLC has
+// accepted our connection and answered nothing at all, bind the AMS port and see
+// whether it is answering on a connection it opens to us instead.
+//
+// Why this is worth binding a socket for: the responses are not lost, they are
+// being delivered somewhere we are not listening (see AcceptPeerConn for the
+// decoded evidence). A caller that only ever calls Connect — which is how the
+// benthos plugin uses this library — has no way to reach for an option, so a
+// session that could work would simply never work. The bind only happens for a
+// session that is otherwise dead, and it is announced at WARN because a device in
+// this state is worth an operator's attention.
+//
+// Returns rescued=true when a request succeeded after the listener came up.
+func (sess *Session) tryPeerFallback(ctx context.Context) (rescued bool, why error) {
+	if sess.peerFallbackDisabled {
+		return false, fmt.Errorf("peer-route fallback disabled by WithoutAmsPeerFallback")
+	}
+	if sess.peerLn != nil {
+		// Already listening and still nothing: the silence is not this.
+		return false, fmt.Errorf("already listening for an inbound PLC connection and it answered nothing there either")
+	}
+	if err := sess.startPeerListener(); err != nil {
+		return false, err
+	}
+	sess.logger.Info("PLC answered nothing on our connection; listening for one it may open to us",
+		"port", sess.peerListenPortOrDefault())
+
+	for attempt := 1; attempt <= peerFallbackProbes; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if _, err := sess.client.Load().GetSymbolVersion(ctx); err == nil {
+			sess.logger.Warn("PLC answers on a connection it opens to us, not on ours; using that connection",
+				"attempts", attempt, "listenPort", sess.peerListenPortOrDefault(),
+				"detail", "the device treats its route to this host as a peer route. "+
+					"Its route table most likely holds more than one entry for this source NetID; "+
+					"a client that cannot accept the inbound connection sees every request time out")
+			return true, nil
+		}
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	return false, nil
+}
+
+// peerListenPortOrDefault is the port the peer listener uses.
+func (sess *Session) peerListenPortOrDefault() int {
+	if sess.peerListenPort != 0 {
+		return sess.peerListenPort
+	}
+	return amsPeerListenPort
+}
+
+// amsPeerListenPort is where a TwinCAT peer router expects to reach us: the same
+// port a PLC serves ADS on. Only relevant with WithAmsPeerListen.
+const amsPeerListenPort = 48898
+
+// startPeerListener begins accepting connections the PLC opens to us, once per
+// session. Each accepted connection is handed to whichever Client is current, so
+// it keeps working across reconnects — the PLC dials again after every drop.
+//
+// Errors are returned rather than logged-and-ignored: a session that needs this
+// cannot work without it, and the usual cause (a local TwinCAT router already
+// owns the port) is worth saying out loud.
+func (sess *Session) startPeerListener() error {
+	var err error
+	sess.peerOnce.Do(func() {
+		port := sess.peerListenPort
+		if port == 0 {
+			port = amsPeerListenPort
+		}
+		var ln net.Listener
+		ln, err = net.Listen("tcp4", net.JoinHostPort("", strconv.Itoa(port)))
+		if err != nil {
+			err = fmt.Errorf("listening for the PLC's own connection on port %d: %w "+
+				"(a local TwinCAT router or another ADS client may already own it)", port, err)
+			return
+		}
+		sess.peerLn = ln
+		sess.logger.Info("listening for inbound PLC connections (peer-route support)", "port", port)
+		sess.peerWG.Add(1)
+		go sess.peerAcceptLoop(ln)
+	})
+	return err
+}
+
+// peerAcceptLoop attaches every inbound connection to the current Client.
+func (sess *Session) peerAcceptLoop(ln net.Listener) {
+	defer sess.peerWG.Done()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return // listener closed by Close
+		}
+		if sess.isClosed() {
+			_ = conn.Close()
+			return
+		}
+		c := sess.client.Load()
+		if c == nil {
+			// No Client yet (or between teardown and redial): the PLC will dial
+			// again once we have one, so dropping this is safe.
+			sess.logger.Debug("inbound PLC connection arrived with no active client; closing",
+				"remote", conn.RemoteAddr().String())
+			_ = conn.Close()
+			continue
+		}
+		c.AcceptPeerConn(conn)
+	}
+}
+
+// stopPeerListener closes the listener and waits for the accept loop to exit.
+func (sess *Session) stopPeerListener() {
+	if sess.peerLn != nil {
+		_ = sess.peerLn.Close()
+	}
+	sess.peerWG.Wait()
 }
 
 // localHandshake performs the local-mode AMSAddress probe used after dial when

@@ -148,6 +148,10 @@ type Client struct {
 	waitGroup sync.WaitGroup
 
 	closeOnce sync.Once
+
+	// peerConns are inbound connections the PLC opened to us; see AcceptPeerConn.
+	peerMu    sync.Mutex
+	peerConns []net.Conn
 }
 
 // markDropped releases every request waiting on this client's connection.
@@ -215,6 +219,7 @@ func Dial(
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		c.tx.disconnected.Store(true)
+		c.closePeerConns()
 		c.markDropped()
 		c.cancel()
 		c.tx.connMu.Lock()
@@ -381,7 +386,53 @@ func (c *Client) startWorkers() {
 
 func (c *Client) listen() {
 	defer c.waitGroup.Done()
-	reader := bufio.NewReader(c.tx.connection)
+	c.readFrames(c.tx.connection, true)
+}
+
+// AcceptPeerConn adopts a TCP connection the PLC opened TO US and reads AMS
+// frames from it into the same response mux as our own connection.
+//
+// Some devices treat a registered route as a peer router: they accept and process
+// our requests on the connection we opened, then send every response over a
+// connection they open back to us on 48898. Measured on TC3.1.4026 (TC/RTOS);
+// TC2 2.10 and TC3.1.4024/CE answer on our connection instead. Beckhoff's own
+// Linux AdsLib never listens, so it cannot talk to a device in that state at all.
+//
+// Frames carry their own invokeID, so responses match up regardless of which
+// socket they arrive on, and notifications dispatch normally.
+func (c *Client) AcceptPeerConn(conn net.Conn) {
+	c.peerMu.Lock()
+	c.peerConns = append(c.peerConns, conn)
+	c.peerMu.Unlock()
+	c.logger.Info("adopted an inbound connection from the PLC (peer-route behaviour)",
+		"remote", conn.RemoteAddr().String())
+	c.waitGroup.Add(1)
+	go func() {
+		defer c.waitGroup.Done()
+		c.readFrames(conn, false)
+	}()
+}
+
+// closePeerConns drops every adopted inbound connection. Called from Close so a
+// reader blocked on one cannot hold up teardown.
+func (c *Client) closePeerConns() {
+	c.peerMu.Lock()
+	conns := c.peerConns
+	c.peerConns = nil
+	c.peerMu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+// readFrames pumps AMS frames from conn into the transport's queues.
+//
+// primary distinguishes our own connection from an adopted inbound one. Losing
+// the primary connection means the transport is down and reconnect must fire;
+// losing an inbound one does not — the PLC can simply dial again, and treating it
+// as a drop would tear down a working session.
+func (c *Client) readFrames(conn net.Conn, primary bool) {
+	reader := bufio.NewReader(conn)
 	const maxAMSPacket = 4 * 1024 * 1024
 	var hdrBytes [6]byte
 	for {
@@ -409,6 +460,10 @@ func (c *Client) listen() {
 					"the route credentials were rejected, " +
 					"or the AMS port addresses no running runtime (851 for TC3, 801 for TC2)"
 			}
+			if !primary {
+				c.logger.Debug("inbound PLC connection closed", "error", err)
+				return
+			}
 			if hint != "" {
 				c.logger.Log(c.ctx, c.transportFaultLevel(), "PLC closed connection, transport down",
 					"error", err, "hint", hint,
@@ -423,14 +478,18 @@ func (c *Client) listen() {
 		}
 		var tcpHeader amsTCPHeader
 		if err := binary.Read(bytes.NewReader(hdrBytes[:]), binary.LittleEndian, &tcpHeader); err != nil {
-			c.logger.Error("listen header decode error, transport down", "error", err)
-			c.callOnDrop()
+			c.logger.Error("listen header decode error, transport down", "error", err, "primary", primary)
+			if primary {
+				c.callOnDrop()
+			}
 			return
 		}
 		if tcpHeader.Length > maxAMSPacket {
 			c.logger.Error("AMS packet length exceeds sanity limit, transport down",
-				"length", tcpHeader.Length)
-			c.callOnDrop()
+				"length", tcpHeader.Length, "primary", primary)
+			if primary {
+				c.callOnDrop()
+			}
 			return
 		}
 		data := make([]byte, tcpHeader.Length)
@@ -444,6 +503,10 @@ func (c *Client) listen() {
 			case <-c.ctx.Done():
 				return
 			default:
+			}
+			if !primary {
+				c.logger.Debug("inbound PLC connection failed mid-frame", "error", err)
+				return
 			}
 			c.logger.Log(c.ctx, c.transportFaultLevel(), "listen body read error, transport down", "error", err)
 			c.callOnDrop()
