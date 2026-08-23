@@ -70,6 +70,18 @@ type sessionLifecycle struct {
 	reconnectMu   sync.Mutex // protects reconnectDone
 	reconnectDone chan struct{}
 
+	// reconnectOwner is the single-flight gate: the goroutine that flips it
+	// false -> true owns the reconnect and clears it on the way out.
+	//
+	// The gate used to be the FSM transition result — "state is already
+	// Reconnecting" was read as "someone is working on it". Nothing enforced
+	// that. A state left behind by an attempt that ended without resolving it
+	// made every later Reconnect log "already in progress" and return nil, so the
+	// session sat in Reconnecting forever with IsClosed() false: no data, and no
+	// consumer signal to rebuild. Ownership is now explicit, and the FSM's
+	// Reconnecting self-loop lets a new owner take over an abandoned state.
+	reconnectOwner atomic.Bool
+
 	closedCh   chan struct{}
 	closedOnce sync.Once // guards close(closedCh) so Close() and Reconnect-exhaustion can both fire safely
 
@@ -1329,7 +1341,7 @@ func (sess *Session) reconnectBackoff(attempt int) time.Duration {
 
 // reconnectSleep sleeps for the appropriate backoff duration based on the attempt
 // number. Returns early if Close() is called.
-func (sess *Session) reconnectSleep(attempt int) error {
+func (sess *Session) reconnectSleep(ctx context.Context, attempt int) error {
 	delay := sess.reconnectBackoff(attempt)
 	sess.logger.Info("reconnect backoff", "attempt", attempt, "delay", delay)
 	timer := time.NewTimer(delay)
@@ -1337,9 +1349,33 @@ func (sess *Session) reconnectSleep(attempt int) error {
 	select {
 	case <-timer.C:
 		return nil
+	case <-ctx.Done():
+		// The caller gave up mid-backoff. Give-up is terminal for the session —
+		// see Reconnect's doc.
+		return sess.giveUpReconnecting(fmt.Errorf("reconnect aborted during backoff: %w", ctx.Err()))
 	case <-sess.lifecycle.closedCh:
 		return fmt.Errorf("connection closed during reconnect")
 	}
+}
+
+// giveUpReconnecting ends a reconnect for good: the FSM goes to Closed, PLC-side
+// resources are released by whoever wins that transition, and closedCh is closed
+// so waiters unblock. Shared by attempt exhaustion and caller cancellation, which
+// differ only in the error they report.
+//
+// Closing rather than parking in Reconnecting is the whole point: a consumer's
+// only liveness signal is IsClosed(), so "gave up but still alive" is a state it
+// can neither observe nor recover from.
+func (sess *Session) giveUpReconnecting(cause error) error {
+	// transitionToOnce so a concurrent Close() wins cleanly; the winner owns the
+	// PLC-side cleanup, because a later user Close() short-circuits and would
+	// otherwise skip it entirely.
+	if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateClosed); ok {
+		sess.releasePLCResources(true) // transport is gone by the time we give up
+	}
+	// Idempotent via closedOnce, whichever of Close() and this ran first.
+	sess.markClosed()
+	return cause
 }
 
 // triggerReconnect prepares the connection state for reconnection and launches
@@ -1371,9 +1407,9 @@ func (sess *Session) triggerReconnect() {
 	}
 
 	if sess.lifecycle.autoReconnect {
-		// Reconnect ignores the context by design (see its doc) — passing
-		// Background states that rather than implying a cancellation that will not
-		// be honoured.
+		// Background, not the lifecycle context: the auto path must not treat a
+		// session-context replacement as "the caller gave up", which now closes
+		// the session. Cancellation of an auto-reconnect is Close's job.
 		go func() { _ = sess.Reconnect(context.Background()) }()
 	} else {
 		// No auto-reconnect: close reconnectDone immediately so sendRequest
@@ -1392,13 +1428,13 @@ func (sess *Session) triggerReconnect() {
 // Uses configurable backoff (see WithBackoff) with fast initial retries and
 // progressive slowdown. Backoff resets on each successful reconnect.
 //
-// ctx is NOT honoured: the first thing this does is tearDownAndReset, which
-// cancels and replaces the session's own context, so a caller's deadline could
-// not survive the first attempt anyway. The loop is bounded by
-// WithMaxReconnectAttempts and by Close — cancel a reconnect with Close, not with
-// a context. The parameter is kept for signature stability; honouring it would
-// mean re-checking it per attempt and is tracked in improvements.md.
-func (sess *Session) Reconnect(_ context.Context) error {
+// Cancelling ctx gives up and CLOSES the session, exactly as exhausting
+// WithMaxReconnectAttempts does. It is not a pause: Reconnecting has no exit to
+// Disconnected (see the FSM table), and a session left there is invisible to a
+// consumer that polls IsClosed() to decide when to rebuild — no data would flow
+// and nothing would ever retry. So cancellation means "this session is done",
+// and PLC-side resources are released on the way out.
+func (sess *Session) Reconnect(ctx context.Context) error {
 	// closeReconnectDone closes the reconnectDone channel if still open and
 	// nils it. Mutex + nil-check is safe against concurrent callers — only
 	// the first observer of a non-nil channel closes it.
@@ -1418,19 +1454,27 @@ func (sess *Session) Reconnect(_ context.Context) error {
 		closeReconnectDone()
 		return fmt.Errorf("connection closed")
 	}
-	// Prevent concurrent reconnect attempts. transitionToOnce returns
-	// ok=false on idempotent re-entry (state already Reconnecting), which
-	// is exactly the single-flight gate we want.
-	if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateReconnecting); !ok {
-		sess.logger.Info("reconnect already in progress or not permitted from current state, skipping")
-		// If FSM rejected because state is terminal (Closed), close the
-		// orphan reconnectDone so Close() unblocks. The winning goroutine
-		// (if any) ran BEFORE state became Closed; we are running AFTER.
-		// Safe vs winner: closeReconnectDone is mutex-protected + nil-check.
+	// Single-flight on explicit ownership, not on the FSM state: see
+	// sessionLifecycle.reconnectOwner for why the state cannot serve as the gate.
+	if !sess.lifecycle.reconnectOwner.CompareAndSwap(false, true) {
+		sess.logger.Info("reconnect already in progress, skipping")
+		return nil
+	}
+	defer sess.lifecycle.reconnectOwner.Store(false)
+
+	// transitionToOnce reports ok=false both for an illegal transition and for
+	// "already in that state". Only the first is a refusal: we hold the ownership
+	// flag, so an existing Reconnecting state has no live owner and is ours to
+	// take over.
+	if from, ok := sess.lifecycle.state.transitionToOnce(SessionStateReconnecting); !ok && from != SessionStateReconnecting {
+		sess.logger.Info("reconnect not permitted from the current state, skipping", "state", from)
+		// Terminal: close any orphan reconnectDone so Close() unblocks.
 		if sess.isClosed() {
 			closeReconnectDone()
 		}
 		return nil
+	} else if !ok {
+		sess.logger.Warn("taking over a reconnect state left behind by an earlier attempt")
 	}
 
 	// Create a channel that waiters (sendRequest) can block on.
@@ -1472,6 +1516,9 @@ func (sess *Session) Reconnect(_ context.Context) error {
 		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return sess.giveUpReconnecting(fmt.Errorf("reconnect aborted during flap cooldown: %w", ctx.Err()))
 		case <-sess.lifecycle.closedCh:
 			timer.Stop()
 			return fmt.Errorf("connection closed during flap cooldown")
@@ -1508,23 +1555,16 @@ func (sess *Session) Reconnect(_ context.Context) error {
 			return fmt.Errorf("connection closed during reconnect")
 		}
 		attempts++
+		if err := ctx.Err(); err != nil {
+			sess.logger.Info("reconnect abandoned: caller context done", "error", err, "attempts", attempts-1)
+			return sess.giveUpReconnecting(fmt.Errorf("reconnect aborted: %w", err))
+		}
+
 		if sess.lifecycle.maxReconnectAttempts > 0 && attempts > sess.lifecycle.maxReconnectAttempts {
 			sess.logger.Error("max reconnect attempts exhausted, closing session",
 				"maxAttempts", sess.lifecycle.maxReconnectAttempts, "error", lastErr)
-			// Transition FSM to Closed so future Reconnect() calls are rejected
-			// instead of silently no-op'ing on the stuck Reconnecting state.
-			// Use transitionToOnce so a concurrent Close() wins cleanly.
-			if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateClosed); ok {
-				// We won the transition: take ownership of PLC-side cleanup so
-				// notification + handle leaks don't strand on the PLC. A subsequent
-				// user Close() will short-circuit on transitionToOnce ok=false and
-				// would otherwise skip cleanup entirely.
-				sess.releasePLCResources(true) // transport already dead by exhaustion
-			}
-			// closedCh close is idempotent via closedOnce, safe whether Close()
-			// or this branch ran first. Unblocks reconnectSleep / waitForReconnect.
-			sess.markClosed()
-			return fmt.Errorf("reconnect failed after %d attempts: %w", sess.lifecycle.maxReconnectAttempts, lastErr)
+			return sess.giveUpReconnecting(
+				fmt.Errorf("reconnect failed after %d attempts: %w", sess.lifecycle.maxReconnectAttempts, lastErr))
 		}
 
 		// Dial TCP, configure keepalive, clear disconnected flag, start goroutines.
@@ -1532,7 +1572,7 @@ func (sess *Session) Reconnect(_ context.Context) error {
 		if err := sess.dialAndStart(); err != nil {
 			lastErr = err
 			sess.logger.Warn("reconnect dial/start failed, retrying", "error", err, "ip", sess.ip, "port", sess.port, "attempt", attempts)
-			if err := sess.reconnectSleep(attempts); err != nil {
+			if err := sess.reconnectSleep(ctx, attempts); err != nil {
 				return err
 			}
 			continue
@@ -1544,7 +1584,7 @@ func (sess *Session) Reconnect(_ context.Context) error {
 				lastErr = err
 				sess.logger.Warn("reconnect local handshake failed, retrying", "error", err, "attempt", attempts)
 				sess.resetForRetry()
-				if err := sess.reconnectSleep(attempts); err != nil {
+				if err := sess.reconnectSleep(ctx, attempts); err != nil {
 					return err
 				}
 				continue
@@ -1556,31 +1596,17 @@ func (sess *Session) Reconnect(_ context.Context) error {
 			lastErr = err
 			sess.logger.Warn("route registration failed during reconnect, retrying", "error", err, "attempt", attempts)
 			sess.resetForRetry()
-			if err := sess.reconnectSleep(attempts); err != nil {
+			if err := sess.reconnectSleep(ctx, attempts); err != nil {
 				return err
 			}
 			continue
 		}
 
-		// Re-load symbols based on discovery mode
-		if err := sess.reloadSymbols(); err != nil {
-			lastErr = err
-			sess.logger.Warn("reconnect symbol reload failed, retrying", "error", err, "attempt", attempts)
-			sess.resetForRetry()
-			if err := sess.reconnectSleep(attempts); err != nil {
-				return err
-			}
-			continue
-		}
-
-		// Transport is fully restored. Before re-subscribing, issue a best-
-		// effort delete for the pre-reconnect handles snapshotted above.
-		// PLC may already have reaped them (route-idle-timeout or PLC reboot)
-		// — bestEffortDelete treats 0x714 NotifyHandleInvalid as success-
-		// equivalent, so already-aged handles don't error. Clear savedHandles
-		// after the first successful pass so a later retry iteration (after
-		// resubscribe failure → resetForRetry → loop) doesn't re-fire on an
-		// already-cleaned PLC table.
+		// Release the pre-reconnect handles now, not after the reload: this is the
+		// first point where the transport is up AND routed, which is all a Delete
+		// needs. Waiting until after reloadSymbols meant a session whose dial and
+		// route came up but whose reload kept failing never issued these deletes at
+		// all, and every retry cycle left another set of handles in the PLC's table.
 		if len(savedHandles) > 0 {
 			deleted := sess.bestEffortDeleteNotifications(sess.currentLifecycleCtx(), savedHandles)
 			sess.logger.Info("reconnect: cleaned up pre-reconnect notification handles",
@@ -1588,12 +1614,23 @@ func (sess *Session) Reconnect(_ context.Context) error {
 			savedHandles = nil
 		}
 
+		// Re-load symbols based on discovery mode
+		if err := sess.reloadSymbols(); err != nil {
+			lastErr = err
+			sess.logger.Warn("reconnect symbol reload failed, retrying", "error", err, "attempt", attempts)
+			sess.resetForRetry()
+			if err := sess.reconnectSleep(ctx, attempts); err != nil {
+				return err
+			}
+			continue
+		}
+
 		// Re-subscribe notifications using stored configs.
 		if err := sess.resubscribeNotifications(); err != nil {
 			lastErr = err
 			sess.logger.Warn("reconnect notification re-subscribe failed, retrying", "error", err, "attempt", attempts)
 			sess.resetForRetry()
-			if err := sess.reconnectSleep(attempts); err != nil {
+			if err := sess.reconnectSleep(ctx, attempts); err != nil {
 				return err
 			}
 			continue

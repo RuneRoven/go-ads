@@ -599,6 +599,13 @@ func TestSession_AutoReload_SingleFlight(t *testing.T) {
 		WithSymbolVersionReloadWindow(60*time.Second),
 	)
 
+	// Make the reload outlast the window in which the N detections arrive.
+	// Without this the guard is only exercised if the goroutines happen to
+	// overlap a reload that fails in microseconds against the stub — so the test
+	// passed or failed on scheduling luck rather than on the guard, and it did
+	// flake (~1 in 16). The delay makes the overlap a property of the test.
+	srv.delayBefore(CommandIDRead, uint32(GroupSymbolUploadInfo), 300*time.Millisecond)
+
 	preEpoch := sess.epoch()
 
 	const N = 5
