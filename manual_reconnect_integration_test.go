@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -50,6 +51,67 @@ func manualDur(env string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+func manualInt(env string, def int) int {
+	if v := os.Getenv(env); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// manualSubscriptionCount is how many symbols the manual scenarios subscribe.
+//
+// Three proved too little: a real consumer subscribes tens of tags, and the paths
+// that matter at that size are different ones. Forty puts the re-subscribe through
+// the sum command as a genuine batch, gives the per-config retry accounting
+// something to get wrong, and makes a partial recovery visible — with three
+// symbols, "all of them came back" and "the batch was retried correctly" are the
+// same observation.
+var manualSubscriptionCount = manualInt("ADS_MANUAL_SYMBOLS", 40)
+
+// manualFillerTypes are the data types worth subscribing in bulk: primitives whose
+// samples are small and whose decode is exercised elsewhere. Structs and arrays are
+// skipped so a slow PLC is not asked to push kilobytes per cycle per handle.
+var manualFillerTypes = map[string]bool{
+	"BOOL": true, "BYTE": true, "SINT": true, "USINT": true,
+	"INT": true, "UINT": true, "WORD": true,
+	"DINT": true, "UDINT": true, "DWORD": true,
+	"LINT": true, "ULINT": true, "LWORD": true,
+	"REAL": true, "LREAL": true,
+	"TIME": true, "DATE": true, "DT": true, "TOD": true,
+}
+
+// fillerSymbols picks additional symbols to subscribe, in a stable order so two
+// runs against the same PLC subscribe the same set.
+//
+// They go on ServerCycle rather than ServerOnChange: the recovery phase requires
+// every subscribed symbol to deliver again, and a constant symbol on-change is
+// legitimately silent forever, which would make this test fail for a reason that
+// is not a defect. The env-named symbols stay on-change, so both modes are covered.
+func fillerSymbols(sess *Session, exclude map[string]bool, want int) []string {
+	sess.cache.lock.Lock()
+	candidates := make([]string, 0, len(sess.cache.symbols))
+	for _, sym := range sess.cache.symbols {
+		if sym == nil || exclude[strings.ToLower(sym.FullName)] {
+			continue
+		}
+		if !manualFillerTypes[strings.ToUpper(sym.DataType)] {
+			continue
+		}
+		if strings.Contains(sym.FullName, "[") {
+			continue // array element
+		}
+		candidates = append(candidates, sym.FullName)
+	}
+	sess.cache.lock.Unlock()
+	sort.Strings(candidates)
+	if len(candidates) > want {
+		candidates = candidates[:want]
+	}
+	return candidates
 }
 
 func TestManualRestartRecovery(t *testing.T) {
@@ -124,7 +186,8 @@ func TestManualRestartRecovery(t *testing.T) {
 		t.Fatalf("LoadSymbols: %v", err)
 	}
 
-	// Subscribe several symbols where the env provides them: re-subscribe has to
+	// Subscribe the env-named symbols on change, then fill up to
+	// manualSubscriptionCount from the symbol table on cycle. Re-subscribe has to
 	// restore all of them, not just the one being watched for liveness.
 	names := []string{symbol}
 	for _, key := range []string{"ADS_READ_REAL", "ADS_READ_STRING"} {
@@ -132,11 +195,27 @@ func TestManualRestartRecovery(t *testing.T) {
 			names = append(names, v)
 		}
 	}
-	configs := make([]NotificationConfig, 0, len(names))
+	onChange := len(names)
+	taken := make(map[string]bool, len(names))
 	for _, n := range names {
+		taken[strings.ToLower(n)] = true
+	}
+	if extra := manualSubscriptionCount - len(names); extra > 0 {
+		filler := fillerSymbols(sess, taken, extra)
+		names = append(names, filler...)
+	}
+	if len(names) < manualSubscriptionCount {
+		t.Logf("note: only %d subscribable symbols found, wanted %d", len(names), manualSubscriptionCount)
+	}
+	configs := make([]NotificationConfig, 0, len(names))
+	for i, n := range names {
+		mode := TransModeServerCycle
+		if i < onChange {
+			mode = TransModeServerOnChange
+		}
 		configs = append(configs, NotificationConfig{
 			SymbolName:       n,
-			TransmissionMode: TransModeServerOnChange,
+			TransmissionMode: mode,
 			MaxDelay:         200 * time.Millisecond,
 			CycleTime:        200 * time.Millisecond,
 		})

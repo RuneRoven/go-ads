@@ -1441,3 +1441,55 @@ func TestReplayEarlySamples_ReleasesBytes(t *testing.T) {
 		t.Errorf("earlyBytes = %d after the sample was consumed, want 0", held)
 	}
 }
+
+// TestRestoreConfigs_KeepsWhatArrivedDuringTheAttempt: putting a snapshot back
+// must not discard newer configs.
+//
+// Heartbeat recovery snapshots the caller's intent, tries to re-subscribe, and
+// restores the snapshot on failure. With resetConfigs that restore was an
+// overwrite, so a subscribe made while the attempt was in flight lost its config
+// while its PLC handle stayed registered: never resubscribed after a reconnect, and
+// subscribing that symbol again would duplicate the registration. Hardware showed
+// the wider version of this race when power-cycling 192.168.3.70 with 40 symbols —
+// heartbeat recovery and the reconnect loop both resubscribing, "bound
+// notifications = 24, want 40".
+func TestRestoreConfigs_KeepsWhatArrivedDuringTheAttempt(t *testing.T) {
+	mgr := newTestNotificationManager()
+
+	// What recovery snapshotted before it started.
+	snapshot := []pendingNotification{
+		{Config: NotificationConfig{SymbolName: "MAIN.a"}},
+		{Config: NotificationConfig{SymbolName: "MAIN.b"}, resubscribeAttempts: 2},
+	}
+	// What the attempt left on file: its own configs cleared, plus one the user
+	// subscribed while it was running.
+	mgr.resetConfigs(nil)
+	mgr.addConfig(NotificationConfig{SymbolName: "MAIN.late"})
+
+	mgr.restoreConfigs(snapshot)
+
+	if !mgr.hasConfig("MAIN.late") {
+		t.Error("the config that arrived during the attempt was discarded by the restore: its handle stays registered on the PLC " +
+			"with nothing to resubscribe it")
+	}
+	for _, name := range []string{"MAIN.a", "MAIN.b"} {
+		if !mgr.hasConfig(name) {
+			t.Errorf("%s was not restored", name)
+		}
+	}
+	if len(mgr.pending) != 3 {
+		t.Errorf("pending = %d, want 3 (two restored plus the newer one)", len(mgr.pending))
+	}
+	// The retry counter has to survive, or a symbol that has already failed twice
+	// gets a fresh budget on every recovery and never drops out.
+	for _, entry := range mgr.pending {
+		if entry.Config.SymbolName == "MAIN.b" && entry.resubscribeAttempts != 2 {
+			t.Errorf("MAIN.b restored with resubscribeAttempts = %d, want 2", entry.resubscribeAttempts)
+		}
+	}
+	// And a restore must not duplicate what is already on file.
+	mgr.restoreConfigs(snapshot)
+	if len(mgr.pending) != 3 {
+		t.Errorf("pending = %d after restoring the same snapshot twice, want 3", len(mgr.pending))
+	}
+}

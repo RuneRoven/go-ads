@@ -1142,6 +1142,13 @@ func (sess *Session) recoverDeadSubscriptions() bool {
 	}
 	ctx := sess.currentLifecycleCtx()
 
+	// Held across the whole sequence below — snapshot the intent, try, restore on
+	// failure — so no other re-subscribe can run between the snapshot and the
+	// restore. Serialising only the attempt would still let a reconnect's
+	// re-subscribe read the intent this one has already cleared.
+	sess.notifications.resubscribeMu.Lock()
+	defer sess.notifications.resubscribeMu.Unlock()
+
 	// The transport is alive here — only the PLC's notification table died — so
 	// quiesce dispatch. Takes the old heartbeat with it, so a stale handle cannot
 	// be mistaken for a beat once a new one is registered, and so
@@ -1166,14 +1173,16 @@ func (sess *Session) recoverDeadSubscriptions() bool {
 
 	restoreIntent := func() {
 		sess.notifications.lock.Lock()
-		sess.notifications.resetConfigs(intent)
+		// Merge, not overwrite: a subscribe that landed while this attempt was in
+		// flight must not be erased by a snapshot taken before it existed.
+		sess.notifications.restoreConfigs(intent)
 		if sess.notifications.notificationChannel == nil {
 			sess.notifications.notificationChannel = channel
 		}
 		sess.notifications.lock.Unlock()
 	}
 
-	if err := sess.resubscribeNotifications(); err != nil {
+	if err := sess.resubscribeNotificationsLocked(); err != nil {
 		restoreIntent()
 		sess.logger.Warn("re-subscribe after a heartbeat timeout failed; keeping the subscriptions on file and retrying in the next window",
 			"error", err, "configs", len(intent))

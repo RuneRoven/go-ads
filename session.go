@@ -2360,6 +2360,19 @@ func (sess *Session) localHandshake() error {
 // successes and restores the saved configs so they can be retried by
 // the next reconnect attempt.
 func (sess *Session) resubscribeNotifications() error {
+	// One re-subscribe at a time, whichever path asked for it. See
+	// notificationManager.resubscribeMu: the snapshot-then-clear at the top of this
+	// function is what makes an overlap destructive.
+	sess.notifications.resubscribeMu.Lock()
+	defer sess.notifications.resubscribeMu.Unlock()
+	return sess.resubscribeNotificationsLocked()
+}
+
+// resubscribeNotificationsLocked is resubscribeNotifications with resubscribeMu
+// already held. Callers whose whole sequence must be atomic — snapshot the intent,
+// try, restore on failure — hold the mutex across all of it and call this, rather
+// than letting another path slip in between their snapshot and their restore.
+func (sess *Session) resubscribeNotificationsLocked() error {
 	sess.notifications.lock.Lock()
 	savedPending := sess.notifications.pending
 	savedChannel := sess.notifications.notificationChannel
