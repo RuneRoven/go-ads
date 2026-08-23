@@ -284,36 +284,38 @@ type routeManager struct {
 	skipRegistration   bool // set via WithSkipRouteRegistration — caller manages routes externally
 	routeProbeFailures atomic.Int32
 
-	// lastRegisteredNs is when this session last registered the route, and the
-	// throttle behind reRegisterInterval.
+	// registered records that this session has already registered its route, so
+	// an ordinary reconnect storm does not register again and again.
 	//
-	// ensureRoute registers whenever its probe fails, and against a PLC that
-	// answers nothing the probe fails on every reconnect attempt — so an
-	// unbounded loop registered the same route over and over. Measured
-	// consequence on a TC/RTOS device: its RUNTIME route table ended up with two
-	// entries for our NetID where the persisted config has one, after which the
-	// router started answering on a connection it opened to us and the session
-	// stopped working at all. Registering the same route twice cannot fix
-	// anything the first registration did not, so it is throttled.
-	lastRegisteredNs atomic.Int64
+	// Not an absolute once-per-session rule, because re-registering the CORRECT
+	// route is the documented recovery for a router that has stopped answering.
+	// Measured: two TC3 devices (3.1.4024 and 3.1.4026) mute after a foreign NetID
+	// claimed the address they route to us, both restored to normal service by one
+	// re-registration of our own NetID at our own address. TwinCAT keys the TC3
+	// route table by ADDRESS, so registering the right NetID for an address rebinds
+	// it; registering a NetID that does not own the address is what broke them.
+	//
+	// So the flag is cleared whenever the session concludes the PLC has stopped
+	// answering (see Session.coolDownAfterUnserved), which permits exactly one
+	// healing registration per cooldown cycle and no more.
+	registered atomic.Bool
 }
 
-// reRegisterInterval is the minimum gap between two route registrations from one
-// session. Long enough that a reconnect storm registers once, short enough that a
-// route genuinely removed on the PLC (someone editing the table, a device reset)
-// is re-created without needing a new Session.
-const reRegisterInterval = 2 * time.Minute
-
-// mayRegister reports whether enough time has passed since the last registration
-// by this session. Always true for the first one.
+// mayRegister reports whether this session may register its route. True exactly
+// once; see routeManager.registered for why that is the rule.
 func (r *routeManager) mayRegister() bool {
-	last := r.lastRegisteredNs.Load()
-	return last == 0 || time.Since(time.Unix(0, last)) >= reRegisterInterval
+	return !r.registered.Load()
 }
 
-// markRegistered records a registration for the throttle.
+// markRegistered records that this session has registered its route.
 func (r *routeManager) markRegistered() {
-	r.lastRegisteredNs.Store(time.Now().UnixNano())
+	r.registered.Store(true)
+}
+
+// allowHealingRegistration permits one further registration, for use when the PLC
+// has stopped answering and re-registering the correct route is the way back.
+func (r *routeManager) allowHealingRegistration() {
+	r.registered.Store(false)
 }
 
 // shouldSkip reports whether route registration must be bypassed entirely.

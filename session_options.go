@@ -71,6 +71,25 @@ func WithLocalBindIP(ip string) SessionOption {
 // 48898). Override with WithLocalAMS(AMSAddress{Port: N}) only when a
 // deployment needs a stable, predictable AMS port (e.g. PLC-side route
 // table pinning).
+// HAZARD when combined with route registration. TwinCAT keys its route table
+// differently per generation — TC2 by route NAME, TC3 by ADDRESS — and on TC3 a
+// table holding two entries for one address takes the router out of service for
+// EVERY client until it is cleared by hand and the device restarted. Measured on
+// TC3.1.4024 and TC3.1.4026: healthy one moment, dead five seconds after a second
+// NetID was registered at an address that already had an entry. Re-registering the
+// same NetID at the same address on TC2 is harmless (measured: one entry before,
+// one after).
+//
+// The library keeps itself on the safe side of that: the NetID is derived from the
+// address the PLC is told to use (WithHostIP, or the local TCP source IP), and a
+// Session registers a route at most once. Overriding the NetID here breaks the
+// correspondence, so if another entry on that PLC already claims the address the
+// PLC will use for us, the two collide on exactly the key TC3 cares about.
+//
+// Safe uses: a NetID that matches the address (what auto-derivation produces), or
+// WithSkipRouteRegistration when the route table is managed elsewhere. Avoid: two
+// sessions from one host under different NetIDs while both register routes, and
+// changing the NetID between runs — the PLC keeps the old entry.
 func WithLocalAMS(local AMSAddress) SessionOption {
 	return func(s *Session) {
 		if local.NetID != [6]byte{} {
@@ -456,5 +475,65 @@ func WithSymbolVersionReloadWindow(d time.Duration) SessionOption {
 func WithOnSymbolVersionChanged(fn func(reason Reason)) SessionOption {
 	return func(sess *Session) {
 		sess.versionCallback = fn
+	}
+}
+
+// WithNotificationHeartbeat tunes the internal heartbeat that detects
+// subscriptions dying silently.
+//
+// A subscription can stop delivering with nothing observable happening. Measured
+// on TC3.1.4024 across a CONFIG -> RUN cycle with no program change: the TCP
+// connection survives (no drop, no reconnect), the symbol version is unchanged
+// because nothing was recompiled, ADS state reads back identical, no error and no
+// terminal sample ever arrives — and the caller's subscriptions never deliver
+// again. A fully passive listener that sent the PLC nothing confirmed it: 210
+// samples, then silence for the rest of the run.
+//
+// Silence alone cannot be the signal, because an on-change subscription on a
+// constant symbol is legitimately silent forever. So the session keeps ONE cyclic
+// notification of its own, on the symbol-version index group: TwinCAT pushes it on
+// a timer regardless of change, and it was measured stopping in the same second as
+// the caller's samples on that transition. Its absence is therefore conclusive,
+// and it costs no client-side polling — the PLC does the sending.
+//
+// interval is the cycle time; missed is how many beats may be lost before the
+// session concludes its subscriptions are dead and re-subscribes them. Defaults:
+// 2s and 5 (so roughly 10s to notice). missed < 2 is raised to 2, because a single
+// late beat is not evidence of anything.
+func WithNotificationHeartbeat(interval time.Duration, missed int) SessionOption {
+	return func(s *Session) {
+		if interval > 0 {
+			// ADS carries cycle times as 32-bit 100ns ticks, so anything beyond
+			// ~429s cannot be expressed and the subscription would be rejected —
+			// leaving the session with no heartbeat at all, which is worse than a
+			// slow one. Clamp rather than fail.
+			if interval > maxADSCycleTime {
+				if s.logger != nil {
+					s.logger.Warn("heartbeat interval exceeds what ADS can express; clamping",
+						"requested", interval, "using", maxADSCycleTime)
+				}
+				interval = maxADSCycleTime
+			}
+			s.heartbeatInterval = interval
+		}
+		if missed < 2 {
+			missed = 2
+		}
+		s.heartbeatMissed = missed
+		s.heartbeatDisabled = false
+	}
+}
+
+// WithoutNotificationHeartbeat disables the heartbeat described in
+// WithNotificationHeartbeat.
+//
+// The cost it saves: one notification handle in the PLC's table per session, and
+// one small cyclic sample per interval. The cost it accepts: a runtime restart or
+// CONFIG toggle leaves this session's subscriptions dead permanently, with no
+// error and nothing in the session's state to show it — the consumer has to notice
+// the absence of data and rebuild the session itself.
+func WithoutNotificationHeartbeat() SessionOption {
+	return func(s *Session) {
+		s.heartbeatDisabled = true
 	}
 }

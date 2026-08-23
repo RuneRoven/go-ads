@@ -287,6 +287,11 @@ func (sess *Session) handleNotification(ctx context.Context, handle uint32, time
 // when replayEarlySamples is re-dispatching a buffered sample, so a handle
 // whose subscribe never committed cannot bounce between buffer and replay.
 func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestamp uint64, content []byte, buffer bool) {
+	// The heartbeat is ours, not the caller's: consume it before the
+	// unknown-handle path can mistake it for a leaked subscription.
+	if sess.consumeHeartbeat(handle, content) {
+		return
+	}
 	// notifications.lock: handle lookup + symbol pointer/channel snapshot.
 	sess.notifications.lock.Lock()
 	entry, ok := sess.notifications.activeNotifications[handle]
@@ -885,4 +890,228 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 			"handle", handle,
 			"hint", "usually a subscription left behind by an earlier process sharing this source NetID and port")
 	}()
+}
+
+// Heartbeat: proving the caller's subscriptions are still alive without asking the
+// PLC anything.
+//
+// See notificationManager.heartbeatHandle for the measurements this rests on. In
+// short: a runtime restart kills subscriptions while leaving the connection, the
+// symbol version and the ADS state unchanged, so there is no inbound event to react
+// to — but one CYCLIC subscription of our own turns silence into proof, because
+// TwinCAT pushes those on a timer whether the value changes or not.
+const (
+	defaultHeartbeatInterval = 2 * time.Second
+	defaultHeartbeatMissed   = 5
+	// maxADSCycleTime is the longest cycle an ADS notification can carry: the
+	// wire field is 32-bit 100ns ticks.
+	maxADSCycleTime = 400 * time.Second
+)
+
+// heartbeatEnabled reports whether this session keeps a heartbeat.
+func (sess *Session) heartbeatEnabled() bool {
+	return !sess.heartbeatDisabled
+}
+
+func (sess *Session) heartbeatCycle() time.Duration {
+	if sess.heartbeatInterval > 0 {
+		return sess.heartbeatInterval
+	}
+	return defaultHeartbeatInterval
+}
+
+func (sess *Session) heartbeatAllowedMisses() int {
+	if sess.heartbeatMissed >= 2 {
+		return sess.heartbeatMissed
+	}
+	return defaultHeartbeatMissed
+}
+
+// establishHeartbeat registers the internal cyclic notification, if enabled and not
+// already present. Failing is not fatal: the session works, it just loses the
+// ability to notice its subscriptions dying quietly.
+func (sess *Session) establishHeartbeat(ctx context.Context) {
+	if !sess.heartbeatEnabled() || sess.notifications.heartbeatHandle.Load() != 0 {
+		return
+	}
+	c := sess.client.Load()
+	if c == nil {
+		return
+	}
+	// Cyclic, one byte, on the symbol-version group: runtime-served (so it dies
+	// with the runtime's notification table, which is the event being detected),
+	// present regardless of the caller's program, and its payload is the version.
+	handle, err := c.AddDeviceNotification(ctx, uint32(GroupSymbolVersion), 0, 1,
+		TransModeServerCycle, 0, sess.heartbeatCycle())
+	if err != nil {
+		sess.logger.Warn("could not establish the notification heartbeat; a silent subscription death will go unnoticed by this session",
+			"error", err)
+		return
+	}
+	// A handle that is already one of the caller's would make every sample for
+	// that subscription look like a beat and be swallowed. No real PLC issues
+	// duplicates, but the consequence is bad enough to check for.
+	sess.notifications.lock.Lock()
+	_, collides := sess.notifications.activeNotifications[handle]
+	sess.notifications.lock.Unlock()
+	if collides {
+		sess.logger.Warn("PLC returned a heartbeat handle that is already in use by a subscription; not using it",
+			"handle", handle)
+		if derr := c.DeleteDeviceNotification(ctx, handle); derr != nil {
+			sess.logger.Debug("releasing the colliding heartbeat handle failed", "error", derr)
+		}
+		return
+	}
+	sess.notifications.heartbeatHandle.Store(handle)
+	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
+	sess.logger.Debug("notification heartbeat established", "handle", handle, "cycle", sess.heartbeatCycle())
+	sess.startHeartbeatWatch()
+}
+
+// consumeHeartbeat records a beat. Returns true when the sample was the heartbeat
+// and must not reach the caller.
+func (sess *Session) consumeHeartbeat(handle uint32, content []byte) bool {
+	if handle == 0 || handle != sess.notifications.heartbeatHandle.Load() {
+		return false
+	}
+	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
+	// The payload is the symbol version, so the beat carries online-change
+	// detection for free — no extra request needed.
+	if len(content) > 0 {
+		sess.cache.lock.Lock()
+		known := sess.cache.symbolVersion
+		sess.cache.lock.Unlock()
+		if known != 0 && content[0] != known {
+			sess.logger.Info("symbol version changed (seen on the heartbeat)", "old", known, "new", content[0])
+			sess.handleStaleDetection(ReturnCodeDeviceSymbolVersionInvalid)
+		}
+	}
+	return true
+}
+
+// startHeartbeatWatch runs the watcher once per session.
+func (sess *Session) startHeartbeatWatch() {
+	sess.heartbeatOnce.Do(func() {
+		sess.heartbeatWG.Add(1)
+		go sess.heartbeatWatch()
+	})
+}
+
+// heartbeatWatch re-subscribes when the beats stop.
+//
+// Retrying matters as much as detecting: while the PLC is in CONFIG the
+// re-subscribe cannot succeed, and that is fine — no data is expected then. The
+// watcher keeps trying so the session recovers by itself the moment the runtime is
+// serving again, which is the whole requirement.
+func (sess *Session) heartbeatWatch() {
+	defer sess.heartbeatWG.Done()
+	cycle := sess.heartbeatCycle()
+	deadline := cycle * time.Duration(sess.heartbeatAllowedMisses())
+	ticker := time.NewTicker(cycle)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sess.lifecycle.closedCh:
+			return
+		case <-ticker.C:
+		}
+		if sess.isClosed() || sess.isDisconnected() {
+			continue // a drop has its own recovery path; do not compete with it
+		}
+		sess.notifications.lock.Lock()
+		active := len(sess.notifications.activeNotifications)
+		wanted := len(sess.notifications.pending)
+		sess.notifications.lock.Unlock()
+		if wanted == 0 && active == 0 {
+			continue // the caller has asked for nothing; nothing to protect
+		}
+		// No special case for "wanted but none active": a failed recovery leaves the
+		// heartbeat clock stale, so the silence check below fires again on the next
+		// tick and retries. Verified by removing this path and watching the test
+		// still pass, which is the definition of code not worth keeping.
+		last := sess.notifications.heartbeatLastNs.Load()
+		if last == 0 || time.Since(time.Unix(0, last)) < deadline {
+			continue
+		}
+
+		sess.logger.Warn("no notification heartbeat within the allowed window; treating this session's subscriptions as dead and re-subscribing",
+			"cycle", cycle, "missed", sess.heartbeatAllowedMisses(),
+			"silentFor", time.Since(time.Unix(0, last)).Round(time.Millisecond),
+			"detail", "a runtime restart or CONFIG toggle stops delivery without dropping the connection, "+
+				"changing the symbol version or reporting an error")
+		sess.recoverDeadSubscriptions()
+	}
+}
+
+// recoverDeadSubscriptions releases what the PLC may still hold and re-subscribes
+// from the stored configs, then re-establishes the heartbeat.
+func (sess *Session) recoverDeadSubscriptions() {
+	ctx := sess.currentLifecycleCtx()
+
+	// Drop the heartbeat first so a stale handle cannot be mistaken for a beat
+	// once a new one is registered.
+	if hb := sess.notifications.heartbeatHandle.Swap(0); hb != 0 {
+		if err := sess.client.Load().DeleteDeviceNotification(ctx, hb); err != nil {
+			sess.logger.Debug("releasing the old heartbeat handle failed (expected if the runtime restarted)", "error", err)
+		}
+	}
+
+	sess.notifications.lock.Lock()
+	stale := make([]uint32, 0, len(sess.notifications.activeNotifications))
+	for h := range sess.notifications.activeNotifications {
+		stale = append(stale, h)
+	}
+	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
+	sess.notifications.lock.Unlock()
+
+	if len(stale) > 0 {
+		// userTeardown=false: this is recovery, so notificationChannel must survive
+		// for the resubscribe that follows.
+		deleted := sess.bestEffortDeleteNotifications(ctx, stale)
+		sess.logger.Info("released dead notification handles before re-subscribing",
+			"requested", len(stale), "deleted", deleted)
+	}
+
+	// Snapshot the caller's intent before trying. resubscribeNotifications treats
+	// a failed attempt as one of a bounded number of retries and drops the config
+	// after three — which is right for a reconnect, and wrong here: while the PLC
+	// is in CONFIG every attempt fails, and burning the budget threw away
+	// subscriptions the caller never cancelled. Measured on hardware: three
+	// refusals and the session was silent for good.
+	sess.notifications.lock.Lock()
+	intent := make([]pendingNotification, len(sess.notifications.pending))
+	copy(intent, sess.notifications.pending)
+	channel := sess.notifications.notificationChannel
+	sess.notifications.lock.Unlock()
+
+	restoreIntent := func() {
+		sess.notifications.lock.Lock()
+		sess.notifications.resetConfigs(intent)
+		if sess.notifications.notificationChannel == nil {
+			sess.notifications.notificationChannel = channel
+		}
+		sess.notifications.lock.Unlock()
+	}
+
+	if err := sess.resubscribeNotifications(); err != nil {
+		restoreIntent()
+		sess.logger.Warn("re-subscribe after a heartbeat timeout failed; keeping the subscriptions on file and retrying in the next window",
+			"error", err, "configs", len(intent))
+		return
+	}
+	// A "successful" resubscribe that bound nothing is the CONFIG case: the PLC
+	// refused every item. Same treatment — keep the intent, try again later.
+	sess.notifications.lock.Lock()
+	bound := len(sess.notifications.activeNotifications)
+	sess.notifications.lock.Unlock()
+	if bound == 0 && len(intent) > 0 {
+		restoreIntent()
+		sess.logger.Warn("re-subscribe bound nothing (PLC not serving yet); keeping the subscriptions on file and retrying in the next window",
+			"configs", len(intent))
+		return
+	}
+	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
+	sess.establishHeartbeat(ctx)
+	sess.logger.Info("subscriptions re-established after the heartbeat stopped")
 }

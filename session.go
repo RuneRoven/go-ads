@@ -216,6 +216,14 @@ type Session struct {
 	// tryPeerFallback. See WithoutAmsPeerFallback.
 	peerFallbackDisabled bool
 
+	// Heartbeat: an internal cyclic notification whose silence proves the caller's
+	// subscriptions have died. See notificationManager.heartbeatHandle.
+	heartbeatInterval time.Duration
+	heartbeatMissed   int
+	heartbeatDisabled bool
+	heartbeatOnce     sync.Once
+	heartbeatWG       sync.WaitGroup
+
 	// Event callbacks (run in goroutine, must not block)
 	onDisconnect func()
 	onReconnect  func()
@@ -1379,6 +1387,15 @@ func (sess *Session) Close() error {
 	// Stop accepting inbound PLC connections before tearing the transport down,
 	// so the accept loop cannot hand one to a Client that is going away.
 	sess.stopPeerListener()
+	// The heartbeat is not in activeNotifications, so releasePLCResources below
+	// cannot see it — release it here or it lingers in the PLC's table.
+	if hb := sess.notifications.heartbeatHandle.Swap(0); hb != 0 && !wasDisconnected {
+		if c := sess.client.Load(); c != nil {
+			if err := c.DeleteDeviceNotification(sess.currentLifecycleCtx(), hb); err != nil {
+				sess.logger.Debug("releasing the heartbeat handle on close failed", "handle", hb, "error", err)
+			}
+		}
+	}
 
 	sess.releasePLCResources(wasDisconnected)
 	// Capture cancel under RLock then release before invoking — see
@@ -1499,6 +1516,14 @@ func (sess *Session) coolDownAfterUnserved(ctx context.Context, attempts int, ca
 	// Nothing open while we wait: the point is to stop competing for the
 	// router's one-connection-per-IP slot.
 	sess.tearDownAndReset(false)
+
+	// Permit one route registration on the next attempt. Re-registering the
+	// correct route is the measured recovery for a router that has stopped
+	// answering — two TC3 devices mute, both restored by exactly this — so a
+	// session that has concluded the PLC is silent should be allowed to try it.
+	if !sess.route.shouldSkip() {
+		sess.route.allowHealingRegistration()
+	}
 
 	timer := time.NewTimer(d)
 	defer timer.Stop()

@@ -86,7 +86,16 @@ func TestSubscribeRace_EarlySampleReplayedAfterCommit(t *testing.T) {
 	preSeedTypedSymbol(sess, "MAIN.sMachineName", 0xC0DE)
 
 	const plcHandle = 0x1234
+	var addSeen atomic.Int32
 	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		// Only the caller's subscription (the first Add) gets plcHandle and the
+		// early sample; anything else — the session's own cyclic heartbeat — must
+		// get a DIFFERENT handle, as a real PLC would. A stub handing the same
+		// handle to two subscriptions makes the heartbeat swallow the caller's
+		// samples, which no device can actually do.
+		if addSeen.Add(1) > 1 {
+			return addNotifResponse{Handle: plcHandle + uint32(addSeen.Load())}
+		}
 		// Fire the sample BEFORE the Add response goes back on the wire, so
 		// the commit into activeNotifications cannot have happened yet.
 		if err := sess.drivePacket(sess.lifecycle.ctx, buildNotificationPacket(plcHandle, 0, intSample(4242))); err != nil {

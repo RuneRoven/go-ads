@@ -87,6 +87,27 @@ type notificationManager struct {
 	// entirely by what the PLC sends for handles we do not recognise.
 	earlyBytes int
 
+	// heartbeatHandle is an internal CYCLIC notification on the symbol-version
+	// index group, and heartbeatLastNs is when it last delivered.
+	//
+	// It exists because a subscription can die with nothing observable happening:
+	// measured on TC3.1.4024 across CONFIG -> RUN with no program change, the TCP
+	// connection survives, the symbol version is unchanged, ADS state reads back
+	// identical, no error or terminal sample arrives — and the caller's
+	// subscriptions never deliver again (confirmed with a fully passive listener
+	// that sent the PLC nothing). An on-change subscription may also be silent
+	// legitimately, so silence alone proves nothing.
+	//
+	// A cyclic subscription fixes that: TwinCAT pushes on a timer regardless of
+	// change, so ITS silence is conclusive. Measured on the same transition, the
+	// beat and the caller's samples stop in the same second, which is what makes
+	// this a valid detector. 0xF008 is served by the runtime (so it dies with the
+	// runtime's notification table, unlike anything on the system port), exists
+	// regardless of the caller's program, is one byte, and its payload is the
+	// symbol version — so each beat doubles as online-change detection.
+	heartbeatHandle atomic.Uint32
+	heartbeatLastNs atomic.Int64
+
 	// orphanDelete tracks unknown-handle Delete attempts so we don't spam
 	// the PLC when a previously-leaked subscription keeps firing. Guarded
 	// by orphanMu (separate from notifications.lock so the throttle check
@@ -304,6 +325,8 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	if err != nil {
 		return 0, err
 	}
+	// A subscription now exists, so it is worth protecting.
+	sess.establishHeartbeat(ctx)
 	sess.logger.Info("notification created",
 		"handle", handle,
 		"symbol", symbolName,
@@ -672,6 +695,9 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 
 	// Everything else was already bound (or recorded as failed/skipped) by
 	// onItem as its result arrived; nothing left to commit here.
+	if len(committed) > 0 {
+		sess.establishHeartbeat(ctx)
+	}
 	return results, nil
 }
 

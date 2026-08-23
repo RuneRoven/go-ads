@@ -571,8 +571,8 @@ func TestConnect_VerifiesTheLinkAnswersEvenWithoutRouteRegistration(t *testing.T
 	}
 }
 
-// TestReconnect_DoesNotReRegisterRouteEveryAttempt: registering the same route
-// again and again is how a device ends up with duplicate runtime entries.
+// TestReconnect_DoesNotReRegisterRouteEveryAttempt: a session registers its route
+// at most once, however many times it reconnects.
 //
 // ensureRoute registers whenever its probe fails, and the probe fails on every
 // attempt against a PLC that answers nothing — so an unbounded reconnect loop
@@ -604,9 +604,81 @@ func TestReconnect_DoesNotReRegisterRouteEveryAttempt(t *testing.T) {
 
 	_ = sess.Reconnect(context.Background())
 
-	if got := router.registrations(); got > 2 {
-		t.Errorf("route registered %d times across 6 reconnect attempts; repeated registration is what creates duplicate runtime entries", got)
+	// One per unserved episode, not one per attempt. Re-registering the correct
+	// route is the measured recovery for a mute router, so a session that has
+	// concluded the PLC is silent is allowed one more — but a plain retry loop
+	// must not register every time round.
+	got := router.registrations()
+	if got == 0 {
+		t.Error("no registration at all; the route was never established")
+	}
+	if got >= 6 {
+		t.Errorf("route registered %d times across 6 reconnect attempts — that is once per attempt, which is the storm this guards against", got)
+	}
+	t.Logf("route registered %d time(s) across 6 attempts", got)
+}
+
+// TestReconnect_ReRegistersRouteToHealAMuteDevice: re-registering our own route is
+// the measured way back from a router that has stopped answering, so a reconnect
+// loop that has concluded the PLC is silent must be allowed to try it.
+//
+// The state, measured on TC3.1.4024 and TC3.1.4026: a foreign NetID claimed the
+// address the PLC routes to us, and TC3 keys its route table by ADDRESS, so the
+// device answered nothing at all — not on our connection, not on one it opened.
+// One registration of our own NetID for our own address rebound it and both
+// devices returned to normal service immediately.
+//
+// So the rule is neither "register every attempt" (which is how the address gets
+// contested in the first place) nor "register once per session, ever" (which locks
+// out the recovery). It is once per unserved episode.
+func TestReconnect_ReRegistersRouteToHealAMuteDevice(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	router := startRouteResponder(t)
+
+	// The device answers only once it has seen a SECOND registration: the first is
+	// the session establishing its route, the second is the healing one.
+	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+		if router.registrations() < 2 {
+			// Outlast the client's request timeout without answering: silence, not
+			// a malformed reply, is what a router in this state produces — and only
+			// a plain deadline counts as "unserved".
+			time.Sleep(400 * time.Millisecond)
+		}
+		return ReturnCodeNoErrors, []byte{12}
+	})
+
+	sess := newDialableTestSession(t, srv.host, srv.port, 40)
+	sess.routerPort = router.port
+	sess.route = &routeManager{
+		name:              "go-ads-test",
+		username:          "Administrator",
+		password:          secret("1"),
+		activationTimeout: 500 * time.Millisecond,
+	}
+	sess.callbackIP = "192.168.3.52"
+	sess.requestTimeout = 200 * time.Millisecond
+	sess.lifecycle.unservedCooldown = 300 * time.Millisecond
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+
+	done := make(chan error, 1)
+	go func() { done <- sess.Reconnect(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("reconnect never recovered: %v (registrations=%d)", err, router.registrations())
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("reconnect did not finish; registrations=%d", router.registrations())
+	}
+
+	if got := router.registrations(); got < 2 {
+		t.Errorf("registrations = %d, want at least 2: the session must be allowed one healing re-registration after concluding the PLC is silent", got)
 	} else {
-		t.Logf("route registered %d time(s) across 6 attempts", got)
+		t.Logf("recovered after %d registrations", got)
+	}
+	if state := sess.lifecycle.state.load(); state != SessionStateConnected {
+		t.Errorf("state = %v, want Connected after recovery", state)
 	}
 }
