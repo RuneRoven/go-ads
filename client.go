@@ -150,8 +150,12 @@ type Client struct {
 	closeOnce sync.Once
 
 	// peerConns are inbound connections the PLC opened to us; see AcceptPeerConn.
-	peerMu    sync.Mutex
-	peerConns []net.Conn
+	// peerClosed latches once closePeerConns has run: the accept loop outlives a
+	// teardown by design, so it can still offer connections to a Client that is
+	// going away, and adopting one then breaks the wait for this Client's workers.
+	peerMu     sync.Mutex
+	peerConns  []net.Conn
+	peerClosed bool
 }
 
 // markDropped releases every request waiting on this client's connection.
@@ -401,24 +405,65 @@ func (c *Client) listen() {
 // Frames carry their own invokeID, so responses match up regardless of which
 // socket they arrive on, and notifications dispatch normally.
 func (c *Client) AcceptPeerConn(conn net.Conn) {
+	// Refuse once the adopted connections have been dropped for a teardown. The
+	// PLC re-dials after every drop, which is exactly when teardown runs, and
+	// tearDownAndReset does closePeerConns() and then waits on this WaitGroup:
+	// adopting here would append to a slice nobody will close again (a leaked fd
+	// and a half-open socket the PLC counts against its one-connection-per-IP
+	// limit), block that wait forever in io.ReadFull, and Add to a WaitGroup whose
+	// Wait may already be running at zero, which panics the process.
+	//
+	// The Add stays inside the same critical section as the flag check, so it
+	// cannot slip past a closePeerConns that has already returned.
 	c.peerMu.Lock()
+	if c.peerClosed || (c.ctx != nil && c.ctx.Err() != nil) {
+		c.peerMu.Unlock()
+		c.logger.Debug("refusing an inbound PLC connection: this client is being torn down (the PLC will dial again)",
+			"remote", conn.RemoteAddr().String())
+		_ = conn.Close()
+		return
+	}
 	c.peerConns = append(c.peerConns, conn)
+	c.waitGroup.Add(1)
 	c.peerMu.Unlock()
+
 	c.logger.Info("adopted an inbound connection from the PLC (peer-route behaviour)",
 		"remote", conn.RemoteAddr().String())
-	c.waitGroup.Add(1)
 	go func() {
 		defer c.waitGroup.Done()
+		// This reader owns the socket. readFrames returns on ctx.Done() and on any
+		// read error without touching conn, so without this every connection the
+		// PLC ever opened would cost an fd for the life of the Client.
+		defer func() {
+			_ = conn.Close()
+			c.forgetPeerConn(conn)
+		}()
 		c.readFrames(conn, false)
 	}()
 }
 
-// closePeerConns drops every adopted inbound connection. Called from Close so a
-// reader blocked on one cannot hold up teardown.
+// forgetPeerConn drops one adopted connection from the list. Without it the slice
+// only ever grows: a device that re-dials on each of its own drops would
+// accumulate an entry per connection for the life of the Client.
+func (c *Client) forgetPeerConn(conn net.Conn) {
+	c.peerMu.Lock()
+	defer c.peerMu.Unlock()
+	for i, existing := range c.peerConns {
+		if existing == conn {
+			c.peerConns = append(c.peerConns[:i], c.peerConns[i+1:]...)
+			return
+		}
+	}
+}
+
+// closePeerConns drops every adopted inbound connection and refuses further ones.
+// Called from Close and from tearDownAndReset so a reader blocked on one cannot
+// hold up the wait for this Client's workers.
 func (c *Client) closePeerConns() {
 	c.peerMu.Lock()
 	conns := c.peerConns
 	c.peerConns = nil
+	c.peerClosed = true
 	c.peerMu.Unlock()
 	for _, conn := range conns {
 		_ = conn.Close()

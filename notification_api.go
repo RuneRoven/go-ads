@@ -263,6 +263,26 @@ func (sess *Session) releaseCleanupCtx(ctx context.Context) (context.Context, co
 	return context.WithTimeout(parent, notificationReleaseTimeout)
 }
 
+// releaseUncommittedHandle gives back a PLC handle this session acquired but never
+// committed into activeNotifications.
+//
+// Deliberately the raw Client call, not the Session wrapper: the wrapper's job is
+// to retire a subscription the caller owns, and running it for a handle that was
+// never committed used to clear notificationChannel whenever activeNotifications
+// happened to be empty — the state every sweep leaves behind — which silently
+// dropped the caller's whole subscription set on the next resubscribe.
+//
+// The release also has to outlive a cancelled caller context. These paths run
+// after the PLC round-trip has already succeeded, so if the caller's deadline
+// expired during it, a delete on that same context is never sent and the PLC is
+// left streaming a subscription nobody owns. The batch path solved this with
+// releaseCleanupCtx; the single-symbol path was still passing ctx straight through.
+func (sess *Session) releaseUncommittedHandle(ctx context.Context, handle uint32) error {
+	releaseCtx, cancel := sess.releaseCleanupCtx(ctx)
+	defer cancel()
+	return sess.client.Load().DeleteDeviceNotification(releaseCtx, handle)
+}
+
 // takeNotificationHandles stops trusting the current notification registrations:
 // it empties activeNotifications and returns every handle the PLC still holds for
 // this session, the internal heartbeat included.
@@ -404,7 +424,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	cacheGen := sess.epoch()
 	sess.cache.lock.Unlock()
 	if fresh == nil {
-		if delErr := sess.DeleteDeviceNotification(ctx, handle); delErr != nil {
+		if delErr := sess.releaseUncommittedHandle(ctx, handle); delErr != nil {
 			sess.logger.Warn("failed to release PLC handle after symbol vanished",
 				"handle", handle, "symbol", symbolName, "error", delErr)
 		}
@@ -416,7 +436,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	sess.notifications.lock.Lock()
 	if sess.epoch() != cacheGen {
 		sess.notifications.lock.Unlock()
-		if delErr := sess.DeleteDeviceNotification(ctx, handle); delErr != nil {
+		if delErr := sess.releaseUncommittedHandle(ctx, handle); delErr != nil {
 			sess.logger.Warn("failed to release PLC handle after cache reload during subscribe",
 				"handle", handle, "symbol", symbolName, "error", delErr)
 		}
@@ -424,7 +444,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	}
 	if sess.notifications.notificationChannel != nil && sess.notifications.notificationChannel != updateReceiver {
 		sess.notifications.lock.Unlock()
-		if delErr := sess.DeleteDeviceNotification(ctx, handle); delErr != nil {
+		if delErr := sess.releaseUncommittedHandle(ctx, handle); delErr != nil {
 			sess.logger.Warn("failed to release PLC handle after channel-mismatch reject",
 				"handle", handle, "symbol", symbolName, "error", delErr)
 		}
@@ -432,7 +452,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	}
 	if sess.notifications.hasConfig(symbolName) {
 		sess.notifications.lock.Unlock()
-		if delErr := sess.DeleteDeviceNotification(ctx, handle); delErr != nil {
+		if delErr := sess.releaseUncommittedHandle(ctx, handle); delErr != nil {
 			sess.logger.Warn("failed to release PLC handle after duplicate-subscribe reject",
 				"handle", handle, "symbol", symbolName, "error", delErr)
 		}

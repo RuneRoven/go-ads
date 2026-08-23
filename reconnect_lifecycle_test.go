@@ -848,3 +848,63 @@ func TestReconnect_DropWhileFinishingIsNotLost(t *testing.T) {
 		t.Fatal("Close() hung: reconnectDone was orphaned by the abandoned drop")
 	}
 }
+
+// TestConnect_FailedRouteActivationLeavesNothingRunning: a Connect that reports
+// failure must not leave a live transport behind.
+//
+// Both route-stage error returns in Connect skipped tearDownAndReset, unlike every
+// sibling path in the same function. The socket stayed open, the Client's workers
+// (listen, transmit, recvWorkers) kept running, and the deferred re-arm restored
+// onDrop — so when the PLC eventually closed that abandoned socket, the session
+// silently began reconnecting a Connect the caller had been told failed. If it
+// then succeeded, the caller holds a Session it believes is dead and never reads
+// from, while a second Client publishes a second transmitWorker onto the same
+// shared tx.sendChannel and frames go to whichever socket wins.
+func TestConnect_FailedRouteActivationLeavesNothingRunning(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	router := startRouteResponder(t)
+
+	// The router ACKs the registration, but the device never serves the route:
+	// silence, which is what awaitRouteActive is there to catch.
+	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+		time.Sleep(400 * time.Millisecond)
+		return ReturnCodeNoErrors, []byte{3}
+	})
+
+	sess, err := NewSession(context.Background(),
+		AMSEndpoint{IP: srv.host, Port: srv.port, AMS: AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851}},
+		WithRequestTimeout(150*time.Millisecond),
+		WithTargetCheck(TargetCheckOff),
+		WithRoute("go-ads-test", "Administrator", "1"),
+		WithHostIP("127.0.0.1"),
+		WithRouteActivationTimeout(600*time.Millisecond),
+		WithoutAmsPeerFallback(),
+		WithBackoff(fastBackoff()),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	sess.routerPort = router.port
+	t.Cleanup(func() { sess.Close() })
+
+	if err := sess.Connect(context.Background()); err == nil {
+		t.Fatal("Connect reported success although the route never activated")
+	}
+
+	// The Client that was published during the attempt must be finished with.
+	if c := sess.client.Load(); c != nil && c.ctx != nil && c.ctx.Err() == nil {
+		t.Error("the Client published during the failed Connect is still live: its workers are running on an open socket")
+	}
+
+	// A retry is explicitly allowed from here (the rollback leaves Disconnected,
+	// and Disconnected -> Connecting is a legal edge). It must not end up with two
+	// Clients on the shared transport: the first one's transmitWorker would still
+	// be competing for tx.sendChannel and writing to a socket that is gone.
+	before := srv.accepts()
+	_ = sess.Connect(context.Background())
+	if got := srv.accepts() - before; got != 1 {
+		t.Errorf("the retry produced %d new connections, want 1: the abandoned transport was never closed, "+
+			"so the route stage redialed on top of it", got)
+	}
+}

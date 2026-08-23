@@ -3,6 +3,7 @@ package ads
 import (
 	"context"
 	"encoding/binary"
+	"log/slog"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -405,5 +406,279 @@ func TestHeartbeat_ReEstablishedAfterReconnect(t *testing.T) {
 	if !slices.Contains(dels, oldHB) {
 		t.Errorf("pre-drop heartbeat handle %d was never released (deleted=%v): it is not in activeNotifications, so the "+
 			"reconnect sweep does not snapshot it and one handle leaks per reconnect", oldHB, dels)
+	}
+}
+
+// TestDeleteNotification_AlreadyGoneStillCleansUpBookkeeping: when the PLC says
+// the registration is already gone, the local bookkeeping must go with it.
+//
+// 0x714 NotifyHandleInvalid and 0x715 DeviceClientUnknown mean the PLC has no such
+// registration — after a runtime restart or a dropped client identity, that is the
+// normal answer. Returning early on it left the entry in activeNotifications
+// forever (every retry gets the same code, so the caller can never delete it) and
+// left the config on file, so the next reconnect re-subscribed a symbol the caller
+// had explicitly deleted, creating a duplicate PLC registration. The batch sibling
+// has always treated these codes as success-equivalent.
+func TestDeleteNotification_AlreadyGoneStillCleansUpBookkeeping(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xB00)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	// The PLC no longer knows this registration.
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode {
+		return ReturnCodeDeviceNotifyHandleInvalid
+	})
+
+	sess, c := newWiredTestSession(t, srv, WithoutNotificationHeartbeat())
+	c.SetNotificationHandler(sess.handleNotification)
+	preSeedTypedSymbol(sess, "MAIN.gone", 0xF600)
+	ch := make(chan *Update, 4)
+	handle, err := sess.AddSymbolNotification(context.Background(), "MAIN.gone", 0, 0,
+		TransModeServerOnChange, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotification: %v", err)
+	}
+
+	// The error is still reported — the caller asked for a delete and it did not
+	// happen the way they asked — but the state must not be stranded.
+	_ = sess.DeleteDeviceNotification(context.Background(), handle)
+
+	sess.notifications.lock.Lock()
+	_, stillActive := sess.notifications.activeNotifications[handle]
+	stillConfigured := sess.notifications.hasConfig("MAIN.gone")
+	sess.notifications.lock.Unlock()
+
+	if stillActive {
+		t.Errorf("handle %d still in activeNotifications after the PLC reported it already gone: "+
+			"every retry gets the same code, so the caller can never remove it", handle)
+	}
+	if stillConfigured {
+		t.Error("config for MAIN.gone still on file after a delete the PLC confirmed as already gone: " +
+			"the next reconnect re-subscribes a symbol the caller deleted")
+	}
+}
+
+// TestDeleteNotification_ForeignHandleKeepsTheSubscriptionChannel: deleting a
+// handle this session does not own must not disturb the ones it does.
+//
+// The clear of notificationChannel was gated on the map being empty rather than on
+// the handle having actually been removed, so a delete for an unknown handle wiped
+// the channel whenever the map happened to be empty — exactly the state a sweep
+// leaves behind. resubscribeNotifications then returns early on a nil channel while
+// the reconnect logs success, and every subscription is silently dropped. This is
+// the single-symbol twin of the sum-path bug that hardware caught: a power cycle
+// left notifications never resuming.
+func TestDeleteNotification_ForeignHandleKeepsTheSubscriptionChannel(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	sess, c := newWiredTestSession(t, srv, WithoutNotificationHeartbeat())
+	c.SetNotificationHandler(sess.handleNotification)
+
+	// The state a sweep leaves: nothing bound yet, but the caller's intent and
+	// channel are on file for the re-subscribe that follows.
+	ch := make(chan *Update, 4)
+	sess.notifications.lock.Lock()
+	sess.notifications.notificationChannel = ch
+	sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.keepme"})
+	sess.notifications.lock.Unlock()
+
+	if err := sess.DeleteDeviceNotification(context.Background(), 0xDEAD); err != nil {
+		t.Fatalf("delete of a foreign handle: %v", err)
+	}
+
+	sess.notifications.lock.Lock()
+	channel := sess.notifications.notificationChannel
+	configs := len(sess.notifications.pending)
+	sess.notifications.lock.Unlock()
+	if channel == nil {
+		t.Errorf("notificationChannel was cleared by deleting a handle this session never owned, with %d config(s) still on file: "+
+			"resubscribeNotifications returns early on a nil channel while the reconnect reports success", configs)
+	}
+}
+
+// TestHeartbeat_SymbolVersionChangeDetectedOnce: the beat carries the symbol
+// version, so a change shows up for free — but it must be detected once, not on
+// every beat forever.
+//
+// consumeHeartbeat compared the beat's payload against cache.symbolVersion and
+// never wrote the new value back, so under SymbolVersionIgnore the same change
+// re-fired handleStaleDetection every interval (2s by default): markAllHandlesStale
+// plus a fresh versionCallback goroutine each time, against the documented
+// once-per-detection contract. Only AutoReload was accidentally safe, because
+// LoadSymbols rewrites the field on its way through.
+func TestHeartbeat_SymbolVersionChangeDetectedOnce(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xC00)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	var detections atomic.Int32
+	// A long cycle so the watchdog cannot interfere; the beats here are driven by
+	// hand.
+	sess, c := newWiredTestSession(t, srv,
+		WithNotificationHeartbeat(5*time.Second, 3),
+		WithSymbolVersionStrategy(SymbolVersionIgnore),
+		WithOnSymbolVersionChanged(func(Reason) { detections.Add(1) }),
+	)
+	c.SetNotificationHandler(sess.handleNotification)
+	sess.cache.lock.Lock()
+	sess.cache.symbolVersion = 4
+	sess.cache.lock.Unlock()
+
+	preSeedTypedSymbol(sess, "MAIN.ver", 0xF700)
+	ch := make(chan *Update, 16)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.ver", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Fatalf("AddSymbolNotification: %v", err)
+	}
+	hb := sess.notifications.heartbeatHandle.Load()
+	if hb == 0 {
+		t.Fatal("no heartbeat handle")
+	}
+
+	// Five beats all reporting the same NEW version: one change, one detection.
+	for i := 0; i < 5; i++ {
+		if err := sess.drivePacket(sess.currentLifecycleCtx(), buildNotificationPacket(hb, 0, []byte{9})); err != nil {
+			t.Fatalf("drivePacket: %v", err)
+		}
+	}
+	time.Sleep(300 * time.Millisecond) // the callback is dispatched on its own goroutine
+
+	if got := detections.Load(); got != 1 {
+		t.Errorf("symbol-version change detected %d times across 5 beats reporting the same version, want 1: "+
+			"the cached version is never advanced, so every subsequent beat re-detects the same change", got)
+	}
+	sess.cache.lock.Lock()
+	cached := sess.cache.symbolVersion
+	sess.cache.lock.Unlock()
+	if cached != 9 {
+		t.Errorf("cache.symbolVersion = %d after the beat reported 9: the detection never records what it saw", cached)
+	}
+}
+
+// TestHeartbeat_RecoveryDoesNothingAfterClose: recovery must not touch the PLC
+// once the session is closed.
+//
+// heartbeatWatch checks isClosed() before calling recovery, but that is a TOCTOU:
+// Close can land right after it. Recovery would then delete and re-subscribe
+// AFTER releasePLCResources had already run, so registrations created by a closed
+// session survive in the PLC's table with nothing left to ever delete them, and
+// samples stream into a channel the caller considers finished. The watcher was also
+// untracked — heartbeatWG was Add/Done'd but never waited — so Close returned while
+// all of that was still in flight.
+func TestHeartbeat_RecoveryDoesNothingAfterClose(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	var adds, deletes atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xD00)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		adds.Add(1)
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode {
+		deletes.Add(1)
+		return ReturnCodeNoErrors
+	})
+	// The resubscribe uses the batch path, so this group has to answer or the test
+	// proves nothing: it would fail on a parse error long before reaching the
+	// behaviour under test.
+	srv.onWriteRead(GroupSumupAddDeviceNotification, func(_ []byte) []byte {
+		adds.Add(1)
+		return buildSumAddNotifPayload([]sumNotifResponse{{Error: ReturnCodeNoErrors, Handle: nextHandle.Add(1)}})
+	})
+	srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(req []byte) []byte {
+		codes := make([]ReturnCode, len(req)/4)
+		for i := range codes {
+			deletes.Add(1)
+			codes[i] = ReturnCodeNoErrors
+		}
+		return buildSumDeleteNotifPayload(codes)
+	})
+
+	// newDialableTestSession, not newWiredTestSession: the latter's Client comes
+	// from Dial with a context of its own, so Session.Close() can never finish
+	// waiting for its workers (see that helper's comment).
+	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeNoErrors, []byte{5}
+	})
+	sess := newDialableTestSession(t, srv.host, srv.port, 5)
+	sess.heartbeatInterval = 5 * time.Second
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+	if err := sess.Reconnect(context.Background()); err != nil {
+		t.Fatalf("initial reconnect: %v", err)
+	}
+	preSeedTypedSymbol(sess, "MAIN.afterclose", 0xF800)
+	ch := make(chan *Update, 4)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.afterclose", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Fatalf("AddSymbolNotification: %v", err)
+	}
+
+	// The window that matters is INSIDE Close: it marks the session closed and
+	// releases the PLC resources, and only then cancels the context. A recovery
+	// entering during that stretch still has a live context, so its RPCs land -
+	// after the release that was supposed to be the last word. Pin Close there.
+	gate := newGateOnLog("releasePLCResources", "")
+	sess.logger = slog.New(gate)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- sess.Close() }()
+	select {
+	case <-gate.w.reached:
+	case err := <-closeDone:
+		t.Fatalf("Close finished without reaching the release log: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close never reached the release log")
+	}
+
+	addsAtClose, deletesAtClose := adds.Load(), deletes.Load()
+
+	// Exactly what the watcher does when Close lands after its isClosed() check.
+	done := make(chan struct{})
+	go func() { defer close(done); sess.recoverDeadSubscriptions() }()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery on a closing session never returned")
+	}
+	recoveryAdds, recoveryDeletes := adds.Load(), deletes.Load()
+	recoveredHB := sess.notifications.heartbeatHandle.Load()
+
+	// establishHeartbeat has its own reachable path onto a closing session — a
+	// caller subscribing concurrently with Close — so it carries its own guard.
+	// Asserted here, still inside the window: after Close returns the context is
+	// cancelled and the RPC would fail regardless, which would make the guard
+	// untestable.
+	sess.establishHeartbeat(sess.currentLifecycleCtx())
+	beatAdds := adds.Load()
+
+	close(gate.w.release)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if recoveryAdds != addsAtClose {
+		t.Errorf("recovery registered %d PLC notification(s) after the session had released its resources: nothing will ever delete them",
+			recoveryAdds-addsAtClose)
+	}
+	if recoveryDeletes != deletesAtClose {
+		t.Errorf("recovery issued %d PLC delete(s) on a closing session", recoveryDeletes-deletesAtClose)
+	}
+	if recoveredHB != 0 {
+		t.Errorf("recovery established heartbeat handle %d on a closing session", recoveredHB)
+	}
+	if beatAdds != recoveryAdds {
+		t.Errorf("establishHeartbeat registered a beat on a closing session (%d new add(s)): nothing will delete it", beatAdds-recoveryAdds)
 	}
 }

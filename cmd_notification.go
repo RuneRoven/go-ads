@@ -141,12 +141,20 @@ func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32
 	// would cause resubscribeNotifications to re-subscribe a deleted symbol).
 	sess.notifications.lock.Lock()
 	var symbolName string
-	if entry, ok := sess.notifications.activeNotifications[handle]; ok && entry.Sym != nil {
+	entry, ours := sess.notifications.activeNotifications[handle]
+	if ours && entry.Sym != nil {
 		symbolName = entry.Sym.FullName
 	}
 	sess.notifications.lock.Unlock()
 
-	if err := sess.client.Load().DeleteDeviceNotification(ctx, handle); err != nil {
+	err := sess.client.Load().DeleteDeviceNotification(ctx, handle)
+	// 0x714 NotifyHandleInvalid and 0x715 DeviceClientUnknown mean the PLC has no
+	// such registration — after a runtime restart or a dropped client identity that
+	// is the normal answer, and the batch path has always counted them as
+	// success-equivalent. Returning early on them stranded the entry forever (every
+	// retry gets the same code) and left the config on file, so the next reconnect
+	// re-subscribed a symbol the caller had deleted. Report the error, but clean up.
+	if err != nil && !isBestEffortDeleteSuccessErr(err) {
 		return err
 	}
 	sess.notifications.lock.Lock()
@@ -154,13 +162,27 @@ func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32
 		sess.removeNotificationConfig(symbolName)
 	}
 	delete(sess.notifications.activeNotifications, handle)
-	if len(sess.notifications.activeNotifications) == 0 {
+	// Gated on the handle having actually been ours, not merely on the map being
+	// empty. A raw-handle caller — or one of AddSymbolNotification's own refusal
+	// paths releasing a handle it never committed — would otherwise clear the
+	// channel whenever the map happened to be empty, which is exactly the state a
+	// sweep leaves behind. resubscribeNotifications then returns early on the nil
+	// channel while the reconnect reports success, and every subscription is
+	// silently dropped.
+	if ours && len(sess.notifications.activeNotifications) == 0 {
 		sess.notifications.notificationChannel = nil
 	}
 	sess.notifications.lock.Unlock()
 	// Name the symbol: a handle alone cannot be tied back to a tag when
 	// reading a shutdown trace, and this layer is the only one that knows the
 	// mapping. Empty when the handle was not ours (raw-handle caller).
+	if err != nil {
+		// Cleaned up, but say what the PLC actually answered rather than reporting
+		// a clean delete.
+		sess.logger.Info("notification bookkeeping cleared; the PLC had already dropped the registration",
+			"handle", handle, "symbol", symbolName, "error", err)
+		return err
+	}
 	sess.logger.Info("notification deleted", "handle", handle, "symbol", symbolName)
 	return nil
 }
@@ -931,7 +953,9 @@ func (sess *Session) heartbeatAllowedMisses() int {
 // already present. Failing is not fatal: the session works, it just loses the
 // ability to notice its subscriptions dying quietly.
 func (sess *Session) establishHeartbeat(ctx context.Context) {
-	if !sess.heartbeatEnabled() || sess.notifications.heartbeatHandle.Load() != 0 {
+	// Same window as recoverDeadSubscriptions: registering a beat on a session that
+	// has already released its PLC resources strands it.
+	if sess.isClosed() || !sess.heartbeatEnabled() || sess.notifications.heartbeatHandle.Load() != 0 {
 		return
 	}
 	c := sess.client.Load()
@@ -978,10 +1002,20 @@ func (sess *Session) consumeHeartbeat(handle uint32, content []byte) bool {
 	// The payload is the symbol version, so the beat carries online-change
 	// detection for free — no extra request needed.
 	if len(content) > 0 {
+		// Record what we saw before acting on it, under the same lock that read the
+		// old value. Without the write-back every following beat re-detects the same
+		// change: under SymbolVersionIgnore that is a markAllHandlesStale and a fresh
+		// versionCallback goroutine per interval, forever, against the documented
+		// once-per-detection contract. AutoReload only escaped it because LoadSymbols
+		// rewrites the field on its way through.
 		sess.cache.lock.Lock()
 		known := sess.cache.symbolVersion
+		changed := known != 0 && content[0] != known
+		if changed {
+			sess.cache.symbolVersion = content[0]
+		}
 		sess.cache.lock.Unlock()
-		if known != 0 && content[0] != known {
+		if changed {
 			sess.logger.Info("symbol version changed (seen on the heartbeat)", "old", known, "new", content[0])
 			sess.handleStaleDetection(ReturnCodeDeviceSymbolVersionInvalid)
 		}
@@ -1047,6 +1081,16 @@ func (sess *Session) heartbeatWatch() {
 // recoverDeadSubscriptions releases what the PLC may still hold and re-subscribes
 // from the stored configs, then re-establishes the heartbeat.
 func (sess *Session) recoverDeadSubscriptions() {
+	// heartbeatWatch checks this too, but that check is a TOCTOU: Close can land
+	// immediately after it. Close marks the session closed and releases the PLC
+	// resources BEFORE cancelling the context, so a recovery entering that window
+	// still has a live transport and its registrations land after the release that
+	// was meant to be the last word — handles nobody will ever delete, streaming
+	// into a channel the caller considers finished.
+	if sess.isClosed() {
+		sess.logger.Debug("skipping subscription recovery: the session is closed")
+		return
+	}
 	ctx := sess.currentLifecycleCtx()
 
 	// The transport is alive here — only the PLC's notification table died — so

@@ -667,6 +667,13 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 			// the error and continuing leads to every subsequent ADS command
 			// failing with ReturnCodeGlobalTargetNotFound, leaving the caller
 			// to debug a connection that "succeeded" but doesn't work.
+			//
+			// Tear down first: a Client is already published on an open socket, and
+			// the deferred re-arm has restored onDrop. Returning without this leaves
+			// workers running on a transport the caller believes is dead, and a
+			// legal retry from Disconnected would publish a second Client onto the
+			// same shared tx.
+			sess.tearDownAndReset(false)
 			return fmt.Errorf("route registration failed during connect: %w", err)
 		}
 		if registered {
@@ -686,6 +693,9 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 			// attempt is safe. See awaitRouteActive on why this is a function.
 			probedVersion, err := sess.awaitRouteActive(func() context.Context { return ctx })
 			if err != nil {
+				// Same reasoning as the registration failure above: the redial
+				// published a Client, so this path owns tearing it down.
+				sess.tearDownAndReset(false)
 				return fmt.Errorf("route registration during connect: %w", err)
 			}
 			// The winning probe WAS a GetSymbolVersion, so seed the cache from it
@@ -1396,6 +1406,12 @@ func (sess *Session) Close() error {
 	if ch != nil {
 		<-ch
 	}
+	// The heartbeat watcher is the one goroutine on these paths whose exit Close did
+	// not observe: heartbeatWG was Add'ed and Done'd but never waited, so Close
+	// could return while the watcher was still inside a recovery. Waited after the
+	// cancel and the socket close above, so anything it has in flight aborts rather
+	// than holding this up.
+	sess.heartbeatWG.Wait()
 	sess.logger.Info("Waiting for workers to close")
 	if c := sess.client.Load(); c != nil {
 		// Adopted inbound connections have their own readers; closing the sockets
