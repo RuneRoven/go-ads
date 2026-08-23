@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
+	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -680,5 +683,168 @@ func TestReconnect_ReRegistersRouteToHealAMuteDevice(t *testing.T) {
 	}
 	if state := sess.lifecycle.state.load(); state != SessionStateConnected {
 		t.Errorf("state = %v, want Connected after recovery", state)
+	}
+}
+
+// gateOnLog pins the goroutine that logs a chosen message until the test releases
+// it, which is how these tests reach a window that is otherwise nanoseconds wide.
+//
+// Reconnect's tail — mark the transport live, transition to Connected, log
+// "reconnect successful", return, run the defers — has no seam a test can drive:
+// the whole stretch is CPU-only, so a drop injected from outside lands after the
+// defers essentially every time. The log call inside that stretch is the one place
+// the session hands control to something the test owns.
+//
+// Only the FIRST match gates. Later ones pass straight through, so the recovery
+// this pins the way open for is free to log the same line.
+// watch is the shared state, so handlers cloned by WithAttrs/WithGroup gate on the
+// same channels as the original.
+type gateWatch struct {
+	match     string
+	reached   chan struct{}
+	release   chan struct{}
+	gateOnce  sync.Once
+	signal    string
+	signalled chan struct{}
+	sigOnce   sync.Once
+}
+
+type gateOnLog struct {
+	inner slog.Handler
+	w     *gateWatch
+}
+
+// newGateOnLog gates the goroutine that logs `match`, and separately signals —
+// without blocking — when some other goroutine logs `signal`.
+func newGateOnLog(match, signal string) *gateOnLog {
+	return &gateOnLog{
+		inner: slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelWarn}),
+		w: &gateWatch{
+			match:     match,
+			reached:   make(chan struct{}),
+			release:   make(chan struct{}),
+			signal:    signal,
+			signalled: make(chan struct{}),
+		},
+	}
+}
+
+func (g *gateOnLog) Enabled(context.Context, slog.Level) bool { return true }
+
+func (g *gateOnLog) Handle(ctx context.Context, r slog.Record) error {
+	if g.w.signal != "" && strings.Contains(r.Message, g.w.signal) {
+		g.w.sigOnce.Do(func() { close(g.w.signalled) })
+	}
+	if strings.Contains(r.Message, g.w.match) {
+		first := false
+		g.w.gateOnce.Do(func() { first = true })
+		if first {
+			close(g.w.reached)
+			<-g.w.release
+		}
+	}
+	return g.inner.Handle(ctx, r)
+}
+
+func (g *gateOnLog) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &gateOnLog{inner: g.inner.WithAttrs(attrs), w: g.w}
+}
+
+func (g *gateOnLog) WithGroup(name string) slog.Handler {
+	return &gateOnLog{inner: g.inner.WithGroup(name), w: g.w}
+}
+
+// TestReconnect_DropWhileFinishingIsNotLost: a drop that lands while a reconnect
+// is finishing must still be recovered.
+//
+// Reconnect holds reconnectOwner until its deferred release runs, which is AFTER
+// it has marked the transport live and gone Connected. A drop in that gap takes
+// the session to Disconnected and spawns a Reconnect that loses the ownership CAS
+// and returns immediately — so the drop is acknowledged by the FSM and then
+// dropped on the floor. Nothing retries: the owner is on its way out, and
+// heartbeatWatch skips while disconnected.
+//
+// The session then sits Disconnected with IsClosed() false and no retry loop,
+// which is precisely the state a consumer polling IsClosed() cannot see (see this
+// file's header). The same gap orphans a reconnectDone that Close() waits on
+// unconditionally, so Close() hangs too — asserted here as well, since it is the
+// same root cause.
+func TestReconnect_DropWhileFinishingIsNotLost(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeNoErrors, []byte{7}
+	})
+
+	sess := newDialableTestSession(t, srv.host, srv.port, 40)
+	gate := newGateOnLog("reconnect successful", "reconnect already in progress")
+	sess.logger = slog.New(gate)
+	// The drop we inject is delivered the way the read loop delivers one, so the
+	// auto path has to be the thing that recovers it.
+	sess.lifecycle.autoReconnect = true
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+
+	first := make(chan error, 1)
+	go func() { first <- sess.Reconnect(context.Background()) }()
+
+	select {
+	case <-gate.w.reached:
+	case err := <-first:
+		t.Fatalf("reconnect finished without reaching the success log: %v", err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("reconnect never reached the success log")
+	}
+
+	// Pinned inside the window: transport live, state Connected, owner still held.
+	if got := sess.lifecycle.state.load(); got != SessionStateConnected {
+		t.Fatalf("state = %v at the success log, want Connected — the gate is in the wrong place", got)
+	}
+	if !sess.lifecycle.reconnectOwner.Load() {
+		t.Fatal("reconnectOwner is already released at the success log — the gate is in the wrong place")
+	}
+
+	// The drop lands here, exactly as callOnDrop would deliver it.
+	sess.triggerReconnect()
+
+	// Wait for the reconnect it spawned to actually LOSE the ownership CAS before
+	// releasing the gate. Without this the test is a race it usually wins: the
+	// owner is released microseconds after triggerReconnect returns, so the new
+	// goroutine's CAS normally succeeds and the window is never exercised.
+	select {
+	case <-gate.w.signalled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drop's reconnect never reported losing the ownership CAS; the window was not exercised")
+	}
+	close(gate.w.release)
+
+	if err := <-first; err != nil {
+		t.Fatalf("first reconnect returned %v, want nil", err)
+	}
+
+	// The session must end up Connected (recovered) or Closed (gave up loudly).
+	// Disconnected forever is the failure this test exists for.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		state := sess.lifecycle.state.load()
+		if state == SessionStateConnected || state == SessionStateClosed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session parked in %v with IsClosed()=%v and no reconnect owner (%v): "+
+				"the drop that landed while the previous reconnect was finishing was acknowledged and then abandoned",
+				state, sess.IsClosed(), sess.lifecycle.reconnectOwner.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Same root cause, second symptom: triggerReconnect may have installed a fresh
+	// reconnectDone that no owner will ever close, and Close() waits on it with no
+	// timeout.
+	closed := make(chan struct{})
+	go func() { defer close(closed); sess.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close() hung: reconnectDone was orphaned by the abandoned drop")
 	}
 }

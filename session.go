@@ -1659,7 +1659,29 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		sess.logger.Info("reconnect already in progress, skipping")
 		return nil
 	}
-	defer sess.lifecycle.reconnectOwner.Store(false)
+	// One defer for the whole hand-off, in this order on purpose.
+	//
+	// The tail of a successful reconnect marks the transport live and goes
+	// Connected while this ownership flag is still held. A drop landing in that
+	// gap is seen by triggerReconnect, which takes the session to Disconnected and
+	// spawns a Reconnect — and that one loses the CAS above and returns. So the
+	// drop is acknowledged by the FSM and then abandoned: nothing owns a retry,
+	// and heartbeatWatch skips while disconnected. The session sits Disconnected
+	// with IsClosed() false forever, which is the one state a consumer polling
+	// IsClosed() cannot see.
+	//
+	// Releasing ownership is therefore not enough; whoever releases it has to look
+	// for a drop that arrived while it was finishing and adopt it. Closing
+	// reconnectDone first keeps Close()'s unconditional wait on that channel from
+	// hanging on an orphan triggerReconnect created in the same gap.
+	defer func() {
+		closeReconnectDone()
+		sess.lifecycle.reconnectOwner.Store(false)
+		if sess.lifecycle.autoReconnect && !sess.isClosed() && sess.tx.disconnected.Load() {
+			sess.logger.Info("adopting a drop that arrived while the previous reconnect was finishing")
+			go func() { _ = sess.Reconnect(context.Background()) }()
+		}
+	}()
 
 	// transitionToOnce reports ok=false both for an illegal transition and for
 	// "already in that state". Only the first is a refusal: we hold the ownership
@@ -1667,10 +1689,9 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 	// take over.
 	if from, ok := sess.lifecycle.state.transitionToOnce(SessionStateReconnecting); !ok && from != SessionStateReconnecting {
 		sess.logger.Info("reconnect not permitted from the current state, skipping", "state", from)
-		// Terminal: close any orphan reconnectDone so Close() unblocks.
-		if sess.isClosed() {
-			closeReconnectDone()
-		}
+		// The deferred hand-off closes reconnectDone on this path too. Close()
+		// waits on that channel with no timeout and no closedCh alternative, so
+		// leaving an orphan open here is a hang whether or not we are closed.
 		return nil
 	} else if !ok {
 		sess.logger.Warn("taking over a reconnect state left behind by an earlier attempt")
@@ -1683,8 +1704,6 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		sess.lifecycle.reconnectDone = make(chan struct{})
 	}
 	sess.lifecycle.reconnectMu.Unlock()
-
-	defer closeReconnectDone()
 
 	// Flap detection: a successful Connected → drop within flapWindow indicates
 	// the previous reconnect cycle didn't really stabilize (typical when the
