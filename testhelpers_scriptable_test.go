@@ -627,6 +627,12 @@ func newWiredTestSession(t *testing.T, srv *scriptableServer, opts ...SessionOpt
 		t.Fatalf("Dial scriptable server: %v", err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
+	// Sessions from this helper cannot be Close()d — the Client comes from Dial with
+	// a context of its own, so Close's wait for its workers never returns (see
+	// newDialableTestSession). Any background goroutine keyed on closedCh therefore
+	// outlives the test unless it is signalled here. Left unsignalled, a heartbeat
+	// watcher from one test kept running for the remainder of the process; in a real
+	// integration run that was 1468 warning lines across 666 later tests.
 
 	sess := &Session{
 		tx:            c.tx,
@@ -650,5 +656,9 @@ func newWiredTestSession(t *testing.T, srv *scriptableServer, opts ...SessionOpt
 	for _, opt := range opts {
 		opt(sess)
 	}
+	t.Cleanup(func() {
+		sess.markClosed() // see the note above the Client cleanup
+		sess.heartbeatWG.Wait()
+	})
 	return sess, c
 }

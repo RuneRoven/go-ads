@@ -273,6 +273,14 @@ func TestHeartbeat_RecoverySurvivesAnUnavailablePLC(t *testing.T) {
 		t.Fatal("no re-subscribe was attempted while the PLC was refusing; the test did not exercise the path")
 	}
 	t.Logf("%d re-subscribe attempts refused while unavailable", refusals.Load())
+	// Throttled, not once per window. 2s with a 200ms window is 10 attempts
+	// unthrottled; backing off doubles the wait after each failure. Each attempt
+	// re-queues every config, so an unthrottled retry also burns the resubscribe
+	// attempt counters at the heartbeat interval.
+	if got := refusals.Load(); got > 5 {
+		t.Errorf("%d re-subscribe attempts in 2s against a PLC that is refusing: recovery is not backing off, so a runtime left in "+
+			"CONFIG is retried at the heartbeat interval indefinitely", got)
+	}
 
 	// Back to RUN: the session must recover by itself, which it cannot do if the
 	// configs were dropped in the meantime.
@@ -680,5 +688,66 @@ func TestHeartbeat_RecoveryDoesNothingAfterClose(t *testing.T) {
 	}
 	if beatAdds != recoveryAdds {
 		t.Errorf("establishHeartbeat registered a beat on a closing session (%d new add(s)): nothing will delete it", beatAdds-recoveryAdds)
+	}
+}
+
+// TestHeartbeat_DoesNotSpinWhenTheTransportIsGone: a dead transport is the
+// reconnect path's problem, not the heartbeat's.
+//
+// Found on hardware, in our own integration run against .224: 1468 copies of the
+// silence warning, 28% of the whole log, each followed by "batch add notification
+// failed: ads: client transport closed". The watcher treated a closed transport
+// exactly like a PLC sitting in CONFIG — worth retrying on the very next tick,
+// forever — so a session whose transport died spun at the heartbeat interval for
+// the rest of the process, re-queueing configs and burning resubscribe attempts
+// every time.
+//
+// Two properties are asserted: silence on a transport that cannot carry a
+// re-subscribe, and an exit once the session is closed. The latter is why the
+// flood in that run outlived its own test by 666 tests.
+func TestHeartbeat_DoesNotSpinWhenTheTransportIsGone(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xE00)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	logs := &testLogHandler{}
+	sess, c := newWiredTestSession(t, srv,
+		WithNotificationHeartbeat(50*time.Millisecond, 2),
+		WithLogger(slog.New(logs)))
+	c.SetNotificationHandler(sess.handleNotification)
+	preSeedTypedSymbol(sess, "MAIN.spin", 0xF900)
+	ch := make(chan *Update, 4)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.spin", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Fatalf("AddSymbolNotification: %v", err)
+	}
+
+	// The transport dies without the session being closed — the state the reconnect
+	// path exists to resolve.
+	_ = c.Close()
+
+	// ~30 ticks at 50ms. One complaint is fine; one per tick is the bug.
+	time.Sleep(1500 * time.Millisecond)
+	// Zero, not "a few": with the transport gone there is nothing to attempt, so
+	// the watcher should not even reach its complaint. A bounded count here would
+	// be satisfied by the backoff alone and would leave the transport check
+	// untested.
+	if got := logs.countByMessage("no notification heartbeat within the allowed window"); got != 0 {
+		t.Errorf("watcher complained %d time(s) in ~30 ticks against a closed transport: it is retrying a resubscribe that cannot "+
+			"work, and would keep doing so for the life of the process", got)
+	}
+
+	// And it must stop for good once the session is closed.
+	sess.markClosed()
+	time.Sleep(300 * time.Millisecond)
+	before := logs.countByMessage("no notification heartbeat within the allowed window")
+	time.Sleep(500 * time.Millisecond)
+	if after := logs.countByMessage("no notification heartbeat within the allowed window"); after != before {
+		t.Errorf("watcher logged %d more time(s) after the session was closed: the goroutine outlives its session", after-before)
 	}
 }

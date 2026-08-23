@@ -358,3 +358,18 @@ func (r *routeResponder) serve() {
 }
 
 func (r *routeResponder) registrations() int64 { return r.adds.Load() }
+
+// countByMessage reports how many records contain msg. Separate from
+// findByMessage because "did this happen at all" and "did this happen once
+// rather than every tick" are different questions.
+func (h *testLogHandler) countByMessage(msg string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, r := range h.records {
+		if strings.Contains(r.Message, msg) {
+			n++
+		}
+	}
+	return n
+}

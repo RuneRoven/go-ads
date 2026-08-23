@@ -928,6 +928,12 @@ const (
 	// maxADSCycleTime is the longest cycle an ADS notification can carry: the
 	// wire field is 32-bit 100ns ticks.
 	maxADSCycleTime = 400 * time.Second
+
+	// maxHeartbeatRecoveryBackoff caps the wait between recovery attempts once they
+	// start failing. A PLC left in CONFIG is the normal reason, and it can sit there
+	// for hours; the session still has to come back on its own within a sensible
+	// time of the runtime serving again.
+	maxHeartbeatRecoveryBackoff = 30 * time.Second
 )
 
 // heartbeatEnabled reports whether this session keeps a heartbeat.
@@ -1037,12 +1043,25 @@ func (sess *Session) startHeartbeatWatch() {
 // re-subscribe cannot succeed, and that is fine — no data is expected then. The
 // watcher keeps trying so the session recovers by itself the moment the runtime is
 // serving again, which is the whole requirement.
+//
+// But it retries on a leash. Measured in our own integration run against
+// 192.168.3.224: 1468 copies of the silence warning, 28% of the entire log, each
+// followed by "batch add notification failed: ads: client transport closed". Two
+// causes, both fixed here — a closed transport was treated exactly like a PLC in
+// CONFIG (retry on the very next tick), and failures did not slow anything down.
+// Each attempt also re-queues every config, so the resubscribe attempt counters
+// were being burned at the heartbeat interval.
 func (sess *Session) heartbeatWatch() {
 	defer sess.heartbeatWG.Done()
 	cycle := sess.heartbeatCycle()
 	deadline := cycle * time.Duration(sess.heartbeatAllowedMisses())
 	ticker := time.NewTicker(cycle)
 	defer ticker.Stop()
+
+	// consecutiveFailures backs the retry off and keeps the log to one line per
+	// episode. Goroutine-local: this is the only writer.
+	consecutiveFailures := 0
+	const maxFailureBackoffShift = 6 // deadline * 64, capped below
 
 	for {
 		select {
@@ -1052,6 +1071,13 @@ func (sess *Session) heartbeatWatch() {
 		}
 		if sess.isClosed() || sess.isDisconnected() {
 			continue // a drop has its own recovery path; do not compete with it
+		}
+		// A transport that is gone cannot carry a re-subscribe, and getting it back
+		// is the reconnect path's job, not ours. Without this the watcher spun at
+		// the heartbeat interval for the life of the process on any session whose
+		// client died while the FSM still said Connected.
+		if c := sess.client.Load(); c == nil || (c.ctx != nil && c.ctx.Err() != nil) {
+			continue
 		}
 		sess.notifications.lock.Lock()
 		active := len(sess.notifications.activeNotifications)
@@ -1064,23 +1090,46 @@ func (sess *Session) heartbeatWatch() {
 		// heartbeat clock stale, so the silence check below fires again on the next
 		// tick and retries. Verified by removing this path and watching the test
 		// still pass, which is the definition of code not worth keeping.
+		// Each consecutive failure doubles the wait, capped, so a PLC that stays in
+		// CONFIG for an hour costs a handful of attempts instead of one per interval.
+		wait := deadline
+		if consecutiveFailures > 0 {
+			shift := min(consecutiveFailures, maxFailureBackoffShift)
+			wait = min(deadline<<shift, maxHeartbeatRecoveryBackoff)
+		}
 		last := sess.notifications.heartbeatLastNs.Load()
-		if last == 0 || time.Since(time.Unix(0, last)) < deadline {
+		if last == 0 || time.Since(time.Unix(0, last)) < wait {
 			continue
 		}
 
-		sess.logger.Warn("no notification heartbeat within the allowed window; treating this session's subscriptions as dead and re-subscribing",
+		// One Warn per episode. Repeats go to Debug: the operator needs to know the
+		// subscriptions died, not to be told again every interval until they recover.
+		msg := "no notification heartbeat within the allowed window; treating this session's subscriptions as dead and re-subscribing"
+		args := []any{
 			"cycle", cycle, "missed", sess.heartbeatAllowedMisses(),
 			"silentFor", time.Since(time.Unix(0, last)).Round(time.Millisecond),
-			"detail", "a runtime restart or CONFIG toggle stops delivery without dropping the connection, "+
-				"changing the symbol version or reporting an error")
-		sess.recoverDeadSubscriptions()
+			"detail", "a runtime restart or CONFIG toggle stops delivery without dropping the connection, " +
+				"changing the symbol version or reporting an error",
+		}
+		if consecutiveFailures == 0 {
+			sess.logger.Warn(msg, args...)
+		} else {
+			sess.logger.Debug(msg, append(args, "retry", consecutiveFailures, "backoff", wait)...)
+		}
+		if sess.recoverDeadSubscriptions() {
+			consecutiveFailures = 0
+			continue
+		}
+		consecutiveFailures++
 	}
 }
 
 // recoverDeadSubscriptions releases what the PLC may still hold and re-subscribes
 // from the stored configs, then re-establishes the heartbeat.
-func (sess *Session) recoverDeadSubscriptions() {
+//
+// Reports whether the subscriptions are live again, so the watcher can back off
+// instead of retrying at the heartbeat interval forever.
+func (sess *Session) recoverDeadSubscriptions() bool {
 	// heartbeatWatch checks this too, but that check is a TOCTOU: Close can land
 	// immediately after it. Close marks the session closed and releases the PLC
 	// resources BEFORE cancelling the context, so a recovery entering that window
@@ -1089,7 +1138,7 @@ func (sess *Session) recoverDeadSubscriptions() {
 	// into a channel the caller considers finished.
 	if sess.isClosed() {
 		sess.logger.Debug("skipping subscription recovery: the session is closed")
-		return
+		return false
 	}
 	ctx := sess.currentLifecycleCtx()
 
@@ -1128,7 +1177,7 @@ func (sess *Session) recoverDeadSubscriptions() {
 		restoreIntent()
 		sess.logger.Warn("re-subscribe after a heartbeat timeout failed; keeping the subscriptions on file and retrying in the next window",
 			"error", err, "configs", len(intent))
-		return
+		return false
 	}
 	// A "successful" resubscribe that bound nothing is the CONFIG case: the PLC
 	// refused every item. Same treatment — keep the intent, try again later.
@@ -1139,9 +1188,10 @@ func (sess *Session) recoverDeadSubscriptions() {
 		restoreIntent()
 		sess.logger.Warn("re-subscribe bound nothing (PLC not serving yet); keeping the subscriptions on file and retrying in the next window",
 			"configs", len(intent))
-		return
+		return false
 	}
 	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
 	sess.establishHeartbeat(ctx)
 	sess.logger.Info("subscriptions re-established after the heartbeat stopped")
+	return true
 }
