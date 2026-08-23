@@ -2,6 +2,7 @@ package ads
 
 import (
 	"context"
+	"encoding/binary"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -294,4 +295,115 @@ func TestHeartbeat_RecoverySurvivesAnUnavailablePLC(t *testing.T) {
 	sess.notifications.lock.Unlock()
 	t.Errorf("never recovered after the PLC served again: successful Adds=%d, pending configs=%d — a session that loses its configs can never come back",
 		adds.Load(), pending)
+}
+
+// TestHeartbeat_ReEstablishedAfterReconnect: a reconnect must leave the session
+// with a live heartbeat.
+//
+// The heartbeat lives outside activeNotifications, so the reconnect sweep — which
+// snapshots that map, wipes it and deletes those handles PLC-side — does not touch
+// heartbeatHandle. A stale non-zero handle makes establishHeartbeat a no-op, so
+// from the first drop onward the session has no beat and cannot notice its
+// subscriptions dying quietly. That is the entire feature, off, in the situation
+// most likely to need it.
+//
+// Two more consequences the assertions below cover: the pre-drop registration is
+// never deleted (one leaked PLC handle per reconnect — the Beckhoff #268
+// accumulation this code fights everywhere else), and the stale handle NUMBER
+// stays armed in consumeHeartbeat, so a caller subscription that the PLC later
+// assigns that same number has every sample swallowed as a beat.
+func TestHeartbeat_ReEstablishedAfterReconnect(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0x900)
+	var mu sync.Mutex
+	var heartbeatAdds []uint32 // handles issued for a cyclic add on the version group
+	var deleted []uint32
+
+	srv.onAddDeviceNotification(func(req addNotifRequest) addNotifResponse {
+		h := nextHandle.Add(1)
+		if Group(req.Group) == GroupSymbolVersion && req.TransMode == uint32(TransModeServerCycle) {
+			mu.Lock()
+			heartbeatAdds = append(heartbeatAdds, h)
+			mu.Unlock()
+		}
+		return addNotifResponse{Handle: h}
+	})
+	srv.onDeleteDeviceNotification(func(h uint32) ReturnCode {
+		mu.Lock()
+		deleted = append(deleted, h)
+		mu.Unlock()
+		return ReturnCodeNoErrors
+	})
+	// The resubscribe goes through the batch path, which tries the sum command first.
+	srv.onWriteRead(GroupSumupAddDeviceNotification, func(_ []byte) []byte {
+		return buildSumAddNotifPayload([]sumNotifResponse{{Error: ReturnCodeNoErrors, Handle: nextHandle.Add(1)}})
+	})
+	// Releases go through the sum group too, so record them there or the leak
+	// assertion below can never be satisfied by any implementation.
+	srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(req []byte) []byte {
+		codes := make([]ReturnCode, len(req)/4)
+		mu.Lock()
+		for i := range codes {
+			deleted = append(deleted, binary.LittleEndian.Uint32(req[i*4:]))
+			codes[i] = ReturnCodeNoErrors
+		}
+		mu.Unlock()
+		return buildSumDeleteNotifPayload(codes)
+	})
+	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeNoErrors, []byte{9}
+	})
+
+	sess := newDialableTestSession(t, srv.host, srv.port, 5)
+	// Long enough that the watchdog never fires during the test: this is about the
+	// reconnect path re-establishing the beat, not about detection.
+	sess.heartbeatInterval = 30 * time.Second
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+
+	// First reconnect just gives us a live Client, so everything below is built by
+	// product code rather than by hand.
+	if err := sess.Reconnect(context.Background()); err != nil {
+		t.Fatalf("initial reconnect: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	preSeedTypedSymbol(sess, "MAIN.beat", 0xF300)
+	ch := make(chan *Update, 16)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.beat", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Fatalf("AddSymbolNotification: %v", err)
+	}
+	oldHB := sess.notifications.heartbeatHandle.Load()
+	if oldHB == 0 {
+		t.Fatal("no heartbeat established by the first subscribe")
+	}
+
+	// Now the drop and the reconnect that has to restore everything.
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+	if err := sess.Reconnect(context.Background()); err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+
+	newHB := sess.notifications.heartbeatHandle.Load()
+	if newHB == 0 {
+		t.Fatal("no heartbeat handle after the reconnect: the session cannot notice its subscriptions dying")
+	}
+	if newHB == oldHB {
+		t.Errorf("heartbeat handle is still the pre-drop %d after a reconnect: establishHeartbeat short-circuits on the stale "+
+			"handle, so no beat was registered on the new connection and the stale number stays armed in consumeHeartbeat", oldHB)
+	}
+	mu.Lock()
+	hbAdds := append([]uint32(nil), heartbeatAdds...)
+	dels := append([]uint32(nil), deleted...)
+	mu.Unlock()
+	if len(hbAdds) < 2 {
+		t.Errorf("cyclic adds on the version group = %d, want 2 (one per connection): the PLC was never asked to beat again", len(hbAdds))
+	}
+	if !slices.Contains(dels, oldHB) {
+		t.Errorf("pre-drop heartbeat handle %d was never released (deleted=%v): it is not in activeNotifications, so the "+
+			"reconnect sweep does not snapshot it and one handle leaks per reconnect", oldHB, dels)
+	}
 }

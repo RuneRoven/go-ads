@@ -263,6 +263,65 @@ func (sess *Session) releaseCleanupCtx(ctx context.Context) (context.Context, co
 	return context.WithTimeout(parent, notificationReleaseTimeout)
 }
 
+// takeNotificationHandles stops trusting the current notification registrations:
+// it empties activeNotifications and returns every handle the PLC still holds for
+// this session, the internal heartbeat included.
+//
+// Four places need exactly this — auto-reload after an online change, the
+// reconnect loop, heartbeat recovery, and terminal release — and each used to
+// open-code it. The heartbeat is deliberately NOT in activeNotifications (a beat
+// must never reach the caller), so every one of those copies had to remember it
+// separately. Only the Close path did. The other three left heartbeatHandle armed,
+// which made establishHeartbeat a no-op on the next connection: after its first
+// reconnect a session had no beat at all, could no longer notice its subscriptions
+// dying quietly, leaked one PLC handle per reconnect, and — once the PLC reissued
+// that handle number to a caller subscription — swallowed that tag's samples as
+// beats while keeping the watchdog clock fresh. Collecting the two together here
+// is the whole point.
+//
+// quiesceDispatch bumps lastSubscribeNs so samples already in flight for the
+// handles we are about to delete are logged as race-window noise rather than Warn.
+// Callers whose transport is still alive want that; a reconnect about to tear the
+// transport down does not, because nothing more can arrive on it.
+//
+// The heartbeat clock is restarted rather than zeroed: zero reads as "no beat
+// expected yet" and would park heartbeatWatch permanently if the re-subscribe that
+// follows never manages to register a new beat.
+func (sess *Session) takeNotificationHandles(quiesceDispatch bool) []uint32 {
+	sess.notifications.lock.Lock()
+	handles := make([]uint32, 0, len(sess.notifications.activeNotifications)+1)
+	for h := range sess.notifications.activeNotifications {
+		handles = append(handles, h)
+	}
+	if quiesceDispatch {
+		sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
+	}
+	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
+	sess.notifications.lock.Unlock()
+
+	if hb := sess.notifications.heartbeatHandle.Swap(0); hb != 0 {
+		handles = append(handles, hb)
+	}
+	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
+	return handles
+}
+
+// releaseNotificationHandles best-effort deletes handles PLC-side and says how
+// many the PLC confirmed. why names the caller in the log, since "requested=N
+// deleted=M" is otherwise untraceable in a shutdown trace.
+//
+// Note when reading that log: bestEffortDelete counts 0x714/0x715 as
+// success-equivalent, so deleted=N does not prove N registrations existed.
+func (sess *Session) releaseNotificationHandles(ctx context.Context, handles []uint32, why string) int {
+	if len(handles) == 0 {
+		return 0
+	}
+	deleted := sess.bestEffortDeleteNotifications(ctx, handles)
+	sess.logger.Info("released PLC notification handles", "why", why,
+		"requested", len(handles), "deleted", deleted)
+	return deleted
+}
+
 // AddSymbolNotification registers a notification for a single symbol.
 // All notifications on one connection must share the same updateReceiver
 // channel; subscribing the same symbol twice is rejected.

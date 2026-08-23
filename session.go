@@ -1266,26 +1266,10 @@ func (sess *Session) autoReloadOnStaleDetection(reason Reason) {
 // treats 0x714 (NotifyHandleInvalid) as success-equivalent so any handles
 // the PLC already auto-invalidated from the online-change don't error.
 func (sess *Session) reloadSymbolsAndResubscribe() error {
-	// Snapshot old handles + bump lastSubscribeNs so concurrent
-	// handleNotification dispatches arriving for these handles during the
-	// delete window log as Debug (first-sample-race branch) rather than Warn.
-	// Clear activeNotifications under the same lock so AddSymbolNotifications
-	// below sees a fresh map and the orphan-delete-on-unknown-handle path
-	// (Fix 1) treats lingering samples as race-window noise, not orphans.
-	sess.notifications.lock.Lock()
-	oldHandles := make([]uint32, 0, len(sess.notifications.activeNotifications))
-	for h := range sess.notifications.activeNotifications {
-		oldHandles = append(oldHandles, h)
-	}
-	sess.notifications.lastSubscribeNs.Store(time.Now().UnixNano())
-	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
-	sess.notifications.lock.Unlock()
-
-	if len(oldHandles) > 0 {
-		deleted := sess.bestEffortDeleteNotifications(sess.currentLifecycleCtx(), oldHandles)
-		sess.logger.Info("auto-reload: deleted old PLC notification handles before resubscribe",
-			"requested", len(oldHandles), "deleted", deleted)
-	}
+	// Transport is alive here, so quiesce dispatch: samples still arriving for the
+	// handles being deleted are race-window noise, not orphans.
+	oldHandles := sess.takeNotificationHandles(true)
+	sess.releaseNotificationHandles(sess.currentLifecycleCtx(), oldHandles, "auto-reload before resubscribe")
 
 	if err := sess.LoadSymbols(sess.currentLifecycleCtx()); err != nil {
 		return fmt.Errorf("LoadSymbols: %w", err)
@@ -1317,12 +1301,9 @@ func (sess *Session) markClosed() {
 // sessions, so the cost of leaking them is just a small PLC-side handle
 // table entry that the PLC reaps on route timeout.
 func (sess *Session) releasePLCResources(wasDisconnected bool) {
-	sess.notifications.lock.Lock()
-	handles := make([]uint32, 0, len(sess.notifications.activeNotifications))
-	for handle := range sess.notifications.activeNotifications {
-		handles = append(handles, handle)
-	}
-	sess.notifications.lock.Unlock()
+	// Terminal, so no need to quiesce dispatch. Takes the heartbeat with it, which
+	// is why Close no longer releases that separately.
+	handles := sess.takeNotificationHandles(false)
 	if len(handles) > 0 {
 		deleted := sess.bestEffortDeleteNotifications(sess.currentLifecycleCtx(), handles)
 		sess.logger.Info("releasePLCResources: best-effort notification cleanup",
@@ -1387,16 +1368,8 @@ func (sess *Session) Close() error {
 	// Stop accepting inbound PLC connections before tearing the transport down,
 	// so the accept loop cannot hand one to a Client that is going away.
 	sess.stopPeerListener()
-	// The heartbeat is not in activeNotifications, so releasePLCResources below
-	// cannot see it — release it here or it lingers in the PLC's table.
-	if hb := sess.notifications.heartbeatHandle.Swap(0); hb != 0 && !wasDisconnected {
-		if c := sess.client.Load(); c != nil {
-			if err := c.DeleteDeviceNotification(sess.currentLifecycleCtx(), hb); err != nil {
-				sess.logger.Debug("releasing the heartbeat handle on close failed", "handle", hb, "error", err)
-			}
-		}
-	}
-
+	// releasePLCResources collects the heartbeat along with the caller's handles
+	// (see takeNotificationHandles), so it no longer needs releasing here.
 	sess.releasePLCResources(wasDisconnected)
 	// Capture cancel under RLock then release before invoking — see
 	// tearDownAndReset for the symmetric pattern. Holding RLock across the
@@ -1767,13 +1740,11 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 	//
 	// Note when reading the log: bestEffortDelete counts 0x714/0x715 as
 	// success-equivalent, so "deleted=N" does not prove N registrations existed.
-	sess.notifications.lock.Lock()
-	savedHandles := make([]uint32, 0, len(sess.notifications.activeNotifications))
-	for h := range sess.notifications.activeNotifications {
-		savedHandles = append(savedHandles, h)
-	}
-	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
-	sess.notifications.lock.Unlock()
+	//
+	// No dispatch quiescing: the transport is about to be torn down, so nothing
+	// more can arrive on it. The heartbeat comes along in this snapshot, which is
+	// what lets establishHeartbeat register a fresh one after the resubscribe.
+	savedHandles := sess.takeNotificationHandles(false)
 
 	sess.tearDownAndReset(true)
 

@@ -1049,29 +1049,15 @@ func (sess *Session) heartbeatWatch() {
 func (sess *Session) recoverDeadSubscriptions() {
 	ctx := sess.currentLifecycleCtx()
 
-	// Drop the heartbeat first so a stale handle cannot be mistaken for a beat
-	// once a new one is registered.
-	if hb := sess.notifications.heartbeatHandle.Swap(0); hb != 0 {
-		if err := sess.client.Load().DeleteDeviceNotification(ctx, hb); err != nil {
-			sess.logger.Debug("releasing the old heartbeat handle failed (expected if the runtime restarted)", "error", err)
-		}
-	}
-
-	sess.notifications.lock.Lock()
-	stale := make([]uint32, 0, len(sess.notifications.activeNotifications))
-	for h := range sess.notifications.activeNotifications {
-		stale = append(stale, h)
-	}
-	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
-	sess.notifications.lock.Unlock()
-
-	if len(stale) > 0 {
-		// userTeardown=false: this is recovery, so notificationChannel must survive
-		// for the resubscribe that follows.
-		deleted := sess.bestEffortDeleteNotifications(ctx, stale)
-		sess.logger.Info("released dead notification handles before re-subscribing",
-			"requested", len(stale), "deleted", deleted)
-	}
+	// The transport is alive here — only the PLC's notification table died — so
+	// quiesce dispatch. Takes the old heartbeat with it, so a stale handle cannot
+	// be mistaken for a beat once a new one is registered, and so
+	// establishHeartbeat below is not a no-op.
+	//
+	// bestEffortDeleteNotifications runs with userTeardown=false, so
+	// notificationChannel survives for the resubscribe that follows.
+	stale := sess.takeNotificationHandles(true)
+	sess.releaseNotificationHandles(ctx, stale, "dead subscriptions before re-subscribing")
 
 	// Snapshot the caller's intent before trying. resubscribeNotifications treats
 	// a failed attempt as one of a bounded number of retries and drops the config
