@@ -179,6 +179,21 @@ func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32
 // the PLC actually saw, rather than leaving phantom entries that would
 // trigger duplicate-cleanup loops on the next reconnect.
 func (sess *Session) SumDeleteDeviceNotification(ctx context.Context, handles []uint32) ([]ReturnCode, error) {
+	return sess.sumDeleteDeviceNotification(ctx, handles, true)
+}
+
+// sumDeleteDeviceNotification is SumDeleteDeviceNotification with control over the
+// "last subscription died" bookkeeping.
+//
+// userTeardown=false is for internal cleanup — the reconnect and reload paths,
+// which delete PLC-side registrations they intend to recreate immediately. Those
+// paths wipe activeNotifications BEFORE deleting, so the empty-map rule below
+// would fire on every reconnect, clear notificationChannel, and make
+// resubscribeNotifications return early on a nil channel: reconnect reported
+// success, the FSM said Connected, and not one notification ever came back.
+// Found by power-cycling a TC2 (see TestReconnect_CleanupKeepsTheUserChannel);
+// no stub test had caught it because none asserted resumption after a cleanup.
+func (sess *Session) sumDeleteDeviceNotification(ctx context.Context, handles []uint32, userTeardown bool) ([]ReturnCode, error) {
 	codes, rpcErr := sess.client.Load().SumDeleteDeviceNotification(ctx, handles)
 	if len(codes) == 0 {
 		return codes, rpcErr
@@ -214,7 +229,10 @@ func (sess *Session) SumDeleteDeviceNotification(ctx context.Context, handles []
 		sess.logger.Debug("batch deleted notification handle",
 			"handle", h, "symbol", symbolName, "errorCode", uint32(codes[i]))
 	}
-	if len(sess.notifications.activeNotifications) == 0 {
+	// Only a user deleting their last subscription releases the channel, so a
+	// later Add may bring a different one. Internal cleanup is mid-recovery: the
+	// same channel is about to be reused by the resubscribe.
+	if userTeardown && len(sess.notifications.activeNotifications) == 0 {
 		sess.notifications.notificationChannel = nil
 	}
 	remaining := len(sess.notifications.activeNotifications)

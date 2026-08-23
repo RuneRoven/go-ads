@@ -601,7 +601,10 @@ func (sess *Session) bestEffortDeleteNotifications(ctx context.Context, handles 
 	if len(handles) == 0 {
 		return 0
 	}
-	errors, err := sess.SumDeleteDeviceNotification(ctx, handles)
+	// userTeardown=false: this is recovery cleanup, not a user releasing their
+	// last subscription, so it must not clear notificationChannel — the
+	// resubscribe that follows needs it. See sumDeleteDeviceNotification.
+	errors, err := sess.sumDeleteDeviceNotification(ctx, handles, false)
 	// Count successes from any returned codes — sumDeleteNotificationFallback
 	// returns partial codes alongside a non-nil error when it short-circuits
 	// on transport failure, so handles cleaned up before the failure are not

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -209,6 +210,81 @@ func waitFor(t *testing.T, done <-chan struct{}, d time.Duration, what string) {
 	case <-done:
 	case <-time.After(d):
 		t.Fatalf("%s did not return within %v", what, d)
+	}
+}
+
+// TestReconnect_CleanupKeepsTheUserChannel is the bug a power-cycle found on
+// hardware and no stub test had caught.
+//
+// Reconnect wipes activeNotifications up front, then issues a best-effort delete
+// for the handles it snapshotted. Session.SumDeleteDeviceNotification clears
+// notificationChannel whenever activeNotifications is empty — a rule that exists
+// so a user who deletes their last subscription can subscribe again with a
+// different channel. During a reconnect that map is empty by construction, so the
+// internal cleanup nils the channel, and resubscribeNotifications then returns
+// early on savedChannel == nil without a single log line.
+//
+// Observed consequence on a power-cycled TC2: reconnect reported success, the FSM
+// said Connected, IsClosed() stayed false, and not one notification ever arrived
+// again. A consumer polling IsClosed() has no way to notice.
+func TestReconnect_CleanupKeepsTheUserChannel(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, c := newWiredTestSession(t, srv)
+	c.SetNotificationHandler(sess.handleNotification)
+	// One Add per symbol, which is also what a TC2 does — the shape this bug was
+	// found on.
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumAddNotif into the unsupported state")
+	}
+	srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(req []byte) []byte {
+		return buildSumDeleteNotifPayload(make([]ReturnCode, len(req)/4))
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	// State as it stands when a reconnect begins: one subscription, and the
+	// config + channel that a resubscribe will need.
+	const handle = 0xAB01
+	sym := preSeedTypedSymbol(sess, "MAIN.keepchan", 0xE300)
+	ch := make(chan *Update, 4)
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[handle] = activeNotification{Sym: sym, Ch: ch}
+	sess.notifications.notificationChannel = ch
+	sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.keepchan", TransmissionMode: TransModeServerOnChange})
+	sess.notifications.lock.Unlock()
+
+	// Exactly what Reconnect does: snapshot the handles, wipe the map, then
+	// release the old registrations.
+	sess.notifications.lock.Lock()
+	saved := []uint32{handle}
+	sess.notifications.activeNotifications = make(map[uint32]activeNotification)
+	sess.notifications.lock.Unlock()
+	sess.bestEffortDeleteNotifications(context.Background(), saved)
+
+	sess.notifications.lock.Lock()
+	gotCh := sess.notifications.notificationChannel
+	pending := len(sess.notifications.pending)
+	sess.notifications.lock.Unlock()
+
+	if gotCh == nil {
+		t.Error("cleanup cleared notificationChannel; resubscribeNotifications will return early and no notification will ever be restored")
+	}
+	if pending == 0 {
+		t.Error("cleanup dropped the saved configs; there is nothing left to resubscribe")
+	}
+
+	// And the end-to-end consequence: a resubscribe must actually reach the PLC.
+	var adds atomic.Int32
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		adds.Add(1)
+		return addNotifResponse{Handle: 0xAB02}
+	})
+	if err := sess.resubscribeNotifications(); err != nil {
+		t.Fatalf("resubscribeNotifications: %v", err)
+	}
+	if adds.Load() == 0 {
+		t.Error("resubscribe issued no Add — the subscription is gone for the life of the session")
 	}
 }
 
