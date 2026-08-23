@@ -1537,15 +1537,26 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 	sess.tx.disconnected.Store(true)
 	// State is already Reconnecting (transitionToOnce above).
 
-	// Clear active notifications (old handles invalid after reconnect) but
-	// snapshot the handle list first. After dialAndStart brings up a new
-	// transport with the same source NetID + port (Fix 4 makes the port
-	// stable per-session), the PLC's notification handle table may still
-	// hold these handles if the TCP drop was transient (within route-idle
-	// timeout). Issue an explicit bestEffortDelete on the new transport so
-	// the PLC table doesn't carry orphans across our reconnect — without
-	// this cleanup, repeated TCP flaps accumulate handle slots and
-	// eventually crash the TwinCAT AMS router (Beckhoff issue #268).
+	// Clear active notifications (old handles are never reused after a reconnect)
+	// but snapshot the handle list first, because the PLC may still hold those
+	// registrations.
+	//
+	// Measured 2026-08-23 with a proxy severing the link, same source AmsAddr on
+	// both sides of the outage:
+	//   - TC3.1.4024/CE, silent loss (the PLC never saw a FIN): the handles are
+	//     ALIVE and start streaming to the new connection. Deleting them returns
+	//     0x0 — real registrations.
+	//   - Any device, clean disconnect (FIN reached the PLC): already invalidated,
+	//     0x714 or 0x715.
+	//   - TC2 2.10: gone within 2s either way; the delete is a formality.
+	// So the delete below is load bearing exactly in the field case — cable,
+	// switch, NAT idle-out — where nothing told the PLC we left. Without it a
+	// flapping session accumulates handle slots and eventually crashes the
+	// TwinCAT AMS router (Beckhoff issue #268), and the stale handles stream
+	// alongside the new ones until the orphan reaper catches them.
+	//
+	// Note when reading the log: bestEffortDelete counts 0x714/0x715 as
+	// success-equivalent, so "deleted=N" does not prove N registrations existed.
 	sess.notifications.lock.Lock()
 	savedHandles := make([]uint32, 0, len(sess.notifications.activeNotifications))
 	for h := range sess.notifications.activeNotifications {
