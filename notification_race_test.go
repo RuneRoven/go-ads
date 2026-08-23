@@ -720,6 +720,89 @@ func TestSubscribeRace_AbortedBatchStillAmendsAndReleases(t *testing.T) {
 	}
 }
 
+// TestOrphanReaperArmedAfterAbortedBatch: an Add whose reply is lost to a
+// transport failure may have created a registration on the PLC whose handle
+// number this side never learned. Nothing can delete a number nobody has, so the
+// only cleanup is the orphan reaper firing when that handle next streams — which
+// makes "the reaper is armed once an aborted batch returns" a load-bearing claim
+// rather than a detail. It would not hold if the batch left its subscribe window
+// open: while the window is open an unknown handle is presumed to be ours and the
+// sample is buffered instead.
+func TestOrphanReaperArmedAfterAbortedBatch(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, c := newWiredTestSession(t, srv)
+	c.SetNotificationHandler(sess.handleNotification)
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumAddNotif into the unsupported state")
+	}
+
+	var deletedMu sync.Mutex
+	var deleted []uint32
+	srv.onDeleteDeviceNotification(func(h uint32) ReturnCode {
+		deletedMu.Lock()
+		deleted = append(deleted, h)
+		deletedMu.Unlock()
+		return ReturnCodeNoErrors
+	})
+
+	const symbolCount = 3
+	configs := make([]NotificationConfig, symbolCount)
+	for i := range configs {
+		name := fmt.Sprintf("MAIN.reaped%d", i)
+		preSeedTypedSymbol(sess, name, uint32(0xD600+i))
+		configs[i] = NotificationConfig{SymbolName: name, TransmissionMode: TransModeServerOnChange}
+	}
+
+	var adds atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xC00)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		if adds.Add(1) == 2 {
+			// Answer late enough that the caller's deadline expires first: the PLC
+			// created a registration whose reply this side never used, which is the
+			// shape that leaves an unknown handle behind.
+			time.Sleep(600 * time.Millisecond)
+		}
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	ch := make(chan *Update, symbolCount)
+	if _, err := sess.AddSymbolNotifications(ctx, configs, ch); err == nil {
+		t.Fatal("batch unexpectedly succeeded; the abort this test needs did not happen")
+	}
+
+	// The window must be shut, or the sample below is buffered as "probably ours".
+	if n := sess.notifications.subscribeInFlight.Load(); n != 0 {
+		t.Fatalf("subscribeInFlight = %d after the batch returned; the reaper is still disabled", n)
+	}
+	// Past the trailing race window too.
+	time.Sleep(subscribeRaceWindow + 50*time.Millisecond)
+
+	// The PLC streams the handle nobody recorded.
+	const unknown = 0xC0FF
+	if err := sess.drivePacket(sess.currentLifecycleCtx(), buildNotificationPacket(unknown, 0, intSample(1))); err != nil {
+		t.Fatalf("drivePacket: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		deletedMu.Lock()
+		seen := slices.Contains(deleted, unknown)
+		deletedMu.Unlock()
+		if seen || time.Now().After(deadline) {
+			if !seen {
+				t.Errorf("handle 0x%X was never reaped; an Add whose reply was lost would stay registered on the PLC", unknown)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // TestSubscribeRace_ConnectionDropsMidBatch is the realistic trigger: not an
 // engineer doing an online change, but the link failing while a sum-unsupported
 // PLC is being subscribed one Add at a time. The stub answers two Adds and then
