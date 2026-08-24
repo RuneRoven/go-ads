@@ -3,9 +3,11 @@ package ads
 import (
 	cryptorand "crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -164,10 +166,25 @@ func addRemoteRouteFrom(logger *slog.Logger, localIP net.IP, remoteHost string, 
 			n, rerr := conn.Read(respBuf)
 			if rerr != nil {
 				lastErr = rerr
+				if !errors.Is(rerr, os.ErrDeadlineExceeded) {
+					// Not the window closing. On a connected UDP socket an ICMP
+					// port-unreachable arrives as an immediate error, so retransmitting
+					// would fire all three attempts in milliseconds and report a
+					// timeout for what is really "nothing is listening there".
+					return fmt.Errorf("route registration: %w", rerr)
+				}
 				break // window expired: retransmit
 			}
 			if n == len(respBuf) {
 				return fmt.Errorf("route response of %d bytes filled the read buffer", n)
+			}
+			if !routeResponseIsOurs(respBuf[:n], invokeID) {
+				// Not an answer to this request: keep reading inside the window.
+				// Rare on a connected socket, which only receives from the address we
+				// dialled, but a late duplicate of an earlier attempt lands here.
+				logger.Debug("route registration: ignoring a datagram that is not our answer",
+					"bytes", n)
+				continue
 			}
 			perr := parseRouteResponse(logger, respBuf[:n], invokeID)
 			if perr == nil {
@@ -176,11 +193,10 @@ func addRemoteRouteFrom(logger *slog.Logger, localIP net.IP, remoteHost string, 
 				}
 				return nil
 			}
-			// Could be a datagram for somebody else on this shared port. Keep
-			// reading inside the window rather than failing on it.
-			lastErr = perr
-			logger.Debug("route registration: ignoring an unusable datagram on port 48899",
-				"bytes", n, "error", perr)
+			// Ours, and it says no. Retransmitting cannot change that answer, and
+			// doing so put the route password on the wire twice more and made the
+			// caller wait out the whole budget for a verdict already in hand.
+			return perr
 		}
 	}
 	if lastErr == nil {
@@ -197,6 +213,29 @@ const (
 	routeRegisterAttempts    = 3
 	routeRegisterTotalBudget = 6 * time.Second
 )
+
+// routeResponseIsOurs reports whether a datagram is the answer to OUR registration
+// request, independent of whether that answer is success or refusal.
+//
+// identify.go keeps this split deliberately: ownership is a header question
+// (cookie, invokeID, service id), and only once a datagram is ours does its
+// content decide the outcome. Conflating the two meant a refusal — a wrong
+// password, say — was treated as somebody else's traffic and retransmitted until
+// the budget ran out.
+func routeResponseIsOurs(data []byte, invokeID uint32) bool {
+	if len(data) < 12 {
+		return false
+	}
+	if binary.LittleEndian.Uint32(data[0:4]) != routeCookie {
+		return false
+	}
+	if binary.LittleEndian.Uint32(data[4:8]) != invokeID {
+		return false
+	}
+	service := binary.LittleEndian.Uint32(data[8:12])
+	// The RESPONSE flag, as parseRouteResponse below also checks.
+	return service == (0x80000000 | routeServiceAdd)
+}
 
 // buildRoutePacket constructs a UDP route registration packet.
 // invokeID is set by the caller (per ADS InvokeID semantics) to identify the

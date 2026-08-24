@@ -118,6 +118,13 @@ func (cfg *SlowDiscoveryConfig) applyDefaults() {
 // If the PLC does not support offset-based chunked reads, it falls back
 // to downloading each table in a single request with a delay between them.
 func (sess *Session) LoadSymbolsSlow(ctx context.Context, cfg SlowDiscoveryConfig) error {
+	// Gated like LoadSymbols: which discovery mode a caller picked should not change
+	// whether a PLC in CONFIG produces a clear refusal or an obscure AMS error. The
+	// unexported loadSymbols stays ungated on purpose — the reconnect loop calls it
+	// and handles the not-running case itself.
+	if err := sess.requireRunningRuntime("LoadSymbolsSlow"); err != nil {
+		return err
+	}
 	cfg.applyDefaults()
 
 	// Step 1: Read symbol version

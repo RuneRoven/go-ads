@@ -1067,8 +1067,15 @@ func (sess *Session) consumeHeartbeat(handle uint32, content []byte) bool {
 // startHeartbeatWatch runs the watcher once per session.
 func (sess *Session) startHeartbeatWatch() {
 	sess.heartbeatOnce.Do(func() {
-		sess.heartbeatWG.Add(1)
-		go sess.heartbeatWatch()
+		// Through the admission gate, not a bare Add: Close now waits this group, so
+		// a raw Add is the same TOCTOU spawnMu exists to close. establishHeartbeat
+		// runs on a USER goroutine and does a full PLC round-trip between its
+		// isClosed() check and this call, which is plenty of room for Close to
+		// complete its own Wait — and an Add landing after that is documented
+		// WaitGroup misuse, i.e. a process-level panic.
+		if !sess.trackGoroutineOn(&sess.heartbeatWG, sess.heartbeatWatch) {
+			sess.logger.Debug("not starting the heartbeat watch: the session is closed")
+		}
 	})
 }
 
@@ -1087,7 +1094,7 @@ func (sess *Session) startHeartbeatWatch() {
 // Each attempt also re-queues every config, so the resubscribe attempt counters
 // were being burned at the heartbeat interval.
 func (sess *Session) heartbeatWatch() {
-	defer sess.heartbeatWG.Done()
+	// No Done here: trackGoroutineOn owns the Add and the Done.
 	cycle := sess.heartbeatCycle()
 	// lastBeats/quietTicks are the whole state of the detector: how many beats had
 	// arrived at the previous tick, and how many ticks have passed with none.
@@ -1107,7 +1114,13 @@ func (sess *Session) heartbeatWatch() {
 			return
 		case <-ticker.C:
 		}
-		if sess.isClosed() || sess.isDisconnected() {
+		// Connected, not merely "not disconnected": dialAndStart clears
+		// tx.disconnected before the route, reload and resubscribe steps run, so a
+		// reconnect's tail looks live here. Ticking through it accumulates quiet
+		// ticks against subscriptions the reconnect is in the middle of restoring,
+		// and can trigger a full delete-and-re-add of handles it has just
+		// registered — correct, thanks to resubscribeMu, but pure churn.
+		if sess.lifecycle.state.load() != SessionStateConnected {
 			continue // a drop has its own recovery path; do not compete with it
 		}
 		// A transport that is gone cannot carry a re-subscribe, and getting it back
@@ -1160,6 +1173,11 @@ func (sess *Session) heartbeatWatch() {
 		// mean the subscriptions are dead.
 		if sess.notifications.heartbeatHandle.Load() == 0 {
 			quietTicks = 0
+			// Counted as a failure so the interval grows: a device that refuses
+			// cyclic notifications outright would otherwise get a round-trip every
+			// `allowed` ticks forever. The log is throttled already; the request
+			// rate was not.
+			consecutiveFailures++
 			ctx, cancel := context.WithTimeout(sess.currentLifecycleCtx(), cycle)
 			sess.establishHeartbeat(ctx)
 			cancel()
@@ -1203,7 +1221,12 @@ func (sess *Session) recoverDeadSubscriptions() bool {
 	// still has a live transport and its registrations land after the release that
 	// was meant to be the last word — handles nobody will ever delete, streaming
 	// into a channel the caller considers finished.
-	if sess.isClosed() {
+	// Atomic with markClosed, not a bare check: Close marks the session closed and
+	// releases its PLC resources before cancelling the context, and a concurrent
+	// Reconnect re-derives lifecycle.ctx from the (uncancelled) parent — so a
+	// recovery that passed a bare check could register handles over a freshly
+	// dialled transport AFTER the release meant to be terminal.
+	if !sess.admitBackgroundWork() {
 		sess.logger.Debug("skipping subscription recovery: the session is closed")
 		return false
 	}

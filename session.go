@@ -225,7 +225,8 @@ type Session struct {
 	// read nil, skip closing the listener, and then block forever in peerWG.Wait()
 	// on an accept loop nothing will ever wake — the loop's isClosed() escape only
 	// runs after a connection arrives, which on a dead PLC never happens.
-	peerMu sync.Mutex
+	peerMu      sync.Mutex
+	peerStopped bool
 	// peerFallbackDisabled turns off the automatic attempt described in
 	// tryPeerFallback. See WithoutAmsPeerFallback.
 	peerFallbackDisabled bool
@@ -534,6 +535,17 @@ func (sess *Session) applyTargetCheck(id RemoteIdentity) error {
 // (in-process TwinCAT runtime at 127.0.0.1) is selected via WithLocalMode at
 // NewSession time.
 //
+// Connect may bind a LISTENING socket on the AMS port (48898 by default) without
+// being asked: some devices answer only on a connection they open to us, and a
+// session that cannot accept it sees every request time out. That happens when a
+// connect proves the device otherwise silent, and — for a device already shown to
+// behave this way in this process — before probing at all. WithAmsPeerListen(port)
+// moves it; WithoutAmsPeerFallback() refuses it entirely.
+//
+// A failed Connect leaves the session usable for a retry (the FSM rolls back to
+// Disconnected), but Close is still the caller's responsibility: a listener or
+// transport this attempt opened is released by Close, not by the failure.
+//
 // Not safe for concurrent invocation on the same Session — the FSM gate via
 // transitionToOnce(Connecting) serializes callers, but races on sess.tx /
 // sess.client publishing would still leak resources. Call once per Session.
@@ -668,9 +680,12 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	// 192.168.3.224, against ~18ms once the answer can be heard.
 	if !sess.peerFallbackDisabled && isKnownPeerRouteHost(sess.peerRouteCacheKey()) {
 		if err := sess.startPeerListener(); err != nil {
-			// Not fatal: the probe below may still succeed, and if it does not, the
-			// fallback will report this same failure with its own context.
-			sess.logger.Debug("could not pre-bind the inbound listener for a known peer-route device", "error", err)
+			// Warn, not Debug: this names a port conflict an operator has to resolve
+			// (usually a local TwinCAT router owning 48898), and swallowing it is
+			// what made the same failure invisible before.
+			sess.logger.Warn("could not bind the inbound AMS port for a device known to need it; requests may all time out",
+				"host", sess.ip, "error", err,
+				"hint", "pass WithAmsPeerListen(port) to use a different port, or WithoutAmsPeerFallback() to opt out")
 		} else {
 			sess.logger.Info("device is known to answer on its own connection; listening before probing", "host", sess.ip)
 		}
@@ -749,7 +764,11 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 				// (192.168.3.224), which does exactly that. Try the fallback before
 				// condemning the route — this is what the peer listener is for, and
 				// until now the route branch returned before it could ever run.
-				if rescued, ferr := sess.tryPeerFallback(ctx); rescued {
+				if errors.Is(err, ErrRuntimeNotRunning) {
+					// The route works; the runtime does not. Come up and wait — the
+					// state poll and the gates on the symbol calls carry it from here.
+					haveVersion = false
+				} else if rescued, ferr := sess.tryPeerFallback(ctx); rescued {
 					rememberPeerRouteHost(sess.peerRouteCacheKey())
 					sess.logger.Warn("route probe was silent, but the PLC answers on a connection it opens to us; continuing",
 						"host", sess.ip)
@@ -763,6 +782,11 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 					return fmt.Errorf("route registration during connect: %w", err)
 				}
 			} else {
+				// The ordinary probe worked, so this device does not need the inbound
+				// listener any more (route table repaired, or it never did). Drop the
+				// remembered fact rather than letting one observation govern every
+				// later session in the process.
+				forgetPeerRouteHost(sess.peerRouteCacheKey())
 				// The winning probe WAS a GetSymbolVersion, so seed the cache from it
 				// instead of issuing the identical request again below.
 				haveVersion, symbolVersion = true, probedVersion
@@ -834,7 +858,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	// subscribe already has evidence. Waiting for the poller's first tick would
 	// leave that call to fail the old obscure way — measured on a PLC in CONFIG:
 	// "ADS error in Read: 0xF008", which is an index group, not a return code.
-	if state, serr := sess.RuntimeState(ctx); serr != nil {
+	if state, serr := sess.runtimeStateQuietly(ctx); serr != nil {
 		sess.logger.Debug("could not read the runtime state from the system service at connect", "error", serr)
 	} else if state != ADSStateRun {
 		sess.logger.Warn("connected, but the PLC runtime is not in RUN: symbol and subscription calls will refuse until it returns",
@@ -1131,7 +1155,12 @@ func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, err
 					sess.route.routeProbeFailures.Store(0)
 					sess.logger.Warn("route is active but the PLC runtime is not in RUN; connecting anyway and waiting for it",
 						"state", uint16(state.ADSState), "probeAttempts", attempt)
-					return 0, nil
+					// ErrRuntimeNotRunning, not (0, nil): the route is proven but no
+					// version was read, and reporting success with version 0 made the
+					// caller record 0 as the real symbol version — which disables
+					// online-change detection (consumeHeartbeat requires known != 0)
+					// and skips the liveness block that would otherwise run.
+					return 0, fmt.Errorf("route is served but %w (ADS state %d)", ErrRuntimeNotRunning, uint16(state.ADSState))
 				}
 			}
 		}
@@ -1424,6 +1453,23 @@ func (sess *Session) trackGoroutineOn(wg *sync.WaitGroup, fn func()) bool {
 	return true
 }
 
+// admitBackgroundWork reports whether work that touches PLC state may still start.
+//
+// Shares spawnMu with markClosed and trackGoroutineOn, so "the session is not
+// closed" and "we have begun" are one decision rather than two — a bare isClosed()
+// check leaves a window in which Close can complete its PLC-side release and the
+// work then re-registers handles nothing will ever delete.
+func (sess *Session) admitBackgroundWork() bool {
+	sess.lifecycle.spawnMu.Lock()
+	defer sess.lifecycle.spawnMu.Unlock()
+	select {
+	case <-sess.lifecycle.closedCh:
+		return false
+	default:
+	}
+	return !sess.isClosed()
+}
+
 // markClosed closes the closedCh signal channel exactly once. Safe for
 // concurrent invocation from Close() and from Reconnect-exhaustion path.
 func (sess *Session) markClosed() {
@@ -1557,6 +1603,7 @@ func (sess *Session) Close() error {
 	sess.stateWG.Wait()
 	sess.logger.Info("Waiting for workers to close")
 	if c := sess.client.Load(); c != nil {
+		c.markDropped() // same reason as in tearDownAndReset
 		// Adopted inbound connections have their own readers; closing the sockets
 		// is what lets those readers return, so it must happen BEFORE the wait.
 		c.closePeerConns()
@@ -2028,6 +2075,20 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 
 		// Re-subscribe notifications using stored configs.
 		if err := sess.resubscribeNotifications(); err != nil {
+			if errors.Is(err, ErrRuntimeNotRunning) {
+				// The transport is fine and the route is served; the runtime is not
+				// running. Counting this as a reconnect attempt spends the budget at
+				// the backoff rate with no network involved and eventually closes a
+				// session whose only problem is a PLC in CONFIG — the opposite of
+				// "stay up and wait". Report it, sleep, and try again without
+				// consuming an attempt.
+				sess.logger.Info("reconnect: transport restored but the PLC runtime is not running; waiting for it",
+					"error", err)
+				if serr := sess.reconnectSleep(ctx, attempts); serr != nil {
+					return serr
+				}
+				continue
+			}
 			if rerr := retryAfter(err, "notification resubscribe"); rerr != nil {
 				return rerr
 			}
@@ -2249,10 +2310,21 @@ func (sess *Session) tearDownAndReset() {
 	// touches, so leaving them open deadlocks this wait — observed hanging a real
 	// session against a peer-route device.
 	if c := sess.client.Load(); c != nil {
+		// Release anything waiting on this transport with the reason, rather than
+		// letting it sit out its full request timeout: readFrames returns on
+		// ctx.Done() without calling callOnDrop, so nothing else closes `dropped`
+		// on a session-initiated teardown.
+		c.markDropped()
 		c.closePeerConns()
 		c.waitGroup.Wait()
 	}
+	// spawnMu across the Wait: trackGoroutineOn takes it to Add, so holding it here
+	// makes "no new goroutines while we wait for the current ones" true. Without it
+	// an orphan delete registering during a Connect-phase teardown can Add while
+	// this Wait is in progress, which is documented WaitGroup misuse and panics.
+	sess.lifecycle.spawnMu.Lock()
 	sess.lifecycle.waitGroup.Wait()
+	sess.lifecycle.spawnMu.Unlock()
 	sess.lifecycle.ctxMu.Lock()
 	// Re-derive lifecycle.ctx from the original NewSession parent so caller
 	// cancellation continues to shut the session down after Reconnect. Prior
@@ -2388,6 +2460,10 @@ func (sess *Session) peerRouteCacheKey() string {
 
 func rememberPeerRouteHost(key string) { peerRouteHosts.Store(key, struct{}{}) }
 
+// forgetPeerRouteHost drops a remembered device, so the fact self-invalidates as
+// soon as an ordinary probe succeeds against it.
+func forgetPeerRouteHost(key string) { peerRouteHosts.Delete(key) }
+
 func isKnownPeerRouteHost(key string) bool {
 	_, ok := peerRouteHosts.Load(key)
 	return ok
@@ -2467,6 +2543,14 @@ func (sess *Session) startPeerListener() error {
 	if sess.peerLn != nil {
 		return nil // already listening
 	}
+	if sess.peerStopped {
+		return fmt.Errorf("session is shutting down; not binding the inbound AMS port")
+	}
+	select {
+	case <-sess.lifecycle.closedCh:
+		return fmt.Errorf("session is closed; not binding the inbound AMS port")
+	default:
+	}
 	port := sess.peerListenPort
 	if port == 0 {
 		port = amsPeerListenPort
@@ -2514,6 +2598,14 @@ func (sess *Session) peerAcceptLoop(ln net.Listener) {
 func (sess *Session) stopPeerListener() {
 	sess.peerMu.Lock()
 	ln := sess.peerLn
+	sess.peerLn = nil
+	// Latch, so a Connect that was about to bind cannot do so after this returns.
+	// Without it: a Connect descheduled just before the bind, a concurrent Close
+	// reading peerLn as nil and waiting on an empty peerWG, and then the bind
+	// landing — leaving 48898 held and an accept loop running in a session the
+	// caller believes is fully closed. The accept loop's own isClosed() escape only
+	// runs after a connection arrives, which on a dead PLC never happens.
+	sess.peerStopped = true
 	sess.peerMu.Unlock()
 	if ln != nil {
 		_ = ln.Close()
@@ -2842,6 +2934,24 @@ func (sess *Session) RuntimeState(ctx context.Context) (ADSState, error) {
 	return state.ADSState, nil
 }
 
+// runtimeStateQuietly is RuntimeState with the transport-fault logging suppressed,
+// for the probe at connect: a device without a system service port answers every one
+// of these with an AMS error, and readStateOn reports that at Error in steady state.
+func (sess *Session) runtimeStateQuietly(ctx context.Context) (ADSState, error) {
+	c := sess.client.Load()
+	if c == nil {
+		return ADSStateInvalid, ErrTransportClosed
+	}
+	c.beginHandshake()
+	defer c.endHandshake()
+	state, err := c.ReadStateOnPort(ctx, PortSystemService)
+	if err != nil {
+		return ADSStateInvalid, err
+	}
+	sess.recordRuntimeState(state.ADSState)
+	return state.ADSState, nil
+}
+
 func (sess *Session) recordRuntimeState(state ADSState) {
 	previous := ADSState(sess.runtimeState.Swap(uint32(state)))
 	sess.runtimeStateNs.Store(time.Now().UnixNano())
@@ -2850,10 +2960,31 @@ func (sess *Session) recordRuntimeState(state ADSState) {
 	}
 }
 
-// knownRuntimeState returns the last observed state and whether one was observed.
+// runtimeStateTTL is how long a state reading is trusted. Beyond it the session
+// treats the state as unknown, which means the gates permit again.
+//
+// Without an expiry a reading was permanent: the watch gives up after a run of
+// failures, and nothing then cleared the last value — so a session that saw CONFIG
+// and then lost the system service refused every symbol and subscribe call for its
+// whole life, with no poller left to notice the runtime coming back. Failing OPEN is
+// the right direction here: the worst case is the old behaviour (attempt it and let
+// the PLC answer), where failing closed is a session that never works again.
+const runtimeStateTTL = 30 * time.Second
+
+// knownRuntimeState returns the last observed state and whether one was observed
+// recently enough to act on.
 func (sess *Session) knownRuntimeState() (ADSState, bool) {
 	state := ADSState(sess.runtimeState.Load())
-	return state, state != ADSStateInvalid
+	if state == ADSStateInvalid {
+		return state, false
+	}
+	// Wall clock, deliberately: a clock step here can only make a fresh reading look
+	// stale, which permits — the safe direction. (Contrast the heartbeat detector,
+	// where a step in either direction was harmful, so that one counts ticks.)
+	if at := sess.runtimeStateNs.Load(); at != 0 && time.Since(time.Unix(0, at)) > runtimeStateTTL {
+		return ADSStateInvalid, false
+	}
+	return state, true
 }
 
 // requireRunningRuntime refuses an operation that cannot work outside RUN.
@@ -2861,8 +2992,25 @@ func (sess *Session) knownRuntimeState() (ADSState, bool) {
 // Gated on evidence: with no reading (a device that does not serve the system
 // service port, or a session that has not polled yet) it permits the operation
 // rather than inventing a reason to fail.
+// runtimeDefinitelyNotServing lists the states in which a runtime port provably
+// does not serve, so the call cannot succeed and attempting it only produces a
+// confusing AMS "port not found".
+//
+// A whitelist of bad states, not "anything that is not RUN": the only measured
+// evidence is TC3.1.4024 reporting CONFIG (15), and refusing on every state this
+// code has not been taught about would turn an unfamiliar-but-working device into
+// one where nothing can be subscribed at all — with no PLC error to explain it.
+func runtimeDefinitelyNotServing(state ADSState) bool {
+	switch state {
+	case ADSStateConfig, ADSStateReconfig, ADSStateStop, ADSStateShutdown:
+		return true
+	default:
+		return false
+	}
+}
+
 func (sess *Session) requireRunningRuntime(what string) error {
-	if state, known := sess.knownRuntimeState(); known && state != ADSStateRun {
+	if state, known := sess.knownRuntimeState(); known && runtimeDefinitelyNotServing(state) {
 		return fmt.Errorf("%s: %w (ADS state %d); the runtime port is not serving, so this cannot succeed until it returns to RUN",
 			what, ErrRuntimeNotRunning, uint16(state))
 	}
@@ -2894,22 +3042,57 @@ func (sess *Session) startRuntimeStateWatch() {
 					return
 				case <-ticker.C:
 				}
-				if sess.isClosed() || sess.isDisconnected() {
+				// Connected, not merely "not disconnected": dialAndStart clears
+				// tx.disconnected BEFORE ensureRoute, awaitRouteActive, reloadSymbols
+				// and resubscribeNotifications run, so isDisconnected() is false for
+				// that whole stretch. Polling through it means firing requests at a
+				// router that is by construction not serving us yet, counting each
+				// timeout as evidence the device has no system service, and adding
+				// traffic to a router already refusing this IP.
+				if sess.lifecycle.state.load() != SessionStateConnected {
 					continue
 				}
 				c := sess.client.Load()
 				if c == nil || (c.ctx != nil && c.ctx.Err() != nil) {
 					continue
 				}
-				ctx, cancel := context.WithTimeout(sess.currentLifecycleCtx(), interval)
+				// requestTimeout, not the tick period: a device answering slower than
+				// one interval would otherwise be declared unable to answer at all.
+				pollTimeout := sess.requestTimeout
+				if pollTimeout < interval {
+					pollTimeout = interval
+				}
+				ctx, cancel := context.WithTimeout(sess.currentLifecycleCtx(), pollTimeout)
+				// Quietly: on a device with no system service every poll fails, and
+				// readStateOn logs a transport fault at Error in steady state, which
+				// is exactly the log-based health signal transportFaultLevel exists
+				// to protect.
+				c.beginHandshake()
 				state, err := c.ReadStateOnPort(ctx, PortSystemService)
+				c.endHandshake()
 				cancel()
 				if err != nil {
+					// Only an answer counts as evidence. A timeout says nothing about
+					// whether the port exists — it is what a busy device, a congested
+					// link, or a router mid-activation produces — so counting those
+					// towards "this device has no system service" retired the feature
+					// on healthy hardware.
+					var code ReturnCode
+					if !errors.As(err, &code) {
+						sess.logger.Debug("runtime-state poll did not get an answer; not counting it against the device",
+							"error", err)
+						continue
+					}
 					failures++
-					sess.logger.Debug("could not read the runtime state from the system service",
+					sess.logger.Debug("the system service refused the runtime-state read",
 						"error", err, "attempt", failures)
 					if failures >= giveUpAfter {
-						sess.logger.Info("this device does not answer on the system service port; runtime-state reporting is off for this session",
+						// Clear the last reading on the way out, or it stands forever
+						// with nothing left to refresh it and every gated call keeps
+						// refusing. knownRuntimeState's TTL would eventually do this
+						// too; doing it here makes the hand-off immediate.
+						sess.runtimeState.Store(uint32(ADSStateInvalid))
+						sess.logger.Info("this device does not answer on the system service port; runtime-state reporting is off for this session, and symbol calls will be attempted as before",
 							"port", uint32(PortSystemService), "attempts", failures)
 						return
 					}

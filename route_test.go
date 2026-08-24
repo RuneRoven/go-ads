@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"log/slog"
-	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 // F-24: parseRouteResponse must reject a response whose invokeID does not
@@ -238,26 +238,59 @@ func TestAddRoute_RetransmitsOnALostDatagram(t *testing.T) {
 	}
 }
 
-// TestAddRoute_IgnoresAnUnrelatedDatagram: port 48899 is shared with identify, so a
-// datagram meant for somebody else must not fail a registration.
+// TestAddRoute_IgnoresAnUnrelatedDatagram: a datagram that is not our answer must
+// be skipped, not treated as a failure.
+//
+// The noise has to come from the responder's own address. An earlier version of
+// this test opened a second UDP socket and wrote to the router, which proved
+// nothing: the client dials a CONNECTED socket (net.DialUDP), so it only ever
+// receives from the address it dialled and the junk never reached the code under
+// test. Verified by mutation — making the skip branch fail immediately left that
+// version green.
 func TestAddRoute_IgnoresAnUnrelatedDatagram(t *testing.T) {
 	router := startRouteResponder(t)
-
-	// Something else on the port answers first, with a payload that is not a route
-	// reply. The registration must keep reading rather than fail on it.
-	go func() {
-		conn, err := net.Dial("udp4", localAddr(router.port))
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		_, _ = conn.Write([]byte("not an ads route reply, just noise on the shared port"))
-	}()
+	router.noiseFirst.Store(1)
 
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	netID := [6]byte{192, 168, 3, 52, 1, 1}
 	if err := addRemoteRouteFrom(logger, nil, "127.0.0.1", router.port, netID, "go-ads-noise",
 		"127.0.0.1", "Administrator", "1"); err != nil {
-		t.Errorf("registration failed because of an unrelated datagram on the shared port: %v", err)
+		t.Errorf("registration failed because of a datagram that was not its answer: %v", err)
+	}
+	// One send: the junk must be skipped within the same window, not answered by a
+	// retransmit.
+	if got := router.adds.Load(); got != 1 {
+		t.Errorf("registration datagrams sent = %d, want 1: the junk should be skipped inside the read window, "+
+			"not waited out until a retransmit", got)
+	}
+}
+
+// TestAddRoute_RefusalIsNotRetransmitted: an answer that says no must be reported
+// at once.
+//
+// parseRouteResponse's error covered both "not ours" and "ours, and refused", and
+// both landed in the skip-and-keep-reading branch. So a wrong password — answered
+// immediately by the router — was waited out for the whole 6s budget and the packet,
+// password included, went on the wire three times.
+func TestAddRoute_RefusalIsNotRetransmitted(t *testing.T) {
+	router := startRouteResponder(t)
+	router.reply.Store(int64(0x706)) // whatever the router says no with
+
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	netID := [6]byte{192, 168, 3, 52, 1, 1}
+	start := time.Now()
+	err := addRemoteRouteFrom(logger, nil, "127.0.0.1", router.port, netID, "go-ads-refused",
+		"127.0.0.1", "Administrator", "wrong")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("registration reported success although the router refused it")
+	}
+	if got := router.adds.Load(); got != 1 {
+		t.Errorf("the refusal was retransmitted %d times; the answer was already in hand, and each retransmission puts the "+
+			"route password on the wire again", got)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("took %v to report a refusal answered immediately; the caller waited out the retransmit budget", elapsed)
 	}
 }

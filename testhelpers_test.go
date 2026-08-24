@@ -296,6 +296,11 @@ type routeResponder struct {
 	// dropFirst silently swallows this many registration datagrams before
 	// answering, so a test can tell a retransmit from a single-shot send.
 	dropFirst atomic.Int32
+	// noiseFirst sends this many junk datagrams BEFORE the real reply. Injected
+	// here rather than from a third party because the client dials a connected UDP
+	// socket, which only ever receives from this responder's address — noise sent
+	// from anywhere else cannot reach the code that is supposed to skip it.
+	noiseFirst atomic.Int32
 
 	pc    *net.UDPConn
 	port  int
@@ -343,6 +348,10 @@ func (r *routeResponder) serve() {
 			continue
 		}
 		r.adds.Add(1)
+		for r.noiseFirst.Load() > 0 {
+			r.noiseFirst.Add(-1)
+			_, _ = r.pc.WriteToUDP([]byte("junk on the shared AMS router port"), from)
+		}
 		if drop := r.dropFirst.Load(); drop > 0 {
 			// Model a lost datagram on a plant network: count it, answer nothing.
 			r.dropFirst.Add(-1)

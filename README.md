@@ -207,6 +207,10 @@ sess, _ := ads.NewSession(ctx, ads.AMSEndpoint{IP: ip, Port: 48898, AMS: target}
 | `WithSkipRouteRegistration()` | Off | Explicit opt-out from probe+AddRoute. Required when routes are managed externally (TC3 UI pre-registered, AmsRouterDaemon front-end). Equivalent to omitting `WithRoute` but explicit |
 | `WithLocalMode()` | Off | Target the in-process TwinCAT runtime at 127.0.0.1 |
 | `WithRequestTimeout(d)` | 5s | Per-request timeout for ADS commands and initial TCP dial |
+| `WithNotificationHeartbeat(interval, missed)` | `2s`, `5` | Tune the internal cyclic subscription that detects subscriptions dying silently. `interval` is clamped to the ADS cycle-time limit (~400s); `missed` below 2 is raised to 2 |
+| `WithoutNotificationHeartbeat()` | Heartbeat on | Opt out. Saves one PLC notification handle and one 1-byte sample per interval, at the cost of not noticing a runtime restart that leaves the TCP connection up |
+| `WithAmsPeerListen(port)` | Off (fallback binds 48898 on demand) | Listen on `port` for a connection the PLC opens to US. Needed for devices that treat their route to this host as a peer route and answer only on their own connection |
+| `WithoutAmsPeerFallback()` | Fallback on | Never bind the AMS port. Use on hosts where a local TwinCAT router owns 48898 |
 
 ### Combining options
 
@@ -222,8 +226,89 @@ All options are composable — no mutual exclusions. Some require others to have
 | `WithAutoReconnect(false)` | — | Backoff still applies when caller invokes `Reconnect()` manually |
 | `WithSkipRouteRegistration()` | — | Overrides `WithRoute`. Skip wins. Useful when an options chain is built uniformly across Sessions and only some opt out |
 | `WithLocalBindIP(ip)` | Host must have `ip` aliased on a local interface before `Connect` | OS returns "address not available" from Dial if alias missing |
+| `WithAmsPeerListen(port)` | — | Also sets the port the automatic fallback uses. Mutually pointless with `WithoutAmsPeerFallback()` (the listener would never be used) |
+| `WithNotificationHeartbeat()` | At least one subscription | The heartbeat is established alongside the first subscription and released with the last |
+
+## Runtime state: CONFIG vs RUN
+
+A TwinCAT system in configuration mode has no runtime port. Every request to it
+comes back with AMS error `0x06` (target port not found) — measured on TC3.1.4024 —
+while the **system service** on port 10000 stays up and answers `ADSState=15`
+(CONFIG). So the state can be asked for, just not of the runtime.
+
+The session polls it (at the heartbeat interval, one small request over the
+connection it already has) and behaves accordingly:
+
+| | Behaviour |
+|---|---|
+| `Connect` | **Succeeds.** The session is usable and waits; there is simply no runtime to talk to yet |
+| `LoadSymbols`, `AddSymbolNotification(s)` | **Refuse**, with an error wrapping `ErrRuntimeNotRunning` that names the ADS state |
+| `IsClosed()` | Stays `false` — nothing is wrong |
+| Back in RUN | The poll notices and the same calls start working, with no reconnect and no rebuild |
+
+```go
+if _, err := sess.AddSymbolNotifications(ctx, configs, ch); errors.Is(err, ads.ErrRuntimeNotRunning) {
+    // Not a failure to give up on: the PLC is in CONFIG. Try again later.
+    state, _ := sess.RuntimeState(ctx) // ads.ADSStateConfig, ADSStateStop, ...
+    log.Printf("PLC not running (ADS state %d), will retry", state)
+}
+```
+
+Note the transition is usually CONFIG → STOP → RUN with a few seconds between, so
+gate on "is it RUN", not "is it CONFIG": the runtime port exists during STOP but is
+not executing.
+
+The gate only ever fires on a positive reading. A device that does not serve the
+system service port behaves exactly as before, and the poll gives up after five
+consecutive failures.
+
+## Peer-route devices
+
+Some devices treat their route to this host as a *peer* route: they accept our TCP
+connection, process our requests, and then send every response over a connection
+**they** open to us on 48898. Measured on TC3.1.4026 (TC/RTOS); TC2 2.10 and
+TC3.1.4024 answer on our connection instead. A client that cannot accept the
+inbound connection sees every request time out, and Beckhoff's own Linux AdsLib
+never listens, so it cannot talk to such a device at all.
+
+Nothing needs configuring: when a Connect proves the device is otherwise silent,
+the session binds the AMS port, discovers the device is answering there, and
+carries on — announced at `WARN`, because a device in this state is worth an
+operator's attention. `WithAmsPeerListen(port)` picks a different port;
+`WithoutAmsPeerFallback()` refuses to bind at all, for hosts where a local TwinCAT
+router owns 48898.
+
+The fact is remembered per process, keyed by host and port: learning it costs a
+probe timeout plus the route-activation budget (~18s), and every later session to
+the same device skips straight to listening (~1s) and registers no route it does
+not need.
 
 ## Notifications and backpressure
+
+### Subscriptions that die silently
+
+Restarting a TwinCAT runtime, or toggling CONFIG and back, kills every notification
+a client holds **without anything observable happening**: measured on TC3.1.4024
+across CONFIG → RUN with no program change, three runs including a fully passive
+listener, the TCP connection survives, the symbol version is unchanged, ADS state
+reads back identical, no error and no terminal sample arrives — and the
+subscriptions never deliver again. 210 samples, then silence.
+
+Silence alone proves nothing either, because an on-change subscription on a
+constant symbol is legitimately silent forever. So the session keeps one internal
+CYCLIC subscription on the symbol-version group: TwinCAT pushes those on a timer
+regardless of change, which makes *its* silence conclusive. On that same transition
+the beat and the caller's samples stop in the same second.
+
+Missing five intervals (default 2s each) means the subscriptions are treated as
+dead and re-established from the stored configs — no polling, no caller
+involvement, and the PLC does the sending. Cost: one notification handle and one
+byte per interval. Silence is counted in ticks of a monotonic ticker, so a
+wall-clock step (an RTC-less box syncing NTP, a resumed VM) cannot fake it.
+
+Recovery backs off as it fails, so a runtime left in CONFIG for an hour costs a
+handful of attempts rather than one per interval, and the subscriptions stay on
+file throughout.
 
 Notification delivery is **non-blocking**: if the receiver's channel is full, the notification is dropped and a warning is logged. This prevents goroutine accumulation and ensures the receive pipeline is never stalled by a slow consumer.
 
