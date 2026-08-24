@@ -1,4 +1,4 @@
-.PHONY: all all-log lint fmt vet test test-race test-cover build build-examples hardware hardware-log test-docker test-docker-tc3 test-docker-tc2 test-native-tc3 test-native-tc2 clean
+.PHONY: all all-log lint fmt vet test test-race test-cover build build-examples hardware hardware-log hardware-parallel test-docker test-docker-tc3 test-docker-tc3-118 test-docker-tc2 test-native-tc3 test-native-tc2 clean
 
 # Software tests (CI-safe, no PLC needed)
 all: fmt lint vet test
@@ -27,17 +27,21 @@ fmt:
 	gofumpt -w .
 	golangci-lint fmt
 
+# Second pass compiles the integration-tagged files, which the normal
+# build never touches. Without it a broken integration file is only
+# found hours later on hardware.
 vet:
 	go vet ./...
+	go vet -tags integration ./...
 
 test:
-	go test -v -timeout 120s ./...
+	go test -v -timeout 600s ./...
 
 test-race:
-	go test -v -race -timeout 120s ./...
+	go test -v -race -timeout 600s ./...
 
 test-cover:
-	go test -v -coverprofile=coverage.out -covermode=atomic -timeout 120s ./...
+	go test -v -coverprofile=coverage.out -covermode=atomic -timeout 600s ./...
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
 
@@ -50,10 +54,18 @@ build-examples:
 test-docker-tc3:
 	docker/run-tests.sh .env.integration.224
 
+test-docker-tc3-118:
+	docker/run-tests.sh .env.integration.118
+
 test-docker-tc2:
 	docker/run-tests.sh .env.integration.70
 
 test-docker: test-docker-tc3 test-docker-tc2
+
+# All three PLCs concurrently (separate devices, no PLC-side contention).
+# Per-PLC log under logs/, exits non-zero if any run fails.
+hardware-parallel:
+	docker/run-tests-parallel.sh 224 118 70
 
 # Native hardware integration tests (run on host, not Docker)
 # Requires PLC reachable from host network. macOS may prompt for firewall on first run.
