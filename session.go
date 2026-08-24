@@ -100,6 +100,26 @@ type sessionLifecycle struct {
 	// Reconnecting self-loop lets a new owner take over an abandoned state.
 	reconnectOwner atomic.Bool
 
+	// connecting is true for the whole of Connect, and suppresses the automatic
+	// Reconnect that a drop would otherwise spawn.
+	//
+	// Connect owns sess.tx / sess.client / lifecycle.ctx end to end — it dials,
+	// publishes, probes, and on any failure tears down and rolls back — but ondrop
+	// is armed across most of that (the local handshake, the liveness probe, the
+	// runtime-state read; the route stage disarms, and its helpers re-arm from a
+	// defer in the middle of Connect). A rival Reconnect running tearDownAndReset
+	// under Connect cancelled the context Connect's fresh Client was holding and
+	// closed the socket it had just dialled, and vice versa, leaving a session the
+	// caller had been told failed sitting Connected on a second connection with
+	// IsClosed() false — socket, workers, runtime watcher and an unbounded
+	// reconnect loop all leaked, and not recoverable in place because a retry is
+	// refused as "Connect already in progress".
+	//
+	// A flag rather than tighter SetOnDrop bookkeeping: five sites arm or re-arm,
+	// two of them from a defer mid-Connect, and TestAwaitRouteActive_RestoresClientState
+	// correctly pins that re-arm. One gate in triggerReconnect is immune to all of it.
+	connecting atomic.Bool
+
 	closedCh   chan struct{}
 	closedOnce sync.Once
 	// shutdownOnce guards the terminal teardown (see Session.shutdownTransport).
@@ -565,6 +585,32 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateConnecting); !ok {
 		return fmt.Errorf("ads: Connect already in progress or session past Constructed state")
 	}
+	// Suppress the auto-reconnect spawn for the whole of Connect: see
+	// lifecycle.connecting. Registered BEFORE the rollback and listener defers so
+	// it runs AFTER them (LIFO) — the flag has to still be set while Connect does
+	// its own teardown, or the rival is merely delayed into the same window.
+	sess.lifecycle.connecting.Store(true)
+	defer func() {
+		sess.lifecycle.connecting.Store(false)
+		// A drop that landed while the spawn was suppressed and that Connect
+		// itself never noticed — a reset after the last request, say — is
+		// Connect's to adopt: on the success path nothing else will, and
+		// tx.disconnected is the sole record of it. Without this, the
+		// suppression would trade a rival Reconnect for a lost drop, which is
+		// the same invisible-stuck state one layer down.
+		//
+		// The ordering interlocks: a drop suppressed by the gate was recorded
+		// before the gate read the flag, so it is visible here; a drop landing
+		// after the store goes down the normal path and any duplicate this
+		// spawns loses the reconnectOwner CAS.
+		//
+		// Narrow on purpose (retErr == nil): after an error the caller's
+		// contract is to throw the session away, and adopting there would race
+		// a caller's own retry.
+		if retErr == nil && !sess.isClosed() && sess.tx.disconnected.Load() {
+			sess.triggerReconnect()
+		}
+	}()
 	// Roll back Connecting→Disconnected on any error return so the caller
 	// can retry Connect via the Disconnected→Connecting edge. Without this,
 	// the FSM is stranded in Connecting and Reconnect (auto-path only) is
@@ -700,6 +746,20 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	// Session and Client share the *transport pointer (no re-dial); the Client
 	// owns the listen / transmit / recvWorker goroutines.
 	newClient := sess.publishWiredClient()
+	// Same rule as dialAndStart: clear AFTER the workers are up, so anything that
+	// observes disconnected=false finds transmitWorker actually running.
+	//
+	// Connect never cleared this flag, which was invisible only because a rival
+	// Reconnect used to do it: the flag starts false, so the first Connect never
+	// noticed, and a retry after a Connect that recorded a drop only worked because
+	// the drop had spawned a Reconnect whose dialAndStart cleared it. With that
+	// spawn suppressed (lifecycle.connecting) the stale true survived into the
+	// retry, and every request on the retry's perfectly good socket failed
+	// ErrTransportClosed — a session that cannot be reconnected in place and cannot
+	// be retried either. A drop landing in the gap above is not erased for long:
+	// the liveness probe is the very next thing to run and fails on the dead
+	// socket, which records it again.
+	sess.tx.disconnected.Store(false)
 	// If this device has already been shown to answer on a connection it opens to
 	// us, bind the listener before probing anything. Otherwise every session pays
 	// the full probe timeout plus the route-activation budget to rediscover it, and
@@ -1827,17 +1887,43 @@ func (sess *Session) triggerReconnect() {
 	if firstDetector {
 		sess.transitionState(SessionStateDisconnected)
 	}
-	sess.lifecycle.reconnectMu.Lock()
-	if sess.lifecycle.reconnectDone == nil {
-		sess.lifecycle.reconnectDone = make(chan struct{})
-	}
-	sess.lifecycle.reconnectMu.Unlock()
-
 	// Fire disconnect callback in goroutine (must not block).
 	// Callback must not call Session methods — connection may be closing.
 	if firstDetector && sess.onDisconnect != nil && !sess.isClosed() {
 		go sess.onDisconnect()
 	}
+
+	// Connect owns the transport end to end; a rival Reconnect must not tear it
+	// down under it (see lifecycle.connecting). The drop is already recorded in
+	// tx.disconnected, so Connect's own error handling — or its exit adopt —
+	// schedules the redial.
+	//
+	// Placement is load-bearing at both ends:
+	//
+	//   - Above the CAS, the drop is never recorded and the exit adopt has nothing
+	//     to see, so the drop is lost rather than deferred.
+	//   - Above the callback dispatch — which is where the obvious reading of
+	//     "immediately after the CAS" puts it — WithOnDisconnect never fires for a
+	//     drop during Connect. The callback is gated on firstDetector, so the exit
+	//     adopt's second pass, finding the CAS already lost, cannot make up for it:
+	//     a consumer whose only drop signal is the callback gets none at all.
+	//
+	// So: after the callback, before the reconnectDone channel. Returning before
+	// the channel exists is deliberate too — it is closed only by Reconnect, and
+	// the Reconnect this would have spawned is exactly what is being suppressed,
+	// so creating it here would leave Session.Close's unconditional wait on it
+	// hanging forever (verified: the package times out) and park the symbol
+	// helpers' waitForReconnect. The exit adopt re-enters here with the flag
+	// clear and creates it then.
+	if sess.lifecycle.connecting.Load() {
+		return
+	}
+
+	sess.lifecycle.reconnectMu.Lock()
+	if sess.lifecycle.reconnectDone == nil {
+		sess.lifecycle.reconnectDone = make(chan struct{})
+	}
+	sess.lifecycle.reconnectMu.Unlock()
 
 	if sess.lifecycle.autoReconnect {
 		// Background, not the lifecycle context: the auto path must not treat a

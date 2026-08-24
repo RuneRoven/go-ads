@@ -1228,6 +1228,125 @@ func TestGiveUpReconnecting_TearsDownTheTransport(t *testing.T) {
 	}
 }
 
+// TestConnect_ResetDuringLivenessProbeSpawnsNoRivalReconnect: a drop that lands
+// while Connect is probing the link must not spawn a Reconnect that rebuilds the
+// transport under Connect - and the consumer must still be told about the drop.
+//
+// Connect owns sess.tx / sess.client from the first publishWiredClient to the
+// Connected transition, but ondrop is armed across most of that: the local
+// handshake, the GetSymbolVersion/ReadState liveness probe, and the runtime-state
+// read. (The route stage is not exposed - it disarms - and its two helpers re-arm
+// from a defer in the MIDDLE of Connect, which is how the hole got there.) A RST
+// in the armed window spawned a Reconnect that ran tearDownAndReset against the
+// same tx while Connect was still building it: each cancelled the other's context
+// and closed the other's socket, and after a Connect the caller was told had
+// failed the session sat Connected on a second connection with IsClosed() false -
+// a leaked socket, the Client's workers, the runtime watcher and an unbounded
+// reconnect loop, per failed Connect. Unrecoverable in place, too: a retry gets
+// "Connect already in progress".
+//
+// The other half of the invariant, and the reason the fix is not just "suppress
+// the spawn": suppressing the rival goroutine must not suppress the drop SIGNAL.
+// WithOnDisconnect is the only channel a consumer that neither polls IsClosed()
+// nor inspects the FSM has, and the callback fires once - on the CAS's first
+// detector - so a suppression placed above it loses it permanently rather than
+// delaying it. Hence onDisconnect == 1 here.
+func TestConnect_ResetDuringLivenessProbeSpawnsNoRivalReconnect(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	// A rival reconnect has to be able to SUCCEED, or "no second dial" and "a
+	// second dial that failed" would look the same from the outside.
+	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeNoErrors, []byte{7}
+	})
+	// Close without answering the very GetSymbolVersion the liveness probe issues:
+	// a real reset inside the armed window, not a timeout. Disarms afterwards, so
+	// the reconnect this used to spawn gets a working link.
+	srv.dropConnAfter(CommandIDRead, 1)
+
+	// "attempting reconnect" is logged before the rival's tearDownAndReset, so
+	// gating on it parks the rival at the start of the damage instead of leaving
+	// the interleaving to chance.
+	gate := newGateOnLog("attempting reconnect", "reconnect successful")
+
+	var disconnects atomic.Int64
+	sess, err := NewSession(context.Background(),
+		AMSEndpoint{IP: srv.host, Port: srv.port, AMS: AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851}},
+		WithRequestTimeout(500*time.Millisecond),
+		WithTargetCheck(TargetCheckOff),
+		// No WithRoute: that is what routes Connect through the armed liveness
+		// block rather than the disarmed route stage.
+		WithoutAmsPeerFallback(),
+		WithBackoff(fastBackoff()),
+		WithOnDisconnect(func() { disconnects.Add(1) }),
+		WithLogger(slog.New(gate)),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	if cerr := sess.Connect(context.Background()); cerr == nil {
+		t.Fatal("Connect reported success although the link was reset during the liveness probe")
+	}
+
+	// If a rival was spawned it is parked at the gate. Let it run to completion
+	// before asserting, so what gets asserted on is the finished leak rather than
+	// a half-built one.
+	spawned := false
+	select {
+	case <-gate.w.reached:
+		spawned = true
+		close(gate.w.release)
+		select {
+		case <-gate.w.signalled:
+		case <-time.After(10 * time.Second):
+			t.Fatal("a rival reconnect was spawned but never finished; cannot assert on a half-built transport")
+		}
+	case <-time.After(1500 * time.Millisecond):
+	}
+	// Reported, not asserted: the invariants below are what must hold, and the
+	// test should not encode the buggy mechanism.
+	t.Logf("rival reconnect spawned: %v", spawned)
+
+	if state := sess.lifecycle.state.load(); state == SessionStateConnected {
+		t.Errorf("state = %v after a Connect that returned an error: a rival Reconnect finished the job underneath it", state)
+	}
+	if got := srv.accepts(); got != 1 {
+		t.Errorf("the server accepted %d connections, want 1: a second one was dialled while Connect still owned the transport", got)
+	}
+	if c := sess.client.Load(); c != nil && c.ctx != nil && c.ctx.Err() == nil {
+		t.Error("the Client published during the failed Connect is still live: its workers are running on an open socket")
+	}
+
+	// The drop signal survives the suppression. Polled, because the callback runs
+	// in its own goroutine.
+	deadline := time.Now().Add(2 * time.Second)
+	for disconnects.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("WithOnDisconnect never fired for a drop during Connect: the consumer is told the Connect failed and nothing else, " +
+				"so a suppression placed above the callback dispatch has silently taken away its only drop signal")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := disconnects.Load(); got != 1 {
+		t.Errorf("onDisconnect fired %d times, want 1", got)
+	}
+
+	// And the session is still retryable, on one new connection - the contract
+	// Connect's own doc states. Connect never cleared tx.disconnected, which only
+	// ever worked because the suppressed Reconnect's dialAndStart did it: with the
+	// spawn gone, the stale flag failed every request on the retry's perfectly
+	// good socket.
+	before := srv.accepts()
+	if rerr := sess.Connect(context.Background()); rerr != nil {
+		t.Fatalf("retry after the failed Connect returned %v, want nil: the session is neither reconnectable nor retryable", rerr)
+	}
+	if got := srv.accepts() - before; got != 1 {
+		t.Errorf("the retry produced %d new connections, want 1", got)
+	}
+}
+
 // TestReconnect_DropDuringTheTailIsNotErased: a drop observed while a reconnect
 // is finishing must not be forgotten by the reconnect that is finishing.
 //
