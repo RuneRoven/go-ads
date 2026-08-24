@@ -462,6 +462,21 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 		maxDelay,
 		cycleTime)
 	if err != nil {
+		// Online-change detection (R-CACHE-009). Same intercept as
+		// readFromSymbolRetry / writeToSymbolRetry: the request above carried a
+		// cached symbol handle, so a stale-cache code here means that handle is
+		// dead. On TC3 a runtime restart answers 0x710 and does NOT bump the
+		// symbol version, so this is the only signal there is — without it every
+		// later subscribe repeats the same dead handle forever.
+		//
+		// Detection only, deliberately no retry: subscribe is not idempotent, and
+		// a retry racing the reload's own resubscribe would double-register the
+		// symbol. The caller's next call re-resolves by name and succeeds, which
+		// is the same two-call shape the read path has in practice.
+		var rc ReturnCode
+		if errors.As(err, &rc) {
+			sess.handleStaleDetection(rc)
+		}
 		return 0, err
 	}
 	// A subscription now exists, so it is worth protecting.
