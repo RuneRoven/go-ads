@@ -8,6 +8,48 @@ automated versioning and changelog generation.
 
 ## Unreleased: target NetID discovery, and a pre-release correctness pass
 
+### Upgrade notes — read before bumping
+
+This is a **minor** release: it connects, reads, writes and subscribes the way it
+always did, and nothing here is a compile break. But five behaviours changed in ways
+a caller can notice at runtime, and none of them will fail to build, so they are
+listed first rather than buried.
+
+1. **A partial batch is now an error.** `ReadMultipleSymbols` and
+   `WriteMultipleSymbols` return a `*BatchError` when any item fails, with the map
+   still holding everything that succeeded. **Callers that do
+   `if err != nil { return err }` will treat a partial batch as fatal** where they
+   previously carried on with a short map — which, before this release, is also how a
+   caller silently lost data after a runtime restart. Branch on the error to keep the
+   old shape:
+
+   ```go
+   values, err := sess.ReadMultipleSymbols(ctx, names)
+   var batchErr *ads.BatchError
+   if errors.As(err, &batchErr) {
+       // values holds every symbol that succeeded; batchErr.Items says what did not
+       // and whether the library skipped it or the PLC refused it.
+   } else if err != nil {
+       // transport failure: no item's outcome is known
+   }
+   ```
+
+2. **"Duplicate subscription" now means "has a live handle"**, not "is on file". A
+   symbol sitting in the resubscribe retry queue can be subscribed again; previously
+   it was refused with no way for the caller to clear it.
+3. **A transport abort mid-batch reports `ReturnCodeDeviceError`** in the per-item
+   code, not `0x06`. Router-level failures are now `AMSError` and no longer satisfy
+   `errors.As(err, &ReturnCode{})` — if you type-switch on `ReturnCode` to detect
+   transport problems, match `AMSError` instead.
+4. **`Connect` no longer self-heals from a reset during its probe phase.** It returns
+   an error, fires `onDisconnect`, and the session is retryable — and the retry now
+   actually works, which it did not before.
+5. **`WithForceRouteRegistration` now registers on every reconnect**, as its
+   documentation always claimed. Sessions that do not set it are unaffected.
+
+No dependency or toolchain changes: this module still has zero dependencies.
+
+
 This branch started as target-NetID discovery and became a hardening pass. Two
 review rounds plus a spec-and-verify round found fifteen candidate defects; five
 were refuted or materially corrected by measurement rather than implemented, and
