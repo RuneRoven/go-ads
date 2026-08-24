@@ -1240,6 +1240,132 @@ func TestHeartbeat_DeferralsKeepAConstantRate(t *testing.T) {
 	}
 }
 
+// TestHeartbeat_ReconnectDoesNotInheritStaleQuietTicks: the detector state is
+// about the subscriptions that existed before the drop, and a reconnect replaces
+// every one of them. Carrying the silence count across the gap declares a session
+// dead that was rebuilt seconds earlier — and because the declaration empties
+// activeNotifications before it re-adds, a re-add the PLC's router is still too
+// busy to serve leaves the session Connected with no subscriptions and no data.
+//
+// The interval is deliberately short so the watcher is LIVE across the gap.
+// TestHeartbeat_ReEstablishedAfterReconnect neutralises it with 30s, which is
+// exactly why it never saw this.
+func TestHeartbeat_ReconnectDoesNotInheritStaleQuietTicks(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var adds atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xA00)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		adds.Add(1)
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	// allowed == 8 ticks of 100ms: wide enough that ±2 ticks of scheduler jitter
+	// under -race cannot flip either assertion below.
+	const cycle = 100 * time.Millisecond
+	const allowed = 8
+	sess, c := newWiredTestSession(t, srv, WithNotificationHeartbeat(cycle, allowed))
+	c.SetNotificationHandler(sess.handleNotification)
+	// The stub speaks individual Add/Delete, not the sum groups.
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) || !c.capabilities.SumDeleteNotifStateCAS(0, 2) {
+		t.Fatal("could not force the sum commands into the unsupported state")
+	}
+	preSeedTypedSymbol(sess, "MAIN.beat", 0xF300)
+
+	ch := make(chan *Update, 16)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.beat", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Fatalf("AddSymbolNotification: %v", err)
+	}
+	hb := sess.notifications.heartbeatHandle.Load()
+	if hb == 0 {
+		t.Fatal("no heartbeat handle established")
+	}
+	if err := sess.drivePacket(sess.currentLifecycleCtx(), buildNotificationPacket(hb, 0, []byte{1})); err != nil {
+		t.Fatalf("drivePacket: %v", err)
+	}
+	afterSetup := adds.Load()
+
+	// Silence to just short of the threshold: ~6 of the 8 allowed ticks.
+	time.Sleep(6*cycle + cycle/2)
+	if got := adds.Load(); got != afterSetup {
+		t.Fatalf("recovery fired before the drop (%d -> %d Add calls); the test needs the counter"+
+			" short of its threshold, so the timings above no longer hold", afterSetup, got)
+	}
+
+	// The drop. Direct store: Connected -> Reconnecting is a legal edge and the
+	// helper builds its FSM state the same way.
+	sess.lifecycle.state.value.Store(uint32(SessionStateReconnecting))
+	time.Sleep(3 * cycle)
+
+	// The reconnect completing: production announces Connected through this
+	// helper, which is what advances the generation.
+	addsAtReconnect := adds.Load()
+	sess.enterConnected()
+
+	// A session that has just been rebuilt gets its full window of silence before
+	// anything is declared dead. With the stale count inherited, the counter is at
+	// 6 and the second tick here trips it.
+	time.Sleep(4 * cycle)
+	if got := adds.Load(); got != addsAtReconnect {
+		t.Fatalf("re-subscribed %d time(s) within %v of a completed reconnect: the silence count survived the gap",
+			got-addsAtReconnect, 4*cycle)
+	}
+
+	// The inverse: the reset must delay detection, not disable it. Keep withholding
+	// beats past the full window and recovery must still happen.
+	deadline := time.Now().Add(time.Duration(allowed+8) * cycle)
+	for time.Now().Before(deadline) {
+		if adds.Load() > addsAtReconnect {
+			return
+		}
+		time.Sleep(cycle / 4)
+	}
+	t.Errorf("no re-subscribe after %d silent ticks following the reconnect (%d Add calls throughout);"+
+		" a genuinely dead subscription set is no longer recovered", allowed+8, adds.Load())
+}
+
+// TestConnectedGeneration_OnlyAdvancesOnAConnectOrReconnect guards the property
+// the heartbeat reset depends on: the generation must move ONLY when the session
+// really re-entered Connected from a connect or reconnect attempt. Anything else
+// resets the detector while the session sits Connected, which masks a real stall
+// for as long as the other event keeps firing — the reason epoch() cannot be used
+// here (bumpEpoch also fires on symbol-cache swaps).
+func TestConnectedGeneration_OnlyAdvancesOnAConnectOrReconnect(t *testing.T) {
+	tests := []struct {
+		name string
+		from SessionState
+		want uint64
+	}{
+		{name: "a first connect advances it", from: SessionStateConnecting, want: 1},
+		{name: "a reconnect advances it", from: SessionStateReconnecting, want: 1},
+		// Reloading -> Connected is in the FSM table but no production path enters
+		// Reloading today. If one ever does, an AutoReload cycle must still not
+		// advance the generation, or every reload resets the heartbeat detector.
+		{name: "a reload does not advance it", from: SessionStateReloading, want: 0},
+		{name: "an idempotent re-announcement does not advance it", from: SessionStateConnected, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := &Session{
+				lifecycle: &sessionLifecycle{closedCh: make(chan struct{})},
+				logger:    getDefaultLogger(),
+			}
+			sess.lifecycle.state.value.Store(uint32(tt.from))
+			sess.enterConnected()
+			if got := sess.lifecycle.state.load(); got != SessionStateConnected {
+				t.Fatalf("state after enterConnected() from %v = %v, want Connected", tt.from, got)
+			}
+			if got := sess.connectedGen(); got != tt.want {
+				t.Errorf("connectedGen() after entering Connected from %v = %d, want %d", tt.from, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestHeartbeatAllowedTicks pins the recovery backoff arithmetic.
 //
 // Both defects it covers are invisible from outside — the session keeps working

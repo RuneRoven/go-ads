@@ -1138,6 +1138,10 @@ func (sess *Session) heartbeatWatch() {
 	// arrived at the previous tick, and how many ticks have passed with none.
 	var lastBeats uint64
 	quietTicks := 0
+	// lastGen is the connected generation this detector state belongs to. A
+	// reconnect deletes and re-adds every subscription and registers a fresh beat,
+	// so a count carried across the gap is about handles that no longer exist.
+	lastGen := sess.connectedGen()
 	ticker := time.NewTicker(cycle)
 	defer ticker.Stop()
 
@@ -1151,12 +1155,43 @@ func (sess *Session) heartbeatWatch() {
 			return
 		case <-ticker.C:
 		}
+		// A completed reconnect starts the detector over. Without this, a session
+		// that dropped one tick short of the threshold fired recovery on its FIRST
+		// Connected tick after a fully successful reconnect and resubscribe, before
+		// the new beat could arrive: a full delete-and-re-add of every handle the
+		// reconnect had just registered, and if the PLC's router was still settling
+		// the re-add bound nothing while takeNotificationHandles had already emptied
+		// activeNotifications — Connected, no subscriptions, no data.
+		//
+		// Strictly conservative: it can only ever DELAY a recovery. A frozen-but-alive
+		// PLC does not reconnect, so its generation does not move and it is treated
+		// exactly as before. See lifecycle.connectedGen for why this is not epoch()
+		// and why nothing but a real connect/reconnect may advance it.
+		if gen := sess.connectedGen(); gen != lastGen {
+			lastGen = gen
+			// The beat counter is monotonic across reconnects, so re-read it rather
+			// than leaving a pre-drop value that would read as a fresh beat.
+			lastBeats = sess.notifications.heartbeatBeats.Load()
+			quietTicks = 0
+			// Also the backoff: the reconnect resubscribed everything, so how hard
+			// recovery was on the previous transport says nothing about this one, and
+			// an inflated window delays detection of a genuinely dead new set by up
+			// to maxHeartbeatRecoveryBackoff. A PLC that flaps faster than the window
+			// therefore regains the un-backed-off rate on each reconnect; that is
+			// bounded by reconnectSleep, not by this counter.
+			consecutiveFailures = 0
+		}
 		// Connected, not merely "not disconnected": dialAndStart clears
 		// tx.disconnected before the route, reload and resubscribe steps run, so a
 		// reconnect's tail looks live here. Ticking through it accumulates quiet
 		// ticks against subscriptions the reconnect is in the middle of restoring,
 		// and can trigger a full delete-and-re-add of handles it has just
 		// registered — correct, thanks to resubscribeMu, but pure churn.
+		//
+		// Deliberately no reset here: every path back to Connected bumps the
+		// generation above, and resetting on any non-Connected tick would reset
+		// once per tick for as long as some future long-lived state (Reloading)
+		// were held — which is the masking bug, arrived at from the other side.
 		if sess.lifecycle.state.load() != SessionStateConnected {
 			continue // a drop has its own recovery path; do not compete with it
 		}

@@ -146,6 +146,25 @@ type sessionLifecycle struct {
 	// Reloading.
 	state sessionFSM
 
+	// connectedGen counts genuine (re)entries into Connected, and nothing else.
+	// It exists for the heartbeat watcher: a reconnect resubscribes everything and
+	// registers a fresh beat, so the silence count the watcher accumulated before
+	// the drop describes subscriptions that no longer exist. Carrying it across the
+	// gap declares the rebuilt session dead on its first Connected tick.
+	//
+	// Deliberately NOT epoch: bumpEpoch also fires on cache.symbols swaps, so a
+	// flapping symbol version would reset the detector every tick and mask a real
+	// stall forever.
+	//
+	// The counter must therefore advance ONLY when the subscriptions were actually
+	// rebuilt. enterConnected enforces that by bumping only for
+	// Connecting/Reconnecting -> Connected. Note Reloading -> Connected is a legal
+	// FSM edge that no production path takes today (SessionStateReloading is never
+	// entered outside tests); if the reload path is ever wired through it, it must
+	// keep going through enterConnected's filter and stay unbumped, or every
+	// AutoReload cycle re-introduces exactly the masking that ruled epoch out.
+	connectedGen atomic.Uint64
+
 	autoReconnect              bool
 	maxReconnectAttempts       int
 	backoffConfig              BackoffConfig
@@ -170,6 +189,33 @@ const (
 	flapWindow      = 5 * time.Second
 	flapResetWindow = 60 * time.Second
 )
+
+// enterConnected announces Connected and advances lifecycle.connectedGen when the
+// session really came from a connect or a reconnect — i.e. when its subscriptions
+// have just been rebuilt. Every production transition into Connected goes through
+// here; see the connectedGen comment for why the from-filter is the whole point.
+//
+// Logging matches transitionState so the FSM trace is unchanged.
+func (sess *Session) enterConnected() {
+	from, ok := sess.lifecycle.state.transitionTo(SessionStateConnected)
+	if !ok {
+		sess.logger.Warn("FSM invalid transition (ignoring)",
+			"from", from, "to", SessionStateConnected)
+		return
+	}
+	sess.logger.Log(context.Background(), LevelTrace, "FSM transition",
+		"from", from, "to", SessionStateConnected)
+	if from == SessionStateConnecting || from == SessionStateReconnecting {
+		sess.lifecycle.connectedGen.Add(1)
+	}
+}
+
+// connectedGen returns the connected-generation counter. Read lock-free, one Load
+// per heartbeat tick; a stale read costs one extra tick of delay and never a
+// skipped recovery.
+func (sess *Session) connectedGen() uint64 {
+	return sess.lifecycle.connectedGen.Load()
+}
 
 // secret is an internal wrapper around password/credential strings that
 // implements String() and slog.LogValuer to return "[REDACTED]" instead
@@ -951,7 +997,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		sess.logger.Warn("connected, but the PLC runtime is not in RUN: symbol and subscription calls will refuse until it returns",
 			"state", uint16(state), "detail", "in CONFIG the runtime port does not exist, so those calls cannot succeed")
 	}
-	sess.transitionState(SessionStateConnected)
+	sess.enterConnected()
 	sess.lifecycle.flapMu.Lock()
 	sess.lifecycle.lastConnectedAt = time.Now()
 	sess.lifecycle.flapMu.Unlock()
@@ -2282,8 +2328,10 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		// on a dead socket with IsClosed() false: no data, and no signal a consumer
 		// polling IsClosed() could act on.
 		sess.lifecycle.strictReconnectFailures = 0 // reset on success
-		// epoch bumps inside the transition helper when target == Connected.
-		sess.transitionState(SessionStateConnected)
+		// epoch bumps inside the transition helper when target == Connected;
+		// enterConnected additionally advances the connected generation, which is
+		// what tells the heartbeat watcher to drop the pre-drop silence count.
+		sess.enterConnected()
 		sess.lifecycle.flapMu.Lock()
 		sess.lifecycle.lastConnectedAt = time.Now()
 		sess.lifecycle.flapMu.Unlock()
