@@ -787,6 +787,12 @@ func (c *Client) send(data []byte) ([]byte, error) {
 // surface as context.Canceled / DeadlineExceeded; Session wraps this with
 // wait-for-reconnect retry semantics in its own helpers.
 func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte) ([]byte, error) {
+	return c.sendRequestTo(ctx, c.target, command, data)
+}
+
+// sendRequestTo is sendRequest addressed to an explicit AMS target — used to reach
+// another port on the same device (the system service) over this one connection.
+func (c *Client) sendRequestTo(ctx context.Context, target AMSAddress, command CommandID, data []byte) ([]byte, error) {
 	if c.tx.disconnected.Load() {
 		return nil, ErrTransportClosed
 	}
@@ -803,7 +809,7 @@ func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte
 	c.logger.Log(context.Background(), LevelTrace, "encoding packet",
 		"command", command, "data", data, "id", id)
 
-	pack, err := c.encode(command, data, id)
+	pack, err := c.encodeTo(target, command, data, id)
 	if err != nil {
 		c.logger.Error("Error during sendRequest encode", "error", err)
 		return nil, err

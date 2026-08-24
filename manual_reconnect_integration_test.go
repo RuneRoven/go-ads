@@ -4,6 +4,7 @@ package ads
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -377,5 +378,164 @@ func waitForStreamResume(ch <-chan *Update, limit time.Duration) bool {
 		case <-deadline:
 			return false
 		}
+	}
+}
+
+// TestManualConfigToRun: connect to a PLC that is in CONFIG, then watch the
+// session pick up the transition to RUN on its own.
+//
+// This is the half the CONFIG probe cannot prove by itself. Measured behaviour in
+// CONFIG (TC3.1.4024): the runtime port answers every request with AMS ErrorCode 6
+// (target port not found) while the system service on port 10000 reports
+// ADSState=15. So Connect succeeds — the session is usable, there is simply no
+// runtime to talk to — and symbol work refuses with ErrRuntimeNotRunning until the
+// state changes.
+//
+// What a consumer needs from this, and what is asserted:
+//
+//   - Connect does NOT fail (a session that waits is more useful than one that dies)
+//
+//   - RuntimeState reports CONFIG, so the status is queryable and not just logged
+//
+//   - subscribing refuses with an error wrapping ErrRuntimeNotRunning, so a plugin
+//     can tell "not ready, retry" from "broken, give up"
+//
+//   - once the human switches to RUN, the session notices without being rebuilt,
+//     and the same calls then succeed
+//
+//     set -a; . ./.env.integration.118; set +a
+//     ADS_MANUAL_CONFIG_RUN=1 go test -tags integration -v -timeout 10m \
+//     -run TestManualConfigToRun .
+func TestManualConfigToRun(t *testing.T) {
+	if os.Getenv("ADS_MANUAL_CONFIG_RUN") == "" {
+		t.Skip("ADS_MANUAL_CONFIG_RUN not set — this test needs a human to switch the PLC from CONFIG to RUN")
+	}
+
+	host := getEnvOrDefault("ADS_PLC_IP", "192.168.3.118")
+	symbol := os.Getenv("ADS_READ_COUNTER")
+	if symbol == "" {
+		t.Skip("ADS_READ_COUNTER not set")
+	}
+	targetAMS := getEnvOrDefault("ADS_TARGET_AMS", "5.66.133.203.1.1")
+	portStr := getEnvOrDefault("ADS_TARGET_PORT", "851")
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("ADS_TARGET_PORT %q: %v", portStr, err)
+	}
+	target, err := NewAMSAddress(targetAMS, uint16(port))
+	if err != nil {
+		t.Fatalf("target AMS: %v", err)
+	}
+
+	opts := []SessionOption{
+		WithRequestTimeout(5 * time.Second),
+		WithAutoReconnect(true),
+		WithMaxReconnectAttempts(0),
+	}
+	if hostIP := os.Getenv("ADS_HOST_IP"); hostIP != "" {
+		opts = append(opts, WithHostIP(hostIP))
+	}
+	if u, p := os.Getenv("ADS_ROUTE_USER"), os.Getenv("ADS_ROUTE_PASS"); u != "" && p != "" {
+		// Reuse the route this suite already registered rather than adding another
+		// entry to the device's table.
+		opts = append(opts, WithRoute("go-ads-manual-restart", u, p))
+	}
+	if localAMS := os.Getenv("ADS_LOCAL_AMS"); localAMS != "" {
+		local, lerr := NewAMSAddress(localAMS, 10600)
+		if lerr != nil {
+			t.Fatalf("ADS_LOCAL_AMS %q: %v", localAMS, lerr)
+		}
+		opts = append(opts, WithLocalAMS(local))
+	}
+
+	ctx := context.Background()
+	sess, err := NewSession(ctx, AMSEndpoint{IP: host, AMS: target}, opts...)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+
+	timeline := func(format string, args ...any) {
+		t.Logf("[%s] %s", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
+	}
+
+	// Phase 1 — connecting to a PLC in CONFIG must work, and must say what it found.
+	if err := sess.Connect(ctx); err != nil {
+		t.Fatalf("Connect to a PLC in CONFIG failed: %v — the session should come up and wait, not refuse", err)
+	}
+	timeline("connected")
+
+	state, err := sess.RuntimeState(ctx)
+	if err != nil {
+		t.Fatalf("RuntimeState: %v — the system service on port %d should answer even in CONFIG", err, PortSystemService)
+	}
+	timeline("runtime state = %d", uint16(state))
+	if state == ADSStateRun {
+		t.Skip("the PLC is already in RUN — put it into CONFIG before running this")
+	}
+
+	// Phase 2 — symbol work must refuse, with a cause a consumer can branch on.
+	lerr := sess.LoadSymbols(ctx)
+	if !errors.Is(lerr, ErrRuntimeNotRunning) {
+		t.Errorf("LoadSymbols error = %v, want one wrapping ErrRuntimeNotRunning so a plugin can tell 'retry later' from 'broken'", lerr)
+	} else {
+		timeline("LoadSymbols refused as expected: %v", lerr)
+	}
+	ch := make(chan *Update, 256)
+	_, serr := sess.AddSymbolNotifications(ctx, []NotificationConfig{{
+		SymbolName:       symbol,
+		TransmissionMode: TransModeServerOnChange,
+	}}, ch)
+	if !errors.Is(serr, ErrRuntimeNotRunning) {
+		t.Errorf("AddSymbolNotifications error = %v, want ErrRuntimeNotRunning", serr)
+	} else {
+		timeline("subscribe refused as expected")
+	}
+	if sess.IsClosed() {
+		t.Fatal("session closed itself because the runtime was in CONFIG; it should stay up and wait")
+	}
+
+	// Phase 3 — the human switches to RUN, and the session notices by itself.
+	fmt.Printf("\n\n=== CONFIG -> RUN ===\n")
+	fmt.Printf(">>> Put the PLC into RUN now (activate configuration / start the runtime)\n")
+	fmt.Printf(">>> Waiting up to %v. No keypress needed.\n\n", manualDisruptWait)
+
+	deadline := time.Now().Add(manualDisruptWait)
+	for {
+		if s, known := sess.knownRuntimeState(); known && s == ADSStateRun {
+			break
+		}
+		if time.Now().After(deadline) {
+			s, _ := sess.knownRuntimeState()
+			t.Fatalf("the poll never reported RUN within %v (last state %d) — a session that connected during CONFIG would "+
+				"never start working", manualDisruptWait, uint16(s))
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	timeline("poll reported RUN without the session being rebuilt")
+
+	// Phase 4 — and the work that was refused now succeeds.
+	if err := sess.LoadSymbols(ctx); err != nil {
+		t.Fatalf("LoadSymbols after RUN: %v", err)
+	}
+	results, err := sess.AddSymbolNotifications(ctx, []NotificationConfig{{
+		SymbolName:       symbol,
+		TransmissionMode: TransModeServerOnChange,
+		MaxDelay:         200 * time.Millisecond,
+		CycleTime:        200 * time.Millisecond,
+	}}, ch)
+	if err != nil {
+		t.Fatalf("subscribe after RUN: %v", err)
+	}
+	if len(results) != 1 || results[0].Handle == 0 {
+		t.Fatalf("subscribe after RUN did not bind: %+v", results)
+	}
+	timeline("subscribed after RUN")
+
+	select {
+	case u := <-ch:
+		timeline("updates flowing again: %s = %s", u.Variable, u.Value)
+	case <-time.After(30 * time.Second):
+		t.Error("no updates within 30s of subscribing after RUN")
 	}
 }

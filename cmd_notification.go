@@ -1195,6 +1195,14 @@ func (sess *Session) recoverDeadSubscriptions() bool {
 
 	if err := sess.resubscribeNotificationsLocked(); err != nil {
 		restoreIntent()
+		if state, known := sess.knownRuntimeState(); known && state != ADSStateRun {
+			// Not a mystery and not our problem to fix: the runtime is not serving.
+			// Say so plainly and at Info — the session is behaving correctly by
+			// waiting, and an operator who sees Warn assumes otherwise.
+			sess.logger.Info("re-subscribe deferred: the PLC runtime is not in RUN",
+				"state", uint16(state), "configs", len(intent))
+			return false
+		}
 		sess.logger.Warn("re-subscribe after a heartbeat timeout failed; keeping the subscriptions on file and retrying in the next window",
 			"error", err, "configs", len(intent))
 		return false

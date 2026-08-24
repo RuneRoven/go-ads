@@ -238,6 +238,19 @@ type Session struct {
 	heartbeatOnce     sync.Once
 	heartbeatWG       sync.WaitGroup
 
+	// runtimeState is the last ADS state read from the system service port, and
+	// runtimeStateNs when. Zero (ADSStateInvalid) means "not known yet" — the gates
+	// below only refuse on a POSITIVE non-RUN reading, never on absence of one, so a
+	// device that does not serve the system service port behaves as before.
+	//
+	// Measured on TC3.1.4024 in CONFIG: the runtime port answers every request with
+	// AMS ErrorCode 6 (target port not found) while port 10000 reports ADSState=15.
+	// Without asking 10000 the session cannot tell "the runtime is not running" from
+	// "this device is broken", and it retries either way.
+	runtimeState   atomic.Uint32
+	runtimeStateNs atomic.Int64
+	stateOnce      sync.Once
+
 	// Event callbacks (run in goroutine, must not block)
 	onDisconnect func()
 	onReconnect  func()
@@ -776,6 +789,21 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		sess.cache.symbolVersion = symbolVersion
 		sess.cache.lock.Unlock()
 	}
+	// Poll the system service for the runtime state from here on. Connect itself
+	// deliberately still succeeds against a runtime in CONFIG — the session is
+	// usable, it just has no runtime to talk to yet — and the poll is what lets the
+	// symbol and subscription calls say so instead of failing obscurely.
+	sess.startRuntimeStateWatch()
+	// One synchronous read before returning, so the very first LoadSymbols or
+	// subscribe already has evidence. Waiting for the poller's first tick would
+	// leave that call to fail the old obscure way — measured on a PLC in CONFIG:
+	// "ADS error in Read: 0xF008", which is an index group, not a return code.
+	if state, serr := sess.RuntimeState(ctx); serr != nil {
+		sess.logger.Debug("could not read the runtime state from the system service at connect", "error", serr)
+	} else if state != ADSStateRun {
+		sess.logger.Warn("connected, but the PLC runtime is not in RUN: symbol and subscription calls will refuse until it returns",
+			"state", uint16(state), "detail", "in CONFIG the runtime port does not exist, so those calls cannot succeed")
+	}
 	sess.transitionState(SessionStateConnected)
 	sess.lifecycle.flapMu.Lock()
 	sess.lifecycle.lastConnectedAt = time.Now()
@@ -1048,6 +1076,28 @@ func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, err
 				sess.logger.Info("route active after registration", "probeAttempts", attempt)
 			}
 			return version, nil
+		}
+		// The probe reads the symbol version, which lives on the RUNTIME port — and
+		// that port does not exist while the system is in CONFIG (measured: every
+		// request answered with AMS ErrorCode 6). The route is not the problem there,
+		// so ask the system service, which stays up: if it answers, the route is
+		// demonstrably being served and the only thing missing is a running runtime.
+		// Without this a session that starts while the PLC is in CONFIG dies here
+		// instead of coming up and waiting, which is the whole point of the gates on
+		// the symbol and subscription calls.
+		if c := sess.client.Load(); c != nil {
+			stateCtx, stateCancel := context.WithTimeout(ctxFor(), probeTimeout)
+			state, serr := c.ReadStateOnPort(stateCtx, PortSystemService)
+			stateCancel()
+			if serr == nil {
+				sess.recordRuntimeState(state.ADSState)
+				if state.ADSState != ADSStateRun {
+					sess.route.routeProbeFailures.Store(0)
+					sess.logger.Warn("route is active but the PLC runtime is not in RUN; connecting anyway and waiting for it",
+						"state", uint16(state.ADSState), "probeAttempts", attempt)
+					return 0, nil
+				}
+			}
 		}
 		if !time.Now().Before(deadline) {
 			break
@@ -2692,4 +2742,115 @@ func isRunningInContainer() bool {
 	s := string(data)
 	return strings.Contains(s, "docker") || strings.Contains(s, "containerd") ||
 		strings.Contains(s, "kubepods") || strings.Contains(s, "lxc")
+}
+
+// ErrRuntimeNotRunning is returned by symbol and subscription calls when the
+// device's system service reports the runtime is not in RUN.
+//
+// Deliberately a refusal rather than a retry: in CONFIG the runtime port does not
+// exist, so a symbol load or subscribe cannot succeed, and attempting it produces a
+// misleading error (an AMS "port not found" that the library used to surface as a
+// fabricated ADS code). The session itself stays up and keeps polling, so the
+// caller can simply try again once the state changes.
+var ErrRuntimeNotRunning = errors.New("ads: PLC runtime is not in RUN")
+
+// RuntimeState reads the device's ADS state from the system service port.
+//
+// This is the state of the SYSTEM, not of the runtime port the session talks to:
+// ADSStateConfig means the PLC is in configuration mode and no runtime port is
+// serving. Answers while the runtime is unavailable, which is the point.
+func (sess *Session) RuntimeState(ctx context.Context) (ADSState, error) {
+	c := sess.client.Load()
+	if c == nil {
+		return ADSStateInvalid, ErrTransportClosed
+	}
+	state, err := c.ReadStateOnPort(ctx, PortSystemService)
+	if err != nil {
+		return ADSStateInvalid, err
+	}
+	sess.recordRuntimeState(state.ADSState)
+	return state.ADSState, nil
+}
+
+func (sess *Session) recordRuntimeState(state ADSState) {
+	previous := ADSState(sess.runtimeState.Swap(uint32(state)))
+	sess.runtimeStateNs.Store(time.Now().UnixNano())
+	if previous != state && previous != ADSStateInvalid {
+		sess.logger.Info("PLC runtime state changed", "from", previous, "to", state)
+	}
+}
+
+// knownRuntimeState returns the last observed state and whether one was observed.
+func (sess *Session) knownRuntimeState() (ADSState, bool) {
+	state := ADSState(sess.runtimeState.Load())
+	return state, state != ADSStateInvalid
+}
+
+// requireRunningRuntime refuses an operation that cannot work outside RUN.
+//
+// Gated on evidence: with no reading (a device that does not serve the system
+// service port, or a session that has not polled yet) it permits the operation
+// rather than inventing a reason to fail.
+func (sess *Session) requireRunningRuntime(what string) error {
+	if state, known := sess.knownRuntimeState(); known && state != ADSStateRun {
+		return fmt.Errorf("%s: %w (ADS state %d); the runtime port is not serving, so this cannot succeed until it returns to RUN",
+			what, ErrRuntimeNotRunning, uint16(state))
+	}
+	return nil
+}
+
+// startRuntimeStateWatch polls the system service for the runtime state, once per
+// session, at the heartbeat interval.
+//
+// Polling is the only option here: there is nothing to subscribe to that survives
+// the transition being watched — in CONFIG the runtime port that would carry a
+// notification does not exist. It is one small request per interval to a port that
+// is up whenever the device is, and it is what lets the session say "the runtime is
+// in CONFIG" instead of retrying blindly.
+//
+// Gives up after a run of failures so a device without a system service port costs
+// nothing: the gates fall back to permitting, which is the pre-existing behaviour.
+func (sess *Session) startRuntimeStateWatch() {
+	sess.stateOnce.Do(func() {
+		started := sess.trackGoroutine(func() {
+			interval := sess.heartbeatCycle()
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			failures := 0
+			const giveUpAfter = 5
+			for {
+				select {
+				case <-sess.lifecycle.closedCh:
+					return
+				case <-ticker.C:
+				}
+				if sess.isClosed() || sess.isDisconnected() {
+					continue
+				}
+				c := sess.client.Load()
+				if c == nil || (c.ctx != nil && c.ctx.Err() != nil) {
+					continue
+				}
+				ctx, cancel := context.WithTimeout(sess.currentLifecycleCtx(), interval)
+				state, err := c.ReadStateOnPort(ctx, PortSystemService)
+				cancel()
+				if err != nil {
+					failures++
+					sess.logger.Debug("could not read the runtime state from the system service",
+						"error", err, "attempt", failures)
+					if failures >= giveUpAfter {
+						sess.logger.Info("this device does not answer on the system service port; runtime-state reporting is off for this session",
+							"port", uint32(PortSystemService), "attempts", failures)
+						return
+					}
+					continue
+				}
+				failures = 0
+				sess.recordRuntimeState(state.ADSState)
+			}
+		})
+		if !started {
+			sess.logger.Debug("not starting the runtime-state watch: the session is closed")
+		}
+	})
 }

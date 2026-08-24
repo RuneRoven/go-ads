@@ -3,8 +3,10 @@ package ads
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -749,5 +751,106 @@ func TestHeartbeat_DoesNotSpinWhenTheTransportIsGone(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if after := logs.countByMessage("no notification heartbeat within the allowed window"); after != before {
 		t.Errorf("watcher logged %d more time(s) after the session was closed: the goroutine outlives its session", after-before)
+	}
+}
+
+// TestRuntimeState_RefusesSymbolWorkOutsideRun: when the system service says the
+// runtime is not in RUN, symbol and subscription calls must refuse and say why.
+//
+// Measured on TC3.1.4024 in CONFIG: every request to the runtime port 851 came back
+// with AMS ErrorCode 6 (target port not found), while port 10000 answered
+// ADSState=15. The library discarded the AMS error and parsed the response body
+// anyway, so a subscribe failed with "0xF008: unknown error code" — an index group
+// formatted as a return code. Asking the system service turns that into a fact.
+func TestRuntimeState_RefusesSymbolWorkOutsideRun(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		return addNotifResponse{Handle: 0x1234}
+	})
+
+	sess, c := newWiredTestSession(t, srv, WithoutNotificationHeartbeat())
+	c.SetNotificationHandler(sess.handleNotification)
+	preSeedTypedSymbol(sess, "MAIN.cfg", 0xFC00)
+	preSeedTypedSymbol(sess, "MAIN.cfg2", 0xFC01)
+	preSeedTypedSymbol(sess, "MAIN.cfg3", 0xFC02)
+	ch := make(chan *Update, 4)
+
+	// No reading yet: the gate must permit, or every device that does not serve the
+	// system service port would stop working.
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.cfg", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Fatalf("subscribe refused with no runtime-state reading: %v", err)
+	}
+
+	// Now the system service reports CONFIG.
+	sess.recordRuntimeState(ADSStateConfig)
+	_, err := sess.AddSymbolNotification(context.Background(), "MAIN.cfg2", 0, 0,
+		TransModeServerOnChange, ch)
+	if err == nil {
+		t.Error("subscribe succeeded although the runtime is in CONFIG: the runtime port does not exist in that state, so this " +
+			"can only fail later and obscurely")
+	}
+	if !errors.Is(err, ErrRuntimeNotRunning) {
+		t.Errorf("error = %v, want one wrapping ErrRuntimeNotRunning so callers can branch on it", err)
+	}
+	if err != nil && !strings.Contains(err.Error(), "15") {
+		t.Errorf("error %q does not name the state; the operator needs to know it is CONFIG, not just that something failed", err)
+	}
+	if lerr := sess.LoadSymbols(context.Background()); !errors.Is(lerr, ErrRuntimeNotRunning) {
+		t.Errorf("LoadSymbols error = %v, want ErrRuntimeNotRunning", lerr)
+	}
+
+	// Back to RUN: work is allowed again without rebuilding anything.
+	sess.recordRuntimeState(ADSStateRun)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.cfg3", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Errorf("subscribe still refused after the runtime returned to RUN: %v", err)
+	}
+}
+
+// TestRuntimeState_PollReportsTheState: the state has to be discovered by the
+// session, not only by a caller who asks.
+//
+// It is a poll on purpose. There is nothing to subscribe to that survives the
+// transition being watched: in CONFIG the runtime port that would carry a
+// notification does not exist. One small request per heartbeat interval to a port
+// that is up whenever the device is.
+func TestRuntimeState_PollReportsTheState(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	srv.setADSState(ADSStateConfig)
+
+	sess, _ := newWiredTestSession(t, srv, WithNotificationHeartbeat(100*time.Millisecond, 3))
+	if state, known := sess.knownRuntimeState(); known {
+		t.Fatalf("state already known before polling: %v", state)
+	}
+	sess.startRuntimeStateWatch()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if state, known := sess.knownRuntimeState(); known {
+			if state != ADSStateConfig {
+				t.Errorf("polled state = %v, want CONFIG", state)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the runtime state was never polled: the session cannot tell CONFIG from a broken device")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// And it must notice the way back.
+	srv.setADSState(ADSStateRun)
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		if state, _ := sess.knownRuntimeState(); state == ADSStateRun {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the poll never saw the return to RUN, so the session would refuse subscriptions forever")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

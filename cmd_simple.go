@@ -172,8 +172,21 @@ type States struct {
 
 // ReadState issues ADS ReadState (cmd 4) and returns the PLC's ADS+device state.
 func (c *Client) ReadState(ctx context.Context) (response States, err error) {
+	return c.readStateOn(ctx, c.target)
+}
+
+// ReadStateOnPort reads the ADS state of another port on the same device. The
+// system service (PortSystemService) is the one that matters: it answers while the
+// system is in CONFIG, when the runtime ports do not exist at all.
+func (c *Client) ReadStateOnPort(ctx context.Context, port Port) (States, error) {
+	target := c.target
+	target.Port = uint16(port)
+	return c.readStateOn(ctx, target)
+}
+
+func (c *Client) readStateOn(ctx context.Context, target AMSAddress) (response States, err error) {
 	// Try to send the request
-	resp, err := c.sendRequest(ctx, CommandIDReadState, []byte{})
+	resp, err := c.sendRequestTo(ctx, target, CommandIDReadState, []byte{})
 	if err != nil {
 		c.logger.Log(ctx, c.transportFaultLevel(), "error during read state", "error", err)
 		return

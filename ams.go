@@ -131,6 +131,14 @@ func (a AMSAddress) Equal(other AMSAddress) bool {
 // encode lives on *Client. Session callers reach it via s.client.encode
 // at the rare sites still on Session.
 func (c *Client) encode(command CommandID, data []byte, invokeID uint32) ([]byte, error) {
+	return c.encodeTo(c.target, command, data, invokeID)
+}
+
+// encodeTo is encode addressed to an explicit target. Requests to a different AMS
+// port on the same device (the system service, say) travel over this same
+// connection: the AMS header carries the port, and the router allows only one TCP
+// connection per remote IP, so opening a second one is not an option.
+func (c *Client) encodeTo(target AMSAddress, command CommandID, data []byte, invokeID uint32) ([]byte, error) {
 	// Snapshot source under lock: setSource replaces it after a local-mode
 	// handshake, which can land while requests are already in flight. target is set
 	// at construction and never mutated after that.
@@ -139,7 +147,7 @@ func (c *Client) encode(command CommandID, data []byte, invokeID uint32) ([]byte
 	c.tx.connMu.Unlock()
 	c.logger.Log(context.Background(), LevelTrace, "Starting encoding of AMS header",
 		"command", command,
-		"target", c.target,
+		"target", target,
 		"source", source,
 		"ID", invokeID,
 		"length of data", len(data))
@@ -149,7 +157,7 @@ func (c *Client) encode(command CommandID, data []byte, invokeID uint32) ([]byte
 		Length:   uint32(AMSHeaderSize + len(data)),
 	}
 	header := &AMSHeader{
-		Target:    c.target,
+		Target:    target,
 		Source:    source,
 		Command:   command,
 		State:     uint16(4),

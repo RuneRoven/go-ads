@@ -390,6 +390,13 @@ func (sess *Session) releaseNotificationHandles(ctx context.Context, handles []u
 // receiving notifications, call DeleteDeviceNotification or Close() — these
 // remove the PLC-side registration before the channel is no longer used.
 func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName string, maxDelay time.Duration, cycleTime time.Duration, transMode TransMode, updateReceiver chan *Update) (uint32, error) {
+	// Refuse outside RUN rather than produce a misleading failure: in CONFIG the
+	// runtime port does not exist, so this cannot succeed, and the PLC's answer is
+	// an AMS "port not found" rather than anything about symbols. Permits when no
+	// state has been observed — see requireRunningRuntime.
+	if err := sess.requireRunningRuntime("AddSymbolNotification"); err != nil {
+		return 0, err
+	}
 	// Pre-check: channel match + duplicate-subscribe.
 	sess.notifications.lock.Lock()
 	if sess.notifications.notificationChannel != nil && sess.notifications.notificationChannel != updateReceiver {
@@ -536,6 +543,13 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 // DeleteDeviceNotification or Close() — these remove the PLC-side registration
 // before the channel is no longer used.
 func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []NotificationConfig, ch chan *Update) ([]SumNotificationResult, error) {
+	// Refuse outside RUN rather than produce a misleading failure: in CONFIG the
+	// runtime port does not exist, so this cannot succeed, and the PLC's answer is
+	// an AMS "port not found" rather than anything about symbols. Permits when no
+	// state has been observed — see requireRunningRuntime.
+	if err := sess.requireRunningRuntime("AddSymbolNotifications"); err != nil {
+		return nil, err
+	}
 	if len(configs) == 0 {
 		return nil, nil
 	}

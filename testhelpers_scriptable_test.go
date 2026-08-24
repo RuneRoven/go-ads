@@ -87,7 +87,11 @@ type scriptableServer struct {
 	// matters most here — a reply followed immediately by a route-idle close, a
 	// runtime restart, or an RST.
 	closeAfterReply map[CommandID]int
-	replySeen       map[CommandID]int
+
+	// adsState is what ReadState reports; zero means RUN. Lets a test put the stub
+	// "in CONFIG" the way a real system service reports it.
+	adsState  ADSState
+	replySeen map[CommandID]int
 
 	// Recorded inbound frames (full bytes including TCP header).
 	frameBuf [][]byte
@@ -190,6 +194,12 @@ func (s *scriptableServer) onDeleteDeviceNotification(fn func(handle uint32) Ret
 // delayBefore injects artificial latency for a particular (cmd, group)
 // before the handler runs. Pass group=0 for commands without an index group
 // (AddDeviceNotification, DeleteDeviceNotification, ReadDeviceInfo, ReadState).
+func (s *scriptableServer) setADSState(state ADSState) {
+	s.mu.Lock()
+	s.adsState = state
+	s.mu.Unlock()
+}
+
 func (s *scriptableServer) delayBefore(cmd CommandID, group uint32, d time.Duration) {
 	s.mu.Lock()
 	s.delays[delayKey{cmd: cmd, group: group}] = d
@@ -451,7 +461,11 @@ func (s *scriptableServer) dispatch(cmd CommandID, group uint32, payload []byte)
 	case CommandIDReadState:
 		// 8 bytes: 4 errCode + 2 ADSState + 2 DeviceState
 		out := make([]byte, 8)
-		binary.LittleEndian.PutUint16(out[4:6], uint16(ADSStateRun))
+		state := ADSStateRun
+		if s.adsState != 0 {
+			state = s.adsState
+		}
+		binary.LittleEndian.PutUint16(out[4:6], uint16(state))
 		return out
 	}
 	return respondErrorBytes(ReturnCodeDeviceServiceNotSupported)

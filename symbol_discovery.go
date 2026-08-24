@@ -74,6 +74,13 @@ func (sess *Session) ListSymbols() (map[string]SymbolView, error) {
 // which may cause real-time jitter on the PLC. For large programs, consider
 // LoadSymbolsSlow() instead.
 func (sess *Session) LoadSymbols(ctx context.Context) error {
+	// Refuse outside RUN rather than produce a misleading failure: in CONFIG the
+	// runtime port does not exist, so this cannot succeed, and the PLC's answer is
+	// an AMS "port not found" rather than anything about symbols. Permits when no
+	// state has been observed — see requireRunningRuntime.
+	if err := sess.requireRunningRuntime("LoadSymbols"); err != nil {
+		return err
+	}
 	err := sess.loadSymbols(ctx)
 	if err != nil {
 		return err
