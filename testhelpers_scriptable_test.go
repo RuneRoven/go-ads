@@ -60,10 +60,23 @@ type scriptableServer struct {
 	host string
 	port int
 	ln   net.Listener
-	t    *testing.T
 	wg   sync.WaitGroup
 
+	stopOnce sync.Once
+	// quit is closed by stop() so a handler parked in an injected delay leaves
+	// immediately. An uninterruptible sleep ignores the socket close, so every test
+	// arming a long delayBefore used to pay stop()'s full 2s wait cap — the same
+	// mistake as the untracked connections above, on the other path.
+	quit chan struct{}
+
 	mu sync.Mutex // guards every field below
+
+	// conns are the accepted client connections, tracked so stop() can close
+	// them. Closing only the listener leaves every handle() goroutine blocked in
+	// io.ReadFull until the client happens to hang up, which cost each test using
+	// this stub the full 2s stop() timeout.
+	conns  map[net.Conn]struct{}
+	closed bool
 
 	// Per-cmd dispatch tables. key (group) used for Read/Write/WriteRead.
 	writeReadHandlers map[uint32]writeReadHandler
@@ -107,6 +120,12 @@ type scriptableServer struct {
 	peerAddr atomic.Pointer[string]
 	peerMu   sync.Mutex
 	peerConn net.Conn
+
+	// unanswered counts requests the stub processed but could not reply to
+	// because the peer connection was not up yet. It is a counter rather than a
+	// t.Logf because this goroutine can outlive the test, and logging after the
+	// test returns kills the whole binary.
+	unanswered atomic.Int64
 }
 
 type delayKey struct {
@@ -129,31 +148,48 @@ func startScriptableServer(t *testing.T) *scriptableServer {
 		host:              addr.IP.String(),
 		port:              addr.Port,
 		ln:                ln,
-		t:                 t,
 		writeReadHandlers: map[uint32]writeReadHandler{},
 		writeHandlers:     map[uint32]writeHandler{},
 		readHandlers:      map[uint32]readHandler{},
 		delays:            map[delayKey]time.Duration{},
+		conns:             map[net.Conn]struct{}{},
+		quit:              make(chan struct{}),
 	}
 	s.wg.Add(1)
 	go s.acceptLoop()
+	// Belt and braces: most callers `defer srv.stop()`, but a t.Fatalf before that
+	// line, or a test that forgets it, would otherwise leave the goroutines running
+	// for the rest of the process. stop() is idempotent, so both can fire.
+	t.Cleanup(s.stop)
 	return s
 }
 
+// stop closes the listener and every accepted connection, then waits for the
+// goroutines. Idempotent: callers both `defer srv.stop()` and get a t.Cleanup.
 func (s *scriptableServer) stop() {
-	s.peerMu.Lock()
-	if s.peerConn != nil {
-		_ = s.peerConn.Close()
-		s.peerConn = nil
-	}
-	s.peerMu.Unlock()
-	_ = s.ln.Close()
-	done := make(chan struct{})
-	go func() { s.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-	}
+	s.stopOnce.Do(func() {
+		close(s.quit) // first: releases any handler sitting in an injected delay
+		s.peerMu.Lock()
+		if s.peerConn != nil {
+			_ = s.peerConn.Close()
+			s.peerConn = nil
+		}
+		s.peerMu.Unlock()
+		_ = s.ln.Close()
+		s.mu.Lock()
+		s.closed = true
+		for c := range s.conns {
+			_ = c.Close()
+		}
+		s.conns = map[net.Conn]struct{}{}
+		s.mu.Unlock()
+		done := make(chan struct{})
+		go func() { s.wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	})
 }
 
 // onWriteRead registers a handler for the given group on CommandIDReadWrite.
@@ -229,6 +265,14 @@ func (s *scriptableServer) acceptLoop() {
 			return
 		}
 		s.acceptCount.Add(1)
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			_ = c.Close()
+			return
+		}
+		s.conns[c] = struct{}{}
+		s.mu.Unlock()
 		s.wg.Add(1)
 		go s.handle(c)
 	}
@@ -237,6 +281,11 @@ func (s *scriptableServer) acceptLoop() {
 func (s *scriptableServer) handle(c net.Conn) {
 	defer s.wg.Done()
 	defer c.Close()
+	defer func() {
+		s.mu.Lock()
+		delete(s.conns, c)
+		s.mu.Unlock()
+	}()
 	for {
 		hdr := make([]byte, 6)
 		if _, err := io.ReadFull(c, hdr); err != nil {
@@ -276,7 +325,13 @@ func (s *scriptableServer) handle(c net.Conn) {
 		s.mu.Lock()
 		if d := s.delays[delayKey{cmd: cmd, group: group}]; d > 0 {
 			s.mu.Unlock()
-			time.Sleep(d)
+			// Interruptible: tests inject hour-long delays to hold a request in
+			// flight, and stop() must not have to outwait them.
+			select {
+			case <-time.After(d):
+			case <-s.quit:
+				return
+			}
 		} else {
 			s.mu.Unlock()
 		}
@@ -304,7 +359,7 @@ func (s *scriptableServer) handle(c net.Conn) {
 			// processed, the answer simply goes somewhere we cannot reach right
 			// now. The client connection stays OPEN — closing it would look like a
 			// transport drop, which is a different failure entirely.
-			s.t.Logf("stub: no peer connection for the response yet (%v); leaving the request unanswered", werr)
+			s.unanswered.Add(1)
 			continue
 		}
 		if err := writeResponse(out, body, cmd, invokeID, respPayload); err != nil {
