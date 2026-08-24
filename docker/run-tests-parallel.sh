@@ -13,6 +13,14 @@
 #   plc: PLC suffix (224, 118, 70) or a path to an env file.
 #        Default: all three (224 118 70).
 #
+# Env:
+#   TEST_PATTERN       -test.run regex, forwarded to run-tests.sh. Unset means
+#                      run-tests.sh's own six-test smoke default, which does NOT
+#                      cover batch, reconnect or route-force behaviour — pass
+#                      'TestIntegration' for the whole tagged suite.
+#   ADS_TEST_TIMEOUT   per-run go test timeout (run-tests.sh default 120s). The
+#                      smoke set fits in 120s; the full suite does not.
+#
 # Output: each run is buffered into its own logs/hardware-<suffix>-<ts>.log so
 # three concurrent runs never interleave on the terminal. A per-PLC summary is
 # printed as each run finishes, then a final table.
@@ -97,7 +105,14 @@ for i in "${!ENV_FILES[@]}"; do
 
     (
         rc=0
-        docker/run-tests.sh "${ENV_FILES[$i]}" > "$log" 2>&1 || rc=$?
+        # TEST_PATTERN is forwarded positionally; unset means run-tests.sh's own
+        # default. Quoting an empty second argument would override that default
+        # with an empty regex, which matches nothing, so branch instead.
+        if [[ -n "${TEST_PATTERN:-}" ]]; then
+            docker/run-tests.sh "${ENV_FILES[$i]}" "$TEST_PATTERN" > "$log" 2>&1 || rc=$?
+        else
+            docker/run-tests.sh "${ENV_FILES[$i]}" > "$log" 2>&1 || rc=$?
+        fi
         # Write-then-rename: the poll loop below tests for the file's existence,
         # and bash reads an empty $(cat) as 0 — i.e. PASS — so a half-written
         # status file would silently turn a failed run green.

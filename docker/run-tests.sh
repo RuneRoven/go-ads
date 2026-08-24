@@ -79,7 +79,7 @@ RAW_OUTPUT=$(docker run --rm \
     --env-file "$ENV_FILE" \
     -e "ADS_HOST_IP=$HOST_IP" \
     go-ads-test \
-    -test.v -test.timeout 120s \
+    -test.v -test.timeout "${ADS_TEST_TIMEOUT:-120s}" \
     -test.run "$TEST_PATTERN" 2>&1) || RUN_EXIT=$?
 
 # ── Format terminal output ──
