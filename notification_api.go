@@ -65,7 +65,7 @@ type notificationManager struct {
 
 	// subscribeInFlight mirrors len(openSubscribes) for lock-free reads on the
 	// dispatch path and in tests. Written under openMu; authoritative answers
-	// about the window come from oldestOpenSubscribe. A subscribe is in flight
+	// about the window come from newestOpenSubscribe. A subscribe is in flight
 	// once it has issued the PLC-side Add and before it has committed every
 	// handle into activeNotifications: during that gap an unknown handle is
 	// presumed ours, so the sample is buffered (see earlySamples) and the orphan

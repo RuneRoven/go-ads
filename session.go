@@ -678,7 +678,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	if local {
 		resp, err := newClient.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 		if err != nil {
-			sess.tearDownAndReset(false)
+			sess.tearDownAndReset()
 			return fmt.Errorf("local mode handshake failed: %w", err)
 		}
 		buf := bytes.NewBuffer(resp)
@@ -686,7 +686,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		sess.logger.Log(context.Background(), LevelTrace, "got stuff", "stuff", buf.Bytes())
 		err = binary.Read(buf, binary.LittleEndian, &result)
 		if err != nil {
-			sess.tearDownAndReset(false)
+			sess.tearDownAndReset()
 			return fmt.Errorf("local mode binary read failed: %w", err)
 		}
 		sess.logger.Info("local mode handshake result", "result", result)
@@ -723,13 +723,13 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 			// workers running on a transport the caller believes is dead, and a
 			// legal retry from Disconnected would publish a second Client onto the
 			// same shared tx.
-			sess.tearDownAndReset(false)
+			sess.tearDownAndReset()
 			return fmt.Errorf("route registration failed during connect: %w", err)
 		}
 		if registered {
 			// TCP reconnect — PLC may reset connections from previously-unknown NetIDs.
 			// Shut down goroutines, close TCP, redial, restart.
-			sess.tearDownAndReset(false)
+			sess.tearDownAndReset()
 			sess.lifecycle.reconnectAttempts.Add(1)
 			if err := sess.dialAndStart(); err != nil {
 				return fmt.Errorf("TCP reconnect after route registration failed: %w", err)
@@ -759,7 +759,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 						err = fmt.Errorf("%w (the peer-route fallback could not run: %w)", err, ferr)
 					}
 					// The redial published a Client, so this path owns tearing it down.
-					sess.tearDownAndReset(false)
+					sess.tearDownAndReset()
 					return fmt.Errorf("route registration during connect: %w", err)
 				}
 			} else {
@@ -789,7 +789,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		case errors.Is(err, ErrTransportClosed):
 			// The link died while we were connecting. Reporting success here hands
 			// the caller a Session whose transport is already gone.
-			sess.tearDownAndReset(false)
+			sess.tearDownAndReset()
 			sess.transitionState(SessionStateDisconnected)
 			return fmt.Errorf("transport dropped during connect to %s: %w", sess.ip, err)
 		case isUnservedError(err):
@@ -805,7 +805,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 					haveVersion = false // the probe above never got a value
 					break
 				}
-				sess.tearDownAndReset(false)
+				sess.tearDownAndReset()
 				sess.transitionState(SessionStateDisconnected)
 				hint := "a stale or duplicate route entry for source NetID " + sess.source.NetIDString() +
 					", or another client using this IP, can hold a TwinCAT router in this state"
@@ -938,7 +938,7 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 	}
 
 	// First probe attempt
-	probeErr := sess.probeRoute(ctx)
+	_, probeErr := sess.probeRouteVersion(ctx)
 	if probeErr == nil {
 		sess.logger.Info("route already exists on PLC, skipping registration")
 		sess.route.routeProbeFailures.Store(0)
@@ -962,7 +962,7 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		case <-ctx.Done():
 			return false, fmt.Errorf("route probe retry aborted: %w", ctx.Err())
 		}
-		sess.tearDownAndReset(false)
+		sess.tearDownAndReset()
 		if dialErr := sess.dialAndStart(); dialErr != nil {
 			return false, fmt.Errorf("redial during route probe retry: %w", dialErr)
 		}
@@ -976,7 +976,7 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		if sess.isClosed() {
 			return false, fmt.Errorf("connection closed during route probe retry")
 		}
-		retryErr := sess.probeRoute(ctx)
+		_, retryErr := sess.probeRouteVersion(ctx)
 		if retryErr == nil {
 			sess.logger.Info("route already exists on PLC (confirmed after retry)")
 			sess.route.routeProbeFailures.Store(0)
@@ -1141,7 +1141,7 @@ func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, err
 		sess.logger.Debug("route not served by PLC yet, re-probing",
 			"attempt", attempt, "error", lastErr, "delay", routeActivationPollDelay)
 		if isProbeRetryable(lastErr) {
-			sess.tearDownAndReset(false)
+			sess.tearDownAndReset()
 			if dialErr := sess.dialAndStart(); dialErr != nil {
 				return 0, fmt.Errorf("redial while waiting for route activation: %w", dialErr)
 			}
@@ -1162,18 +1162,13 @@ func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, err
 		sess.route.name, total, lastErr)
 }
 
-// probeRouteVersion is probeRoute, returning the symbol version the probe read
-// so a caller that needs it can skip a second identical round-trip.
+// probeRouteVersion sends a lightweight ADS command (GetSymbolVersion) to verify
+// the PLC accepts our source NetID, returning the version it read.
+//
+// The route is proven by the round-trip succeeding at all; the version is a free
+// by-product, so a caller that needs it can skip a second identical round-trip.
 func (sess *Session) probeRouteVersion(ctx context.Context) (uint8, error) {
 	return sess.client.Load().GetSymbolVersion(ctx)
-}
-
-// probeRoute sends a lightweight ADS command (GetSymbolVersion) to verify
-// the PLC accepts our source NetID. Returns nil if the round-trip succeeds
-// (route is valid) or the underlying error otherwise.
-func (sess *Session) probeRoute(ctx context.Context) error {
-	_, err := sess.client.Load().GetSymbolVersion(ctx)
-	return err
 }
 
 // handleStaleDetection runs the configured online-change strategy when a
@@ -1652,7 +1647,7 @@ func (sess *Session) coolDownAfterUnserved(ctx context.Context, attempts int, ca
 		"hint", "a stale or duplicate route entry for this source NetID, or another client on this IP, can hold a TwinCAT router in this state")
 	// Nothing open while we wait: the point is to stop competing for the
 	// router's one-connection-per-IP slot.
-	sess.tearDownAndReset(false)
+	sess.tearDownAndReset()
 
 	// Permit one route registration on the next attempt. Re-registering the
 	// correct route is the measured recovery for a router that has stopped
@@ -1910,7 +1905,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 	// what lets establishHeartbeat register a fresh one after the resubscribe.
 	savedHandles := sess.takeNotificationHandles(false)
 
-	sess.tearDownAndReset(true)
+	sess.tearDownAndReset()
 
 	var lastErr error
 	attempts := 0
@@ -2070,7 +2065,7 @@ func (sess *Session) ensureRoute() error {
 	}
 
 	// Force mode or too many probe failures → register, unless this session
-	// registered recently. See routeManager.lastRegisteredNs: re-registering the
+	// registered recently. See routeManager.registered and mayRegister: re-registering the
 	// same route cannot fix anything, and on some firmware it leaves a duplicate
 	// runtime entry that breaks the device outright.
 	probeFailures := sess.route.routeProbeFailures.Load()
@@ -2098,7 +2093,7 @@ func (sess *Session) ensureRoute() error {
 	}
 
 	// Probe: try a lightweight ADS command to see if route already exists
-	_, probeErr := sess.client.Load().GetSymbolVersion(sess.currentLifecycleCtx())
+	_, probeErr := sess.probeRouteVersion(sess.currentLifecycleCtx())
 	if probeErr == nil {
 		sess.logger.Debug("route still valid, skipping re-registration")
 		sess.route.routeProbeFailures.Store(0)
@@ -2226,7 +2221,6 @@ func (sess *Session) reloadSymbols() error {
 
 // tearDownAndReset cancels the active goroutines, closes the TCP connection,
 // and resets ctx/channels/activeRequests so the connection can be re-dialed.
-// The resetFeatureFlags parameter is retained for API symmetry with prior
 // callers but is now a no-op — capability state lives on *Client, and
 // dialAndStart allocates a fresh zero-valued Client on every attempt.
 //
@@ -2234,7 +2228,7 @@ func (sess *Session) reloadSymbols() error {
 //   - Connect()'s post-route-registration TCP teardown
 //   - Reconnect()'s pre-retry-loop reset
 //   - resetForRetry()
-func (sess *Session) tearDownAndReset(resetFeatureFlags bool) {
+func (sess *Session) tearDownAndReset() {
 	// Capture cancel under RLock then release before invoking. Calling the
 	// cancel under RLock would deadlock against the subsequent ctxMu.Lock
 	// at the ctx replacement below if shutdown ever became a function that
@@ -2284,9 +2278,6 @@ func (sess *Session) tearDownAndReset(resetFeatureFlags bool) {
 	sess.tx.activeRequestLock.Unlock()
 	// Capability state lives on Client. A fresh Client (allocated in
 	// dialAndStart on each reconnect attempt) has zero-value capabilities,
-	// equivalent to a reset. resetFeatureFlags is therefore implicit and
-	// the parameter is retained only for symmetric API with prior callers.
-	_ = resetFeatureFlags
 }
 
 // dialAndStart performs net.DialTimeout, configures keepalive, clears the
@@ -2685,7 +2676,7 @@ func (sess *Session) resubscribeNotificationsLocked() error {
 // channels/state so the next retry iteration starts clean.
 func (sess *Session) resetForRetry() {
 	sess.tx.disconnected.Store(true)
-	sess.tearDownAndReset(false)
+	sess.tearDownAndReset()
 	// Allow route re-registration on next attempt (PLC may have rebooted)
 }
 
