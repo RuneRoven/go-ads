@@ -52,6 +52,21 @@ func preSeedSymbol(sess *Session, name string) *symbol {
 	return sym
 }
 
+// seedLiveNotification stages a symbol as fully subscribed: a committed handle in
+// activeNotifications plus its entry on file, which is what makes a further
+// subscribe of that symbol a duplicate.
+//
+// Staging the config alone is NOT enough and never was a duplicate in any sense the
+// API claims — an entry with no handle is a resubscribe retry the caller is entitled
+// to re-declare (see notificationManager.hasLiveNotification).
+func seedLiveNotification(sess *Session, name string, handle uint32, ch chan *Update) {
+	sym := preSeedSymbol(sess, name)
+	sess.notifications.lock.Lock()
+	defer sess.notifications.lock.Unlock()
+	sess.notifications.activeNotifications[handle] = activeNotification{Sym: sym, Ch: ch}
+	sess.notifications.addConfig(NotificationConfig{SymbolName: name})
+}
+
 // TestAddSymbolNotification_ChannelMismatchRejected pre-seeds a notifications
 // channel, then calls AddSymbolNotification with a DIFFERENT channel. The
 // pre-check inside AddSymbolNotification (under notifications.lock, BEFORE
@@ -96,13 +111,10 @@ func TestAddSymbolNotification_ChannelMismatchRejected(t *testing.T) {
 func TestAddSymbolNotifications_DuplicateRejected(t *testing.T) {
 	t.Run("cross_batch_existing", func(t *testing.T) {
 		sess := newNotifTestSession()
-		preSeedSymbol(sess, "MAIN.x")
 
 		ch := make(chan *Update, 1)
-		// Pre-stage one config so the pre-check rejects on second batch.
-		sess.notifications.lock.Lock()
-		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.x"})
-		sess.notifications.lock.Unlock()
+		// Pre-stage one LIVE subscription so the pre-check rejects the second batch.
+		seedLiveNotification(sess, "MAIN.x", 0x1001, ch)
 
 		results, err := sess.AddSymbolNotifications(context.Background(), []NotificationConfig{
 			{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange},
@@ -122,17 +134,14 @@ func TestAddSymbolNotifications_DuplicateRejected(t *testing.T) {
 
 	t.Run("in_batch", func(t *testing.T) {
 		sess := newNotifTestSession()
-		preSeedSymbol(sess, "MAIN.dup")
 
 		ch := make(chan *Update, 1)
-		// Pre-seed an existing config so the FIRST entry is rejected as
+		// Pre-seed a LIVE subscription so the FIRST entry is rejected as
 		// already-subscribed; the second entry hits the in-batch dup
 		// branch. Both are Skipped at the pre-check stage so requests[]
 		// stays empty and SumAddDeviceNotification is not invoked
 		// (nil client would panic).
-		sess.notifications.lock.Lock()
-		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.dup"})
-		sess.notifications.lock.Unlock()
+		seedLiveNotification(sess, "MAIN.dup", 0x1002, ch)
 
 		results, err := sess.AddSymbolNotifications(context.Background(), []NotificationConfig{
 			{SymbolName: "MAIN.dup", TransmissionMode: TransModeServerOnChange},
@@ -493,13 +502,11 @@ func TestNotificationChannel_SetOnFirstSuccess(t *testing.T) {
 
 	t.Run("all_skipped_no_channel_set", func(t *testing.T) {
 		sess := newNotifTestSession()
-		preSeedSymbol(sess, "MAIN.dup")
 
+		// Pre-stage a live subscription so every config is rejected as duplicate.
+		// Its channel is not the one under test below.
+		seedLiveNotification(sess, "MAIN.dup", 0x1003, make(chan *Update, 1))
 		ch := make(chan *Update, 1)
-		// Pre-stage so every config is rejected as duplicate.
-		sess.notifications.lock.Lock()
-		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.dup"})
-		sess.notifications.lock.Unlock()
 
 		_, _ = sess.AddSymbolNotifications(context.Background(), []NotificationConfig{
 			{SymbolName: "MAIN.dup", TransmissionMode: TransModeServerOnChange},
@@ -517,17 +524,16 @@ func TestNotificationChannel_SetOnFirstSuccess(t *testing.T) {
 
 	t.Run("concurrent_calls_no_channel_race", func(t *testing.T) {
 		sess := newNotifTestSession()
-		preSeedSymbol(sess, "MAIN.x")
 
-		// Pre-set channel + pre-stage an existing config so every
+		// Pre-set channel + pre-stage a LIVE subscription so every
 		// concurrent AddSymbolNotifications call results in all-Skipped
 		// (no PLC roundtrip needed). The race detector watches the
 		// notificationChannel field for torn writes during the
 		// concurrent pre-checks.
 		ch := make(chan *Update, 1)
+		seedLiveNotification(sess, "MAIN.x", 0x1004, ch)
 		sess.notifications.lock.Lock()
 		sess.notifications.notificationChannel = ch
-		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.x"})
 		sess.notifications.lock.Unlock()
 
 		var wg sync.WaitGroup
@@ -859,6 +865,109 @@ func TestResubscribeNotifications_RollbackOnError(t *testing.T) {
 	// SumAddNotifState CAS landed on unsupported (triggering fallback). Either
 	// is acceptable for the rollback contract — we care about the restoration.
 	_ = err
+}
+
+// TestResubscribe_NilChannelKeepsTheDeclaredIntent: a re-subscribe that has no
+// channel to deliver to is a no-op, and a no-op must not destroy the caller's
+// declared subscriptions.
+//
+// resubscribeNotificationsLocked cleared pending BEFORE its "nothing to do" guard
+// and then returned nil, so M symbols the caller never cancelled were dropped from
+// the resubscribe set silently, with a "reconnect successful" logged over the top.
+// The state is reachable: a resubscribe re-queues entries the PLC refused with a
+// retryable reason (they have no handle), and the caller then deletes its remaining
+// LIVE subscriptions by handle — the last delete nils notificationChannel while
+// those re-queued entries are still on file.
+func TestResubscribe_NilChannelKeepsTheDeclaredIntent(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	sess, _ := newWiredTestSession(t, srv)
+
+	// Declared intent with no channel bound and nothing live — exactly the state a
+	// re-queued entry plus a full user teardown leaves behind.
+	sess.notifications.lock.Lock()
+	sess.notifications.addPending(pendingNotification{Config: NotificationConfig{SymbolName: "MAIN.stranded"}})
+	sess.notifications.notificationChannel = nil
+	sess.notifications.lock.Unlock()
+
+	if err := sess.resubscribeNotifications(); err != nil {
+		t.Fatalf("resubscribe with no bound channel = %v, want nil: a no-op must still report success", err)
+	}
+
+	sess.notifications.lock.Lock()
+	pending := len(sess.notifications.pending)
+	mirrored := sess.notifications.hasConfig("MAIN.stranded")
+	sess.notifications.lock.Unlock()
+	if pending != 1 {
+		t.Errorf("pending = %d after a resubscribe with no bound channel, want 1: the caller's declared intent must survive a no-op resubscribe", pending)
+	}
+	if !mirrored {
+		t.Error("configsByKey no longer mirrors pending: the two must move in lockstep")
+	}
+}
+
+// TestAddSymbolNotification_DeclaredButNotLiveSymbolIsNotADuplicate: a symbol that
+// is on file but has no live handle must still be subscribable.
+//
+// This is the other half of the nil-channel fix, and a defect in its own right.
+// pending is the declared intent and legitimately outlives a handle — a resubscribe
+// re-queues whatever the PLC refused for a retryable reason — but the duplicate
+// check asked pending, not activeNotifications. So a re-queued entry answered
+// "symbol already has an active notification" for a symbol with no notification at
+// all, and DeleteDeviceNotification works by handle, so the caller had no way to
+// clear it: the symbol was soft-locked for the life of the session.
+//
+// Retaining the intent (the test above) is what makes this state persist rather
+// than being accidentally cleaned up, so the two must land together.
+func TestAddSymbolNotification_DeclaredButNotLiveSymbolIsNotADuplicate(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	const fakeHandle uint32 = 0x22220002
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		return addNotifResponse{Handle: fakeHandle, Error: ReturnCodeNoErrors}
+	})
+
+	sess, _ := newWiredTestSession(t, srv)
+	preSeedSymbol(sess, "MAIN.stranded")
+
+	// On file, nothing live, no channel: the state a re-queued entry leaves.
+	sess.notifications.lock.Lock()
+	sess.notifications.addPending(pendingNotification{Config: NotificationConfig{SymbolName: "MAIN.stranded"}})
+	sess.notifications.lock.Unlock()
+
+	ch := make(chan *Update, 1)
+	h, err := sess.AddSymbolNotification(context.Background(), "MAIN.stranded", 0, 0, TransModeServerOnChange, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotification on a declared-but-not-live symbol: %v — the caller cannot clear a pending-only entry, so this is a permanently dead symbol", err)
+	}
+	if h != fakeHandle {
+		t.Fatalf("handle = 0x%X, want 0x%X", h, fakeHandle)
+	}
+
+	sess.notifications.lock.Lock()
+	pending := len(sess.notifications.pending)
+	_, live := sess.notifications.activeNotifications[h]
+	boundChannel := sess.notifications.notificationChannel
+	sess.notifications.lock.Unlock()
+	if !live {
+		t.Error("the handle was never committed to activeNotifications")
+	}
+	// One entry, not two: configsByKey cannot hold a second entry for one symbol,
+	// and a duplicated pending entry would make the next resubscribe register the
+	// symbol twice on the PLC.
+	if pending != 1 {
+		t.Errorf("pending = %d after re-declaring a symbol already on file, want 1", pending)
+	}
+	if boundChannel != ch {
+		t.Errorf("notificationChannel = %v, want the channel this subscribe supplied", boundChannel)
+	}
+
+	// And a genuine duplicate — the symbol now HAS a live handle — must still be
+	// refused, or this fix has simply deleted the duplicate check.
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.stranded", 0, 0, TransModeServerOnChange, ch); err == nil {
+		t.Error("a second subscribe of a LIVE symbol succeeded; duplicate detection is gone")
+	}
 }
 
 // seedStaleSymbol wires the scriptable stub for the TC3 runtime-restart case and

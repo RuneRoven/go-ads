@@ -165,25 +165,89 @@ type earlySample struct {
 }
 
 // addConfig wraps cfg into a fresh pendingNotification (resubscribeAttempts=0)
-// and appends it to pending. Caller must hold lock.
+// and files it under its symbol, so a successful subscribe naturally resets any
+// prior retry counter. Caller must hold lock.
 func (m *notificationManager) addConfig(cfg NotificationConfig) {
-	m.pending = append(m.pending, pendingNotification{Config: cfg})
-	m.configsByKey[symbolKey(cfg.SymbolName)] = struct{}{}
+	m.setPending(pendingNotification{Config: cfg})
 }
 
-// addPending appends an already-wrapped pending entry (preserving its
+// addPending files an already-wrapped pending entry (preserving its
 // resubscribeAttempts counter). Used by resubscribeNotifications when
 // re-queueing Skipped retries. Caller must hold lock.
 func (m *notificationManager) addPending(p pendingNotification) {
+	m.setPending(p)
+}
+
+// setPending files one entry per symbol, REPLACING any entry already on file for
+// that symbol rather than appending a second. Caller must hold lock.
+//
+// configsByKey cannot represent two entries for one symbol, and pending must not
+// either: a duplicated entry there makes the next resubscribe register the symbol
+// twice on the PLC, and the caller can only ever delete one of them. The case that
+// reaches this with the key already present is a legal re-declaration of a symbol
+// that is on file but not live — see hasLiveNotification.
+func (m *notificationManager) setPending(p pendingNotification) {
+	key := symbolKey(p.Config.SymbolName)
+	if _, onFile := m.configsByKey[key]; onFile {
+		for i := range m.pending {
+			if symbolKey(m.pending[i].Config.SymbolName) == key {
+				m.pending[i] = p
+				return
+			}
+		}
+	}
 	m.pending = append(m.pending, p)
-	m.configsByKey[symbolKey(p.Config.SymbolName)] = struct{}{}
+	m.configsByKey[key] = struct{}{}
 }
 
 // hasConfig returns true if any existing config matches symbolName
 // (case-insensitive). Caller must hold lock.
+//
+// This answers "did the caller declare this symbol", NOT "is it subscribed" — use
+// hasLiveNotification for the duplicate decision.
 func (m *notificationManager) hasConfig(symbolName string) bool {
 	_, ok := m.configsByKey[symbolKey(symbolName)]
 	return ok
+}
+
+// hasLiveNotification reports whether symbolName currently has a committed handle
+// in activeNotifications. Caller must hold lock.
+//
+// This, and not hasConfig, is what makes a subscribe a duplicate. The three pieces
+// of state mean different things:
+//
+//   - pending / configsByKey — the caller's declared intent, one entry per symbol.
+//   - activeNotifications — the handles the PLC has actually given us.
+//   - notificationChannel — the single channel everything is delivered to.
+//
+// pending is a superset by design and legitimately outlives a handle: a resubscribe
+// re-queues every entry the PLC refused for a retryable reason
+// (ErrNotificationStrandedByReload, ErrNotificationSymbolVanished) and those have no
+// handle of their own. Deciding duplicates on pending therefore answered "symbol
+// already has an active notification" for a symbol with no notification at all —
+// and since DeleteDeviceNotification works by handle, a pending-only entry had no
+// exported way out: the symbol was un-subscribable for the life of the session.
+func (m *notificationManager) hasLiveNotification(symbolName string) bool {
+	key := symbolKey(symbolName)
+	for _, entry := range m.activeNotifications {
+		if entry.Sym != nil && symbolKey(entry.Sym.FullName) == key {
+			return true
+		}
+	}
+	return false
+}
+
+// liveNotificationNames snapshots the symbol keys that have a committed handle, so
+// a batch can dup-check every candidate against a per-call copy instead of
+// re-scanning under the manager lock per item. Caller must hold lock.
+func (m *notificationManager) liveNotificationNames() map[string]struct{} {
+	live := make(map[string]struct{}, len(m.activeNotifications))
+	for _, entry := range m.activeNotifications {
+		if entry.Sym != nil {
+			live[symbolKey(entry.Sym.FullName)] = struct{}{}
+		}
+	}
+	return live
 }
 
 // resetConfigs swaps the entire slice and rebuilds the key index. Used by
@@ -421,7 +485,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 		sess.notifications.lock.Unlock()
 		return 0, fmt.Errorf("all symbol notifications on a connection must use the same updateReceiver channel")
 	}
-	if sess.notifications.hasConfig(symbolName) {
+	if sess.notifications.hasLiveNotification(symbolName) {
 		sess.notifications.lock.Unlock()
 		return 0, fmt.Errorf("symbol %q already has an active notification; delete it before re-subscribing", symbolName)
 	}
@@ -525,7 +589,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 		}
 		return 0, fmt.Errorf("all symbol notifications on a connection must use the same updateReceiver channel")
 	}
-	if sess.notifications.hasConfig(symbolName) {
+	if sess.notifications.hasLiveNotification(symbolName) {
 		sess.notifications.lock.Unlock()
 		if delErr := sess.releaseUncommittedHandle(ctx, handle); delErr != nil {
 			sess.logger.Warn("failed to release PLC handle after duplicate-subscribe reject",
@@ -597,13 +661,12 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		sess.notifications.lock.Unlock()
 		return nil, fmt.Errorf("all symbol notifications on a connection must use the same updateReceiver channel")
 	}
-	// Snapshot the configsByKey mirror so the dup-check inside the batch loop
-	// runs lock-free against a per-call copy (cheaper than re-acquiring the
-	// manager lock for each candidate).
-	existing := make(map[string]struct{}, len(sess.notifications.configsByKey))
-	for k := range sess.notifications.configsByKey {
-		existing[k] = struct{}{}
-	}
+	// Snapshot the LIVE subscriptions so the dup-check inside the batch loop runs
+	// lock-free against a per-call copy (cheaper than re-acquiring the manager lock
+	// for each candidate). Live, not the configsByKey mirror: an entry on file with
+	// no handle is a retry the caller may legitimately re-declare — see
+	// hasLiveNotification.
+	existing := sess.notifications.liveNotificationNames()
 	sess.notifications.lock.Unlock()
 
 	// Resolve symbols and build requests; track which result index maps to
@@ -898,10 +961,10 @@ func (sess *Session) commitNotification(cfg NotificationConfig, handle uint32, c
 	if sess.notifications.notificationChannel != nil && sess.notifications.notificationChannel != ch {
 		return fmt.Errorf("symbol %q: %w", cfg.SymbolName, ErrNotificationChannelMismatch)
 	}
-	// configsByKey is authoritative and already contains anything committed
-	// earlier in this same batch, so it doubles as the in-batch duplicate
-	// guard — no separate pre/post snapshot needed.
-	if sess.notifications.hasConfig(cfg.SymbolName) {
+	// activeNotifications already contains anything committed earlier in this same
+	// batch (the insert below precedes addConfig), so it doubles as the in-batch
+	// duplicate guard — no separate pre/post snapshot needed.
+	if sess.notifications.hasLiveNotification(cfg.SymbolName) {
 		return fmt.Errorf("symbol %q subscribed concurrently during batch: %w", cfg.SymbolName, ErrNotificationDuplicate)
 	}
 
