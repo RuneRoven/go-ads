@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -24,7 +25,7 @@ type transport struct {
 
 	currentRequest    atomic.Uint32
 	activeRequestLock sync.Mutex // protects activeRequests against concurrent map access
-	activeRequests    map[uint32]chan []byte
+	activeRequests    map[uint32]chan amsReply
 
 	// disconnected reflects whether the underlying socket is usable for
 	// sending. Flipped to false by Client.Dial after a successful TCP dial
@@ -45,3 +46,29 @@ const recvWorkerCount = 16
 // recvQueueSize is the buffer between listen and recvWorkers. Beyond this,
 // listen drops packets with a Warn log.
 const recvQueueSize = 256
+
+// amsReply is one response handed back to the goroutine that issued the request.
+//
+// It carries the AMS header's ErrorCode alongside the payload because that field
+// was previously discarded entirely: an AMS-level rejection (target port not found,
+// no runtime, invalid NetID) arrives with a body that is not a valid response, and
+// parsing it anyway produced fabricated diagnostics — a read of index group 0xF008
+// reporting "0xF008: unknown error code", which is the group, not a code.
+type amsReply struct {
+	data   []byte
+	amsErr ReturnCode
+}
+
+// payload returns the response body, or the AMS-level error the router reported.
+//
+// An AMS error means the request never reached a service that could answer it, so
+// the body is not a response and must not be parsed. Reported with the code named:
+// 0x06 target port not found is what a TwinCAT system in CONFIG answers for every
+// request to a runtime port, and it is the difference between "the runtime is not
+// running" and "this device is broken".
+func (r amsReply) payload() ([]byte, error) {
+	if r.amsErr != 0 {
+		return nil, fmt.Errorf("AMS error from the router: %w", r.amsErr)
+	}
+	return r.data, nil
+}

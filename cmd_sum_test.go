@@ -161,7 +161,7 @@ func TestSumReadOverflowGuard(t *testing.T) {
 			sendChannel:    make(chan []byte),
 			systemResponse: make(chan []byte),
 			recvQueue:      make(chan []byte),
-			activeRequests: map[uint32]chan []byte{},
+			activeRequests: map[uint32]chan amsReply{},
 		},
 	}
 	requests := []SumReadRequest{

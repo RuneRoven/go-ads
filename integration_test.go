@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -2898,13 +2899,34 @@ func TestIntegrationWSTRING(t *testing.T) {
 		t.Fatalf("ListSymbols failed: %v", err)
 	}
 
-	// Find a WSTRING symbol
-	var wstringName string
+	// Find a WSTRING symbol to write to, preferring one this suite owns.
+	//
+	// Map iteration order is random, so this used to pick a different symbol on
+	// every run — including ones the PLC program writes itself
+	// (PRG_Machine.fbStringCycler.wsValue, GVL_ProcessData.wsStatusMessage,
+	// PRG_Diagnostics.sShadowWstring). Writing to those and reading back races the
+	// running program, which failed ~1 run in 7 and twice looked like a regression
+	// in the library. Prefer the write-test namespace, and pick deterministically
+	// so a failure is reproducible.
+	var candidates []string
 	for name, sym := range symbols {
 		if sym.DataType == "WSTRING" {
+			candidates = append(candidates, name)
+		}
+	}
+	sort.Strings(candidates)
+	wstringName := ""
+	for _, name := range candidates {
+		if strings.Contains(strings.ToUpper(name), "WRITETEST") {
 			wstringName = name
 			break
 		}
+	}
+	if wstringName == "" && len(candidates) > 0 {
+		// Nothing owned by this suite: fall back, but say so — a failure here may be
+		// the PLC program writing the same symbol, not a defect.
+		wstringName = candidates[0]
+		t.Logf("no WSTRING under a write-test namespace; falling back to %s, which the PLC program may also write", wstringName)
 	}
 	if wstringName == "" {
 		t.Skip("no WSTRING symbol found on PLC")

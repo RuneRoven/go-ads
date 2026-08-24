@@ -854,3 +854,109 @@ func TestRuntimeState_PollReportsTheState(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// TestHeartbeat_DetectionSurvivesABackwardClockStep: silence is measured in ticks,
+// not in wall-clock time.
+//
+// The detector used to compare time.Now().UnixNano() against a stored timestamp,
+// and time.Unix carries no monotonic reading, so a wall-clock STEP was read as
+// elapsed time. Both directions were wrong: a forward step declared every live
+// subscription dead and re-registered all of them for nothing, and a BACKWARD step
+// left time.Since negative, so the watchdog went blind for the length of the step
+// while subscriptions may genuinely have been gone. Not exotic on this hardware —
+// an IPC without a battery-backed RTC steps years forward on its first NTP sync,
+// and a suspended VM resumes with a jump.
+//
+// A future timestamp is exactly what a backward step leaves behind, so setting one
+// reproduces it deterministically.
+func TestHeartbeat_DetectionSurvivesABackwardClockStep(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	var adds atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xFD00)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		adds.Add(1)
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	sess, c := newWiredTestSession(t, srv, WithNotificationHeartbeat(100*time.Millisecond, 2))
+	c.SetNotificationHandler(sess.handleNotification)
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) || !c.capabilities.SumDeleteNotifStateCAS(0, 2) {
+		t.Fatal("could not force the sum commands into the unsupported state")
+	}
+	preSeedTypedSymbol(sess, "MAIN.clock", 0xFD10)
+	ch := make(chan *Update, 8)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.clock", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Fatalf("AddSymbolNotification: %v", err)
+	}
+	afterSetup := adds.Load()
+
+	// The clock jumps backwards by an hour: the stored "last beat" is now an hour in
+	// the future. Under the old timestamp comparison this made silence unmeasurable.
+	sess.notifications.heartbeatLastNs.Store(time.Now().Add(time.Hour).UnixNano())
+
+	// Beats stop. The detector must still fire, because it counts ticks.
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if adds.Load() > afterSetup {
+			return // re-subscribed despite the clock being wrong
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("beats stopped but nothing was re-subscribed within 4s while the stored timestamp sat in the future: "+
+		"detection is still keyed on the wall clock, so a backward step blinds it (Adds stayed at %d)", afterSetup)
+}
+
+// TestHeartbeat_ConcurrentSubscribesEstablishOneBeat: two subscribes racing on a
+// fresh session must leave exactly one cyclic registration on the PLC.
+//
+// establishHeartbeat checked the handle and then stored it, so both callers could
+// see zero, both register, and the second Store orphan the first — a cyclic
+// registration the PLC keeps pushing that belongs to nothing, reclaimed only by the
+// orphan reaper.
+func TestHeartbeat_ConcurrentSubscribesEstablishOneBeat(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var cyclicAdds atomic.Int32
+	var deletes atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xFE00)
+	srv.onAddDeviceNotification(func(req addNotifRequest) addNotifResponse {
+		if Group(req.Group) == GroupSymbolVersion && req.TransMode == uint32(TransModeServerCycle) {
+			cyclicAdds.Add(1)
+			// Wide enough that both callers are inside the round-trip together.
+			time.Sleep(150 * time.Millisecond)
+		}
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode {
+		deletes.Add(1)
+		return ReturnCodeNoErrors
+	})
+
+	sess, c := newWiredTestSession(t, srv, WithNotificationHeartbeat(10*time.Second, 3))
+	c.SetNotificationHandler(sess.handleNotification)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); sess.establishHeartbeat(context.Background()) }()
+	}
+	wg.Wait()
+
+	hb := sess.notifications.heartbeatHandle.Load()
+	if hb == 0 {
+		t.Fatal("no heartbeat established by either caller")
+	}
+	if got := cyclicAdds.Load(); got == 2 && deletes.Load() == 0 {
+		t.Errorf("both callers registered a cyclic notification (%d adds) and neither released the loser: the PLC is left "+
+			"pushing a beat that belongs to nothing", got)
+	}
+	if cyclicAdds.Load() > 1 && deletes.Load() < cyclicAdds.Load()-1 {
+		t.Errorf("%d cyclic registrations, only %d released", cyclicAdds.Load(), deletes.Load())
+	}
+}

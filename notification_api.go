@@ -106,6 +106,21 @@ type notificationManager struct {
 	// regardless of the caller's program, is one byte, and its payload is the
 	// symbol version — so each beat doubles as online-change detection.
 	heartbeatHandle atomic.Uint32
+	// heartbeatBeats counts delivered beats. The watchdog compares this against what
+	// it saw on the previous tick, so the decision never touches a clock.
+	//
+	// It used to compare time.Now().UnixNano() against a stored timestamp, and
+	// time.Unix carries no monotonic reading — so a wall-clock STEP was read as
+	// elapsed time. That is not exotic on the hardware this runs on: an IPC without
+	// a battery-backed RTC boots at some stale time and steps years forward on its
+	// first NTP sync, and a suspended VM or container resumes with a jump. A forward
+	// step past the window declared every live subscription dead and re-registered
+	// all of them for nothing; a backward step blinded the watchdog for the length of
+	// the step while subscriptions may genuinely have been gone. The ticker driving
+	// the watch is monotonic, so counting its ticks is both correct and less code.
+	heartbeatBeats atomic.Uint64
+	// heartbeatLastNs is kept for the log line only ("silentFor"), never for the
+	// decision. A stepped clock makes it a confusing number, not a wrong outcome.
 	heartbeatLastNs atomic.Int64
 
 	// resubscribeMu serialises whole re-subscribe sequences. Three paths run one —

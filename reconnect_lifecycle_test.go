@@ -66,7 +66,7 @@ func newDialableTestSession(t *testing.T, host string, port int, maxAttempts int
 			sendChannel:    make(chan []byte),
 			systemResponse: make(chan []byte, 1),
 			recvQueue:      make(chan []byte, recvQueueSize),
-			activeRequests: map[uint32]chan []byte{},
+			activeRequests: map[uint32]chan amsReply{},
 		},
 		notifications: newTestNotificationManager(),
 		cache:         &symbolCache{symbols: map[string]*symbol{}, onDemandSymbols: map[string]bool{}},

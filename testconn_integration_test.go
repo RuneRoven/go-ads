@@ -4,6 +4,7 @@ package ads
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -44,6 +45,13 @@ func setupConnectionWithDefaults(t *testing.T, d connDefaults, extra ...SessionO
 	// it unset keeps OS-default routing, which is what production usually wants.
 	if bindIP := os.Getenv("ADS_LOCAL_BIND_IP"); bindIP != "" {
 		opts = append(opts, WithLocalBindIP(bindIP))
+	}
+	// ADS_TEST_DEBUG=1 turns on Debug logging for the session under test. The
+	// reconnect path logs its decisions at Debug, and without them a stall inside a
+	// step is invisible — which cost real time diagnosing one.
+	if os.Getenv("ADS_TEST_DEBUG") != "" {
+		opts = append(opts, WithLogger(slog.New(slog.NewTextHandler(os.Stderr,
+			&slog.HandlerOptions{Level: slog.LevelDebug}))))
 	}
 	routeUser := os.Getenv("ADS_ROUTE_USER")
 	routePass := os.Getenv("ADS_ROUTE_PASS")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"log/slog"
+	"net"
 	"strings"
 	"testing"
 )
@@ -211,4 +212,52 @@ func TestAddRemoteRouteWithLoggerNilLogger(t *testing.T) {
 	// unreachable host → network error, not panic
 	err := AddRemoteRouteWithLogger(nil, "127.0.0.1", [6]byte{}, "route", "host", "user", "pass")
 	_ = err
+}
+
+// TestAddRoute_RetransmitsOnALostDatagram: one dropped UDP datagram must not fail
+// a registration.
+//
+// identify already retransmits three times, with a comment recording why: a single
+// dropped datagram was observed failing NewSession outright. Registration ran on
+// the same plant networks over the same shared port 48899 with a single Write and a
+// single Read, and its failure is the costlier one — Connect aborts on it.
+func TestAddRoute_RetransmitsOnALostDatagram(t *testing.T) {
+	router := startRouteResponder(t)
+	router.dropFirst.Store(1) // the first attempt is lost
+
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	netID := [6]byte{192, 168, 3, 52, 1, 1}
+	err := addRemoteRouteFrom(logger, nil, "127.0.0.1", router.port, netID, "go-ads-retransmit",
+		"127.0.0.1", "Administrator", "1")
+	if err != nil {
+		t.Fatalf("AddRoute gave up after one lost datagram: %v", err)
+	}
+	if got := router.adds.Load(); got < 2 {
+		t.Errorf("registration datagrams sent = %d, want at least 2: the first was dropped, so a single-shot send "+
+			"cannot have succeeded", got)
+	}
+}
+
+// TestAddRoute_IgnoresAnUnrelatedDatagram: port 48899 is shared with identify, so a
+// datagram meant for somebody else must not fail a registration.
+func TestAddRoute_IgnoresAnUnrelatedDatagram(t *testing.T) {
+	router := startRouteResponder(t)
+
+	// Something else on the port answers first, with a payload that is not a route
+	// reply. The registration must keep reading rather than fail on it.
+	go func() {
+		conn, err := net.Dial("udp4", localAddr(router.port))
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = conn.Write([]byte("not an ads route reply, just noise on the shared port"))
+	}()
+
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	netID := [6]byte{192, 168, 3, 52, 1, 1}
+	if err := addRemoteRouteFrom(logger, nil, "127.0.0.1", router.port, netID, "go-ads-noise",
+		"127.0.0.1", "Administrator", "1"); err != nil {
+		t.Errorf("registration failed because of an unrelated datagram on the shared port: %v", err)
+	}
 }

@@ -249,7 +249,12 @@ type Session struct {
 	// "this device is broken", and it retries either way.
 	runtimeState   atomic.Uint32
 	runtimeStateNs atomic.Int64
-	stateOnce      sync.Once
+	// stateWG, not lifecycle.waitGroup: the watch lives for the whole session, and
+	// tearDownAndReset waits lifecycle.waitGroup on every reconnect — putting it
+	// there deadlocked the first reconnect, exactly as it once did for the peer
+	// accept loop.
+	stateWG   sync.WaitGroup
+	stateOnce sync.Once
 
 	// Event callbacks (run in goroutine, must not block)
 	onDisconnect func()
@@ -365,7 +370,7 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 			sendChannel:    make(chan []byte),
 			systemResponse: make(chan []byte, 1),
 			recvQueue:      make(chan []byte, recvQueueSize),
-			activeRequests: map[uint32]chan []byte{},
+			activeRequests: map[uint32]chan amsReply{},
 		},
 		lifecycle: &sessionLifecycle{
 			autoReconnect:        true,
@@ -1361,6 +1366,17 @@ func (sess *Session) reloadSymbolsAndResubscribe() error {
 // Callers that hold resources for the goroutine (a semaphore slot, a throttle
 // entry) must release them when this returns false.
 func (sess *Session) trackGoroutine(fn func()) bool {
+	return sess.trackGoroutineOn(&sess.lifecycle.waitGroup, fn)
+}
+
+// trackGoroutineOn is trackGoroutine against a specific WaitGroup.
+//
+// Choose it by lifetime, and get this wrong and reconnect deadlocks:
+// lifecycle.waitGroup is waited by tearDownAndReset on EVERY reconnect, so only
+// goroutines that finish on their own belong there (an orphan delete). Anything
+// that lives as long as the session — the peer accept loop, the heartbeat watcher,
+// the runtime-state watch — needs its own group, waited only by Close.
+func (sess *Session) trackGoroutineOn(wg *sync.WaitGroup, fn func()) bool {
 	sess.lifecycle.spawnMu.Lock()
 	defer sess.lifecycle.spawnMu.Unlock()
 	// closedCh, not isClosed(): isClosed() reads the FSM, and closedCh is closed
@@ -1374,9 +1390,9 @@ func (sess *Session) trackGoroutine(fn func()) bool {
 	if sess.isClosed() {
 		return false
 	}
-	sess.lifecycle.waitGroup.Add(1)
+	wg.Add(1)
 	go func() {
-		defer sess.lifecycle.waitGroup.Done()
+		defer wg.Done()
 		fn()
 	}()
 	return true
@@ -1512,6 +1528,7 @@ func (sess *Session) Close() error {
 	// cancel and the socket close above, so anything it has in flight aborts rather
 	// than holding this up.
 	sess.heartbeatWG.Wait()
+	sess.stateWG.Wait()
 	sess.logger.Info("Waiting for workers to close")
 	if c := sess.client.Load(); c != nil {
 		// Adopted inbound connections have their own readers; closing the sockets
@@ -2232,7 +2249,7 @@ func (sess *Session) tearDownAndReset(resetFeatureFlags bool) {
 	sess.tx.recvQueue = make(chan []byte, recvQueueSize)
 	sess.tx.chanMu.Unlock()
 	sess.tx.activeRequestLock.Lock()
-	sess.tx.activeRequests = map[uint32]chan []byte{}
+	sess.tx.activeRequests = map[uint32]chan amsReply{}
 	sess.tx.activeRequestLock.Unlock()
 	// Capability state lives on Client. A fresh Client (allocated in
 	// dialAndStart on each reconnect attempt) has zero-value capabilities,
@@ -2812,7 +2829,7 @@ func (sess *Session) requireRunningRuntime(what string) error {
 // nothing: the gates fall back to permitting, which is the pre-existing behaviour.
 func (sess *Session) startRuntimeStateWatch() {
 	sess.stateOnce.Do(func() {
-		started := sess.trackGoroutine(func() {
+		started := sess.trackGoroutineOn(&sess.stateWG, func() {
 			interval := sess.heartbeatCycle()
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()

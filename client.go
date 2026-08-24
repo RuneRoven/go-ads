@@ -208,7 +208,7 @@ func Dial(
 			sendChannel:    make(chan []byte),
 			systemResponse: make(chan []byte, 1),
 			recvQueue:      make(chan []byte, recvQueueSize),
-			activeRequests: map[uint32]chan []byte{},
+			activeRequests: map[uint32]chan amsReply{},
 		},
 	}
 	for _, opt := range opts {
@@ -642,7 +642,7 @@ func (c *Client) handleReceive(ctx context.Context, data []byte) {
 				c.logger.Info("receive channel timed out",
 					"id", header.InvokeID, "command", header.Command)
 				return
-			case response <- adsData:
+			case response <- amsReply{data: adsData, amsErr: ReturnCode(header.ErrorCode)}:
 				c.logger.Log(context.Background(), LevelTrace, "Successfully delivered answer",
 					"id", header.InvokeID, "command", header.Command)
 			}
@@ -798,7 +798,7 @@ func (c *Client) sendRequestTo(ctx context.Context, target AMSAddress, command C
 	}
 	c.tx.activeRequestLock.Lock()
 	id := c.tx.currentRequest.Add(1)
-	responseCh := make(chan []byte, 1)
+	responseCh := make(chan amsReply, 1)
 	c.tx.activeRequests[id] = responseCh
 	c.tx.activeRequestLock.Unlock()
 	defer func() {
@@ -853,15 +853,15 @@ func (c *Client) sendRequestTo(ctx context.Context, target AMSAddress, command C
 		grace := time.NewTimer(droppedResponseGrace)
 		defer grace.Stop()
 		select {
-		case response := <-responseCh:
-			return response, nil
+		case reply := <-responseCh:
+			return reply.payload()
 		case <-grace.C:
 			return nil, ErrTransportClosed
 		case <-ctx.Done():
 			return nil, ErrTransportClosed
 		}
-	case response := <-responseCh:
-		return response, nil
+	case reply := <-responseCh:
+		return reply.payload()
 	}
 }
 

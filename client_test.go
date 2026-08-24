@@ -552,12 +552,12 @@ func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 	conn := &Session{
 		lifecycle: &sessionLifecycle{ctx: ctx},
 		logger:    getDefaultLogger(),
-		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
+		tx:        &transport{activeRequests: make(map[uint32]chan amsReply)},
 	}
 	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
 
 	// Register a response channel for invokeID 42
-	ch := make(chan []byte, 1)
+	ch := make(chan amsReply, 1)
 	conn.tx.activeRequestLock.Lock()
 	conn.tx.activeRequests[42] = ch
 	conn.tx.activeRequestLock.Unlock()
@@ -579,9 +579,12 @@ func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 	conn.client.Load().handleReceive(ctx, buf.Bytes())
 
 	select {
-	case resp := <-ch:
-		if !bytes.Equal(resp, []byte{0xDE, 0xAD, 0xBE, 0xEF}) {
-			t.Errorf("response = %v, want [0xDE 0xAD 0xBE 0xEF]", resp)
+	case reply := <-ch:
+		if reply.amsErr != 0 {
+			t.Errorf("amsErr = %v, want 0 for a successful response", reply.amsErr)
+		}
+		if !bytes.Equal(reply.data, []byte{0xDE, 0xAD, 0xBE, 0xEF}) {
+			t.Errorf("response = %v, want [0xDE 0xAD 0xBE 0xEF]", reply.data)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for response")
@@ -594,7 +597,7 @@ func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 	conn := &Session{
 		lifecycle: &sessionLifecycle{ctx: ctx},
 		logger:    getDefaultLogger(),
-		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
+		tx:        &transport{activeRequests: make(map[uint32]chan amsReply)},
 	}
 	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
 
@@ -619,7 +622,7 @@ func TestHandleReceive_TooShort(t *testing.T) {
 	conn := &Session{
 		lifecycle: &sessionLifecycle{ctx: ctx},
 		logger:    getDefaultLogger(),
-		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
+		tx:        &transport{activeRequests: make(map[uint32]chan amsReply)},
 	}
 	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
 
@@ -1022,7 +1025,7 @@ func TestClient_OnDropFiresExactlyOnce(t *testing.T) {
 			sendChannel:    make(chan []byte),
 			systemResponse: make(chan []byte),
 			recvQueue:      make(chan []byte, 8),
-			activeRequests: map[uint32]chan []byte{},
+			activeRequests: map[uint32]chan amsReply{},
 		},
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
@@ -1169,5 +1172,72 @@ func TestSetSource_TakesEffectOnTheWire(t *testing.T) {
 	if !bytes.Equal(gotAfter, assigned.NetID[:]) {
 		t.Errorf("source on the wire = % x after setSource(%v): requests still carry the pre-handshake address, so the PLC "+
 			"answers a NetID this session is not using", gotAfter, assigned)
+	}
+}
+
+// TestHandleReceive_AMSErrorSurfacesAsItself: an AMS-level rejection must reach the
+// caller as that error, not as a guess parsed from the body.
+//
+// AMSHeader.ErrorCode was only ever written, never read. So when the router refused
+// a request — target port not found, no runtime, invalid NetID — the library parsed
+// the accompanying body as though it were a response. Measured against a TC3.1.4024
+// system in CONFIG, where every request to the runtime port comes back with
+// ErrorCode 6: a read of index group 0xF008 was reported as
+// "ADS error in Read: 0xF008: unknown error code". That is the index group echoed
+// back, formatted as a return code. Every "unknown error code" in this project's
+// logs came from this, and it sent two diagnoses down the wrong path.
+func TestHandleReceive_AMSErrorSurfacesAsItself(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &Session{
+		lifecycle: &sessionLifecycle{ctx: ctx},
+		logger:    getDefaultLogger(),
+		tx:        &transport{activeRequests: make(map[uint32]chan amsReply)},
+	}
+	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
+
+	ch := make(chan amsReply, 1)
+	conn.tx.activeRequestLock.Lock()
+	conn.tx.activeRequests[7] = ch
+	conn.tx.activeRequestLock.Unlock()
+
+	// What a system in CONFIG actually sends: ErrorCode 6, and a body that is the
+	// echoed request rather than a response.
+	header := AMSHeader{
+		Command:   CommandIDRead,
+		State:     5,
+		Length:    4,
+		ErrorCode: uint32(ReturnCodeGlobalTargetPortNotFound),
+		InvokeID:  7,
+	}
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, header); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	buf.Write([]byte{0x08, 0xF0, 0x00, 0x00}) // 0xF008, the index group, echoed
+	conn.client.Load().handleReceive(ctx, buf.Bytes())
+
+	select {
+	case reply := <-ch:
+		if reply.amsErr != ReturnCodeGlobalTargetPortNotFound {
+			t.Errorf("amsErr = %v, want ReturnCodeGlobalTargetPortNotFound: the header's ErrorCode is being discarded", reply.amsErr)
+		}
+		data, err := reply.payload()
+		if err == nil {
+			t.Error("payload() returned no error for an AMS-rejected request: the body would be parsed as a response, " +
+				"which is how an index group ends up reported as a return code")
+		}
+		if data != nil {
+			t.Errorf("payload() returned %v alongside an AMS error; the body is not a response", data)
+		}
+		if !errors.Is(err, ReturnCodeGlobalTargetPortNotFound) {
+			t.Errorf("error %v does not wrap the code, so callers cannot branch on it", err)
+		}
+		if !strings.Contains(err.Error(), "target port") {
+			t.Errorf("error %q does not name the cause; an operator needs to read 'target port not found', "+
+				"which is what a PLC in CONFIG reports for its runtime port", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the reply")
 	}
 }

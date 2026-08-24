@@ -133,23 +133,70 @@ func addRemoteRouteFrom(logger *slog.Logger, localIP net.IP, remoteHost string, 
 	// Build the route request packet
 	packet := buildRoutePacket(localNetID, routeName, computerName, username, password, invokeID)
 
-	_, err = conn.Write(packet)
-	if err != nil {
-		return fmt.Errorf("failed to send route request: %w", err)
+	// Retransmit, like identify does, and for the measured reason: a single dropped
+	// datagram was seen failing NewSession outright, and this runs on the same plant
+	// networks over the same shared port 48899. Registration is the costlier failure
+	// of the two, because Connect aborts on it.
+	//
+	// Same invokeID across attempts, so a late answer to an earlier one still counts;
+	// and unrelated datagrams on the shared port are skipped rather than parsed,
+	// which previously turned somebody else's identify reply into a registration
+	// failure.
+	respBuf := make([]byte, 2048)
+	deadline := time.Now().Add(routeRegisterTotalBudget)
+	var lastErr error
+	for attempt := 1; attempt <= routeRegisterAttempts; attempt++ {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		window := remaining / time.Duration(routeRegisterAttempts-attempt+1)
+		if attempt == routeRegisterAttempts {
+			window = remaining
+		}
+		if _, err = conn.Write(packet); err != nil {
+			return fmt.Errorf("failed to send route request: %w", err)
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(window)); err != nil {
+			return fmt.Errorf("failed to set read deadline: %w", err)
+		}
+		for {
+			n, rerr := conn.Read(respBuf)
+			if rerr != nil {
+				lastErr = rerr
+				break // window expired: retransmit
+			}
+			if n == len(respBuf) {
+				return fmt.Errorf("route response of %d bytes filled the read buffer", n)
+			}
+			perr := parseRouteResponse(logger, respBuf[:n], invokeID)
+			if perr == nil {
+				if attempt > 1 {
+					logger.Info("route registered after a retransmit", "attempts", attempt)
+				}
+				return nil
+			}
+			// Could be a datagram for somebody else on this shared port. Keep
+			// reading inside the window rather than failing on it.
+			lastErr = perr
+			logger.Debug("route registration: ignoring an unusable datagram on port 48899",
+				"bytes", n, "error", perr)
+		}
 	}
-
-	// Wait for response
-	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return fmt.Errorf("failed to set read deadline: %w", err)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no answer")
 	}
-	respBuf := make([]byte, 1024)
-	n, err := conn.Read(respBuf)
-	if err != nil {
-		return fmt.Errorf("failed to read route response: %w", err)
-	}
-
-	return parseRouteResponse(logger, respBuf[:n], invokeID)
+	return fmt.Errorf("route registration got no usable answer in %v over %d attempts: %w",
+		routeRegisterTotalBudget, routeRegisterAttempts, lastErr)
 }
+
+const (
+	// routeRegisterAttempts / routeRegisterTotalBudget mirror identify's retransmit
+	// policy. UDP on a plant network drops datagrams, and a single loss here used to
+	// fail the whole connect.
+	routeRegisterAttempts    = 3
+	routeRegisterTotalBudget = 6 * time.Second
+)
 
 // buildRoutePacket constructs a UDP route registration packet.
 // invokeID is set by the caller (per ADS InvokeID semantics) to identify the

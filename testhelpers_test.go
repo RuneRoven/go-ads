@@ -293,6 +293,10 @@ func localAddr(port int) string {
 // routeResponder is a UDP stub that speaks the AddRoute half of the AMS router
 // protocol, so tests can count how many times a session registers a route.
 type routeResponder struct {
+	// dropFirst silently swallows this many registration datagrams before
+	// answering, so a test can tell a retransmit from a single-shot send.
+	dropFirst atomic.Int32
+
 	pc    *net.UDPConn
 	port  int
 	adds  atomic.Int64
@@ -339,6 +343,11 @@ func (r *routeResponder) serve() {
 			continue
 		}
 		r.adds.Add(1)
+		if drop := r.dropFirst.Load(); drop > 0 {
+			// Model a lost datagram on a plant network: count it, answer nothing.
+			r.dropFirst.Add(-1)
+			continue
+		}
 		// cookie + invokeID + (RESPONSE|service) + AmsAddr + tagCount, then tag 1
 		// carrying the 4-byte result.
 		resp := make([]byte, 0, 40)

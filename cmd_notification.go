@@ -1003,7 +1003,17 @@ func (sess *Session) establishHeartbeat(ctx context.Context) {
 		}
 		return
 	}
-	sess.notifications.heartbeatHandle.Store(handle)
+	// CompareAndSwap, not Store: two concurrent first subscribes both see no
+	// heartbeat, both register one, and the second Store would orphan the first —
+	// a cyclic registration the PLC keeps pushing that belongs to nothing. The
+	// loser deletes what it just created.
+	if !sess.notifications.heartbeatHandle.CompareAndSwap(0, handle) {
+		sess.logger.Debug("another subscribe established the heartbeat first; releasing this one", "handle", handle)
+		if derr := c.DeleteDeviceNotification(ctx, handle); derr != nil {
+			sess.logger.Debug("releasing the redundant heartbeat handle failed", "handle", handle, "error", derr)
+		}
+		return
+	}
 	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
 	sess.logger.Debug("notification heartbeat established", "handle", handle, "cycle", sess.heartbeatCycle())
 	sess.startHeartbeatWatch()
@@ -1015,6 +1025,7 @@ func (sess *Session) consumeHeartbeat(handle uint32, content []byte) bool {
 	if handle == 0 || handle != sess.notifications.heartbeatHandle.Load() {
 		return false
 	}
+	sess.notifications.heartbeatBeats.Add(1)
 	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
 	// The payload is the symbol version, so the beat carries online-change
 	// detection for free — no extra request needed.
@@ -1065,7 +1076,10 @@ func (sess *Session) startHeartbeatWatch() {
 func (sess *Session) heartbeatWatch() {
 	defer sess.heartbeatWG.Done()
 	cycle := sess.heartbeatCycle()
-	deadline := cycle * time.Duration(sess.heartbeatAllowedMisses())
+	// lastBeats/quietTicks are the whole state of the detector: how many beats had
+	// arrived at the previous tick, and how many ticks have passed with none.
+	var lastBeats uint64
+	quietTicks := 0
 	ticker := time.NewTicker(cycle)
 	defer ticker.Stop()
 
@@ -1101,31 +1115,53 @@ func (sess *Session) heartbeatWatch() {
 		// heartbeat clock stale, so the silence check below fires again on the next
 		// tick and retries. Verified by removing this path and watching the test
 		// still pass, which is the definition of code not worth keeping.
-		// Each consecutive failure doubles the wait, capped, so a PLC that stays in
-		// CONFIG for an hour costs a handful of attempts instead of one per interval.
-		wait := deadline
-		if consecutiveFailures > 0 {
-			shift := min(consecutiveFailures, maxFailureBackoffShift)
-			wait = min(deadline<<shift, maxHeartbeatRecoveryBackoff)
-		}
-		last := sess.notifications.heartbeatLastNs.Load()
-		if last == 0 || time.Since(time.Unix(0, last)) < wait {
+		// Silence measured in ticks of this ticker, not in wall-clock time: the
+		// ticker is monotonic, so a clock step cannot make a healthy session look
+		// dead (or a dead one look healthy). See notificationManager.heartbeatBeats.
+		beats := sess.notifications.heartbeatBeats.Load()
+		if beats != lastBeats {
+			lastBeats = beats
+			quietTicks = 0
 			continue
 		}
+		quietTicks++
+		// Each consecutive failed recovery doubles the tolerated silence, capped, so
+		// a PLC that stays in CONFIG for an hour costs a handful of attempts instead
+		// of one per interval.
+		allowed := sess.heartbeatAllowedMisses()
+		if consecutiveFailures > 0 {
+			shift := min(consecutiveFailures, maxFailureBackoffShift)
+			scaled := allowed << shift
+			if capped := int(maxHeartbeatRecoveryBackoff / cycle); capped > 0 && scaled > capped {
+				scaled = capped
+			}
+			allowed = scaled
+		}
+		// No "have we ever seen a beat" guard: this watcher only exists because
+		// establishHeartbeat succeeded at least once, so zero beats means the PLC has
+		// stopped beating, which is precisely the thing being detected. Guarding on it
+		// disabled the detector permanently in the CONFIG case, where a failed
+		// recovery leaves both the beat count and the handle at zero.
+		if quietTicks < allowed {
+			continue
+		}
+		quietTicks = 0
 
 		// One Warn per episode. Repeats go to Debug: the operator needs to know the
 		// subscriptions died, not to be told again every interval until they recover.
 		msg := "no notification heartbeat within the allowed window; treating this session's subscriptions as dead and re-subscribing"
 		args := []any{
-			"cycle", cycle, "missed", sess.heartbeatAllowedMisses(),
-			"silentFor", time.Since(time.Unix(0, last)).Round(time.Millisecond),
+			"cycle", cycle, "missedTicks", allowed,
+			// Wall clock, so only ever informational — the decision above is made in
+			// ticks. A stepped clock makes this number odd, not the outcome wrong.
+			"silentForApprox", time.Duration(allowed) * cycle,
 			"detail", "a runtime restart or CONFIG toggle stops delivery without dropping the connection, " +
 				"changing the symbol version or reporting an error",
 		}
 		if consecutiveFailures == 0 {
 			sess.logger.Warn(msg, args...)
 		} else {
-			sess.logger.Debug(msg, append(args, "retry", consecutiveFailures, "backoff", wait)...)
+			sess.logger.Debug(msg, append(args, "retry", consecutiveFailures)...)
 		}
 		if sess.recoverDeadSubscriptions() {
 			consecutiveFailures = 0
