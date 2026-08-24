@@ -43,6 +43,13 @@ var (
 	manualStreamProof   = manualDur("ADS_MANUAL_PROOF", 20*time.Second)       // updates must flow before we disturb anything
 	manualDisruptWait   = manualDur("ADS_MANUAL_DISRUPT_WAIT", 5*time.Minute) // how long to wait for the human
 	manualRecoveryGrace = manualDur("ADS_MANUAL_RECOVERY", 4*time.Minute)     // PLC boot + route + reload + resubscribe
+	// manualMinOutage is how long the stream must stay down before the stop counts
+	// as the disruption under test rather than the device's own flakiness.
+	//
+	// OFF by default, because duration turned out to be the wrong discriminator —
+	// see the long comment at the wait loop. Opt in when a device's own dips are
+	// short enough to be clearly separable from the event you are staging.
+	manualMinOutage = manualDur("ADS_MANUAL_MIN_OUTAGE", 0)
 )
 
 func manualDur(env string, def time.Duration) time.Duration {
@@ -255,11 +262,57 @@ func TestManualRestartRecovery(t *testing.T) {
 	fmt.Printf(">>> %s\n", instruction)
 	fmt.Printf(">>> Waiting up to %v for the stream to stop. No keypress needed.\n\n", manualDisruptWait)
 
-	if !waitForStreamStop(ch, manualDisruptWait) {
-		t.Fatalf("updates never stopped within %v — the disruption did not happen", manualDisruptWait)
-	}
+	// A stopped stream is not proof the human did anything. Measured on
+	// 192.168.3.224 (TC/RTOS, reachable only via the peer-route fallback): that
+	// device mutes its own notification delivery about five seconds after the
+	// baseline window closes, every single run. The heartbeat watcher notices,
+	// recovers in 5-12s, and the test printed PASS three times in a row while the
+	// operator was still walking to the cabinet — a hardware test passing on the
+	// wrong event, which is worse than one that fails.
+	//
+	// An outage shorter than manualMinOutage is therefore logged and skipped. That
+	// knob is OFF by default, because measuring it proved duration is the WRONG
+	// discriminator, and the failed experiment is worth recording:
+	//
+	// A floor of 20s was calibrated on the two slow-booting devices (.70 32s, .118
+	// 25s) and then threw away a genuine power cycle on .224, which came back in
+	// 16s — inside the floor. On that device the intrinsic dips measured 3s, 5s,
+	// 10s and 12s and the real power cycle measured 16s, so no threshold separates
+	// them reliably.
+	//
+	// What DOES separate them is transport-level evidence, visible in the same
+	// logs: a power-cycled box fails the dial with `i/o timeout` (host not
+	// answering at all), while the mute dip fails it with `connection refused`
+	// (host up, ADS router not listening). If this test is ever made to classify
+	// the disruption itself, probe reachability — do not tune a duration.
+	//
+	// Recovery is verified either way; a rejected outage only means the harness
+	// stops watching, not that the library failed.
 	stoppedAt := time.Now()
-	timeline("stream stopped — the session should now be detecting the drop")
+	disruptDeadline := time.Now().Add(manualDisruptWait)
+	for {
+		remaining := time.Until(disruptDeadline)
+		if remaining <= 0 {
+			t.Fatalf("no outage longer than %v within %v — the disruption did not happen "+
+				"(shorter dips were ignored; see ADS_MANUAL_MIN_OUTAGE)", manualMinOutage, manualDisruptWait)
+		}
+		if !waitForStreamStop(ch, remaining) {
+			t.Fatalf("updates never stopped within %v — the disruption did not happen", manualDisruptWait)
+		}
+		stoppedAt = time.Now()
+		timeline("stream stopped — the session should now be detecting the drop")
+		if manualMinOutage <= 0 {
+			break
+		}
+		// If it comes back on its own inside the floor, this was the device's own
+		// flakiness rather than the event under test.
+		if waitForStreamResume(ch, manualMinOutage) {
+			timeline("stream resumed after %v, under the %v floor — transient, not the disruption; still waiting",
+				time.Since(stoppedAt).Round(time.Second), manualMinOutage)
+			continue
+		}
+		break
+	}
 
 	// Phase 3 — the library recovers on its own.
 	fmt.Printf(">>> Stream stopped. Bring the PLC back if it is not already.\n")
