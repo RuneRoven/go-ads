@@ -1005,3 +1005,147 @@ func TestOrphanDelete_NotStartedAfterClose(t *testing.T) {
 		t.Errorf("the refused attempt leaked a semaphore slot (%d held)", len(sess.notifications.orphanSem))
 	}
 }
+
+// TestReconnect_RuntimeNotRunningDoesNotBurnAttempts: a PLC in CONFIG must not walk
+// the session through its reconnect budget.
+//
+// The RUN gate on AddSymbolNotifications fires inside the reconnect loop's
+// resubscribe, and an instant refusal costs no network time — so the whole attempt
+// budget burns at the backoff rate and giveUpReconnecting CLOSES a session whose
+// only problem is a runtime that is not running. That is the opposite of the
+// contract: stay up, keep polling, resume when it returns.
+func TestReconnect_RuntimeNotRunningDoesNotBurnAttempts(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeNoErrors, []byte{4}
+	})
+	// The resubscribe uses the batch path, so this group has to answer or the second
+	// phase fails on a parse error long before reaching the behaviour under test —
+	// the same stub gap that made three earlier tests pass for the wrong reason.
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0x4200)
+	srv.onWriteRead(GroupSumupAddDeviceNotification, func(req []byte) []byte {
+		items := make([]sumNotifResponse, len(req)/40)
+		for i := range items {
+			items[i] = sumNotifResponse{Error: ReturnCodeNoErrors, Handle: nextHandle.Add(1)}
+		}
+		return buildSumAddNotifPayload(items)
+	})
+	srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(req []byte) []byte {
+		codes := make([]ReturnCode, len(req)/4)
+		for i := range codes {
+			codes[i] = ReturnCodeNoErrors
+		}
+		return buildSumDeleteNotifPayload(codes)
+	})
+
+	const attempts = 3
+	sess := newDialableTestSession(t, srv.host, srv.port, attempts)
+
+	// A subscription on file, and a runtime that is not running: the resubscribe
+	// inside the reconnect loop is refused by the gate every time.
+	ch := make(chan *Update, 4)
+	preSeedTypedSymbol(sess, "MAIN.waiting", 0x4100)
+	sess.notifications.lock.Lock()
+	sess.notifications.notificationChannel = ch
+	sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.waiting", TransmissionMode: TransModeServerOnChange})
+	sess.notifications.lock.Unlock()
+	sess.recordRuntimeState(ADSStateConfig)
+
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+	done := make(chan error, 1)
+	go func() { done <- sess.Reconnect(context.Background()) }()
+
+	// Long enough that an attempt-consuming loop would exhaust 3 attempts at the
+	// 50ms test backoff and close the session many times over.
+	select {
+	case err := <-done:
+		t.Fatalf("Reconnect returned %v while the runtime was not running; it should keep waiting", err)
+	case <-time.After(2 * time.Second):
+	}
+	if sess.IsClosed() {
+		t.Error("the session closed itself because the PLC was in CONFIG: a runtime that is not running is not a reconnect failure")
+	}
+
+	// And it recovers by itself once the runtime is back, without being rebuilt.
+	sess.recordRuntimeState(ADSStateRun)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Reconnect after the runtime returned: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Reconnect never completed after the runtime returned to RUN")
+	}
+	if state := sess.lifecycle.state.load(); state != SessionStateConnected {
+		t.Errorf("state = %v, want Connected", state)
+	}
+}
+
+// TestPeerListener_NotBoundAfterStop: once teardown has stopped the listener, a
+// Connect that was on its way to binding must not.
+//
+// stopPeerListener read peerLn, unlocked, then waited on an empty peerWG. A Connect
+// descheduled just before its bind would then bind AFTER Close returned, leaving
+// 48898 and an accept loop held for the life of the process — in a session the
+// caller believes is fully closed. The accept loop's own isClosed() escape only runs
+// once a connection arrives, which on a dead PLC never happens.
+func TestPeerListener_NotBoundAfterStop(t *testing.T) {
+	sess := &Session{
+		logger:    getDefaultLogger(),
+		lifecycle: &sessionLifecycle{closedCh: make(chan struct{})},
+	}
+	sess.peerListenPort = freeLocalPort(t)
+
+	sess.stopPeerListener()
+	if err := sess.startPeerListener(); err == nil {
+		sess.peerMu.Lock()
+		ln := sess.peerLn
+		sess.peerMu.Unlock()
+		if ln != nil {
+			_ = ln.Close()
+		}
+		t.Error("bound the inbound AMS port after the listener had been stopped: a Connect racing Close can leave the port and " +
+			"an accept loop held for the process lifetime")
+	}
+}
+
+// TestTearDownAndReset_ReleasesWaitersImmediately: a session-initiated teardown must
+// fail in-flight requests with the reason, not let them sit out their timeout.
+//
+// readFrames returns on ctx.Done() without calling callOnDrop, so nothing else
+// closed the Client's `dropped` channel on this path — the very signal `dropped`
+// exists to provide.
+func TestTearDownAndReset_ReleasesWaitersImmediately(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	// Answers nothing, so the request is still in flight when teardown happens.
+	srv.delayBefore(CommandIDRead, uint32(GroupSymbolVersion), time.Hour)
+
+	sess := newDialableTestSession(t, srv.host, srv.port, 1)
+	sess.requestTimeout = 30 * time.Second // far longer than this test may take
+	if err := sess.dialAndStart(); err != nil {
+		t.Fatalf("dialAndStart: %v", err)
+	}
+	c := sess.client.Load()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := c.GetSymbolVersion(context.Background())
+		errCh <- err
+	}()
+	time.Sleep(200 * time.Millisecond) // let the request reach the wire
+
+	go sess.tearDownAndReset()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrTransportClosed) {
+			t.Logf("in-flight request returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("an in-flight request was not released by the teardown: it will wait out its full request timeout instead of " +
+			"learning the transport is gone")
+	}
+}

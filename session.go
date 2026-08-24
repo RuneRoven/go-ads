@@ -1997,8 +1997,15 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		if sess.lifecycle.maxReconnectAttempts > 0 && attempts > sess.lifecycle.maxReconnectAttempts {
 			sess.logger.Error("max reconnect attempts exhausted, closing session",
 				"maxAttempts", sess.lifecycle.maxReconnectAttempts, "error", lastErr)
-			return sess.giveUpReconnecting(
-				fmt.Errorf("reconnect failed after %d attempts: %w", sess.lifecycle.maxReconnectAttempts, lastErr))
+			// lastErr can be nil: a path that retries without recording an error
+			// (waiting for a runtime that is not running) leaves it unset, and
+			// wrapping nil with %w prints "%!w(<nil>)" — which is what this said
+			// before.
+			giveUp := fmt.Errorf("reconnect failed after %d attempts", sess.lifecycle.maxReconnectAttempts)
+			if lastErr != nil {
+				giveUp = fmt.Errorf("reconnect failed after %d attempts: %w", sess.lifecycle.maxReconnectAttempts, lastErr)
+			}
+			return sess.giveUpReconnecting(giveUp)
 		}
 
 		// Dial TCP, configure keepalive, clear disconnected flag, start goroutines.
@@ -2084,9 +2091,19 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 				// consuming an attempt.
 				sess.logger.Info("reconnect: transport restored but the PLC runtime is not running; waiting for it",
 					"error", err)
+				// resetForRetry, exactly as retryAfter does: the loop dials a fresh
+				// connection every iteration and only a teardown stops the previous
+				// Client's workers. Skipping it redialed on top of a live Client —
+				// caught by -race as a write/read conflict on tx.connection.
+				sess.resetForRetry()
 				if serr := sess.reconnectSleep(ctx, attempts); serr != nil {
 					return serr
 				}
+				// Give the attempt back. `continue` alone returns to the attempts++ at
+				// the loop head, so the budget burned anyway — which is the whole
+				// defect: a PLC in CONFIG walked the session through every attempt and
+				// closed it, just more slowly.
+				attempts--
 				continue
 			}
 			if rerr := retryAfter(err, "notification resubscribe"); rerr != nil {
@@ -3002,9 +3019,18 @@ func (sess *Session) knownRuntimeState() (ADSState, bool) {
 // one where nothing can be subscribed at all — with no PLC error to explain it.
 func runtimeDefinitelyNotServing(state ADSState) bool {
 	switch state {
-	case ADSStateConfig, ADSStateReconfig, ADSStateStop, ADSStateShutdown:
+	case ADSStateConfig, ADSStateReconfig:
+		// The measured cases. TC3.1.4024 in CONFIG reports 15 and answers every
+		// request to a runtime port with AMS ErrorCode 6 (target port not found).
 		return true
 	default:
+		// Everything else is permitted, including STOP and SHUTDOWN, which an
+		// earlier version of this list refused on inference rather than evidence.
+		// STOP in particular was observed only as a ~4s way-point during a CONFIG ->
+		// RUN switch; whether a device can idle there with a serving runtime port is
+		// unknown, and refusing every subscribe on such a device — with no PLC error
+		// to explain it — is a worse failure than attempting the call and letting the
+		// PLC answer, which is what this library did before the gate existed.
 		return false
 	}
 }

@@ -1135,3 +1135,61 @@ func TestHeartbeat_RecoveryKeepsALargeConfigSet(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+// TestRuntimeState_RefusesOnlyMeasuredStates: the gate must refuse only where a
+// runtime port provably does not serve.
+//
+// An earlier version refused on anything that was not RUN, then on a list that
+// included STOP and SHUTDOWN by inference. Only CONFIG and RECONFIG are measured
+// (TC3.1.4024 in CONFIG reports 15 and answers AMS ErrorCode 6 for every request to
+// a runtime port). STOP was seen only as a ~4s way-point during a CONFIG -> RUN
+// switch, so whether a device can idle there while serving is unknown — and
+// refusing every subscribe on such a device, with no PLC error to explain it, is
+// worse than attempting the call.
+func TestRuntimeState_RefusesOnlyMeasuredStates(t *testing.T) {
+	refuse := []ADSState{ADSStateConfig, ADSStateReconfig}
+	permit := []ADSState{ADSStateRun, ADSStateStop, ADSStateShutdown, ADSStateIdle, ADSStateStart, ADSStateInvalid, ADSState(99)}
+
+	for _, state := range refuse {
+		if !runtimeDefinitelyNotServing(state) {
+			t.Errorf("state %d should be refused: it is measured to have no serving runtime port", uint16(state))
+		}
+	}
+	for _, state := range permit {
+		if runtimeDefinitelyNotServing(state) {
+			t.Errorf("state %d is refused on inference rather than evidence; attempting the call and letting the PLC answer is "+
+				"the safer default", uint16(state))
+		}
+	}
+}
+
+// TestRuntimeState_ReadingExpires: a state reading must not outlive its usefulness.
+//
+// The watch gives up after a run of failed polls, and before this a session that had
+// seen CONFIG then kept that verdict forever — refusing every symbol and subscribe
+// call for the rest of its life with nothing left to notice the runtime returning.
+// Failing OPEN is deliberate: the worst case is the behaviour that predates the
+// gate.
+func TestRuntimeState_ReadingExpires(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	sess, _ := newWiredTestSession(t, srv, WithoutNotificationHeartbeat())
+
+	sess.recordRuntimeState(ADSStateConfig)
+	if _, known := sess.knownRuntimeState(); !known {
+		t.Fatal("a fresh reading is not known")
+	}
+	if err := sess.requireRunningRuntime("probe"); err == nil {
+		t.Fatal("a fresh CONFIG reading must refuse")
+	}
+
+	// Age it past the TTL, as an abandoned poll would.
+	sess.runtimeStateNs.Store(time.Now().Add(-2 * runtimeStateTTL).UnixNano())
+	if _, known := sess.knownRuntimeState(); known {
+		t.Error("a stale reading is still reported as known: nothing refreshes it once the watch has given up, so the gates " +
+			"would refuse for the life of the session")
+	}
+	if err := sess.requireRunningRuntime("probe"); err != nil {
+		t.Errorf("a stale reading still refuses: %v", err)
+	}
+}

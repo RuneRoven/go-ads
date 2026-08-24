@@ -405,7 +405,17 @@ func (c *Client) startWorkers() {
 
 func (c *Client) listen() {
 	defer c.waitGroup.Done()
-	c.readFrames(c.tx.connection, true)
+	// Snapshot under the mutex that guards it. A reconnect writes tx.connection
+	// while dialing, and reading it bare here raced that write — reported by -race
+	// against the reconnect loop, which dials a fresh connection per attempt.
+	c.tx.connMu.Lock()
+	conn := c.tx.connection
+	c.tx.connMu.Unlock()
+	if conn == nil {
+		c.logger.Debug("listen: no connection to read from")
+		return
+	}
+	c.readFrames(conn, true)
 }
 
 // AcceptPeerConn adopts a TCP connection the PLC opened TO US and reads AMS
@@ -661,7 +671,14 @@ func (c *Client) handleReceive(ctx context.Context, data []byte) {
 
 func (c *Client) transmitWorker() {
 	defer c.waitGroup.Done()
-	writer := bufio.NewWriter(c.tx.connection)
+	c.tx.connMu.Lock()
+	conn := c.tx.connection
+	c.tx.connMu.Unlock()
+	if conn == nil {
+		c.logger.Debug("transmitWorker: no connection to write to")
+		return
+	}
+	writer := bufio.NewWriter(conn)
 	for {
 		select {
 		case <-c.ctx.Done():
