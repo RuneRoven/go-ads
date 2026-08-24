@@ -1227,3 +1227,99 @@ func TestGiveUpReconnecting_TearsDownTheTransport(t *testing.T) {
 		t.Error("client workers still running after give-up + Close")
 	}
 }
+
+// TestReconnect_DropDuringTheTailIsNotErased: a drop observed while a reconnect
+// is finishing must not be forgotten by the reconnect that is finishing.
+//
+// Sibling of TestReconnect_DropWhileFinishingIsNotLost above, one step earlier in
+// the tail. That test injects the drop after "reconnect successful" is logged;
+// this one lands it before, while the pre-reconnect handle cleanup is still
+// running - i.e. before Reconnect stores disconnected=false on its way out.
+//
+// The bug: that store is a no-op on the happy path, because dialAndStart already
+// cleared the flag once the workers were up. Its only effect is to erase a drop
+// that landed in between - and tx.disconnected is the SOLE record of it, since
+// the FSM has no Reconnecting->Disconnected edge. Erased, the adopt check in the
+// deferred hand-off sees a healthy transport, nothing redials, and the session
+// sits Connected on a dead socket with IsClosed() false: no data, and no signal
+// the consumer can act on.
+func TestReconnect_DropDuringTheTailIsNotErased(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeNoErrors, []byte{7}
+	})
+
+	sess := newDialableTestSession(t, srv.host, srv.port, 40)
+	sess.lifecycle.autoReconnect = true
+	// One saved handle, so takeNotificationHandles returns non-empty and the
+	// cleanup below logs from inside the window we need to pin.
+	sess.notifications.heartbeatHandle.Store(4242)
+	gate := newGateOnLog("cleaned up pre-reconnect notification handles", "reconnect already in progress")
+	sess.logger = slog.New(gate)
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+	t.Cleanup(func() { _ = sess.Close() })
+
+	first := make(chan error, 1)
+	go func() { first <- sess.Reconnect(context.Background()) }()
+
+	select {
+	case <-gate.w.reached:
+	case err := <-first:
+		t.Fatalf("reconnect finished without reaching the cleanup log: %v", err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("reconnect never reached the cleanup log")
+	}
+
+	// The gate sits after dialAndStart, so the flag is already clear here. If it
+	// is not, the drop below would be indistinguishable from the state we started
+	// in and the test would prove nothing.
+	if sess.tx.disconnected.Load() {
+		t.Fatal("transport still marked disconnected at the cleanup log — the gate is in the wrong place")
+	}
+	before := srv.accepts()
+
+	// A real drop, delivered the way the read loop delivers one.
+	srv.closeClientConns()
+
+	// Poll until the drop is RECORDED, not merely injected. This is what makes the
+	// ordering deterministic instead of hopeful: the erasing store is downstream of
+	// the gate, so the flag must be observably true before the gate is released.
+	deadline := time.Now().Add(10 * time.Second)
+	for !sess.tx.disconnected.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("the injected drop was never recorded on the transport; the window was not exercised")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	select {
+	case <-gate.w.signalled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drop's reconnect never reported losing the ownership CAS; the window was not exercised")
+	}
+	close(gate.w.release)
+
+	if err := <-first; err != nil {
+		t.Fatalf("first reconnect returned %v, want nil", err)
+	}
+
+	// The invariant, not the interleaving: a drop observed during a reconnect must
+	// be adopted and redialled.
+	deadline = time.Now().Add(15 * time.Second)
+	for srv.accepts() <= before {
+		if time.Now().After(deadline) {
+			t.Fatalf("no redial after a drop during the reconnect tail (accepts stayed at %d): "+
+				"state=%v IsClosed=%v disconnected=%v — the drop was erased on the way out",
+				before, sess.lifecycle.state.load(), sess.IsClosed(), sess.tx.disconnected.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// And never Connected over a Client that has already been dropped.
+	if state := sess.lifecycle.state.load(); state == SessionStateConnected {
+		if c := sess.client.Load(); c != nil && c.ctx != nil && c.ctx.Err() != nil {
+			t.Error("session reports Connected over a client whose context is already cancelled")
+		}
+	}
+}

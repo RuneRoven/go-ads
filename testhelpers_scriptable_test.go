@@ -192,6 +192,23 @@ func (s *scriptableServer) stop() {
 	})
 }
 
+// closeClientConns closes every accepted client connection and leaves the
+// listener up, so the session's next dial is still served.
+//
+// stop() cannot stand in for this: it closes the listener too, so a session that
+// is supposed to redial after the drop has nothing to redial to.
+func (s *scriptableServer) closeClientConns() {
+	s.mu.Lock()
+	conns := make([]net.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
 // onWriteRead registers a handler for the given group on CommandIDReadWrite.
 func (s *scriptableServer) onWriteRead(group Group, fn writeReadHandler) {
 	s.mu.Lock()

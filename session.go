@@ -2172,7 +2172,14 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 			continue
 		}
 
-		sess.tx.disconnected.Store(false)
+		// Deliberately no disconnected.Store(false) here. dialAndStart already
+		// cleared the flag once the workers were up, so on the happy path this was a
+		// no-op; its only effect was to erase a drop that landed in the tail between
+		// that clear and here. tx.disconnected is the SOLE record of such a drop —
+		// the FSM has no Reconnecting->Disconnected edge — so erasing it blinded the
+		// adopt check in the deferred hand-off below, and the session sat Connected
+		// on a dead socket with IsClosed() false: no data, and no signal a consumer
+		// polling IsClosed() could act on.
 		sess.lifecycle.strictReconnectFailures = 0 // reset on success
 		// epoch bumps inside the transition helper when target == Connected.
 		sess.transitionState(SessionStateConnected)
