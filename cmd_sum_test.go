@@ -324,9 +324,15 @@ func TestSession_ReadMultipleSymbols_StaleDetection(t *testing.T) {
 		return resp
 	})
 
-	_, err := sess.ReadMultipleSymbols(context.Background(), []string{"MAIN.a", "MAIN.b"})
-	if err != nil {
-		t.Fatalf("ReadMultipleSymbols: %v", err)
+	// The stale item now comes back as a per-item failure in a *BatchError
+	// (DECISIONS.md Decision 1); detection must still fire regardless.
+	values, err := sess.ReadMultipleSymbols(context.Background(), []string{"MAIN.a", "MAIN.b"})
+	batchErr := batchErrorFor(t, err)
+	if len(batchErr.Items) != 1 || batchErr.Items[0].Symbol != "MAIN.a" {
+		t.Errorf("got failed items %v, want just MAIN.a", batchErr.Items)
+	}
+	if _, ok := values["MAIN.b"]; !ok {
+		t.Errorf("got values = %v, want the readable symbol MAIN.b present", values)
 	}
 
 	select {
@@ -374,9 +380,15 @@ func TestSession_ReadMultipleSymbols_FiresCallbackOncePerBatch(t *testing.T) {
 		)
 	})
 
+	// All three items carry a failing code, so the call now reports an
+	// all-failed batch (DECISIONS.md Decision 1) — asserted here rather than
+	// ignored, so this test still notices if the read path stops reporting it.
+	// The subject of the test is unchanged: detection fires exactly once.
 	_, err := sess.ReadMultipleSymbols(context.Background(), []string{"MAIN.a", "MAIN.b", "MAIN.c"})
-	if err != nil {
-		t.Fatalf("ReadMultipleSymbols: %v", err)
+	batchErr := batchErrorFor(t, err)
+	if len(batchErr.Items) != 3 || batchErr.Succeeded != 0 {
+		t.Errorf("got Succeeded=%d failed items %v, want 0 succeeded and all three failed",
+			batchErr.Succeeded, batchErr.Items)
 	}
 
 	// Wait for first callback.
@@ -426,12 +438,20 @@ func TestSession_WriteMultipleSymbols_StaleDetection(t *testing.T) {
 		return buf
 	})
 
-	_, err := sess.WriteMultipleSymbols(context.Background(), map[string]string{
+	// The rejected item is now named in a *BatchError (DECISIONS.md Decision 1);
+	// detection must still fire.
+	codes, err := sess.WriteMultipleSymbols(context.Background(), map[string]string{
 		"MAIN.a": "true",
 		"MAIN.b": "false",
 	})
-	if err != nil {
-		t.Fatalf("WriteMultipleSymbols: %v", err)
+	// Which name lands in slot 0 depends on Go's map iteration order, so assert
+	// the shape rather than the identity: one rejected, one accepted.
+	batchErr := batchErrorFor(t, err)
+	if len(batchErr.Items) != 1 || batchErr.Succeeded != 1 {
+		t.Errorf("got Succeeded=%d failed items %v, want 1 of each", batchErr.Succeeded, batchErr.Items)
+	}
+	if len(codes) != 2 {
+		t.Errorf("got codes = %v, want a code for both symbols", codes)
 	}
 
 	select {
@@ -618,5 +638,398 @@ func TestAMSRouterErrorIsNotADeviceVerdict(t *testing.T) {
 				t.Error("isSumCommandUnsupportedError = true for a router rejection, want false")
 			}
 		})
+	}
+}
+
+// --- batch error contract (DECISIONS.md Decision 1) ---
+//
+// The contract these pin: a batch call returns the values it obtained plus a
+// *BatchError naming every item that produced none. A bare error is reserved
+// for a transport failure, where no item's outcome is known. Batch size does
+// not change the shape of any of this.
+
+// batchErrorFor extracts the *BatchError from err, failing the test if err is
+// nil or is a different kind of error.
+func batchErrorFor(t *testing.T, err error) *BatchError {
+	t.Helper()
+	if err == nil {
+		t.Fatal("got err = nil, want a *BatchError naming the failed items")
+	}
+	var batchErr *BatchError
+	if !errors.As(err, &batchErr) {
+		t.Fatalf("got err = %v (%T), want a *BatchError", err, err)
+	}
+	return batchErr
+}
+
+// itemFor returns the BatchError entry for symbol, or fails the test.
+func itemFor(t *testing.T, batchErr *BatchError, symbol string) BatchItemError {
+	t.Helper()
+	for _, item := range batchErr.Items {
+		if item.Symbol == symbol {
+			return item
+		}
+	}
+	t.Fatalf("no BatchError item for %q; got %v", symbol, batchErr.Items)
+	return BatchItemError{}
+}
+
+// TestReadMultipleSymbols_AllItemsFailedIsNotSuccess pins the measured TC3
+// failure: after a runtime restart every cached handle is refused, so every
+// item comes back 0x710. Before the batch error contract this returned an
+// empty map with err == nil — total data loss reported as success.
+//
+// Validates: DECISIONS.md Decision 1 (per-item status, PLC-verdict state).
+func TestReadMultipleSymbols_AllItemsFailedIsNotSuccess(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, _ := newWiredTestSession(t, srv, WithSymbolVersionStrategy(SymbolVersionIgnore))
+	seedSymbol(sess, "MAIN.a", 0x4001)
+	seedSymbol(sess, "MAIN.b", 0x4002)
+	seedSymbol(sess, "MAIN.c", 0x4003)
+
+	srv.onWriteRead(GroupSumupReadEx2, func(_ []byte) []byte {
+		return craftSumReadResponse(
+			[]ReturnCode{
+				ReturnCodeDeviceSymbolNoFound,
+				ReturnCodeDeviceSymbolNoFound,
+				ReturnCodeDeviceSymbolNoFound,
+			},
+			[]uint32{0, 0, 0},
+			nil,
+		)
+	})
+
+	names := []string{"MAIN.a", "MAIN.b", "MAIN.c"}
+	values, err := sess.ReadMultipleSymbols(context.Background(), names)
+	batchErr := batchErrorFor(t, err)
+
+	if len(values) != 0 {
+		t.Errorf("got %d values for a batch where every item was refused, want 0: %v", len(values), values)
+	}
+	if batchErr.Requested != 3 || batchErr.Succeeded != 0 || len(batchErr.Items) != 3 {
+		t.Errorf("got Requested=%d Succeeded=%d items=%d, want 3/0/3",
+			batchErr.Requested, batchErr.Succeeded, len(batchErr.Items))
+	}
+	for _, item := range batchErr.Items {
+		// A refused handle is a device verdict, not a library-side skip: the
+		// caller must be able to tell those apart to know whether retrying
+		// the same request could ever work.
+		if item.Skipped != nil {
+			t.Errorf("item %s: Skipped = %v, want nil (the PLC gave a verdict)", item.Symbol, item.Skipped)
+		}
+		if item.Error != ReturnCodeDeviceSymbolNoFound {
+			t.Errorf("item %s: Error = 0x%X, want 0x%X", item.Symbol, uint32(item.Error), uint32(ReturnCodeDeviceSymbolNoFound))
+		}
+	}
+}
+
+// TestReadMultipleSymbols_OneAbsentSymbolKeepsTheRest pins the constraint that
+// one misspelled tag must not stop the other values flowing: the successful
+// items stay in the map and only the failed one is named.
+//
+// Validates: DECISIONS.md Decision 1 (partial success stays usable).
+func TestReadMultipleSymbols_OneAbsentSymbolKeepsTheRest(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, _ := newWiredTestSession(t, srv, WithSymbolVersionStrategy(SymbolVersionIgnore))
+	seedSymbol(sess, "MAIN.a", 0x4101)
+	seedSymbol(sess, "MAIN.absent", 0x4102)
+	seedSymbol(sess, "MAIN.c", 0x4103)
+
+	srv.onWriteRead(GroupSumupReadEx2, func(_ []byte) []byte {
+		return craftSumReadResponse(
+			[]ReturnCode{ReturnCodeNoErrors, ReturnCodeDeviceSymbolNoFound, ReturnCodeNoErrors},
+			[]uint32{1, 0, 1},
+			[]byte{0x01, 0x00},
+		)
+	})
+
+	names := []string{"MAIN.a", "MAIN.absent", "MAIN.c"}
+	values, err := sess.ReadMultipleSymbols(context.Background(), names)
+	batchErr := batchErrorFor(t, err)
+
+	if len(values) != 2 || values["MAIN.a"] == "" || values["MAIN.c"] == "" {
+		t.Errorf("got values = %v, want the two readable symbols present", values)
+	}
+	if len(batchErr.Items) != 1 {
+		t.Fatalf("got %d failed items, want 1: %v", len(batchErr.Items), batchErr.Items)
+	}
+	if batchErr.Succeeded != 2 {
+		t.Errorf("got Succeeded = %d, want 2", batchErr.Succeeded)
+	}
+	item := itemFor(t, batchErr, "MAIN.absent")
+	if item.Skipped != nil || item.Error != ReturnCodeDeviceSymbolNoFound {
+		t.Errorf("got item %+v, want a PLC verdict of 0x710", item)
+	}
+	if !strings.Contains(err.Error(), "MAIN.absent") {
+		t.Errorf("error message %q does not name the failed symbol", err.Error())
+	}
+}
+
+// TestReadMultipleSymbols_UnresolvedSymbolIsReported covers the drop site where
+// getSymbol fails, so the item never reaches the wire. Previously the name was
+// dropped from the result map with no error whenever any other item decoded.
+//
+// Validates: DECISIONS.md Decision 1 (Skipped state, resolve-time drop).
+func TestReadMultipleSymbols_UnresolvedSymbolIsReported(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, _ := newWiredTestSession(t, srv, WithSymbolVersionStrategy(SymbolVersionIgnore))
+	seedSymbol(sess, "MAIN.a", 0x4201)
+	// MAIN.typo is not seeded, and the server answers no handle lookup, so
+	// getSymbol fails for it before any request is built.
+
+	srv.onWriteRead(GroupSumupReadEx2, func(_ []byte) []byte {
+		return craftSumReadResponse([]ReturnCode{ReturnCodeNoErrors}, []uint32{1}, []byte{0x01})
+	})
+
+	values, err := sess.ReadMultipleSymbols(context.Background(), []string{"MAIN.a", "MAIN.typo"})
+	batchErr := batchErrorFor(t, err)
+
+	if len(values) != 1 || values["MAIN.a"] == "" {
+		t.Errorf("got values = %v, want MAIN.a present", values)
+	}
+	item := itemFor(t, batchErr, "MAIN.typo")
+	if !errors.Is(item.Skipped, ErrBatchSymbolUnresolved) {
+		t.Errorf("got Skipped = %v, want it to match ErrBatchSymbolUnresolved", item.Skipped)
+	}
+	if !errors.Is(err, ErrBatchSymbolUnresolved) {
+		t.Error("errors.Is(err, ErrBatchSymbolUnresolved) = false; the skip reason must be reachable from the returned error")
+	}
+
+	// Nothing resolvable at all takes an earlier return, and it must produce the
+	// same shape — the contract cannot depend on how many items survived.
+	values, err = sess.ReadMultipleSymbols(context.Background(), []string{"MAIN.typo", "MAIN.other"})
+	batchErr = batchErrorFor(t, err)
+	if len(values) != 0 {
+		t.Errorf("got values = %v, want none", values)
+	}
+	if batchErr.Requested != 2 || len(batchErr.Items) != 2 {
+		t.Errorf("got Requested=%d items=%v, want both names reported", batchErr.Requested, batchErr.Items)
+	}
+}
+
+// TestReadMultipleSymbols_VanishedAndUnparsableAreReported covers the two
+// post-roundtrip drop sites: the cache entry disappearing mid-roundtrip
+// (live == nil) and the payload failing to decode against the cached type,
+// which is what an undetected INT→LREAL online change looks like. Both used to
+// leave the name missing from the map with err == nil, permanently.
+//
+// Validates: DECISIONS.md Decision 1 (Skipped state, decode-time drops).
+func TestReadMultipleSymbols_VanishedAndUnparsableAreReported(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, _ := newWiredTestSession(t, srv, WithSymbolVersionStrategy(SymbolVersionIgnore))
+	seedSymbol(sess, "MAIN.a", 0x4301)
+	seedSymbol(sess, "MAIN.gone", 0x4302)
+	seedSymbol(sess, "MAIN.widened", 0x4303)
+
+	// The handler runs after the requests are on the wire and before the decode
+	// loop takes cache.lock, so it can stage exactly the two races: drop one
+	// entry from the cache, and widen another's Length past the payload the PLC
+	// is about to return.
+	srv.onWriteRead(GroupSumupReadEx2, func(_ []byte) []byte {
+		sess.cache.lock.Lock()
+		delete(sess.cache.symbols, symbolKey("MAIN.gone"))
+		sess.cache.symbols[symbolKey("MAIN.widened")].Length = 8
+		sess.cache.lock.Unlock()
+		return craftSumReadResponse(
+			[]ReturnCode{ReturnCodeNoErrors, ReturnCodeNoErrors, ReturnCodeNoErrors},
+			[]uint32{1, 1, 1},
+			[]byte{0x01, 0x01, 0x01},
+		)
+	})
+
+	names := []string{"MAIN.a", "MAIN.gone", "MAIN.widened"}
+	values, err := sess.ReadMultipleSymbols(context.Background(), names)
+	batchErr := batchErrorFor(t, err)
+
+	if len(values) != 1 || values["MAIN.a"] == "" {
+		t.Errorf("got values = %v, want only MAIN.a", values)
+	}
+	if got := itemFor(t, batchErr, "MAIN.gone"); !errors.Is(got.Skipped, ErrBatchSymbolVanished) {
+		t.Errorf("MAIN.gone: Skipped = %v, want ErrBatchSymbolVanished", got.Skipped)
+	}
+	if got := itemFor(t, batchErr, "MAIN.widened"); !errors.Is(got.Skipped, ErrBatchValueUnparsable) {
+		t.Errorf("MAIN.widened: Skipped = %v, want ErrBatchValueUnparsable", got.Skipped)
+	}
+}
+
+// TestReadMultipleSymbols_TransportFailureIsABareError pins the other half of
+// the contract: a router-level rejection is not a per-item verdict, so it must
+// NOT arrive as a *BatchError. A caller that unwraps one and reads the map
+// would be trusting values that were never fetched.
+//
+// Validates: DECISIONS.md Decision 1 (bare error reserved for transport).
+func TestReadMultipleSymbols_TransportFailureIsABareError(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, _ := newWiredTestSession(t, srv, WithSymbolVersionStrategy(SymbolVersionIgnore))
+	seedSymbol(sess, "MAIN.a", 0x4401)
+	seedSymbol(sess, "MAIN.b", 0x4402)
+
+	// Seeded symbols need no handle lookup, so the first ReadWrite is the
+	// SumRead itself: the router rejects it the way a PLC in CONFIG does.
+	srv.amsErrorAfter(CommandIDReadWrite, 1, ReturnCodeGlobalTargetPortNotFound)
+
+	values, err := sess.ReadMultipleSymbols(context.Background(), []string{"MAIN.a", "MAIN.b"})
+	if err == nil {
+		t.Fatal("got err = nil for a router-rejected batch")
+	}
+	var batchErr *BatchError
+	if errors.As(err, &batchErr) {
+		t.Errorf("got a *BatchError (%v) for a transport failure; per-item results are not knowable here", batchErr)
+	}
+	if !errors.Is(err, ReturnCodeGlobalTargetPortNotFound) {
+		t.Errorf("got err = %v, want it to match ReturnCodeGlobalTargetPortNotFound", err)
+	}
+	if values != nil {
+		t.Errorf("got values = %v, want nil on transport failure", values)
+	}
+}
+
+// TestReadMultipleSymbols_EmptyRequestIsNotAnError guards the boundary the
+// contract keeps unchanged: asking for nothing is not a failure.
+//
+// Validates: DECISIONS.md Decision 1 (empty request stays nil, nil).
+func TestReadMultipleSymbols_EmptyRequestIsNotAnError(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, _ := newWiredTestSession(t, srv, WithSymbolVersionStrategy(SymbolVersionIgnore))
+
+	for _, names := range [][]string{nil, {}} {
+		values, err := sess.ReadMultipleSymbols(context.Background(), names)
+		if err != nil || values != nil {
+			t.Errorf("ReadMultipleSymbols(%v) = %v, %v; want nil, nil", names, values, err)
+		}
+	}
+}
+
+// TestWriteMultipleSymbols_DroppedItemIsNotSuccess pins the write half. A
+// dropped item is absent from the returned map, and ReturnCodeNoErrors is 0, so
+// the idiomatic per-symbol check reads a write that never happened as a write
+// that succeeded. Only the error can distinguish them.
+//
+// Validates: DECISIONS.md Decision 1 (write-path dropped item).
+func TestWriteMultipleSymbols_DroppedItemIsNotSuccess(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, _ := newWiredTestSession(t, srv, WithSymbolVersionStrategy(SymbolVersionIgnore))
+	seedSymbol(sess, "MAIN.a", 0x4501)
+	seedSymbol(sess, "MAIN.bad", 0x4502)
+	// MAIN.typo is not seeded: getSymbol fails and the setpoint never reaches
+	// the PLC. MAIN.bad is a BOOL handed a non-boolean, the shape a type change
+	// under an online change takes, and it dies at serialization instead.
+
+	srv.onWriteRead(GroupSumupWrite, func(_ []byte) []byte {
+		buf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(buf, uint32(ReturnCodeNoErrors))
+		return buf
+	})
+
+	codes, err := sess.WriteMultipleSymbols(context.Background(), map[string]string{
+		"MAIN.a":    "true",
+		"MAIN.bad":  "not-a-bool",
+		"MAIN.typo": "true",
+	})
+	batchErr := batchErrorFor(t, err)
+
+	if codes["MAIN.a"] != ReturnCodeNoErrors {
+		t.Errorf("MAIN.a: code = 0x%X, want 0x0 — the write that did land must still report success", uint32(codes["MAIN.a"]))
+	}
+	if _, ok := codes["MAIN.typo"]; ok {
+		t.Error("MAIN.typo is present in the code map; a write that never happened must not carry a code")
+	}
+	item := itemFor(t, batchErr, "MAIN.typo")
+	if !errors.Is(item.Skipped, ErrBatchSymbolUnresolved) {
+		t.Errorf("MAIN.typo: Skipped = %v, want ErrBatchSymbolUnresolved", item.Skipped)
+	}
+	if bad := itemFor(t, batchErr, "MAIN.bad"); !errors.Is(bad.Skipped, ErrBatchValueUnserializable) {
+		t.Errorf("MAIN.bad: Skipped = %v, want ErrBatchValueUnserializable", bad.Skipped)
+	}
+	if batchErr.Requested != 3 || batchErr.Succeeded != 1 {
+		t.Errorf("got Requested=%d Succeeded=%d, want 3/1", batchErr.Requested, batchErr.Succeeded)
+	}
+}
+
+// TestWriteMultipleSymbols_PerItemRejectionIsAnError covers the write path's
+// device-verdict state: the batch reached the PLC and one item was rejected.
+//
+// Validates: DECISIONS.md Decision 1 (write-path PLC verdict).
+func TestWriteMultipleSymbols_PerItemRejectionIsAnError(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, _ := newWiredTestSession(t, srv, WithSymbolVersionStrategy(SymbolVersionIgnore))
+	seedSymbol(sess, "MAIN.a", 0x4601)
+
+	srv.onWriteRead(GroupSumupWrite, func(_ []byte) []byte {
+		buf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(buf, uint32(ReturnCodeDeviceSymbolNoFound))
+		return buf
+	})
+
+	codes, err := sess.WriteMultipleSymbols(context.Background(), map[string]string{"MAIN.a": "true"})
+	batchErr := batchErrorFor(t, err)
+
+	if codes["MAIN.a"] != ReturnCodeDeviceSymbolNoFound {
+		t.Errorf("MAIN.a: code = 0x%X, want 0x710", uint32(codes["MAIN.a"]))
+	}
+	item := itemFor(t, batchErr, "MAIN.a")
+	if item.Skipped != nil || item.Error != ReturnCodeDeviceSymbolNoFound {
+		t.Errorf("got item %+v, want a PLC verdict of 0x710", item)
+	}
+}
+
+// TestBatchSymbols_FullSuccessIsNotAnError guards the other end of the
+// contract: when every item succeeds there is no error at all. Without this,
+// nothing stops the batch error from firing on a healthy batch — every caller
+// would see a permanent failure.
+//
+// Validates: DECISIONS.md Decision 1 (error only when an item failed).
+func TestBatchSymbols_FullSuccessIsNotAnError(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, _ := newWiredTestSession(t, srv, WithSymbolVersionStrategy(SymbolVersionIgnore))
+	seedSymbol(sess, "MAIN.a", 0x4701)
+	seedSymbol(sess, "MAIN.b", 0x4702)
+
+	srv.onWriteRead(GroupSumupReadEx2, func(_ []byte) []byte {
+		return craftSumReadResponse(
+			[]ReturnCode{ReturnCodeNoErrors, ReturnCodeNoErrors},
+			[]uint32{1, 1},
+			[]byte{0x01, 0x00},
+		)
+	})
+	srv.onWriteRead(GroupSumupWrite, func(_ []byte) []byte {
+		return make([]byte, 8) // two items, both ReturnCodeNoErrors
+	})
+
+	values, err := sess.ReadMultipleSymbols(context.Background(), []string{"MAIN.a", "MAIN.b"})
+	if err != nil {
+		t.Errorf("ReadMultipleSymbols on a healthy batch: got err = %v, want nil", err)
+	}
+	if len(values) != 2 {
+		t.Errorf("got values = %v, want both symbols", values)
+	}
+
+	codes, err := sess.WriteMultipleSymbols(context.Background(), map[string]string{
+		"MAIN.a": "true",
+		"MAIN.b": "false",
+	})
+	if err != nil {
+		t.Errorf("WriteMultipleSymbols on a healthy batch: got err = %v, want nil", err)
+	}
+	if len(codes) != 2 {
+		t.Errorf("got codes = %v, want both symbols", codes)
 	}
 }
