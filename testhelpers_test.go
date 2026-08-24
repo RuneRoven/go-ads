@@ -308,6 +308,13 @@ type routeResponder struct {
 	done  chan struct{}
 	wg    sync.WaitGroup
 	reply atomic.Int64 // result code to answer with (0 = success)
+
+	// netIDMu guards netIDs, the source NetID carried by each registration. Kept
+	// so a test can assert on the identity that went on the wire and not only on
+	// how many datagrams did — a torn read of Session.source shows up here as a
+	// NetID that was never written.
+	netIDMu sync.Mutex
+	netIDs  [][6]byte
 }
 
 func startRouteResponder(t *testing.T) *routeResponder {
@@ -348,6 +355,11 @@ func (r *routeResponder) serve() {
 			continue
 		}
 		r.adds.Add(1)
+		var netID [6]byte
+		copy(netID[:], buf[12:18])
+		r.netIDMu.Lock()
+		r.netIDs = append(r.netIDs, netID)
+		r.netIDMu.Unlock()
 		for r.noiseFirst.Load() > 0 {
 			r.noiseFirst.Add(-1)
 			_, _ = r.pc.WriteToUDP([]byte("junk on the shared AMS router port"), from)
@@ -376,6 +388,15 @@ func (r *routeResponder) serve() {
 }
 
 func (r *routeResponder) registrations() int64 { return r.adds.Load() }
+
+// registeredNetIDs returns the source NetID from every registration received.
+func (r *routeResponder) registeredNetIDs() [][6]byte {
+	r.netIDMu.Lock()
+	defer r.netIDMu.Unlock()
+	out := make([][6]byte, len(r.netIDs))
+	copy(out, r.netIDs)
+	return out
+}
 
 // countByMessage reports how many records contain msg. Separate from
 // findByMessage because "did this happen at all" and "did this happen once
