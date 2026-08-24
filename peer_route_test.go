@@ -172,10 +172,11 @@ func TestPeerRoute_CloseDoesNotHangWithAdoptedConnection(t *testing.T) {
 // itself, and hands it back exactly as it was found.
 //
 // peerRouteHosts is a package-level sync.Map keyed by "host:port" that lives for
-// the whole process, and nothing in a test binary ever expires it: the only
-// self-invalidation (forgetPeerRouteHost) sits in Connect's route-registration
-// branch, which a test without WithRoute never reaches. So every rescued session
-// leaves an entry behind — measured at two per run of this file, from
+// the whole process, and nothing in a test binary ever expires it. Its
+// self-invalidation (forgetPeerRouteHostIfUnused) only fires for a device that
+// answered without an inbound connection, which is exactly what a RESCUED stub did
+// not do — so every rescued session still leaves an entry behind, by design:
+// measured at two per run of this file, from
 // TestPeerRoute_AutomaticFallback and TestPeerRoute_FallbackCanBeDisabled's first
 // arm — and every stub in the binary lives on 127.0.0.1, so a later stub that the
 // OS hands a recycled ephemeral port INHERITS that entry.
@@ -212,6 +213,85 @@ func isolatePeerRouteCache(t *testing.T) {
 			rememberPeerRouteHost(key)
 		}
 	})
+}
+
+// TestPeerRoute_HealthyDeviceDropsTheRememberedHost: a session that gets its
+// answers on its OWN connection must drop the remembered peer-route fact for that
+// device, whether or not it registered a route.
+//
+// forgetPeerRouteHost was reachable only from Connect's route-registration branch,
+// so a caller that does not use WithRoute never invalidated anything: once a device
+// was remembered, every later session in the process pre-bound the inbound AMS port
+// — wildcard :48898 by default — for the rest of the process's life, even after the
+// device's route table had been repaired. That is the configuration umh-core runs in
+// a container, and the doc comment on forgetPeerRouteHost claimed the entry
+// "self-invalidates as soon as an ordinary probe succeeds", which it did not.
+//
+// Two assertions, because the entry is not the harm: the harm is the port it makes
+// the NEXT session seize.
+func TestPeerRoute_HealthyDeviceDropsTheRememberedHost(t *testing.T) {
+	isolatePeerRouteCache(t)
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	// A healthy device: it answers on the connection we opened, and never dials us.
+	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeNoErrors, []byte{5}
+	})
+
+	// Seed the fact, as a genuine peer-route device (or a stub on a recycled port)
+	// would have. Deliberately no WithRoute anywhere in this test — that is the path
+	// that had no invalidation at all.
+	key := net.JoinHostPort(srv.host, strconv.Itoa(srv.port))
+	rememberPeerRouteHost(key)
+
+	// Deliberately no WithAmsPeerListen: that option binds unconditionally, so it
+	// would hide the very thing under test. The pre-bind this exercises is the
+	// implicit one, on the wildcard protocol port.
+	if perr := protocolPortIsBindable(t); perr != nil {
+		t.Skipf("port %d unavailable on this host (%v); the pre-bind cannot be observed", amsPeerListenPort, perr)
+	}
+	connect := func(t *testing.T) (*Session, *testLogHandler) {
+		t.Helper()
+		logs := &testLogHandler{}
+		sess, err := NewSession(context.Background(),
+			AMSEndpoint{IP: srv.host, Port: srv.port, AMS: AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851}},
+			WithRequestTimeout(500*time.Millisecond),
+			WithTargetCheck(TargetCheckOff),
+			WithAutoReconnect(false),
+			WithLogger(slog.New(logs)),
+		)
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		t.Cleanup(func() { sess.Close() })
+		if err := sess.Connect(context.Background()); err != nil {
+			skipIfPortTaken(t, err)
+			t.Fatalf("Connect against a healthy device: %v", err)
+		}
+		return sess, logs
+	}
+
+	first, firstLogs := connect(t)
+	// The seeded entry must actually have cost this session a bound port, or the
+	// assertion below would hold with the whole mechanism deleted.
+	if firstLogs.findByMessage("device is known to answer on its own connection") == nil {
+		t.Fatal("the seeded entry was never acted on, so this test proves nothing about invalidating it")
+	}
+	if isKnownPeerRouteHost(key) {
+		t.Error("the device answered on our own connection, yet it is still remembered as needing an inbound listener: every later session in this process now pre-binds the AMS port for nothing")
+	}
+	// Hand the port back before the second session, so a pre-bind there is visible
+	// as a bind rather than as a collision with this one.
+	_ = first.Close()
+
+	second, _ := connect(t)
+	second.peerMu.Lock()
+	ln := second.peerLn
+	second.peerMu.Unlock()
+	if ln != nil {
+		t.Errorf("the next session still bound the inbound AMS port (%v) against a healthy device", ln.Addr())
+	}
 }
 
 // protocolPortIsBindable reports whether the fallback could bind the AMS port.
@@ -301,6 +381,14 @@ func TestPeerRoute_AutomaticFallback(t *testing.T) {
 		t.Error("no log line telling the operator the fallback was used")
 	} else if rec.Level < slog.LevelWarn {
 		t.Errorf("fallback logged at %v; it should be at least Warn so it is not missed", rec.Level)
+	}
+	// The other half of forgetPeerRouteHostIfUnused: learning this costs a full
+	// probe timeout plus the route-activation budget, so a device that really does
+	// answer on its own connection must stay remembered. Without this, invalidating
+	// on every successful Connect would look correct and quietly re-learn the same
+	// ~15s fact for every session.
+	if !isKnownPeerRouteHost(net.JoinHostPort(srv.host, strconv.Itoa(srv.port))) {
+		t.Error("the rescued device was not remembered, so every later session in this process pays the discovery cost again")
 	}
 }
 
