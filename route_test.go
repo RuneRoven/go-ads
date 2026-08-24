@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"log/slog"
+	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -203,15 +205,30 @@ func TestParseRouteResponse_WrongServiceID(t *testing.T) {
 
 // F-25: AddRemoteRouteWithLogger must not panic when logger is nil.
 // A nil logger must be replaced by getDefaultLogger() before first use.
+//
+// Aimed at a local responder on an ephemeral port, never at 48899: passing a
+// bare "127.0.0.1" made this test write a real routeServiceAdd datagram (source
+// NetID 0.0.0.0.0.0, credentials in cleartext) to the host's own AMS router
+// port, and burn the full 6s retransmit budget whenever anything held that port
+// or ICMP port-unreachable was suppressed — invisibly, because the error was
+// discarded. Asserting err and the registration count also covers the host:port
+// branch of splitHostRouterPort.
 func TestAddRemoteRouteWithLoggerNilLogger(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("panicked with nil logger: %v", r)
 		}
 	}()
-	// unreachable host → network error, not panic
-	err := AddRemoteRouteWithLogger(nil, "127.0.0.1", [6]byte{}, "route", "host", "user", "pass")
-	_ = err
+	router := startRouteResponder(t) // 127.0.0.1, ephemeral UDP port
+	err := AddRemoteRouteWithLogger(nil,
+		net.JoinHostPort("127.0.0.1", strconv.Itoa(router.port)),
+		[6]byte{192, 168, 3, 52, 1, 1}, "go-ads-nil-logger", "127.0.0.1", "Administrator", "1")
+	if err != nil {
+		t.Fatalf("registration against the local responder failed: %v", err)
+	}
+	if got := router.registrations(); got != 1 {
+		t.Errorf("registration datagrams = %d, want 1", got)
+	}
 }
 
 // TestAddRoute_RetransmitsOnALostDatagram: one dropped UDP datagram must not fail

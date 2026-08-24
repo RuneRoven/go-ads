@@ -3,6 +3,8 @@ package ads
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,7 +18,8 @@ import (
 //   - R-CACHE-003 (epoch bumps on swap, NOT on insert)
 //   - R-CACHE-007 (concurrent on-demand resolve duplicate-handle release —
 //     marked TODO until a stub Client can be wired without real PLC I/O).
-//   - R-CACHE-008 (never both cache.lock + notifs.lock simultaneously).
+//   - R-CACHE-008 — deliberately NOT covered by a runtime test; see the note
+//     where its test used to live, below TestCacheEpoch_BumpsOnSwapNotInsert.
 
 // newCacheTestSession builds a minimal Session sufficient for cache-only
 // tests. No client, no transport workers. The session FSM is left in the
@@ -30,51 +33,132 @@ func newCacheTestSession() *Session {
 	}
 }
 
-// TestCacheLock_GuardsMutations spawns 50 readers and 50 writers exercising
-// cache.symbols under cache.lock. The race detector flags any unguarded
-// access. The test passes only when every read and write goes through
-// cache.lock — which is the production invariant.
+// TestCacheLock_GuardsMutations drives the two PRODUCTION families that touch
+// cache.symbols concurrently: the on-demand resolve path (sess.getSymbol, which
+// inserts into cache.symbols) and the notification dispatch path (drivePacket →
+// dispatchSample, which reads the map and mutates the symbol under parse). The
+// race detector is the oracle for the locking; the assertions below pin that both
+// families actually did their work, so a silently-empty run cannot pass.
+//
+// The version this replaced hand-rolled cache.lock Lock/Unlock in test code and
+// called no production function at all — stripping every production cache.lock
+// call from the package left it green under -race. This shape goes red under
+// that same mutation (verified before landing). Note two other tests already
+// kill it — TestAddSymbolNotification_StrandedSymbol_DetectedByEpoch and
+// TestReadFromSymbol_SymbolNotFoundReResolvesTheCachedHandle — so this is the
+// dedicated pin, not the only one; do not delete those thinking it is.
 //
 // Validates: R-CACHE-002 (race-detector clean cache).
 func TestCacheLock_GuardsMutations(t *testing.T) {
-	sess := newCacheTestSession()
+	srv := startScriptableServer(t)
+	defer srv.stop()
 
-	const Goroutines = 50
-	const Iterations = 200
+	// Name-aware symbol info so every distinct name resolves to its own symbol.
+	srv.onWriteRead(GroupSymbolInfoByNameEx, func(req []byte) []byte {
+		name := strings.TrimRight(string(req), "\x00")
+		return buildSymbolInfoPayload(name, "INT", "", 0x4040, 0x100, 2, ADSTInt16, 0)
+	})
+	var nextHandle atomic.Uint32
+	srv.onWriteRead(GroupSymbolHandleByName, func(_ []byte) []byte {
+		return buildHandlePayload(nextHandle.Add(1))
+	})
+	srv.onWrite(GroupSymbolReleaseHandle, func(_, _ uint32, _ []byte) ReturnCode {
+		return ReturnCodeNoErrors
+	})
 
+	sess, client := newWiredTestSession(t, srv)
+	// The helper leaves the notification callback unset; without it drivePacket
+	// decodes the packet and dispatches into nothing.
+	client.SetNotificationHandler(sess.handleNotification)
+	ctx := context.Background()
+
+	// The dispatch side needs one live subscription. Resolve its symbol through
+	// production getSymbol, then register the handle: seeding activeNotifications
+	// is setup, the cache access under test is dispatchSample's own.
+	const dispatchName = "MAIN.dispatched"
+	const dispatchHandle uint32 = 0x0BAD0001
+	dispatched, err := sess.getSymbol(ctx, dispatchName)
+	if err != nil {
+		t.Fatalf("resolving %s: %v", dispatchName, err)
+	}
+	updates := make(chan *Update, 1)
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[dispatchHandle] = activeNotification{Sym: dispatched, Ch: updates}
+	sess.notifications.lock.Unlock()
+
+	sample := make([]byte, 2)
+	binary.LittleEndian.PutUint16(sample, 42)
+	packet := buildNotificationPacket(dispatchHandle, 0, sample)
+
+	const (
+		resolvers   = 8
+		dispatchers = 8
+		resolves    = 25
+		dispatches  = 200
+	)
+
+	resolveErrs := make([]error, resolvers*resolves)
 	var wg sync.WaitGroup
 
-	// Writers — insert symbols under cache.lock.
-	for i := 0; i < Goroutines; i++ {
+	// Writers — production on-demand resolve inserts a fresh cache entry.
+	for i := 0; i < resolvers; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < Iterations; j++ {
-				key := symbolKey(string(rune('a' + (id+j)%26)))
-				sess.cache.lock.Lock()
-				sess.cache.symbols[key] = &symbol{FullName: key, Name: key}
-				sess.cache.lock.Unlock()
+			for j := 0; j < resolves; j++ {
+				name := fmt.Sprintf("MAIN.w%d_%d", id, j)
+				sym, err := sess.getSymbol(ctx, name)
+				switch {
+				case err != nil:
+					resolveErrs[id*resolves+j] = err
+				case sym == nil || sym.Handle == 0:
+					resolveErrs[id*resolves+j] = fmt.Errorf("%s resolved to %+v, want a symbol with a handle", name, sym)
+				}
 			}
 		}(i)
 	}
 
-	// Readers — iterate snapshot under cache.lock.
-	for i := 0; i < Goroutines; i++ {
+	// Readers — production dispatch reads cache.symbols and parses under cache.lock.
+	for i := 0; i < dispatchers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < Iterations; j++ {
-				sess.cache.lock.Lock()
-				_ = len(sess.cache.symbols)
-				for _, s := range sess.cache.symbols {
-					_ = s.Name
+			for j := 0; j < dispatches; j++ {
+				if err := sess.drivePacket(ctx, packet); err != nil {
+					t.Errorf("drivePacket: %v", err)
+					return
 				}
-				sess.cache.lock.Unlock()
 			}
 		}()
 	}
 
-	wg.Wait()
+	// A lock-order inversion between these two families deadlocks rather than
+	// races, and a deadlock must report as a failure, not as a package timeout.
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("resolve and dispatch did not finish in 60s: cache.lock/notifications.lock deadlock?")
+	}
+
+	for _, err := range resolveErrs {
+		if err != nil {
+			t.Fatalf("on-demand resolve failed: %v", err)
+		}
+	}
+	sess.cache.lock.Lock()
+	cached := len(sess.cache.symbols)
+	value, valid := dispatched.Value, dispatched.Valid
+	sess.cache.lock.Unlock()
+	if want := resolvers*resolves + 1; cached != want {
+		t.Errorf("cache.symbols size = %d, want %d", cached, want)
+	}
+	// Proof the dispatch family reached the parse section, not just the
+	// unknown-handle early return.
+	if value != "42" || !valid {
+		t.Errorf("dispatched symbol Value = %q, Valid = %v; want \"42\", true — dispatch never parsed a sample", value, valid)
+	}
 }
 
 // TestCacheEpoch_BumpsOnSwapNotInsert confirms cache.generation (now
@@ -113,66 +197,23 @@ func TestCacheEpoch_BumpsOnSwapNotInsert(t *testing.T) {
 	}
 }
 
-// TestCacheLockOrdering_NoSimultaneousHold drives concurrent goroutines
-// that take cache.lock and then notifs.lock (and vice versa) to defend
-// against the deadlock pattern. The production guidance is "never both
-// at once" — this test wraps each acquire/release in a single critical
-// section so the race detector + Go's deadlock detector validate behavior
-// when these locks are used following the contract.
+// R-CACHE-008 ("never hold cache.lock and notifications.lock simultaneously")
+// has no runtime test here, deliberately. TestCacheLockOrdering_NoSimultaneousHold
+// used to sit at this spot; it hand-rolled both lock families in test code and
+// released lock 1 before taking lock 2, so the simultaneous hold it named could
+// not occur in its own code and the production paths were never invoked — it
+// survived stripping every production cache.lock call in the package.
 //
-// We use the production AddSymbolNotification's pattern: capture under
-// cache.lock, release, then take notifs.lock. The reverse-order goroutine
-// uses the symmetric DeleteDeviceNotification pattern (notifs.lock first,
-// then cache.lock for parse).
-//
-// Validates: R-CACHE-008 (never hold both locks simultaneously) +
-// R-LOCK-002 (race-detector clean).
-func TestCacheLockOrdering_NoSimultaneousHold(t *testing.T) {
-	sess := newCacheTestSession()
-	// Seed cache with one symbol so the readers do real work.
-	sess.cache.lock.Lock()
-	sess.cache.symbols[symbolKey("MAIN.x")] = &symbol{FullName: "MAIN.x", Name: "x"}
-	sess.cache.lock.Unlock()
-
-	const Goroutines = 25
-	const Iterations = 100
-
-	var wg sync.WaitGroup
-
-	// Goroutine family A: cache → release → notifs (subscribe-side pattern).
-	for i := 0; i < Goroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < Iterations; j++ {
-				sess.cache.lock.Lock()
-				_ = sess.cache.symbols[symbolKey("MAIN.x")]
-				sess.cache.lock.Unlock()
-
-				sess.notifications.lock.Lock()
-				_ = len(sess.notifications.activeNotifications)
-				sess.notifications.lock.Unlock()
-			}
-		}()
-	}
-	// Goroutine family B: notifs → release → cache (dispatch-side pattern).
-	for i := 0; i < Goroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < Iterations; j++ {
-				sess.notifications.lock.Lock()
-				_ = len(sess.notifications.activeNotifications)
-				sess.notifications.lock.Unlock()
-
-				sess.cache.lock.Lock()
-				_ = sess.cache.symbols[symbolKey("MAIN.x")]
-				sess.cache.lock.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-}
+// It was deleted rather than rewritten because the invariant is STATIC: no
+// production path holds both locks (notification_api.go:19, and the ordering
+// comments in dispatchSample). A deadlock only materialises when TWO paths each
+// hold both in opposite order, so no single-site mutation can turn a runtime
+// probe red — verifying a rewrite would mean injecting the bug twice, in two
+// files, which is not a defect any realistic edit produces. What is worth
+// keeping — a deadlock reporting as a failure instead of a package timeout — is
+// carried by the bounded wg.Wait in TestCacheLock_GuardsMutations above, which
+// drives the subscribe/resolve and dispatch families concurrently through
+// production code.
 
 // TestCache_OnDemandResolve_DuplicateHandleReleased is the canonical R-CACHE-007
 // test: two goroutines call sess.getSymbol(context.Background(), "MAIN.x") concurrently; one

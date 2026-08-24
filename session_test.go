@@ -69,10 +69,22 @@ func TestZeroOldSymbolHandles(t *testing.T) {
 	}
 }
 
-// Nil and empty input must not panic. Validates: R-CACHE-004 (defensive).
+// Nil and empty input must not panic, and a nil map ENTRY must be skipped
+// rather than dereferenced. The nil/empty calls alone asserted nothing: ranging
+// a nil map is a language guarantee, so deleting the `if s != nil` guard in
+// zeroOldSymbolHandles left the old version green. The real entry also pins
+// "every field is cleared", which the old version missed too.
+//
+// Validates: R-CACHE-004 (defensive).
 func TestZeroOldSymbolHandles_NilSafe(t *testing.T) {
 	zeroOldSymbolHandles(nil)
 	zeroOldSymbolHandles(map[string]*symbol{})
+
+	sym := &symbol{Handle: 7, Value: "1", Valid: true, ValueParsed: true, LastUpdateTime: time.Now()}
+	zeroOldSymbolHandles(map[string]*symbol{"gone": nil, "MAIN.x": sym})
+	if sym.Handle != 0 || sym.Value != "" || sym.Valid || sym.ValueParsed || !sym.LastUpdateTime.IsZero() {
+		t.Errorf("stale symbol not fully zeroed: %+v", sym)
+	}
 }
 
 // TestNewSession_TotalConstruction asserts NewSession does no I/O, spawns

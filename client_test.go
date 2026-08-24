@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"runtime"
@@ -616,18 +617,33 @@ func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 	conn.client.Load().handleReceive(ctx, buf.Bytes())
 }
 
+// TestHandleReceive_TooShort pins WHICH branch a sub-header-sized packet takes.
+// The bare call asserted nothing, and the length guard is redundant behind
+// binary.Read (which fails with ErrUnexpectedEOF on 5 bytes), so deleting the
+// guard left the old version green. Asserting the log record kills that mutant:
+// without the guard the message is "Error parsing header" instead. The guard is
+// still worth pinning — it is the only thing between a future header-size change
+// and the unguarded data[32:] slice.
 func TestHandleReceive_TooShort(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	logs := &testLogHandler{}
 	conn := &Session{
 		lifecycle: &sessionLifecycle{ctx: ctx},
-		logger:    getDefaultLogger(),
+		logger:    slog.New(logs),
 		tx:        &transport{activeRequests: make(map[uint32]chan amsReply)},
 	}
 	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
 
 	// Less than 32 bytes — should return early
 	conn.client.Load().handleReceive(ctx, []byte{1, 2, 3, 4, 5})
+
+	if logs.findByMessage("header too short") == nil {
+		t.Error("short packet did not hit the length guard; it fell through to header decode")
+	}
+	if len(conn.tx.activeRequests) != 0 {
+		t.Errorf("short packet touched activeRequests: %d entries", len(conn.tx.activeRequests))
+	}
 }
 
 // ==========================================================================
