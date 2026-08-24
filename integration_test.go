@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"sort"
@@ -1265,6 +1266,71 @@ func TestIntegrationReconnect(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Log("no post-reconnect notification within 5s (may be expected if value doesn't change)")
 	}
+}
+
+// TestIntegrationRouteForceRegistration is R-ROUTE-005's designated test (T-I-040),
+// which never existed: WithForceRouteRegistration must register the route on Connect
+// AND again on every Reconnect, against a real AMS router.
+//
+// The unit test (TestReconnect_ForceRegistrationRegistersOnEveryReconnect) pins the
+// decision against a stub router; only hardware can show that a TwinCAT router
+// accepts a second registration of the same route on a live session and keeps
+// serving it. That is the risk this option carries: TwinCAT keys its TC3 route table
+// by ADDRESS, and duplicate entries for one NetID are what took two devices in this
+// lab mute (see route.go). So the assertions are both halves — the registration was
+// attempted, and the session still works afterwards.
+//
+// Deliberately no new route name: this reuses the same name every other integration
+// test registers (ADS_ROUTE_NAME, else derived from ADS_HOST_IP), because a second
+// name for the same NetID adds a SECOND runtime entry, which is the litter that
+// causes the failure this test is watching for.
+func TestIntegrationRouteForceRegistration(t *testing.T) {
+	if os.Getenv("ADS_ROUTE_USER") == "" || os.Getenv("ADS_ROUTE_PASS") == "" {
+		t.Skip("ADS_ROUTE_USER / ADS_ROUTE_PASS not set: forced registration has no credentials to register with")
+	}
+	if strings.EqualFold(os.Getenv("ADS_SKIP_ROUTE_REGISTER"), "true") {
+		t.Skip("ADS_SKIP_ROUTE_REGISTER=true: route registration is disabled for this run")
+	}
+
+	logs := &testLogHandler{}
+	conn := setupConnectionWithDefaults(t, connDefaults{
+		ip:        "192.168.3.224",
+		targetAMS: "5.154.236.19.1.1",
+		routeName: "go-ads-test",
+	}, WithForceRouteRegistration(), WithLogger(slog.New(logs)))
+
+	// Connect has always honoured the option; assert it so a failure further down
+	// is unambiguous about which half broke.
+	if n := logs.countByMessage("registering route (force mode)"); n != 1 {
+		t.Fatalf("connect registered the route %d times, want 1: force mode must register on Connect", n)
+	}
+
+	// Drop the socket and let the automatic reconnect run, exactly as
+	// TestIntegrationReconnect does — the point is what the production reconnect
+	// path does with the option, not what a hand-driven Reconnect does.
+	t.Log("simulating network drop (expect 'listen read error' log)...")
+	conn.tx.connMu.Lock()
+	conn.tx.connection.Close()
+	conn.tx.connMu.Unlock()
+	waitForReconnect(t, conn, 30*time.Second)
+
+	if n := logs.countByMessage("registering route (forced/fallback)"); n < 1 {
+		t.Errorf("the reconnect registered the route %d times, want at least 1: WithForceRouteRegistration promises registration on every Reconnect (R-ROUTE-005)", n)
+	}
+	// The exact line the once-per-session latch logs when it overrules force. Its
+	// presence is the defect this test was written for, so name it rather than
+	// relying only on the count above.
+	if rec := logs.findByMessage("route already registered by this session"); rec != nil {
+		t.Errorf("the latch overruled force mode on reconnect: %q", rec.Message)
+	}
+
+	// And the device must still be serving us on the re-registered route: a router
+	// left holding a duplicate entry answers nothing at all.
+	state, err := conn.client.Load().ReadState(context.Background())
+	if err != nil {
+		t.Fatalf("ReadState after a forced re-registration: %v (the route may have been left in a state the router does not serve)", err)
+	}
+	t.Logf("ADS state after the forced re-registration: %d", state.ADSState)
 }
 
 func TestIntegrationReconnectDuringBatchRead(t *testing.T) {

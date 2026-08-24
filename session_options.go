@@ -361,6 +361,14 @@ func WithoutAmsPeerFallback() SessionOption {
 // WithForceRouteRegistration disables route probing and always registers the route
 // with credentials on every Connect and Reconnect. Use this in environments where
 // routes are not persistent or must be refreshed on each connection.
+//
+// The cost, accepted deliberately: a session that sets this sends one route
+// registration per reconnect, so a flapping link means one UDP registration per
+// attempt. The AMS router is the component this library has already seen go mute
+// under duplicate route entries for one NetID (see route.go on the two TC3 devices
+// that recovered only after their tables were rebound), so freshness is traded for
+// route-table safety here. Sessions that do not set the option register at most
+// once per session, plus one healing registration per unserved-recovery episode.
 func WithForceRouteRegistration() SessionOption {
 	return func(s *Session) {
 		s.route.forceRouteRegistration = true

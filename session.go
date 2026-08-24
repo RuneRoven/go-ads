@@ -303,6 +303,13 @@ type Session struct {
 	// peerFallbackDisabled turns off the automatic attempt described in
 	// tryPeerFallback. See WithoutAmsPeerFallback.
 	peerFallbackDisabled bool
+	// peerConnsAdopted counts the inbound connections this session has handed to a
+	// Client. Non-zero means the device really does answer on a connection it opens
+	// to us, which is what forgetPeerRouteHostIfUnused needs to know: a Connect that
+	// succeeded with this at zero got its answers on our own connection and must not
+	// leave the device remembered. Atomic because the accept loop writes it while
+	// Connect reads it.
+	peerConnsAdopted atomic.Int64
 
 	// Heartbeat: an internal cyclic notification whose silence proves the caller's
 	// subscriptions have died. See notificationManager.heartbeatHandle.
@@ -771,20 +778,26 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	}
 	sess.tx.connMu.Unlock()
 
+	// One snapshot for the three log lines below, taken under the lock that guards
+	// the field (see sourceAddr): a rival Reconnect's localHandshake can be writing
+	// it, and these lines are exactly the diagnostics an operator uses to decide
+	// whether their NetID configuration is wrong.
+	sourceAddr := sess.sourceAddr()
+	sourceIP := sourceAddr.NetID
 	// Log container detection — auto-derived NetID works in containers because
 	// the PLC stores the UDP source IP (post-NAT) for routes, not the computerName tag.
 	if sess.callbackIP == "" && isRunningInContainer() {
 		sess.logger.Info("container detected — auto-derived NetID will be used for route registration",
-			"netidIP", fmt.Sprintf("%d.%d.%d.%d", sess.source.NetID[0], sess.source.NetID[1], sess.source.NetID[2], sess.source.NetID[3]))
+			"netidIP", fmt.Sprintf("%d.%d.%d.%d", sourceIP[0], sourceIP[1], sourceIP[2], sourceIP[3]))
 	}
 
 	// Log ADS-level addressing (what matters for AMS routing, may differ from TCP)
 	routeHostIP := sess.callbackIP
 	if routeHostIP == "" {
-		routeHostIP = fmt.Sprintf("%d.%d.%d.%d (from NetID, PLC will use UDP source IP)", sess.source.NetID[0], sess.source.NetID[1], sess.source.NetID[2], sess.source.NetID[3])
+		routeHostIP = fmt.Sprintf("%d.%d.%d.%d (from NetID, PLC will use UDP source IP)", sourceIP[0], sourceIP[1], sourceIP[2], sourceIP[3])
 	}
 	sess.logger.Info("ADS addressing",
-		"sourceNetID", sess.source.NetIDString(),
+		"sourceNetID", sourceAddr.NetIDString(),
 		"routeHostIP", routeHostIP,
 		"target", sess.target.String())
 
@@ -916,10 +929,10 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 				}
 			} else {
 				// The ordinary probe worked, so this device does not need the inbound
-				// listener any more (route table repaired, or it never did). Drop the
-				// remembered fact rather than letting one observation govern every
-				// later session in the process.
-				forgetPeerRouteHost(sess.peerRouteCacheKey())
+				// listener any more (route table repaired, or it never did). The
+				// remembered fact is dropped for every path at the end of Connect —
+				// see forgetPeerRouteHostIfUnused — rather than only for this one.
+				//
 				// The winning probe WAS a GetSymbolVersion, so seed the cache from it
 				// instead of issuing the identical request again below.
 				haveVersion, symbolVersion = true, probedVersion
@@ -964,7 +977,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 				}
 				sess.tearDownAndReset()
 				sess.transitionState(SessionStateDisconnected)
-				hint := "a stale or duplicate route entry for source NetID " + sess.source.NetIDString() +
+				hint := "a stale or duplicate route entry for source NetID " + sess.sourceAddr().NetIDString() +
 					", or another client using this IP, can hold a TwinCAT router in this state"
 				if ferr != nil {
 					hint += "; the peer-route fallback could not run: " + ferr.Error()
@@ -997,6 +1010,12 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		sess.logger.Warn("connected, but the PLC runtime is not in RUN: symbol and subscription calls will refuse until it returns",
 			"state", uint16(state), "detail", "in CONFIG the runtime port does not exist, so those calls cannot succeed")
 	}
+	// This Connect worked. If it never heard from the device on a connection the
+	// device opened, that device does not need the inbound listener, whatever an
+	// earlier session concluded. Deliberately here rather than in the branches: only
+	// a Connect that is about to report success has earned the right to overwrite
+	// what a previous one learned.
+	sess.forgetPeerRouteHostIfUnused()
 	sess.enterConnected()
 	sess.lifecycle.flapMu.Lock()
 	sess.lifecycle.lastConnectedAt = time.Now()
@@ -2362,9 +2381,17 @@ func (sess *Session) ensureRoute() error {
 	// registered recently. See routeManager.registered and mayRegister: re-registering the
 	// same route cannot fix anything, and on some firmware it leaves a duplicate
 	// runtime entry that breaks the device outright.
+	//
+	// Force is the one caller-declared exception, and it bypasses the latch here
+	// exactly as it already does on Connect (ensureRouteOnConnect). Gating it was
+	// what made WithForceRouteRegistration mean "register once, then stop" —
+	// contradicting its godoc, README.md and R-ROUTE-005, and failing the very case
+	// it is documented for: a device that forgets its route table on reboot was
+	// reconnected to without a re-registration. The route-table cost is stated in
+	// the option's godoc and is opt-in; sessions that do not set it are unaffected.
 	probeFailures := sess.route.routeProbeFailures.Load()
 	if sess.route.forceRouteRegistration || probeFailures >= 3 {
-		if !sess.route.mayRegister() {
+		if !sess.route.forceRouteRegistration && !sess.route.mayRegister() {
 			sess.logger.Debug("route already registered by this session; not registering again",
 				"probeFailures", probeFailures)
 			_, err := sess.awaitRouteActive(sess.currentLifecycleCtx)
@@ -2614,6 +2641,24 @@ func (sess *Session) dialAndStart() error {
 	return nil
 }
 
+// sourceAddr returns the source AMS address under the mutex that guards it.
+//
+// tx.connMu is the field's lock: Connect takes it around the auto-derive
+// (session.go, "Auto-derive source AMS NetID") and around the local-mode
+// handshake's assignment, and localHandshake does the same on the reconnect
+// goroutine. Every reader outside those critical sections must come through here —
+// the exported AddRoute is callable from any goroutine, and Client.encodeTo
+// (ams.go) and Client.sourceAddr take the same lock for the same reason.
+//
+// Returns the whole AMSAddress, not just the NetID: publishWiredClient needs the
+// port too, and one accessor for the field beats two that could disagree about
+// which lock protects it.
+func (sess *Session) sourceAddr() AMSAddress {
+	sess.tx.connMu.Lock()
+	defer sess.tx.connMu.Unlock()
+	return sess.source
+}
+
 // publishWiredClient allocates the Client for the connection currently on
 // sess.tx, wires its handlers, starts its workers and publishes it.
 //
@@ -2635,7 +2680,7 @@ func (sess *Session) publishWiredClient() *Client {
 		ip:             sess.ip,
 		port:           sess.port,
 		target:         sess.target,
-		source:         sess.source,
+		source:         sess.sourceAddr(),
 		requestTimeout: sess.requestTimeout,
 		logger:         sess.logger,
 		tx:             sess.tx,
@@ -2693,9 +2738,36 @@ func (sess *Session) peerRouteCacheKey() string {
 
 func rememberPeerRouteHost(key string) { peerRouteHosts.Store(key, struct{}{}) }
 
-// forgetPeerRouteHost drops a remembered device, so the fact self-invalidates as
-// soon as an ordinary probe succeeds against it.
+// forgetPeerRouteHost drops a remembered device. Call it through
+// Session.forgetPeerRouteHostIfUnused rather than directly, so the entry is only
+// dropped when the session proved the device does not need it.
 func forgetPeerRouteHost(key string) { peerRouteHosts.Delete(key) }
+
+// forgetPeerRouteHostIfUnused drops the remembered fact for this device when the
+// session reached Connected without a single inbound connection from it.
+//
+// This is the self-invalidation the comment on peerRouteHosts describes, and until
+// now it lived inside Connect's route-registration branch — so a caller that does
+// not use WithRoute (umh-core in a container, and every session in the default
+// configuration) never invalidated anything. One observation then governed every
+// later session in the process: each of them pre-bound the inbound AMS port —
+// wildcard :48898 with no WithAmsPeerListen — for its whole lifetime, long after
+// the device's route table had been repaired.
+//
+// The inbound-connection count is what makes this safe to call unconditionally. A
+// Connect can succeed BECAUSE the listener was pre-bound and the device answered
+// there, and dropping the entry then would throw away the ~15s of probing that
+// learned it; a device that dialled us has peerConnsAdopted > 0 and keeps its entry.
+//
+// No expiry and no reaper: with this in place an entry is dropped by the first
+// Connect that does not need it, which is a better clock than any timeout, and a
+// timeout would need a goroutine or a lazy sweep for no gain.
+func (sess *Session) forgetPeerRouteHostIfUnused() {
+	if sess.peerConnsAdopted.Load() != 0 {
+		return
+	}
+	forgetPeerRouteHost(sess.peerRouteCacheKey())
+}
 
 func isKnownPeerRouteHost(key string) bool {
 	_, ok := peerRouteHosts.Load(key)
@@ -2823,6 +2895,10 @@ func (sess *Session) peerAcceptLoop(ln net.Listener) {
 			_ = conn.Close()
 			continue
 		}
+		// Counted before the hand-off, and never decremented: the question this
+		// answers is "did this device ever dial us", and a Client that refuses the
+		// connection because it is being torn down does not make the answer no.
+		sess.peerConnsAdopted.Add(1)
 		c.AcceptPeerConn(conn)
 	}
 }
@@ -2909,14 +2985,28 @@ func (sess *Session) resubscribeNotificationsLocked() error {
 	sess.notifications.lock.Lock()
 	savedPending := sess.notifications.pending
 	savedChannel := sess.notifications.notificationChannel
-	// Clear via resetConfigs so the key-index mirror is wiped in lockstep —
-	// AddSymbolNotifications dup-checks against the mirror and would reject
-	// every resubscribe if the old keys remained.
-	sess.notifications.resetConfigs(nil)
-	sess.notifications.lock.Unlock()
+	// Nothing to resubscribe, so nothing may be destroyed on the way out. The clear
+	// used to happen before this guard, so a no-op that reports success wiped the
+	// caller's declared intent: with a non-empty pending and no bound channel — the
+	// state left by re-queued retry entries plus a full user teardown — every symbol
+	// the caller never cancelled was silently dropped from the resubscribe set, with
+	// "reconnect successful" logged over the top.
 	if len(savedPending) == 0 || savedChannel == nil {
+		sess.notifications.lock.Unlock()
+		if len(savedPending) > 0 {
+			// Not silent, and not a Warn: the caller cannot act on this, and the
+			// intent is being KEPT. It matters only when reading back why a
+			// resubscribe registered nothing.
+			sess.logger.Debug("re-subscribe skipped: no channel is bound; keeping the declared subscriptions on file",
+				"configs", len(savedPending))
+		}
 		return nil
 	}
+	// Clear via resetConfigs so the key-index mirror is wiped in lockstep — the
+	// resubscribe below re-files every entry it commits, and a stale mirror would
+	// leave the intent describing symbols this attempt has already replaced.
+	sess.notifications.resetConfigs(nil)
+	sess.notifications.lock.Unlock()
 	validPending := sess.filterValidPending(savedPending)
 	validConfigs := make([]NotificationConfig, len(validPending))
 	for i, p := range validPending {
@@ -3107,11 +3197,17 @@ func (sess *Session) loadSymbols(ctx context.Context) error {
 // It uses callbackIP (from WithHostIP) if set, otherwise derives the callback
 // address from the source AMS NetID (first 4 bytes = IP).
 func (sess *Session) AddRoute(ctx context.Context, routeName, username, password string) error {
+	// One snapshot, taken here on the caller's goroutine, used for both the derived
+	// host IP and the registration itself. AddRoute is exported and callable from any
+	// goroutine while localHandshake writes sess.source under connMu — and the
+	// goroutine below outlives this call when ctx is cancelled, so reading the field
+	// there was an unsynchronised read on a detached goroutine. A torn NetID
+	// registers a route for an identity that exists nowhere: the PLC answers nothing
+	// and a junk entry is left in its route table.
+	netID := sess.sourceAddr().NetID
 	hostIP := sess.callbackIP
 	if hostIP == "" {
-		hostIP = fmt.Sprintf("%d.%d.%d.%d",
-			sess.source.NetID[0], sess.source.NetID[1],
-			sess.source.NetID[2], sess.source.NetID[3])
+		hostIP = fmt.Sprintf("%d.%d.%d.%d", netID[0], netID[1], netID[2], netID[3])
 	}
 	// AddRemoteRouteWithLogger uses a fixed 5s UDP read deadline internally
 	// and has no context parameter. Wrap in goroutine + select so caller
@@ -3119,7 +3215,7 @@ func (sess *Session) AddRoute(ctx context.Context, routeName, username, password
 	// UDP socket keeps draining toward its own deadline in the background.
 	done := make(chan error, 1)
 	go func() {
-		done <- addRemoteRouteFrom(sess.logger, sess.localBindIP, sess.ip, sess.effectiveRouterPort(), sess.source.NetID, routeName, hostIP, username, password)
+		done <- addRemoteRouteFrom(sess.logger, sess.localBindIP, sess.ip, sess.effectiveRouterPort(), netID, routeName, hostIP, username, password)
 	}()
 	select {
 	case err := <-done:

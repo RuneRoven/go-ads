@@ -721,6 +721,58 @@ func TestReconnect_ReRegistersRouteToHealAMuteDevice(t *testing.T) {
 	}
 }
 
+// TestReconnect_ForceRegistrationRegistersOnEveryReconnect: WithForceRouteRegistration
+// promises registration on every Connect AND every Reconnect, so a session that
+// sets it must register again on each reconnect.
+//
+// The option was honoured unconditionally on Connect and then overruled by the
+// once-per-session latch on Reconnect, so "always re-register" meant "register
+// once, then stop" — which fails exactly the case its godoc names: a device with
+// non-persistent routes that forgets its route table on reboot is reconnected to
+// without a re-registration, and the session then waits out awaitRouteActive on a
+// route the PLC no longer has.
+//
+// Three reconnects, not one: asserting a single re-registration would also pass
+// against the latch, whose one healing registration per unserved-cooldown episode
+// is a different mechanism (see TestReconnect_ReRegistersRouteToHealAMuteDevice).
+// The probe here always succeeds, so no unserved episode can occur and every
+// registration observed is the option's own doing.
+func TestReconnect_ForceRegistrationRegistersOnEveryReconnect(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	router := startRouteResponder(t)
+
+	// Always answered, so the probe and awaitRouteActive both succeed: this
+	// isolates the force flag from the probe-failure fallback path.
+	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeNoErrors, []byte{12}
+	})
+
+	sess := newDialableTestSession(t, srv.host, srv.port, 6)
+	sess.routerPort = router.port
+	sess.route = &routeManager{
+		name:                   "go-ads-test",
+		username:               "Administrator",
+		password:               secret("1"),
+		forceRouteRegistration: true,
+		activationTimeout:      300 * time.Millisecond,
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	const reconnects = 3
+	for i := 1; i <= reconnects; i++ {
+		sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+		if err := sess.Reconnect(context.Background()); err != nil {
+			t.Fatalf("reconnect %d of %d: %v (registrations=%d)", i, reconnects, err, router.registrations())
+		}
+	}
+
+	if got := router.registrations(); got != reconnects {
+		t.Errorf("WithForceRouteRegistration: registrations = %d after %d reconnects, want %d (the godoc and R-ROUTE-005 both say every Connect and Reconnect)",
+			got, reconnects, reconnects)
+	}
+}
+
 // gateOnLog pins the goroutine that logs a chosen message until the test releases
 // it, which is how these tests reach a window that is otherwise nanoseconds wide.
 //
