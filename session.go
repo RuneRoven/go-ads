@@ -1721,6 +1721,21 @@ func (l *sessionLifecycle) reconnectAttemptsForTest() int64 {
 	return l.reconnectAttempts.Load()
 }
 
+// isDeviceAnswer reports whether err carries an answer from the far side — an
+// ADS return code from the device, or a rejection from its AMS router — as
+// opposed to silence (a timeout, a dead link, a cancelled context), which says
+// nothing about what is or is not there.
+//
+// A router rejection is an answer, and for a port that does not exist it is the
+// most direct evidence there is: a request to an absent port comes back with AMS
+// ErrorCode 0x06 (defs.go). AMSError deliberately does not unwrap to ReturnCode,
+// so both cases have to be asked about separately.
+func isDeviceAnswer(err error) bool {
+	var rc ReturnCode
+	var amsErr AMSError
+	return errors.As(err, &rc) || errors.As(err, &amsErr)
+}
+
 // isUnservedError reports whether err means "the PLC accepted our connection and
 // then said nothing", as opposed to a refused dial or a PLC-side verdict. A
 // timeout with no ADS return code is the signature: the request went out and
@@ -3196,8 +3211,7 @@ func (sess *Session) startRuntimeStateWatch() {
 					// link, or a router mid-activation produces — so counting those
 					// towards "this device has no system service" retired the feature
 					// on healthy hardware.
-					var code ReturnCode
-					if !errors.As(err, &code) {
+					if !isDeviceAnswer(err) {
 						sess.logger.Debug("runtime-state poll did not get an answer; not counting it against the device",
 							"error", err)
 						continue

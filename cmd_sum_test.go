@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -554,5 +555,68 @@ func TestParseSumReadResponse_ErroredItemOverflowsRemaining(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), "errored-item declared length exceeds remaining bytes") {
 		t.Errorf("expected errored-item-overflow log, got: %s", logBuf.String())
+	}
+}
+
+// TestAMSRouterErrorIsNotADeviceVerdict pins the provenance invariant at the one
+// line where it used to be lost: amsReply.payload() wraps the AMS header's
+// ErrorCode, and the result must not look like something the PLC said about an
+// item. Every abort guard in this package (cmd_sum.go's notification fallbacks
+// among them) decides "transport failure" vs "device verdict" with
+// errors.As(err, &ReturnCode), so a router code that satisfies errors.As is
+// silently promoted to a per-item PLC verdict.
+//
+// The code itself must stay readable through errors.Is — client_test.go's AMS
+// test and every consumer branching on a named router condition depend on that.
+func TestAMSRouterErrorIsNotADeviceVerdict(t *testing.T) {
+	_, err := amsReply{amsErr: ReturnCodeGlobalTargetPortNotFound}.payload()
+	if err == nil {
+		t.Fatal("payload() returned nil error for a non-zero AMS ErrorCode")
+	}
+	// Double wrap is the real shape: executeSumCommand and the notification
+	// fallbacks each add their own %w on the way out.
+	wrapped := fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", err))
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "bare", err: err},
+		{name: "double wrapped", err: wrapped},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var rc ReturnCode
+			if errors.As(tc.err, &rc) {
+				t.Errorf("errors.As extracted ReturnCode %v from a router rejection; "+
+					"every abort guard will read it as a PLC verdict about an item", rc)
+			}
+			if !errors.Is(tc.err, ReturnCodeGlobalTargetPortNotFound) {
+				t.Errorf("errors.Is(err, ReturnCodeGlobalTargetPortNotFound) = false, want true; got %v", tc.err)
+			}
+			if errors.Is(tc.err, ReturnCodeGlobalInsertMailboxError) {
+				t.Error("errors.Is matched an unrelated router code")
+			}
+			if !strings.Contains(tc.err.Error(), "target port") {
+				t.Errorf("error text lost the code name: %q", tc.err.Error())
+			}
+			// A router rejection IS an answer from the far side. startRuntimeStateWatch
+			// retires the system-service poll on a run of answers; if this reads false,
+			// a device with no system service port never retires and the watcher polls
+			// for the life of the session.
+			if !isDeviceAnswer(tc.err) {
+				t.Error("isDeviceAnswer = false for an AMS router rejection, want true")
+			}
+			// The reconnect loop's unserved cooldown must stay out of this: the
+			// router answered, so this is not "accepted the connection then said
+			// nothing".
+			if isUnservedError(tc.err) {
+				t.Error("isUnservedError = true for an AMS router rejection, want false")
+			}
+			// Only device codes may drive capability latching and stale-cache
+			// detection. A router code reaching either poisons session-wide state.
+			if isSumCommandUnsupportedError(tc.err) {
+				t.Error("isSumCommandUnsupportedError = true for a router rejection, want false")
+			}
+		})
 	}
 }

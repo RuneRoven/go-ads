@@ -95,6 +95,14 @@ type scriptableServer struct {
 	dropAfter map[CommandID]int
 	dropSeen  map[CommandID]int
 
+	// amsErrAfter/amsErrCode/amsErrSeen implement amsErrorAfter: answer the nth
+	// and every later occurrence of a command with an AMS-header ErrorCode
+	// instead of a normal reply. Models a TwinCAT system dropping into CONFIG —
+	// the router keeps answering, the runtime port stops existing.
+	amsErrAfter map[CommandID]int
+	amsErrCode  map[CommandID]uint32
+	amsErrSeen  map[CommandID]int
+
 	// closeAfterReply implements answerThenClose: answer the nth occurrence of a
 	// command normally, then close the connection. Models the PLC behaviour that
 	// matters most here — a reply followed immediately by a route-idle close, a
@@ -369,6 +377,20 @@ func (s *scriptableServer) handle(c net.Conn) {
 		}
 		s.mu.Unlock()
 
+		// Answer with an AMS-header ErrorCode from the nth occurrence of this
+		// command onward. Sticky, unlike dropAfter: a system in CONFIG does not
+		// come back on its own. The handler still runs, so a test can keep
+		// counting the requests that reached the stub.
+		s.mu.Lock()
+		var amsErr uint32
+		if amsErrAt, armed := s.amsErrAfter[cmd]; armed {
+			s.amsErrSeen[cmd]++
+			if s.amsErrSeen[cmd] >= amsErrAt {
+				amsErr = s.amsErrCode[cmd]
+			}
+		}
+		s.mu.Unlock()
+
 		respPayload := s.dispatch(cmd, group, payload)
 		out, werr := s.responseWriter(c)
 		if werr != nil {
@@ -379,7 +401,7 @@ func (s *scriptableServer) handle(c net.Conn) {
 			s.unanswered.Add(1)
 			continue
 		}
-		if err := writeResponse(out, body, cmd, invokeID, respPayload); err != nil {
+		if err := writeResponse(out, body, cmd, invokeID, respPayload, amsErr); err != nil {
 			return
 		}
 
@@ -451,6 +473,26 @@ func (s *scriptableServer) dropConnAfter(cmd CommandID, n int) {
 	}
 	s.dropAfter[cmd] = n
 	s.dropSeen[cmd] = 0
+	s.mu.Unlock()
+}
+
+// amsErrorAfter answers the nth occurrence of cmd (1-based) and every one after
+// it with code in the AMS header's ErrorCode field instead of a reply. Use to
+// land a router-level rejection — a TwinCAT system in CONFIG answers 0x06 for
+// every request to a runtime port — as opposed to dropConnAfter's dead socket.
+//
+// Deliberately sticky: unlike dropConnAfter this never disarms, because the
+// condition it models does not clear itself.
+func (s *scriptableServer) amsErrorAfter(cmd CommandID, n int, code ReturnCode) {
+	s.mu.Lock()
+	if s.amsErrAfter == nil {
+		s.amsErrAfter = map[CommandID]int{}
+		s.amsErrCode = map[CommandID]uint32{}
+		s.amsErrSeen = map[CommandID]int{}
+	}
+	s.amsErrAfter[cmd] = n
+	s.amsErrCode[cmd] = uint32(code)
+	s.amsErrSeen[cmd] = 0
 	s.mu.Unlock()
 }
 
@@ -643,7 +685,14 @@ func decodeAddNotifRequest(payload []byte) addNotifRequest {
 // writeResponse builds and writes a complete response frame.
 // reqBody is the original 32-byte AMS header (used to swap target/source).
 // respPayload is the post-header response data.
-func writeResponse(c net.Conn, reqBody []byte, cmd CommandID, invokeID uint32, respPayload []byte) error {
+//
+// amsErr, when non-zero, goes into the AMS header's ErrorCode field and the body
+// is dropped: an AMS rejection never carries a response, and client.go rejects
+// the frame outright unless Length matches the body actually written.
+func writeResponse(c net.Conn, reqBody []byte, cmd CommandID, invokeID uint32, respPayload []byte, amsErr uint32) error {
+	if amsErr != 0 {
+		respPayload = nil
+	}
 	respBody := make([]byte, 32+len(respPayload))
 	// Swap source/target so addressing looks right.
 	copy(respBody[0:8], reqBody[8:16]) // new Target = old Source
@@ -651,7 +700,7 @@ func writeResponse(c net.Conn, reqBody []byte, cmd CommandID, invokeID uint32, r
 	binary.LittleEndian.PutUint16(respBody[16:18], uint16(cmd))
 	binary.LittleEndian.PutUint16(respBody[18:20], 5) // State = response
 	binary.LittleEndian.PutUint32(respBody[20:24], uint32(len(respPayload)))
-	binary.LittleEndian.PutUint32(respBody[24:28], 0) // ErrorCode
+	binary.LittleEndian.PutUint32(respBody[24:28], amsErr) // ErrorCode
 	binary.LittleEndian.PutUint32(respBody[28:32], invokeID)
 	copy(respBody[32:], respPayload)
 

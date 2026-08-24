@@ -962,6 +962,98 @@ func TestSubscribeRace_ConnectionDropsMidBatchAtScale(t *testing.T) {
 	}
 }
 
+// TestSubscribeFallback_AMSRouterErrorAbortsBatch is the deliberate sibling of
+// the test above, one failure mode over: instead of the socket dying, the AMS
+// router keeps answering and refuses every request. That is what a TwinCAT
+// system dropping into CONFIG does — port 851 stops existing, the connection
+// stays up, and each reply carries AMS ErrorCode 0x06.
+//
+// The router's refusal must not be recorded as a per-item PLC verdict. Skipped
+// == nil means "Error carries the PLC-side return code" (cmd_sum.go's
+// SumNotificationResult contract), so mislabelling here tells the consumer the
+// runtime individually rejected 37 named symbols it never saw — destroying the
+// ErrNotificationTransportFailure retry signal that is the documented way to
+// know the batch is worth retrying.
+func TestSubscribeFallback_AMSRouterErrorAbortsBatch(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	sess, c := newWiredTestSession(t, srv, WithRequestTimeout(300*time.Millisecond))
+	c.SetNotificationHandler(sess.handleNotification)
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) {
+		t.Fatal("could not force SumAddNotif into the unsupported state")
+	}
+	c.SetOnDrop(nil)
+
+	const symbolCount = 40
+	configs := make([]NotificationConfig, symbolCount)
+	for i := range configs {
+		name := fmt.Sprintf("MAIN.router%02d", i)
+		preSeedTypedSymbol(sess, name, uint32(0xB000+i))
+		configs[i] = NotificationConfig{SymbolName: name, TransmissionMode: TransModeServerOnChange}
+	}
+
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0x500)
+	var adds atomic.Int32
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		adds.Add(1)
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	// Items 0-2 get handles; from item 3 on, the router refuses. Sticky, as
+	// CONFIG mode is.
+	srv.amsErrorAfter(CommandIDAddDeviceNotification, 4, ReturnCodeGlobalTargetPortNotFound)
+
+	ch := make(chan *Update, symbolCount)
+	results, err := sess.AddSymbolNotifications(context.Background(), configs, ch)
+	t.Logf("40-symbol batch with the router refusing from Add 4: err=%v (answered Adds=%d)", err, adds.Load())
+
+	if err == nil {
+		t.Error("AddSymbolNotifications returned nil error after the router refused 37 of 40 items")
+	}
+	if len(results) != symbolCount {
+		t.Fatalf("results len = %d, want %d", len(results), symbolCount)
+	}
+	successes, transportFailures, routerCodeAsVerdict, other := 0, 0, 0, 0
+	for _, r := range results {
+		switch {
+		case r.Skipped != nil && errors.Is(r.Skipped, ErrNotificationTransportFailure):
+			transportFailures++
+		case r.Skipped == nil && r.Error == ReturnCodeGlobalTargetPortNotFound:
+			routerCodeAsVerdict++
+		case r.Skipped == nil && r.Handle != 0 && r.Error == ReturnCodeNoErrors:
+			successes++
+		default:
+			other++
+		}
+	}
+	t.Logf("verdicts: %d success, %d transport-failure, %d router-code-as-device-verdict, %d other",
+		successes, transportFailures, routerCodeAsVerdict, other)
+
+	// The load-bearing assertion: a router code must never be presented as a
+	// per-item PLC verdict.
+	if routerCodeAsVerdict != 0 {
+		t.Errorf("%d items report the router's 0x06 as a PLC verdict (Skipped == nil), want 0", routerCodeAsVerdict)
+	}
+	if successes != 3 {
+		t.Errorf("successes = %d, want 3", successes)
+	}
+	if transportFailures != symbolCount-3 {
+		t.Errorf("transport failures = %d, want %d", transportFailures, symbolCount-3)
+	}
+	if other != 0 {
+		t.Errorf("%d items have a verdict that is none of the three expected shapes", other)
+	}
+	// The batch must stop issuing requests at the first refusal instead of
+	// sending all 40 against a router that has already said no.
+	if got := adds.Load(); got != 4 {
+		t.Errorf("stub answered %d Adds, want 4 — the batch carried on past the first router refusal", got)
+	}
+	if n := sess.notifications.subscribeInFlight.Load(); n != 0 {
+		t.Errorf("subscribeInFlight = %d, want 0", n)
+	}
+}
+
 // TestOrphanDeleteAbortReason covers the reaper's last-moment guards directly.
 // The previous pair of tests for this did not: one set subscribeInFlight and
 // asserted no Delete RPC, but with the counter set dispatch takes the buffer

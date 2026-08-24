@@ -1,7 +1,6 @@
 package ads
 
 import (
-	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -66,9 +65,39 @@ type amsReply struct {
 // 0x06 target port not found is what a TwinCAT system in CONFIG answers for every
 // request to a runtime port, and it is the difference between "the runtime is not
 // running" and "this device is broken".
+//
+// Returned as an AMSError rather than a bare ReturnCode: it is the one line where
+// the two provenances used to become indistinguishable, and every abort guard in
+// the package tells them apart by type. See AMSError.
 func (r amsReply) payload() ([]byte, error) {
 	if r.amsErr != 0 {
-		return nil, fmt.Errorf("AMS error from the router: %w", r.amsErr)
+		return nil, AMSError{Code: r.amsErr}
 	}
 	return r.data, nil
+}
+
+// AMSError is a rejection from the AMS router, carried in the AMS header's
+// ErrorCode field. It is not a verdict about any ADS item: the request never
+// reached a service that could answer it. A TwinCAT system in CONFIG answers
+// 0x06 (target port not found) for every request to a runtime port.
+//
+// Callers branch on the condition with errors.Is against the ReturnCode
+// constants, e.g. errors.Is(err, ReturnCodeGlobalTargetPortNotFound), or read
+// Code off the typed value.
+type AMSError struct {
+	Code ReturnCode
+}
+
+func (e AMSError) Error() string { return "AMS router: " + e.Code.String() }
+
+// Is makes errors.Is(err, ReturnCodeX) match the router's code without making a
+// router rejection indistinguishable from an ADS device verdict.
+//
+// There is deliberately no Unwrap: errors.As traverses it, and every abort guard
+// in this package asks errors.As(err, &ReturnCode) to mean "the device answered
+// about my item". Unwrapping to Code would put the router back inside that
+// answer — which is the bug this type exists to close, so do not add one.
+func (e AMSError) Is(target error) bool {
+	rc, ok := target.(ReturnCode)
+	return ok && rc == e.Code
 }
