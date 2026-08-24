@@ -909,24 +909,55 @@ func TestClient_ClosedReturnsErrTransportClosed(t *testing.T) {
 	}
 }
 
+// clientWorkerFrames are the entry points of the goroutines startWorkers spawns.
+// Counting these frames in a full goroutine dump identifies this package's workers
+// specifically, unlike runtime.NumGoroutine, which counts every goroutine in the
+// test binary — including whatever an unrelated test happens to be running.
+var clientWorkerFrames = []string{
+	"(*Client).listen(",
+	"(*Client).transmitWorker(",
+	"(*Client).recvWorker(",
+}
+
+// countClientWorkers returns how many Client worker goroutines exist right now,
+// across the whole process.
+func countClientWorkers(t *testing.T) int {
+	t.Helper()
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	dump := string(buf)
+	total := 0
+	for _, frame := range clientWorkerFrames {
+		total += strings.Count(dump, frame)
+	}
+	return total
+}
+
 // TestClient_GoroutineCountBoundedAfterClose asserts that Dial spawns exactly
 // 1 listen + 1 transmit + recvWorkerCount recv workers, and that Close
-// terminates them all. We measure NumGoroutine before Dial, after Dial, and
-// after Close.
+// terminates them all.
+//
+// It used to assert an absolute runtime.NumGoroutine() delta in a shared test
+// process, which made it flaky by construction: any unrelated test's goroutines
+// inflate the baseline between the two samples and shrink the observed delta. It
+// failed once under load at delta 16 against a want of 18 while passing in
+// isolation. Both halves are now pinned on the Client's own machinery instead —
+// its worker stack frames, and its waitGroup via Close — so the assertion is
+// independent of the rest of the binary and stays valid under t.Parallel().
 //
 // Validates: R-CL-004 (goroutines bounded), R-CL-001 (Close cleans up).
 func TestClient_GoroutineCountBoundedAfterClose(t *testing.T) {
 	host, port, stop := startStubTCPServer(t)
 	defer stop()
 
-	// Allow background runtime goroutines (GC, etc.) to settle slightly.
-	runtimeGosched := func() {
-		for i := 0; i < 5; i++ {
-			runtime.Gosched()
-		}
-	}
-	runtimeGosched()
-	baseline := runtime.NumGoroutine()
+	baseline := countClientWorkers(t)
 
 	c, err := Dial(host, port, AMSAddress{}, AMSAddress{}, time.Second)
 	if err != nil {
@@ -934,39 +965,53 @@ func TestClient_GoroutineCountBoundedAfterClose(t *testing.T) {
 	}
 
 	// listen + transmit + recvWorkerCount.
-	wantDelta := 2 + recvWorkerCount
-	// Give workers a moment to actually start.
-	deadline := time.Now().Add(time.Second)
-	var dialed int
+	wantWorkers := 2 + recvWorkerCount
+	deadline := time.Now().Add(2 * time.Second)
+	started := 0
 	for time.Now().Before(deadline) {
-		dialed = runtime.NumGoroutine()
-		if dialed-baseline >= wantDelta {
+		started = countClientWorkers(t) - baseline
+		if started >= wantWorkers {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if dialed-baseline < wantDelta {
-		t.Errorf("after Dial: NumGoroutine delta = %d, want at least %d", dialed-baseline, wantDelta)
+	if started < wantWorkers {
+		t.Fatalf("after Dial: %d Client worker goroutines started, want %d (baseline %d)",
+			started, wantWorkers, baseline)
 	}
 
-	if err := c.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	// Close cancels the worker context and then waits on the Client's own
+	// waitGroup, which every worker is registered in before it is spawned. So a
+	// worker that ignores its exit signal blocks Close forever: bound the wait so
+	// that failure lands here with a diagnosis instead of as a package timeout.
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return within 10s: its waitGroup never drained, so at least one " +
+			"worker ignored ctx.Done / the closed connection")
 	}
-	// Allow the connection's accept-side goroutine on the stub to exit too;
-	// runtime may report a transient extra. Loop with a short bound.
+
+	// Close's Wait returning proves every registered worker called Done. Poll the
+	// frame count back to the baseline as well, which additionally catches a worker
+	// goroutine that leaked without being registered in the waitGroup, plus the
+	// brief window where a goroutine has run its deferred Done but not yet unwound.
 	deadline = time.Now().Add(2 * time.Second)
-	var post int
+	remaining := 0
 	for time.Now().Before(deadline) {
-		runtimeGosched()
-		post = runtime.NumGoroutine()
-		if post <= baseline+1 { // tolerate one runtime-noise goroutine
+		remaining = countClientWorkers(t) - baseline
+		if remaining <= 0 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if post > baseline+2 {
-		t.Errorf("after Close: NumGoroutine = %d, baseline = %d (delta %d > 2 — workers may have leaked)",
-			post, baseline, post-baseline)
+	if remaining > 0 {
+		t.Errorf("after Close: %d Client worker goroutines still running (baseline %d) — workers leaked",
+			remaining, baseline)
 	}
 }
 
@@ -1188,6 +1233,198 @@ func TestSetSource_TakesEffectOnTheWire(t *testing.T) {
 	if !bytes.Equal(gotAfter, assigned.NetID[:]) {
 		t.Errorf("source on the wire = % x after setSource(%v): requests still carry the pre-handshake address, so the PLC "+
 			"answers a NetID this session is not using", gotAfter, assigned)
+	}
+}
+
+// TestReadFrames_SourceRaceWithLocalHandshake: the transport-fault log line reads
+// c.source from the listen goroutine while the local-mode handshake writes it.
+//
+// setSource holds tx.connMu; the "PLC closed connection" log line read the field
+// bare. Both setSource callers publish the Client — and so start listen — before
+// the handshake runs, because the handshake is itself an ADS request. So the two
+// accesses genuinely overlap, and this test is the configuration no existing test
+// had: live workers plus setSource on the same Client. The race detector is the
+// oracle; the log assertion only proves the branch under test executed.
+func TestReadFrames_SourceRaceWithLocalHandshake(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		_ = ln.Close()
+		t.Fatalf("unexpected addr type: %T", ln.Addr())
+	}
+	// The server holds the accepted connection until dropConn, then closes it:
+	// readFrames sees io.EOF, which isLikelyMissingRoute accepts, so the log
+	// line that reads c.source runs.
+	dropConn := make(chan struct{})
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		<-dropConn
+		_ = conn.Close()
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-served
+	})
+
+	handler := &testLogHandler{}
+	placeholder := AMSAddress{NetID: [6]byte{127, 0, 0, 1, 1, 1}, Port: 33333}
+	c, err := Dial(addr.IP.String(), addr.Port, AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851},
+		placeholder, time.Second, WithClientLogger(slog.New(handler)))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	// Differ in every byte from the placeholder so a torn read is also visible
+	// as a value, not only to the detector.
+	assigned := AMSAddress{NetID: [6]byte{192, 168, 3, 52, 2, 2}, Port: 32905}
+	stop := make(chan struct{})
+	var writer sync.WaitGroup
+	writer.Add(1)
+	go func() {
+		defer writer.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if i%2 == 0 {
+				c.setSource(assigned)
+			} else {
+				c.setSource(placeholder)
+			}
+		}
+	}()
+
+	close(dropConn)
+	deadline := time.Now().Add(2 * time.Second)
+	logged := false
+	for time.Now().Before(deadline) {
+		if handler.findByMessage("PLC closed connection, transport down") != nil {
+			logged = true
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	close(stop)
+	writer.Wait()
+	if !logged {
+		t.Fatal("readFrames never logged the transport-fault line, so the racing read never ran — " +
+			"the stub's close did not surface as an isLikelyMissingRoute error")
+	}
+}
+
+// TestGetSymbol_TraceLogDoesNotRaceNotificationWriter: the trace line at the end of
+// getSymbol must not hand the live *symbol to the logger.
+//
+// slog formats a *symbol by reflection and reads Value / Valid / ValueParsed /
+// LastUpdateTime. Those are written by updateValue under cache.lock, from the
+// Client's recvWorker via handleNotification → dispatchSample. getSymbol logged the
+// pointer after releasing cache.lock, so a subscribed session with trace logging on
+// read a string header and a multi-word time.Time unsynchronised.
+//
+// The configuration no other test had is the enabled LevelTrace handler: slog skips
+// its args at a disabled level, which is the only reason the suite was green. So this
+// test enables LevelTrace while notifications flow. -race is the oracle.
+//
+// Lives in client_test.go rather than beside getSymbol only because of file ownership
+// during the concurrent fix waves.
+func TestGetSymbol_TraceLogDoesNotRaceNotificationWriter(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	srv.onWriteRead(GroupSymbolInfoByNameEx, func(req []byte) []byte {
+		name := strings.TrimRight(string(req), "\x00")
+		return buildSymbolInfoPayload(name, "INT", "", 0x4040, 0x100, 2, ADSTInt16, 0)
+	})
+	var nextHandle atomic.Uint32
+	srv.onWriteRead(GroupSymbolHandleByName, func(_ []byte) []byte {
+		return buildHandlePayload(nextHandle.Add(1))
+	})
+
+	sess, client := newWiredTestSession(t, srv)
+	// An ENABLED trace handler that actually formats its attrs. io.Discard keeps
+	// the output cost off the test, but the reflection over the attr still happens.
+	sess.logger = slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: LevelTrace}))
+	client.SetNotificationHandler(sess.handleNotification)
+	ctx := context.Background()
+
+	const symbolName = "MAIN.traced"
+	const notifHandle uint32 = 0x0BAD0002
+	sym, err := sess.getSymbol(ctx, symbolName)
+	if err != nil {
+		t.Fatalf("resolving %s: %v", symbolName, err)
+	}
+	updates := make(chan *Update, 1)
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[notifHandle] = activeNotification{Sym: sym, Ch: updates}
+	sess.notifications.lock.Unlock()
+
+	sample := make([]byte, 2)
+	binary.LittleEndian.PutUint16(sample, 7)
+	packet := buildNotificationPacket(notifHandle, 0, sample)
+
+	const (
+		readers     = 4
+		dispatchers = 4
+		iterations  = 200
+	)
+	var wg sync.WaitGroup
+	var readErr atomic.Value
+
+	// Readers — production getSymbol on a cached symbol reaches the trace line.
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				got, err := sess.getSymbol(ctx, symbolName)
+				switch {
+				case err != nil:
+					readErr.Store(err)
+					return
+				case got != sym:
+					readErr.Store(fmt.Errorf("getSymbol returned %p, want the cached %p", got, sym))
+					return
+				}
+			}
+		}()
+	}
+	// Writers — production dispatch mutates Value / Valid / LastUpdateTime under cache.lock.
+	for i := 0; i < dispatchers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				if err := sess.drivePacket(ctx, packet); err != nil {
+					readErr.Store(fmt.Errorf("drivePacket: %w", err))
+					return
+				}
+			}
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("getSymbol / dispatch workers did not finish in 30s — a lock-order inversion, not a race")
+	}
+	if err, ok := readErr.Load().(error); ok && err != nil {
+		t.Fatalf("worker failed: %v", err)
+	}
+	if !sym.ValueParsed {
+		t.Error("no notification sample was ever parsed, so the writer half never ran")
 	}
 }
 

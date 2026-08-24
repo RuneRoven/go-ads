@@ -285,6 +285,33 @@ func (sess *Session) GetSymbol(ctx context.Context, symbolName string) (SymbolVi
 	return sym.view(sess), nil
 }
 
+// logSymbolGot traces a resolved symbol without handing the live *symbol to the
+// logger. slog formats a *symbol by reflection, reading Value / Valid /
+// ValueParsed / LastUpdateTime — the exact fields updateValue writes under
+// cache.lock from the Client's recvWorker (handleNotification → dispatchSample).
+// Logging the pointer therefore read a string header and a multi-word time.Time
+// with no lock, and a panic inside the handler on a spliced header would land in
+// the listen path. -race stayed green only because slog skips its args at a
+// disabled level, so the defect was armed for the first trace-logged subscribed
+// session in the field, never for CI.
+//
+// The snapshot is taken under cache.lock and the lock is released before the log
+// call: the handler can be user-supplied, and holding a cache lock across
+// arbitrary handler code is how the deadlocks in this package were built.
+func (sess *Session) logSymbolGot(sym *symbol) {
+	ctx := context.Background()
+	if !sess.logger.Enabled(ctx, LevelTrace) {
+		return
+	}
+	sess.cache.lock.Lock()
+	name, handle, dataType := sym.FullName, sym.Handle, sym.DataType
+	value, valid, parsed, updated := sym.Value, sym.Valid, sym.ValueParsed, sym.LastUpdateTime
+	sess.cache.lock.Unlock()
+	sess.logger.Log(ctx, LevelTrace, "symbol got",
+		"symbol", name, "handle", handle, "dataType", dataType,
+		"value", value, "valid", valid, "valueParsed", parsed, "lastUpdate", updated)
+}
+
 // getSymbol returns the internal *symbol for the named symbol. Used by
 // in-package code paths that need direct access to mutable symbol state
 // (notifications, reads, writes). External callers should use GetSymbol.
@@ -336,7 +363,7 @@ func (sess *Session) getSymbol(ctx context.Context, symbolName string) (*symbol,
 				sess.cache.lock.Unlock()
 			}
 		}
-		sess.logger.Log(context.Background(), LevelTrace, "symbol got", "symbol", localSymbol)
+		sess.logSymbolGot(localSymbol)
 		return localSymbol, nil
 	}
 

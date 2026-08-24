@@ -173,6 +173,17 @@ func (c *Client) setSource(addr AMSAddress) {
 	c.tx.connMu.Unlock()
 }
 
+// sourceAddr returns the source AMS address under the mutex that guards it.
+// readFrames logs it from the listen goroutine while a local-mode handshake may
+// be writing it via setSource — both callers of setSource publish the Client,
+// and so start the workers, before the handshake that assigns the address.
+// encodeTo (ams.go) already takes connMu for the same reason.
+func (c *Client) sourceAddr() AMSAddress {
+	c.tx.connMu.Lock()
+	defer c.tx.connMu.Unlock()
+	return c.source
+}
+
 // markDropped releases every request waiting on this client's connection.
 // Idempotent: a drop can be observed by listen and the transmit worker both.
 func (c *Client) markDropped() {
@@ -535,9 +546,12 @@ func (c *Client) readFrames(conn net.Conn, primary bool) {
 				return
 			}
 			if hint != "" {
+				// Snapshot once into a local: a local-mode handshake can be
+				// assigning c.source right now from the Connect goroutine.
+				source := c.sourceAddr()
 				c.logger.Log(c.ctx, c.transportFaultLevel(), "PLC closed connection, transport down",
 					"error", err, "hint", hint,
-					"sourceNetID", c.source.NetIDString(),
+					"sourceNetID", source.NetIDString(),
 					"targetNetID", c.target.NetIDString(),
 					"targetPort", c.target.Port)
 			} else {
