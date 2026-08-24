@@ -1,9 +1,12 @@
 package ads
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"log/slog"
 	"os"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -199,34 +202,122 @@ func TestHandshakeGating_PerSite(t *testing.T) {
 	}
 }
 
-// TestNoUngatedTransportDownLogs is a source guard. The behavioural test above
-// can only reach the paths it can provoke; this one pins the invariant across
-// every site, including ones added later: a "transport down" fault must never be
-// logged at a hardcoded Error level, because whether it is an error depends on
-// whether a handshake is in flight.
+// TestNoUngatedTransportDownLogs is a source guard. The behavioural test above can
+// only reach the paths it can provoke; this one pins the invariant across every
+// site, including ones added later: a "transport down" fault must never be logged
+// at a hardcoded Error level, because whether it IS an error depends on whether a
+// handshake is in flight.
 //
-// Deliberately narrow — it matches only the transport-down wording, so protocol
-// and programming faults (header parse, sanity limit, binary.Write) are free to
-// stay at Error, which is what they should be.
+// Parsed, not grepped. The regex this replaces required the call and the message to
+// sit on one source line and matched only logger.Error, so two mutations walked
+// straight through it: wrapping the call across lines, and switching
+// logger.Log(ctx, c.transportFaultLevel(), ...) to logger.Log(ctx, slog.LevelError,
+// ...). Its file list was hardcoded too, so a new file was invisible. This walks
+// every .go file in the package and inspects the actual call expressions.
+//
+// Deliberately narrow: it only looks at calls whose message mentions a transport
+// going down, so protocol and programming faults (header parse, sanity limit,
+// binary.Write) stay at Error, which is where they belong.
 func TestNoUngatedTransportDownLogs(t *testing.T) {
-	// Anything matching logger.Error(... "transport down" ...) on one line.
-	ungated := regexp.MustCompile(`logger\.Error\([^)]*transport down`)
-	for _, file := range []string{"client.go", "cmd_simple.go", "cmd_notification.go", "cmd_sum.go"} {
-		src, err := os.ReadFile(file)
-		if err != nil {
-			t.Fatalf("read %s: %v", file, err)
-		}
-		for i, line := range strings.Split(string(src), "\n") {
-			if ungated.MatchString(line) {
-				// Two known exceptions, both unreachable from a handshake: a
-				// malformed header and an oversized packet mean corruption, not
-				// a link that went away.
-				if strings.Contains(line, "header decode error") || strings.Contains(line, "sanity limit") {
-					continue
-				}
-				t.Errorf("%s:%d logs a transport fault at a hardcoded Error level; use transportFaultLevel():\n\t%s",
-					file, i+1, strings.TrimSpace(line))
-			}
-		}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
 	}
+	fset := token.NewFileSet()
+	checked := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, perr := parser.ParseFile(fset, name, nil, 0)
+		if perr != nil {
+			t.Fatalf("parse %s: %v", name, perr)
+		}
+		checked++
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			method := sel.Sel.Name
+			if method != "Error" && method != "Log" {
+				return true
+			}
+			if !mentionsTransportDown(call.Args) {
+				return true
+			}
+			pos := fset.Position(call.Pos())
+			switch method {
+			case "Error":
+				t.Errorf("%s:%d logs a transport fault at a hardcoded Error level; use transportFaultLevel():\n\t%s",
+					pos.Filename, pos.Line, exprText(call.Fun))
+			case "Log":
+				// logger.Log(ctx, level, msg, ...): the level must be the gate.
+				if len(call.Args) < 2 || !isTransportFaultLevelCall(call.Args[1]) {
+					level := "<missing>"
+					if len(call.Args) >= 2 {
+						level = exprText(call.Args[1])
+					}
+					t.Errorf("%s:%d logs a transport fault at level %s; use transportFaultLevel()",
+						pos.Filename, pos.Line, level)
+				}
+			}
+			return true
+		})
+	}
+	if checked == 0 {
+		t.Fatal("no source files were parsed; the guard would pass vacuously")
+	}
+	t.Logf("checked %d source files", checked)
+}
+
+// mentionsTransportDown reports whether any argument is a string literal about a
+// transport going down. Excludes the two faults that mean corruption rather than a
+// link that went away, which are legitimately Error.
+func mentionsTransportDown(args []ast.Expr) bool {
+	for _, arg := range args {
+		lit, ok := arg.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			continue
+		}
+		text := strings.ToLower(lit.Value)
+		if !strings.Contains(text, "transport down") {
+			continue
+		}
+		if strings.Contains(text, "header decode error") || strings.Contains(text, "sanity limit") {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+// isTransportFaultLevelCall reports whether an expression is a call to
+// transportFaultLevel() — the gate that decides whether a transport fault is an
+// error or an expected consequence of a handshake in flight.
+func isTransportFaultLevelCall(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		return fn.Name == "transportFaultLevel"
+	case *ast.SelectorExpr:
+		return fn.Sel.Name == "transportFaultLevel"
+	}
+	return false
+}
+
+func exprText(expr ast.Expr) string {
+	var sb strings.Builder
+	if err := printer.Fprint(&sb, token.NewFileSet(), expr); err != nil {
+		return "<unprintable>"
+	}
+	return sb.String()
 }

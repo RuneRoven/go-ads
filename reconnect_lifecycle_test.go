@@ -395,8 +395,13 @@ func TestReconnect_HandleReleaseRetryIsBounded(t *testing.T) {
 	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
 	_ = sess.Reconnect(context.Background())
 
-	if got := int(releaseAttempts.Load()); got > preReconnectReleaseAttempts {
-		t.Errorf("release attempted %d times, want at most %d — an unreleasable handle must not be retried on every reconnect attempt forever",
+	// Two-sided on purpose. "at most N" alone passed with the release removed from
+	// the reconnect loop entirely (0 <= 3), which is the opposite defect and was
+	// only caught by a sibling test. The session is given more reconnect attempts
+	// than the release cap, so the count is exactly the cap.
+	if got := int(releaseAttempts.Load()); got != preReconnectReleaseAttempts {
+		t.Errorf("release attempted %d times, want exactly %d — fewer means the retry was dropped, more means an unreleasable "+
+			"handle is retried on every reconnect attempt forever",
 			got, preReconnectReleaseAttempts)
 	}
 }
@@ -559,6 +564,13 @@ func TestConnect_VerifiesTheLinkAnswersEvenWithoutRouteRegistration(t *testing.T
 		WithAutoReconnect(false),
 		// No WithRoute: the route is assumed to exist already, so registration —
 		// and with it the old liveness check — is skipped.
+		//
+		// WithoutAmsPeerFallback matters here: without it this test silently bound
+		// 0.0.0.0:48898, the host's real AMS port. On a machine running TwinCAT the
+		// bind fails and the test still passes (it only asserts err != nil), so the
+		// collision is invisible. It also made the fallback part of what this test
+		// exercised, which belongs in the peer-route tests.
+		WithoutAmsPeerFallback(),
 	)
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
@@ -567,10 +579,25 @@ func TestConnect_VerifiesTheLinkAnswersEvenWithoutRouteRegistration(t *testing.T
 
 	err = sess.Connect(context.Background())
 	if err == nil {
-		t.Error("Connect reported success against a PLC that answered nothing; the session is deaf but looks healthy")
+		t.Fatal("Connect reported success against a PLC that answered nothing; the session is deaf but looks healthy")
 	}
-	if err == nil && !sess.IsClosed() {
-		t.Error("...and IsClosed() is false, so a consumer has no way to notice")
+	// The error has to name what was tried, or the operator cannot tell a deaf PLC
+	// from a misconfigured one. Asserting only err != nil let the whole liveness
+	// check — the second-opinion ReadState and the peer fallback — be deleted with
+	// this test still green.
+	for _, want := range []string{"GetSymbolVersion", "ReadState"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s; it should say which services were tried", err, want)
+		}
+	}
+	if state := sess.lifecycle.state.load(); state == SessionStateConnected {
+		t.Error("session left Connected after a failed connect")
+	}
+	sess.peerMu.Lock()
+	ln := sess.peerLn
+	sess.peerMu.Unlock()
+	if ln != nil {
+		t.Error("a listener was bound although the fallback is disabled")
 	}
 }
 

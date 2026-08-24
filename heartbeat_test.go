@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -141,11 +142,32 @@ func TestHeartbeat_NotDeliveredToTheCaller(t *testing.T) {
 	if got := sess.notifications.heartbeatLastNs.Load(); got <= before {
 		t.Errorf("beat not recorded: lastNs %d -> %d; the watchdog would conclude the beats had stopped", before, got)
 	}
-	deletedMu.Lock()
-	killedOwnHeartbeat := slices.Contains(deleted, hb)
-	deletedMu.Unlock()
-	if killedOwnHeartbeat {
-		t.Error("the orphan reaper deleted our own heartbeat handle")
+	// The reaper must delete a handle that is genuinely nobody's, and must not
+	// delete the heartbeat. The first half is what makes the second half mean
+	// something: asserting only "the heartbeat was not deleted" passed even with the
+	// reaper call removed entirely, because dispatchSample consumes the heartbeat
+	// before the reaper is ever reached — unreachable by construction, not by timing.
+	const strayHandle = uint32(0xBADBEEF)
+	sess.notifications.lastSubscribeNs.Store(0) // no subscribe race to hide behind
+	if err := sess.drivePacket(sess.currentLifecycleCtx(), buildNotificationPacket(strayHandle, 0, []byte{2})); err != nil {
+		t.Fatalf("drivePacket: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		deletedMu.Lock()
+		sawStray := slices.Contains(deleted, strayHandle)
+		killedOwnHeartbeat := slices.Contains(deleted, hb)
+		deletedMu.Unlock()
+		if killedOwnHeartbeat {
+			t.Fatal("the orphan reaper deleted our own heartbeat handle")
+		}
+		if sawStray {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the reaper never deleted a handle belonging to nobody (%d), so this test cannot tell whether it runs at all", strayHandle)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -958,5 +980,158 @@ func TestHeartbeat_ConcurrentSubscribesEstablishOneBeat(t *testing.T) {
 	}
 	if cyclicAdds.Load() > 1 && deletes.Load() < cyclicAdds.Load()-1 {
 		t.Errorf("%d cyclic registrations, only %d released", cyclicAdds.Load(), deletes.Load())
+	}
+}
+
+// TestHeartbeat_RetriesAfterAFailedEstablish: a first attempt that the PLC refuses
+// must not leave the session without a watchdog for its entire life.
+//
+// startHeartbeatWatch ran only after a SUCCESSFUL establish. So if the very first
+// cyclic subscribe was refused, no watcher existed, nothing ever retried, and a
+// later silent subscription death went unnoticed with one Warn as the only trace.
+// None of the three firmwares on the bench does that — TC2 2.10, TC3.1.4024 and
+// TC3.1.4026 all accept a cyclic subscribe on 0xF008 — so this is a hazard on
+// unobserved firmware, guarded because the failure is silent and the fix is small.
+func TestHeartbeat_RetriesAfterAFailedEstablish(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var refuse atomic.Bool
+	refuse.Store(true)
+	var cyclicAttempts atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xFF00)
+	srv.onAddDeviceNotification(func(req addNotifRequest) addNotifResponse {
+		if Group(req.Group) == GroupSymbolVersion && req.TransMode == uint32(TransModeServerCycle) {
+			cyclicAttempts.Add(1)
+			if refuse.Load() {
+				return addNotifResponse{Error: ReturnCodeDeviceServiceNotSupported}
+			}
+		}
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	sess, c := newWiredTestSession(t, srv, WithNotificationHeartbeat(100*time.Millisecond, 2))
+	c.SetNotificationHandler(sess.handleNotification)
+	preSeedTypedSymbol(sess, "MAIN.nobeat", 0xFF10)
+	ch := make(chan *Update, 4)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.nobeat", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Fatalf("AddSymbolNotification: %v", err)
+	}
+	if sess.notifications.heartbeatHandle.Load() != 0 {
+		t.Fatal("the stub was supposed to refuse the cyclic subscribe")
+	}
+	if cyclicAttempts.Load() == 0 {
+		t.Fatal("no cyclic subscribe was attempted; the test proves nothing")
+	}
+
+	// The PLC starts accepting it. Nobody subscribes again, so only a watcher can
+	// pick this up.
+	refuse.Store(false)
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		if hb := sess.notifications.heartbeatHandle.Load(); hb != 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the heartbeat was never re-attempted after the first refusal (%d cyclic attempts): the session has no "+
+				"watchdog and will not notice its subscriptions dying", cyclicAttempts.Load())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestHeartbeat_RecoveryKeepsALargeConfigSet: recovery must not shed subscriptions
+// when there are many of them.
+//
+// Every failed recovery re-queues every config and increments its per-config
+// resubscribe counter, and a config is dropped once that counter hits
+// resubscribeMaxAttempts. With one subscription that behaviour is invisible; the
+// defect that motivated this only appeared at 40 symbols on hardware, where a
+// power cycle produced "bound notifications = 24, want 40". So exercise it at a
+// size where partial loss is visible.
+func TestHeartbeat_RecoveryKeepsALargeConfigSet(t *testing.T) {
+	const symbols = 40
+
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var serving atomic.Bool
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0x2000)
+	srv.onWriteRead(GroupSumupAddDeviceNotification, func(req []byte) []byte {
+		items := make([]sumNotifResponse, len(req)/40)
+		for i := range items {
+			if !serving.Load() {
+				items[i] = sumNotifResponse{Error: ReturnCodeDeviceServiceNotSupported}
+				continue
+			}
+			items[i] = sumNotifResponse{Error: ReturnCodeNoErrors, Handle: nextHandle.Add(1)}
+		}
+		return buildSumAddNotifPayload(items)
+	})
+	srv.onWriteRead(GroupSumupDeleteDeviceNotification, func(req []byte) []byte {
+		codes := make([]ReturnCode, len(req)/4)
+		for i := range codes {
+			codes[i] = ReturnCodeNoErrors
+		}
+		return buildSumDeleteNotifPayload(codes)
+	})
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		if !serving.Load() {
+			return addNotifResponse{Error: ReturnCodeDeviceServiceNotSupported}
+		}
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	serving.Store(true)
+	sess, c := newWiredTestSession(t, srv, WithNotificationHeartbeat(80*time.Millisecond, 2))
+	c.SetNotificationHandler(sess.handleNotification)
+
+	configs := make([]NotificationConfig, 0, symbols)
+	for i := 0; i < symbols; i++ {
+		name := fmt.Sprintf("MAIN.bulk%02d", i)
+		preSeedTypedSymbol(sess, name, uint32(0x3000+i))
+		configs = append(configs, NotificationConfig{SymbolName: name, TransmissionMode: TransModeServerOnChange})
+	}
+	ch := make(chan *Update, 256)
+	results, err := sess.AddSymbolNotifications(context.Background(), configs, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotifications: %v", err)
+	}
+	bound := 0
+	for _, r := range results {
+		if r.Skipped == nil && r.Handle != 0 {
+			bound++
+		}
+	}
+	if bound != symbols {
+		t.Fatalf("bound %d/%d symbols up front", bound, symbols)
+	}
+
+	// The PLC stops serving: beats stop AND every re-subscribe is refused, for long
+	// enough that the per-config retry budget would be spent several times over.
+	serving.Store(false)
+	time.Sleep(2 * time.Second)
+
+	// Back to serving. Nothing may have been dropped in the meantime.
+	serving.Store(true)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		sess.notifications.lock.Lock()
+		active := len(sess.notifications.activeNotifications)
+		pending := len(sess.notifications.pending)
+		sess.notifications.lock.Unlock()
+		if active == symbols {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after recovery %d/%d subscriptions are bound (%d configs still on file): a recovery that fails while the "+
+				"PLC is unavailable must not shed the caller's subscriptions", active, symbols, pending)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

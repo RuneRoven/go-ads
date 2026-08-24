@@ -119,6 +119,9 @@ type notificationManager struct {
 	// the step while subscriptions may genuinely have been gone. The ticker driving
 	// the watch is monotonic, so counting its ticks is both correct and less code.
 	heartbeatBeats atomic.Uint64
+	// heartbeatEstablishFailures counts consecutive failures to register the beat,
+	// so a PLC that refuses it permanently costs one Warn rather than one per retry.
+	heartbeatEstablishFailures atomic.Int64
 	// heartbeatLastNs is kept for the log line only ("silentFor"), never for the
 	// decision. A stepped clock makes it a confusing number, not a wrong outcome.
 	heartbeatLastNs atomic.Int64

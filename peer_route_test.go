@@ -87,11 +87,15 @@ func TestPeerRoute_DisabledStillFailsClearly(t *testing.T) {
 	port := freeLocalPort(t)
 	srv.answerViaPeerConnection(localAddr(port)) // nothing listens there
 
+	// Its own port, not the protocol default: this test used to bind
+	// 0.0.0.0:48898 — the host's real AMS port — as a side effect.
+	fallbackPort := freeLocalPort(t)
 	sess, err := NewSession(context.Background(),
 		AMSEndpoint{IP: srv.host, Port: srv.port, AMS: AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851}},
 		WithRequestTimeout(300*time.Millisecond),
 		WithTargetCheck(TargetCheckOff),
 		WithAutoReconnect(false),
+		WithAmsPeerListen(fallbackPort),
 	)
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
@@ -104,6 +108,19 @@ func TestPeerRoute_DisabledStillFailsClearly(t *testing.T) {
 	}
 	if sess.lifecycle.state.load() == SessionStateConnected {
 		t.Error("session left in Connected after a failed connect")
+	}
+	// The fallback must have RUN and failed honestly, not been skipped. Asserting
+	// only "Connect failed" passed even with tryPeerFallback gutted to an
+	// unconditional error, and would also pass on a host where the port is simply
+	// taken.
+	sess.peerMu.Lock()
+	ln := sess.peerLn
+	sess.peerMu.Unlock()
+	if ln == nil {
+		t.Error("no listener was ever bound: the fallback did not run, so this test would pass with it deleted")
+	}
+	if !strings.Contains(err.Error(), "answered neither GetSymbolVersion nor ReadState") {
+		t.Errorf("error %q does not report what was tried", err)
 	}
 }
 
@@ -145,6 +162,21 @@ func TestPeerRoute_CloseDoesNotHangWithAdoptedConnection(t *testing.T) {
 	}
 }
 
+// skipIfPortTaken turns a lost race for the protocol port into a skip.
+//
+// The fallback binds 48898 by definition, and the port is a single system-wide
+// resource: an integration run against a peer-route device holds it for the whole
+// run, and these tests share the binary. Probing the port up front is not enough,
+// because it can be taken between the probe and the bind — which is exactly what
+// happened during a sweep against 192.168.3.224.
+func skipIfPortTaken(t *testing.T, err error) {
+	t.Helper()
+	if err != nil && strings.Contains(err.Error(), "address already in use") {
+		t.Skipf("port %d is held by something else (likely a concurrent integration run against a peer-route device): %v",
+			amsPeerListenPort, err)
+	}
+}
+
 // TestPeerRoute_AutomaticFallback: with no option set at all, a Connect that
 // proves total silence must bind the AMS port, discover the device is answering
 // there, and carry on — announcing it, because a device in this state is worth an
@@ -182,43 +214,90 @@ func TestPeerRoute_AutomaticFallback(t *testing.T) {
 	t.Cleanup(func() { sess.Close() })
 
 	if err := sess.Connect(context.Background()); err != nil {
+		skipIfPortTaken(t, err)
 		t.Fatalf("Connect did not fall back to listening: %v", err)
 	}
 	if rec := logs.findByMessage("answers on a connection it opens to us"); rec == nil {
+		if logs.findByMessage("address already in use") != nil {
+			t.Skip("the protocol port was taken mid-test by something else in this binary")
+		}
 		t.Error("no log line telling the operator the fallback was used")
 	} else if rec.Level < slog.LevelWarn {
 		t.Errorf("fallback logged at %v; it should be at least Warn so it is not missed", rec.Level)
 	}
 }
 
-// TestPeerRoute_FallbackCanBeDisabled: hosts that already run a TwinCAT router
-// own the AMS port, so binding it must be refusable.
+// TestPeerRoute_FallbackCanBeDisabled: hosts that already run a TwinCAT router own
+// the AMS port, so binding it must be refusable — and refusing it must be the ONLY
+// difference from the default.
+//
+// Two arms in one test on purpose. Asserting only "Connect failed and the message
+// names the option" passed even with tryPeerFallback gutted to an unconditional
+// error, and asserting "no socket was bound" does not help either, because a gutted
+// fallback binds nothing too. The contrast is what discriminates: the same silent
+// device must be rescued without the option and refused with it.
 func TestPeerRoute_FallbackCanBeDisabled(t *testing.T) {
-	srv := startScriptableServer(t)
-	defer srv.stop()
-	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
-		return ReturnCodeNoErrors, []byte{9}
-	})
-	srv.answerViaPeerConnection(localAddr(amsPeerListenPort))
-
-	sess, err := NewSession(context.Background(),
-		AMSEndpoint{IP: srv.host, Port: srv.port, AMS: AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851}},
-		WithRequestTimeout(300*time.Millisecond),
-		WithTargetCheck(TargetCheckOff),
-		WithAutoReconnect(false),
-		WithoutAmsPeerFallback(),
-	)
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
+	// The default arm binds the protocol port, so skip if this host cannot.
+	probe, perr := net.Listen("tcp4", localAddr(amsPeerListenPort))
+	if perr != nil {
+		t.Skipf("port %d unavailable on this host (%v); the contrast cannot be exercised", amsPeerListenPort, perr)
 	}
-	t.Cleanup(func() { sess.Close() })
+	_ = probe.Close()
 
-	err = sess.Connect(context.Background())
+	newSilentDevice := func(t *testing.T) *scriptableServer {
+		t.Helper()
+		srv := startScriptableServer(t)
+		t.Cleanup(srv.stop)
+		srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
+			return ReturnCodeNoErrors, []byte{9}
+		})
+		// Answers only on a connection it opens to us, on the protocol port.
+		srv.answerViaPeerConnection(localAddr(amsPeerListenPort))
+		return srv
+	}
+	connect := func(t *testing.T, srv *scriptableServer, extra ...SessionOption) (*Session, error) {
+		t.Helper()
+		opts := append([]SessionOption{
+			WithRequestTimeout(500 * time.Millisecond),
+			WithTargetCheck(TargetCheckOff),
+			WithAutoReconnect(false),
+		}, extra...)
+		sess, err := NewSession(context.Background(),
+			AMSEndpoint{IP: srv.host, Port: srv.port, AMS: AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851}},
+			opts...)
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		t.Cleanup(func() { sess.Close() })
+		return sess, sess.Connect(context.Background())
+	}
+
+	// Arm A — default: the fallback rescues this device.
+	rescued, err := connect(t, newSilentDevice(t))
+	if err != nil {
+		skipIfPortTaken(t, err)
+		t.Fatalf("default Connect did not rescue a peer-route device: %v", err)
+	}
+	rescued.peerMu.Lock()
+	rescuedLn := rescued.peerLn
+	rescued.peerMu.Unlock()
+	if rescuedLn == nil {
+		t.Error("rescued without binding a listener — then the rescue came from somewhere else and this test proves nothing")
+	}
+
+	// Arm B — opted out: the same device must be refused, and nothing bound.
+	refused, err := connect(t, newSilentDevice(t), WithoutAmsPeerFallback())
 	if err == nil {
 		t.Fatal("Connect succeeded with the fallback disabled")
 	}
 	if !strings.Contains(err.Error(), "WithoutAmsPeerFallback") {
 		t.Errorf("error does not say the fallback was disabled: %v", err)
+	}
+	refused.peerMu.Lock()
+	refusedLn := refused.peerLn
+	refused.peerMu.Unlock()
+	if refusedLn != nil {
+		t.Error("a listener was bound although the fallback is disabled")
 	}
 }
 

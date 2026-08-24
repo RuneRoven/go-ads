@@ -985,10 +985,23 @@ func (sess *Session) establishHeartbeat(ctx context.Context) {
 	handle, err := c.AddDeviceNotification(ctx, uint32(GroupSymbolVersion), 0, 1,
 		TransModeServerCycle, 0, sess.heartbeatCycle())
 	if err != nil {
-		sess.logger.Warn("could not establish the notification heartbeat; a silent subscription death will go unnoticed by this session",
-			"error", err)
+		// First failure is worth a Warn; the rest are Debug, because the watcher
+		// retries on a cadence and a device that refuses cyclic notifications
+		// altogether would otherwise produce one Warn per interval forever.
+		msg := "could not establish the notification heartbeat; retrying, and until it succeeds a silent subscription death will go unnoticed"
+		if sess.notifications.heartbeatEstablishFailures.Add(1) == 1 {
+			sess.logger.Warn(msg, "error", err)
+		} else {
+			sess.logger.Debug(msg, "error", err)
+		}
+		// Start the watcher anyway. It used to run only after a SUCCESSFUL establish,
+		// so a session whose first attempt failed had no watchdog for its entire life
+		// — no retry, and a later silent death went unnoticed with one Warn as the
+		// only trace. The watcher re-attempts the beat itself (see heartbeatWatch).
+		sess.startHeartbeatWatch()
 		return
 	}
+	sess.notifications.heartbeatEstablishFailures.Store(0)
 	// A handle that is already one of the caller's would make every sample for
 	// that subscription look like a beat and be swallowed. No real PLC issues
 	// duplicates, but the consequence is bad enough to check for.
@@ -1137,12 +1150,19 @@ func (sess *Session) heartbeatWatch() {
 			}
 			allowed = scaled
 		}
-		// No "have we ever seen a beat" guard: this watcher only exists because
-		// establishHeartbeat succeeded at least once, so zero beats means the PLC has
-		// stopped beating, which is precisely the thing being detected. Guarding on it
-		// disabled the detector permanently in the CONFIG case, where a failed
-		// recovery leaves both the beat count and the handle at zero.
 		if quietTicks < allowed {
+			continue
+		}
+		// No beat registered at all: re-attempt that first. It is the cheap
+		// explanation for silence — one Add, versus tearing down and re-subscribing
+		// everything — and it is the only way a session whose first attempt failed
+		// ever gets a watchdog. Only if the beat is in place does continued silence
+		// mean the subscriptions are dead.
+		if sess.notifications.heartbeatHandle.Load() == 0 {
+			quietTicks = 0
+			ctx, cancel := context.WithTimeout(sess.currentLifecycleCtx(), cycle)
+			sess.establishHeartbeat(ctx)
+			cancel()
 			continue
 		}
 		quietTicks = 0

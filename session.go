@@ -661,6 +661,20 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	// Session and Client share the *transport pointer (no re-dial); the Client
 	// owns the listen / transmit / recvWorker goroutines.
 	newClient := sess.publishWiredClient()
+	// If this device has already been shown to answer on a connection it opens to
+	// us, bind the listener before probing anything. Otherwise every session pays
+	// the full probe timeout plus the route-activation budget to rediscover it, and
+	// registers a route it did not need — measured at ~18s per Connect against
+	// 192.168.3.224, against ~18ms once the answer can be heard.
+	if !sess.peerFallbackDisabled && isKnownPeerRouteHost(sess.peerRouteCacheKey()) {
+		if err := sess.startPeerListener(); err != nil {
+			// Not fatal: the probe below may still succeed, and if it does not, the
+			// fallback will report this same failure with its own context.
+			sess.logger.Debug("could not pre-bind the inbound listener for a known peer-route device", "error", err)
+		} else {
+			sess.logger.Info("device is known to answer on its own connection; listening before probing", "host", sess.ip)
+		}
+	}
 	if local {
 		resp, err := newClient.send([]byte{0, 16, 2, 0, 0, 0, 0, 0})
 		if err != nil {
@@ -729,14 +743,30 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 			// attempt is safe. See awaitRouteActive on why this is a function.
 			probedVersion, err := sess.awaitRouteActive(func() context.Context { return ctx })
 			if err != nil {
-				// Same reasoning as the registration failure above: the redial
-				// published a Client, so this path owns tearing it down.
-				sess.tearDownAndReset(false)
-				return fmt.Errorf("route registration during connect: %w", err)
+				// A device that answers on a connection IT opens to us cannot pass
+				// this probe, however healthy the route is: our socket stays silent
+				// because the reply goes to the other one. Measured on TC3.1.4026
+				// (192.168.3.224), which does exactly that. Try the fallback before
+				// condemning the route — this is what the peer listener is for, and
+				// until now the route branch returned before it could ever run.
+				if rescued, ferr := sess.tryPeerFallback(ctx); rescued {
+					rememberPeerRouteHost(sess.peerRouteCacheKey())
+					sess.logger.Warn("route probe was silent, but the PLC answers on a connection it opens to us; continuing",
+						"host", sess.ip)
+					haveVersion = false
+				} else {
+					if ferr != nil {
+						err = fmt.Errorf("%w (the peer-route fallback could not run: %w)", err, ferr)
+					}
+					// The redial published a Client, so this path owns tearing it down.
+					sess.tearDownAndReset(false)
+					return fmt.Errorf("route registration during connect: %w", err)
+				}
+			} else {
+				// The winning probe WAS a GetSymbolVersion, so seed the cache from it
+				// instead of issuing the identical request again below.
+				haveVersion, symbolVersion = true, probedVersion
 			}
-			// The winning probe WAS a GetSymbolVersion, so seed the cache from it
-			// instead of issuing the identical request again below.
-			haveVersion, symbolVersion = true, probedVersion
 		}
 
 	}
@@ -771,6 +801,7 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 				// connection it opens to us rather than on ours.
 				rescued, ferr := sess.tryPeerFallback(ctx)
 				if rescued {
+					rememberPeerRouteHost(sess.peerRouteCacheKey())
 					haveVersion = false // the probe above never got a value
 					break
 				}
@@ -2343,6 +2374,34 @@ const peerFallbackProbes = 3
 // session that is otherwise dead, and it is announced at WARN because a device in
 // this state is worth an operator's attention.
 //
+// peerRouteHosts remembers which devices answer on a connection they open to us,
+// keyed by host, for the life of the process.
+//
+// Learning this costs a full route-probe timeout plus the route-activation budget —
+// about 15s on a device in that state, measured on 192.168.3.224 — and it is a
+// property of the DEVICE, not of one session. Re-learning it on every Connect made
+// a suite of ~50 sessions spend a quarter of an hour discovering the same fact.
+//
+// Only ever causes the inbound listener to be bound earlier, so a stale entry
+// (device's route table repaired since) costs a bound port and nothing else: the
+// normal probe still runs and still wins.
+// Keyed by host AND port, not host alone: every scriptable stub in the test suite
+// lives on 127.0.0.1, so an IP-only key made one rescued stub speak for all of them
+// and every later session pre-bound the protocol port they then fought over. Real
+// devices all sit on 48898, so the port adds nothing there and costs nothing.
+var peerRouteHosts sync.Map // "host:port" -> struct{}
+
+func (sess *Session) peerRouteCacheKey() string {
+	return net.JoinHostPort(sess.ip, strconv.Itoa(sess.port))
+}
+
+func rememberPeerRouteHost(key string) { peerRouteHosts.Store(key, struct{}{}) }
+
+func isKnownPeerRouteHost(key string) bool {
+	_, ok := peerRouteHosts.Load(key)
+	return ok
+}
+
 // Returns rescued=true when a request succeeded after the listener came up.
 func (sess *Session) tryPeerFallback(ctx context.Context) (rescued bool, why error) {
 	if sess.peerFallbackDisabled {
@@ -2351,15 +2410,18 @@ func (sess *Session) tryPeerFallback(ctx context.Context) (rescued bool, why err
 	sess.peerMu.Lock()
 	listening := sess.peerLn != nil
 	sess.peerMu.Unlock()
-	if listening {
-		// Already listening and still nothing: the silence is not this.
-		return false, fmt.Errorf("already listening for an inbound PLC connection and it answered nothing there either")
+	if !listening {
+		if err := sess.startPeerListener(); err != nil {
+			return false, err
+		}
+		sess.logger.Info("PLC answered nothing on our connection; listening for one it may open to us",
+			"port", sess.peerListenPortOrDefault())
 	}
-	if err := sess.startPeerListener(); err != nil {
-		return false, err
-	}
-	sess.logger.Info("PLC answered nothing on our connection; listening for one it may open to us",
-		"port", sess.peerListenPortOrDefault())
+	// Probe either way. Returning early when a listener already existed was wrong
+	// twice over: a caller that set WithAmsPeerListen never got the fallback's
+	// probes at all, and pre-binding for a device already KNOWN to answer on its own
+	// connection turned the fast path into a guaranteed failure. Whether the device
+	// answers there is exactly what the probes below determine.
 
 	for attempt := 1; attempt <= peerFallbackProbes; attempt++ {
 		if err := ctx.Err(); err != nil {
