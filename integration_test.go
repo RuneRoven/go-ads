@@ -5,6 +5,8 @@ package ads
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"math"
 	"os"
 	"sort"
@@ -84,6 +86,74 @@ func pickParseableSymbols(symbols map[string]SymbolView, n int) []string {
 		}
 	}
 	return names
+}
+
+// asBatchError recovers the per-item detail of a partial batch read or write.
+// A non-nil result means the call's map is still usable and holds every item
+// that succeeded; nil with a non-nil err means transport failure, where no
+// item's outcome is known and the map must not be trusted.
+func asBatchError(err error) *BatchError {
+	var batchErr *BatchError
+	if errors.As(err, &batchErr) {
+		return batchErr
+	}
+	return nil
+}
+
+// batchFailureReport renders a *BatchError one item per line, splitting library
+// skips from PLC verdicts, so a hardware run is diagnosable from the test output
+// alone. Example, one absent symbol out of five:
+//
+//	batch read: 1 of 5 symbols failed, 4 succeeded
+//	  MAIN.bMissing                             PLC verdict: 0x710 (symbol not found)
+func batchFailureReport(batchErr *BatchError) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "batch %s: %d of %d symbols failed, %d succeeded",
+		batchErr.Op, len(batchErr.Items), batchErr.Requested, batchErr.Succeeded)
+	for _, item := range batchErr.Items {
+		if item.Skipped != nil {
+			// The library never sent this item, or could not use the answer.
+			fmt.Fprintf(&b, "\n  %-40s library skip: %v", item.Symbol, item.Skipped)
+			continue
+		}
+		// The PLC gave a verdict on this item; a genuinely absent symbol or a
+		// stale handle after a runtime restart lands here.
+		fmt.Fprintf(&b, "\n  %-40s PLC verdict: 0x%X (%s)", item.Symbol, uint32(item.Error), item.Error)
+	}
+	return b.String()
+}
+
+// requireBatchOK fails the test on any error from a batch call, naming the
+// per-item reasons when the error is a *BatchError. Use it where the test's
+// purpose is "every one of these symbols works"; a site that can legitimately
+// tolerate a partial batch must branch on asBatchError itself and say why.
+func requireBatchOK(t *testing.T, op string, err error) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if batchErr := asBatchError(err); batchErr != nil {
+		t.Fatalf("%s: %s", op, batchFailureReport(batchErr))
+	}
+	t.Fatalf("%s: transport failure, no item outcome is known: %v", op, err)
+}
+
+// reportFailedRestore fails the test for a batch write that was putting the
+// PLC's original values back. A restore that half-succeeded is a hazard beyond
+// the failing test: every later test in the run then sees this test's values on
+// those symbols. Errorf rather than Fatalf so any read-back the caller does
+// afterwards still runs and shows the operator what the symbols actually hold.
+func reportFailedRestore(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if batchErr := asBatchError(err); batchErr != nil {
+		t.Errorf("RESTORE INCOMPLETE — PLC left in a mixed state, the symbols below still hold this test's values: %s",
+			batchFailureReport(batchErr))
+		return
+	}
+	t.Errorf("RESTORE FAILED — transport error, no symbol's restore outcome is known, PLC may still hold this test's values: %v", err)
 }
 
 func setupConnection(t *testing.T) *Session {
@@ -880,11 +950,11 @@ func TestIntegrationWriteMultipleSymbols(t *testing.T) {
 		writeValues[p.name] = v
 	}
 
-	// 3. Write all via WriteMultipleSymbols
+	// 3. Write all via WriteMultipleSymbols.
+	// Every symbol here came from an ADS_WRITE_* env var and was just read
+	// successfully, so a per-item failure is a real defect, not a config gap.
 	codes, err := conn.WriteMultipleSymbols(context.Background(), writeValues)
-	if err != nil {
-		t.Fatalf("WriteMultipleSymbols failed: %v", err)
-	}
+	requireBatchOK(t, "WriteMultipleSymbols", err)
 
 	// 4. Check per-symbol return codes
 	for name, code := range codes {
@@ -907,11 +977,14 @@ func TestIntegrationWriteMultipleSymbols(t *testing.T) {
 		t.Logf("confirmed %s = %s", p.name, readBack)
 	}
 
-	// 6. Restore originals and confirm
+	// 6. Restore originals and confirm.
+	// A half-succeeded restore leaves the PLC holding this test's values for
+	// every later test in the run, so it must be loud and it must name the
+	// symbols that were not put back. Reported with Errorf rather than Fatalf
+	// deliberately: the read-back loop below then shows the operator the actual
+	// state of each symbol, which is what they need to fix it by hand.
 	restoreCodes, err := conn.WriteMultipleSymbols(context.Background(), originals)
-	if err != nil {
-		t.Fatalf("failed to restore originals: %v", err)
-	}
+	reportFailedRestore(t, err)
 	for name, code := range restoreCodes {
 		if code != ReturnCodeNoErrors {
 			t.Errorf("restore %s returned error code %d", name, code)
@@ -944,13 +1017,16 @@ func TestIntegrationReadMultipleSymbols(t *testing.T) {
 		t.Skip("need at least 2 parseable symbols for ReadMultipleSymbols test")
 	}
 
+	// Every name came out of the PLC's own symbol table moments ago, so a
+	// per-item refusal here is the defect this test exists to catch — not a
+	// config gap. Fail, and name the reasons.
 	values, err := conn.ReadMultipleSymbols(context.Background(), names)
-	if err != nil {
-		t.Fatalf("ReadMultipleSymbols failed: %v", err)
-	}
+	requireBatchOK(t, "ReadMultipleSymbols", err)
 
+	// With a nil error the contract guarantees a value for every requested
+	// symbol; a short map without an error is the silent-loss bug itself.
 	if len(values) != len(names) {
-		t.Errorf("expected %d results from ReadMultipleSymbols, got %d", len(names), len(values))
+		t.Errorf("ReadMultipleSymbols returned no error but got %d values, want %d", len(values), len(names))
 	}
 
 	for name, val := range values {
@@ -1204,11 +1280,14 @@ func TestIntegrationReconnectDuringBatchRead(t *testing.T) {
 		t.Skip("need at least 2 parseable symbols")
 	}
 
-	// 1. Successful batch read before reconnect
+	// 1. Successful batch read before reconnect.
+	// Judgement: fail on a partial batch here. This read is the test's baseline
+	// on a freshly connected session whose symbol table was just loaded, so
+	// nothing about it is stale — a refused item means the batch read is broken
+	// before the reconnect under test even happens, and comparing against a
+	// half-empty baseline afterwards would prove nothing.
 	values1, err := conn.ReadMultipleSymbols(context.Background(), names)
-	if err != nil {
-		t.Fatalf("pre-reconnect ReadMultipleSymbols failed: %v", err)
-	}
+	requireBatchOK(t, "pre-reconnect ReadMultipleSymbols", err)
 	t.Logf("pre-reconnect batch read: %d symbols", len(values1))
 	for name, val := range values1 {
 		t.Logf("  %s = %s", name, val)
@@ -1226,11 +1305,24 @@ func TestIntegrationReconnectDuringBatchRead(t *testing.T) {
 	waitForReconnect(t, conn, 15*time.Second)
 	t.Log("reconnect completed")
 
-	// 4. Batch read again — must succeed, proving handles and SumRead work after reconnect
+	// 4. Batch read again — must succeed, proving handles and SumRead work after reconnect.
+	//
+	// Judgement: fail on a partial batch here too, and this is the deliberate
+	// call. Stale handles ARE expected across a reconnect — every handle from
+	// the dead socket is refused — but recovering from that is precisely the
+	// library's job and the thing this test guards: Reconnect() calls
+	// reloadSymbols(), which zeroes every cached handle, and waitForReconnect
+	// above returned only after that finished, so getSymbol re-resolves each
+	// name before this read reaches the wire. A per-item stale code (0x710 /
+	// 0x711) surviving to the caller therefore means a handle was not refreshed
+	// — the regression, not the contract. Tolerating it would make this test
+	// pass whatever the PLC returns, which is worse than no test.
+	//
+	// The per-item report matters most here: it tells the operator whether the
+	// items came back as PLC verdicts (handles not refreshed) or as library
+	// skips (re-resolution itself failed), which are different bugs.
 	values2, err := conn.ReadMultipleSymbols(context.Background(), names)
-	if err != nil {
-		t.Fatalf("post-reconnect ReadMultipleSymbols failed: %v", err)
-	}
+	requireBatchOK(t, "post-reconnect ReadMultipleSymbols", err)
 	t.Logf("post-reconnect batch read: %d symbols", len(values2))
 	for name, val := range values2 {
 		t.Logf("  %s = %s", name, val)
@@ -1518,12 +1610,13 @@ func TestIntegrationSumReadFallbackForced(t *testing.T) {
 	// Force fallback: mark sum read as unsupported
 	conn.client.Load().capabilities.SumReadCmdStore(1)
 
+	// The point of this test is that the per-symbol fallback path returns the
+	// same values as the sum path, so a refused item makes the comparison
+	// meaningless — fail and name it.
 	values, err := conn.ReadMultipleSymbols(context.Background(), names)
-	if err != nil {
-		t.Fatalf("ReadMultipleSymbols (fallback) failed: %v", err)
-	}
+	requireBatchOK(t, "ReadMultipleSymbols (fallback)", err)
 	if len(values) != len(names) {
-		t.Fatalf("expected %d results, got %d", len(names), len(values))
+		t.Fatalf("ReadMultipleSymbols (fallback) returned no error but got %d values, want %d", len(values), len(names))
 	}
 
 	// Cross-check each via individual read
@@ -1589,9 +1682,7 @@ func TestIntegrationSumWriteFallbackForced(t *testing.T) {
 
 	// Batch write in fallback mode
 	codes, err := conn.WriteMultipleSymbols(context.Background(), writeValues)
-	if err != nil {
-		t.Fatalf("WriteMultipleSymbols (fallback) failed: %v", err)
-	}
+	requireBatchOK(t, "WriteMultipleSymbols (fallback)", err)
 	for name, code := range codes {
 		if code != ReturnCodeNoErrors {
 			t.Errorf("write %s returned error: 0x%X", name, uint32(code))
@@ -1610,8 +1701,12 @@ func TestIntegrationSumWriteFallbackForced(t *testing.T) {
 		}
 	}
 
-	// Restore
-	_, _ = conn.WriteMultipleSymbols(context.Background(), originals)
+	// Restore. Reported, not discarded: this test forced the fallback write
+	// path, so a half-restore here leaves the PLC holding test values for every
+	// later test in the run.
+	if _, err := conn.WriteMultipleSymbols(context.Background(), originals); err != nil {
+		reportFailedRestore(t, err)
+	}
 }
 
 func TestIntegrationSumNotifFallbackForced(t *testing.T) {
@@ -1820,9 +1915,7 @@ func TestIntegrationSumWritePartialFailure(t *testing.T) {
 		writeVal = "100"
 	}
 	codes, err := conn.WriteMultipleSymbols(context.Background(), map[string]string{symbolName: writeVal})
-	if err != nil {
-		t.Fatalf("WriteMultipleSymbols failed: %v", err)
-	}
+	requireBatchOK(t, "WriteMultipleSymbols (single-symbol control write)", err)
 	if codes[symbolName] != ReturnCodeNoErrors {
 		t.Fatalf("WriteMultipleSymbols returned error: 0x%X", uint32(codes[symbolName]))
 	}
@@ -1928,11 +2021,11 @@ func TestIntegrationSumWriteVerifyData(t *testing.T) {
 		envVarMap[p.name] = p.envVar
 	}
 
-	// Batch write
+	// Batch write. This test's whole subject is that SumWrite put the right
+	// bytes on the right symbols, so an item that never got written leaves
+	// nothing to verify.
 	codes, err := conn.WriteMultipleSymbols(context.Background(), writeValues)
-	if err != nil {
-		t.Fatalf("WriteMultipleSymbols failed: %v", err)
-	}
+	requireBatchOK(t, "WriteMultipleSymbols", err)
 	for name, code := range codes {
 		if code != ReturnCodeNoErrors {
 			t.Errorf("write %s error: 0x%X", name, uint32(code))
@@ -1953,8 +2046,10 @@ func TestIntegrationSumWriteVerifyData(t *testing.T) {
 		}
 	}
 
-	// Restore
-	_, _ = conn.WriteMultipleSymbols(context.Background(), originals)
+	// Restore. Reported, not discarded — see reportFailedRestore.
+	if _, err := conn.WriteMultipleSymbols(context.Background(), originals); err != nil {
+		reportFailedRestore(t, err)
+	}
 }
 
 func TestIntegrationSumReadKnownValues(t *testing.T) {
@@ -2008,10 +2103,10 @@ func TestIntegrationSumReadKnownValues(t *testing.T) {
 	for name := range knownValues {
 		names = append(names, name)
 	}
+	// Each name was written individually and read back just above, so the PLC
+	// cannot honestly refuse it in a batch — that would be the bug.
 	batchValues, err := conn.ReadMultipleSymbols(context.Background(), names)
-	if err != nil {
-		t.Fatalf("ReadMultipleSymbols failed: %v", err)
-	}
+	requireBatchOK(t, "ReadMultipleSymbols", err)
 
 	// Verify each matches the known written value
 	for name, expected := range knownValues {
@@ -2550,8 +2645,15 @@ func TestIntegrationLargeBatchRead(t *testing.T) {
 	start := time.Now()
 	values, err := conn.ReadMultipleSymbols(context.Background(), names)
 	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("ReadMultipleSymbols failed: %v", err)
+	// Every name here had its handle acquired successfully above, so a per-item
+	// failure is a defect and this test fails on it. Reported with Errorf rather
+	// than Fatalf so the per-symbol diagnostics below still run: at 50 symbols
+	// the pattern of which ones failed (all of them, the tail of the batch, only
+	// the nested ones) is what tells the operator where to look.
+	if batchErr := asBatchError(err); batchErr != nil {
+		t.Errorf("large batch read: %s", batchFailureReport(batchErr))
+	} else if err != nil {
+		t.Fatalf("large batch read: transport failure, no item outcome is known: %v", err)
 	}
 
 	// Log missing and empty symbols for diagnostics.
