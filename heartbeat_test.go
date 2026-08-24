@@ -1193,3 +1193,49 @@ func TestRuntimeState_ReadingExpires(t *testing.T) {
 		t.Errorf("a stale reading still refuses: %v", err)
 	}
 }
+
+// TestHeartbeat_DeferralsKeepAConstantRate: waiting for a runtime that is not
+// serving must not make the next check later.
+//
+// Found on hardware, .118 with 40 symbols: the CONFIG toggle was detected and the
+// re-subscribe correctly deferred, but every deferral counted as a recovery FAILURE,
+// so the backoff doubled each window. By the time the runtime returned to RUN the
+// next attempt was minutes out and the session missed a 2 minute grace entirely.
+//
+// Measured as a RATE, not as "did it recover": a recovery-after-RUN assertion is
+// also satisfied by the return-to-RUN nudge, so it cannot tell the two fixes apart.
+// A deferral attempts nothing, so its interval must stay at the base window.
+func TestHeartbeat_DeferralsKeepAConstantRate(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0x5000)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	logs := &testLogHandler{}
+	sess, c := newWiredTestSession(t, srv,
+		WithNotificationHeartbeat(100*time.Millisecond, 2),
+		WithLogger(slog.New(logs)))
+	c.SetNotificationHandler(sess.handleNotification)
+	preSeedTypedSymbol(sess, "MAIN.deferred", 0x5100)
+	ch := make(chan *Update, 8)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.deferred", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Fatalf("AddSymbolNotification: %v", err)
+	}
+
+	// The runtime is in CONFIG for 1.5s. At a 100ms cycle and 2 missed ticks the
+	// base window is 200ms, so a constant rate is ~7 deferrals. Doubling gives
+	// 200ms, 400ms, 800ms, 1600ms — three at most inside the same window.
+	sess.recordRuntimeState(ADSStateConfig)
+	time.Sleep(1500 * time.Millisecond)
+
+	got := logs.countByMessage("re-subscribe deferred")
+	if got < 5 {
+		t.Errorf("only %d deferrals in 1.5s (base window 200ms, so ~7 expected): the interval is growing, which means a "+
+			"deferral is being counted as a failure — it attempts nothing, so it says nothing about how hard recovery is", got)
+	}
+}

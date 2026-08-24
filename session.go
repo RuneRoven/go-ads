@@ -2972,9 +2972,15 @@ func (sess *Session) runtimeStateQuietly(ctx context.Context) (ADSState, error) 
 func (sess *Session) recordRuntimeState(state ADSState) {
 	previous := ADSState(sess.runtimeState.Swap(uint32(state)))
 	sess.runtimeStateNs.Store(time.Now().UnixNano())
-	if previous != state && previous != ADSStateInvalid {
-		sess.logger.Info("PLC runtime state changed", "from", previous, "to", state)
+	if previous == state || previous == ADSStateInvalid {
+		return
 	}
+	sess.logger.Info("PLC runtime state changed", "from", previous, "to", state)
+	// No nudge into the heartbeat watcher here. One was written — force a recovery on
+	// the transition back into RUN — and then removed: with deferrals no longer
+	// counted as failures the interval never inflates while a runtime is unavailable,
+	// so no test could distinguish the nudge being present from absent. Unprovable
+	// machinery, and a coupling from the state poll into notification internals.
 }
 
 // runtimeStateTTL is how long a state reading is trusted. Beyond it the session

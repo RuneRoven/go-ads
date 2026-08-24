@@ -1201,20 +1201,35 @@ func (sess *Session) heartbeatWatch() {
 		} else {
 			sess.logger.Debug(msg, append(args, "retry", consecutiveFailures)...)
 		}
-		if sess.recoverDeadSubscriptions() {
+		switch sess.recoverDeadSubscriptions() {
+		case recoveryDone:
 			consecutiveFailures = 0
-			continue
+		case recoveryDeferred:
+			// Nothing was attempted, so this says nothing about how hard recovery is.
+			// Counting it doubled the wait every window while a runtime sat in CONFIG,
+			// so by the time it returned to RUN the next attempt was minutes out —
+			// measured on 192.168.3.118, which never recovered inside a 2 minute grace.
+		default:
+			consecutiveFailures++
 		}
-		consecutiveFailures++
 	}
 }
 
 // recoverDeadSubscriptions releases what the PLC may still hold and re-subscribes
 // from the stored configs, then re-establishes the heartbeat.
 //
-// Reports whether the subscriptions are live again, so the watcher can back off
-// instead of retrying at the heartbeat interval forever.
-func (sess *Session) recoverDeadSubscriptions() bool {
+// Reports the outcome so the watcher can tell the three cases apart: recovered,
+// failed (back off), and deferred because the runtime is not serving (do not back
+// off — nothing was attempted, and the state poll will say when to try again).
+type recoveryOutcome int
+
+const (
+	recoveryFailed recoveryOutcome = iota
+	recoveryDone
+	recoveryDeferred
+)
+
+func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
 	// heartbeatWatch checks this too, but that check is a TOCTOU: Close can land
 	// immediately after it. Close marks the session closed and releases the PLC
 	// resources BEFORE cancelling the context, so a recovery entering that window
@@ -1228,8 +1243,19 @@ func (sess *Session) recoverDeadSubscriptions() bool {
 	// dialled transport AFTER the release meant to be terminal.
 	if !sess.admitBackgroundWork() {
 		sess.logger.Debug("skipping subscription recovery: the session is closed")
-		return false
+		return recoveryFailed
 	}
+	// Before touching anything: a runtime that is not serving cannot accept a
+	// re-subscribe, so releasing the handles and attempting one only to fail is pure
+	// churn — and the attempt used to be counted as a failure, which doubled the
+	// backoff every window. On hardware that meant the session was minutes away from
+	// its next try by the time the runtime came back.
+	if state, known := sess.knownRuntimeState(); known && runtimeDefinitelyNotServing(state) {
+		sess.logger.Info("re-subscribe deferred: the PLC runtime is not in RUN",
+			"state", uint16(state))
+		return recoveryDeferred
+	}
+
 	ctx := sess.currentLifecycleCtx()
 
 	// Held across the whole sequence below — snapshot the intent, try, restore on
@@ -1274,17 +1300,15 @@ func (sess *Session) recoverDeadSubscriptions() bool {
 
 	if err := sess.resubscribeNotificationsLocked(); err != nil {
 		restoreIntent()
-		if state, known := sess.knownRuntimeState(); known && state != ADSStateRun {
-			// Not a mystery and not our problem to fix: the runtime is not serving.
-			// Say so plainly and at Info — the session is behaving correctly by
-			// waiting, and an operator who sees Warn assumes otherwise.
-			sess.logger.Info("re-subscribe deferred: the PLC runtime is not in RUN",
-				"state", uint16(state), "configs", len(intent))
-			return false
+		if errors.Is(err, ErrRuntimeNotRunning) {
+			// The gate refused mid-flight: the runtime stopped serving between the
+			// check above and the attempt. Deferred, not failed.
+			sess.logger.Info("re-subscribe deferred: the PLC runtime stopped serving", "error", err)
+			return recoveryDeferred
 		}
 		sess.logger.Warn("re-subscribe after a heartbeat timeout failed; keeping the subscriptions on file and retrying in the next window",
 			"error", err, "configs", len(intent))
-		return false
+		return recoveryFailed
 	}
 	// A "successful" resubscribe that bound nothing is the CONFIG case: the PLC
 	// refused every item. Same treatment — keep the intent, try again later.
@@ -1295,10 +1319,10 @@ func (sess *Session) recoverDeadSubscriptions() bool {
 		restoreIntent()
 		sess.logger.Warn("re-subscribe bound nothing (PLC not serving yet); keeping the subscriptions on file and retrying in the next window",
 			"configs", len(intent))
-		return false
+		return recoveryFailed
 	}
 	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
 	sess.establishHeartbeat(ctx)
 	sess.logger.Info("subscriptions re-established after the heartbeat stopped")
-	return true
+	return recoveryDone
 }
