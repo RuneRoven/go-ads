@@ -85,11 +85,17 @@ func (c *Client) AddDeviceNotification(
 	respBuffer := bytes.NewBuffer(resp)
 	notificationResponse := addDeviceNotificationResponse{}
 	if err = binary.Read(respBuffer, binary.LittleEndian, &notificationResponse); err != nil {
+		// Error stays: a response that will not decode is broken framing, not a PLC
+		// saying no. Retrying cannot fix it and someone has to look.
 		c.logger.Error("failed to parse notification response", "error", err)
 		return 0, err
 	}
 	if notificationResponse.Error != 0 {
-		c.logger.Error("failed to add notification handler", "errorCode", uint32(notificationResponse.Error))
+		// Warn, not Error: the PLC refusing an Add is the normal answer while the
+		// runtime is in CONFIG, and the heartbeat watcher retries on a cadence — an
+		// Error per attempt is what produced 28% of one integration log. The code is
+		// returned to the caller either way, so nothing loses its signal.
+		c.logger.Warn("failed to add notification handler", "errorCode", uint32(notificationResponse.Error))
 		return 0, fmt.Errorf("unable to create notification: %w", notificationResponse.Error)
 	}
 	c.logger.Log(context.Background(), LevelTrace, "added notification handler", "handle", notificationResponse.Handle)
@@ -945,7 +951,39 @@ const (
 	// for hours; the session still has to come back on its own within a sensible
 	// time of the runtime serving again.
 	maxHeartbeatRecoveryBackoff = 30 * time.Second
+
+	// maxFailureBackoffShift bounds the doubling at base * 64, so the shift itself
+	// can never run off into a nonsense window if failures keep counting up.
+	maxFailureBackoffShift = 6
 )
+
+// heartbeatAllowedTicks reports how many silent ticks the watcher tolerates before
+// it attempts a recovery: the base window, doubled once per consecutive failed
+// recovery, bounded by maxHeartbeatRecoveryBackoff in wall-clock terms.
+//
+// Pure and separate from the watcher because the two ways this arithmetic goes
+// wrong are both invisible from the outside — the session simply retries at the
+// wrong rate — and a previous version of this fix was lost precisely because
+// nothing pinned it.
+//
+// The cap is a duration converted to ticks, which is why it is floored at base:
+//   - At a long cycle the budget is FEWER ticks than the base window, so applying
+//     it raw makes the first failure shrink the tolerated silence instead of
+//     growing it (base 5 at a 10s cycle: 50s -> 30s) — backoff running backwards.
+//   - Once cycle >= the budget the division truncates to 0. Skipping the cap on
+//     that (the old `capped > 0` guard) let the window grow to base<<6 unbounded:
+//     at a 31s cycle the effective wait was hours.
+//
+// The floor answers both: it keeps the cap from ever reducing the window, and it
+// keeps the cap binding when the division has nothing left to say.
+func heartbeatAllowedTicks(base, consecutiveFailures int, cycle time.Duration) int {
+	if consecutiveFailures <= 0 || base <= 0 || cycle <= 0 {
+		return base
+	}
+	shift := min(consecutiveFailures, maxFailureBackoffShift)
+	capTicks := max(int(maxHeartbeatRecoveryBackoff/cycle), base)
+	return min(base<<shift, capTicks)
+}
 
 // heartbeatEnabled reports whether this session keeps a heartbeat.
 func (sess *Session) heartbeatEnabled() bool {
@@ -1106,7 +1144,6 @@ func (sess *Session) heartbeatWatch() {
 	// consecutiveFailures backs the retry off and keeps the log to one line per
 	// episode. Goroutine-local: this is the only writer.
 	consecutiveFailures := 0
-	const maxFailureBackoffShift = 6 // deadline * 64, capped below
 
 	for {
 		select {
@@ -1154,15 +1191,7 @@ func (sess *Session) heartbeatWatch() {
 		// Each consecutive failed recovery doubles the tolerated silence, capped, so
 		// a PLC that stays in CONFIG for an hour costs a handful of attempts instead
 		// of one per interval.
-		allowed := sess.heartbeatAllowedMisses()
-		if consecutiveFailures > 0 {
-			shift := min(consecutiveFailures, maxFailureBackoffShift)
-			scaled := allowed << shift
-			if capped := int(maxHeartbeatRecoveryBackoff / cycle); capped > 0 && scaled > capped {
-				scaled = capped
-			}
-			allowed = scaled
-		}
+		allowed := heartbeatAllowedTicks(sess.heartbeatAllowedMisses(), consecutiveFailures, cycle)
 		if quietTicks < allowed {
 			continue
 		}

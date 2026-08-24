@@ -1239,3 +1239,110 @@ func TestHeartbeat_DeferralsKeepAConstantRate(t *testing.T) {
 			"deferral is being counted as a failure — it attempts nothing, so it says nothing about how hard recovery is", got)
 	}
 }
+
+// TestHeartbeatAllowedTicks pins the recovery backoff arithmetic.
+//
+// Both defects it covers are invisible from outside — the session keeps working
+// and just retries at the wrong rate — and an earlier version of this fix was lost
+// because no test held it in place. The cap is a duration turned into ticks, so at
+// long cycles it can be smaller than the base window (first failure SHRINKS the
+// tolerated silence) and at cycles past the budget it truncates to zero (cap
+// skipped, window grows to base*64). Table rows exist for both.
+func TestHeartbeatAllowedTicks(t *testing.T) {
+	tests := []struct {
+		name                string
+		base                int
+		consecutiveFailures int
+		cycle               time.Duration
+		want                int
+	}{{
+		name:                "no failures leaves the base window untouched",
+		base:                5,
+		consecutiveFailures: 0,
+		cycle:               2 * time.Second,
+		want:                5,
+	}, {
+		name:                "default cycle doubles on the first failure",
+		base:                5,
+		consecutiveFailures: 1,
+		cycle:               2 * time.Second,
+		want:                10,
+	}, {
+		name:                "10s cycle: the first failure must not shrink the window below the base",
+		base:                5,
+		consecutiveFailures: 1,
+		cycle:               10 * time.Second,
+		want:                5, // cap is 3 ticks here; flooring at base keeps 50s, not 30s
+	}, {
+		name:                "cycle exactly at the cap boundary still floors at the base",
+		base:                5,
+		consecutiveFailures: 3,
+		cycle:               maxHeartbeatRecoveryBackoff,
+		want:                5, // cap is 1 tick
+	}, {
+		name:                "31s cycle: the cap still binds even though it truncates to zero ticks",
+		base:                5,
+		consecutiveFailures: 1,
+		cycle:               31 * time.Second,
+		want:                5, // without the floor the cap is skipped and this is 10 (~5min)
+	}, {
+		name:                "31s cycle, many failures: bounded, not base*64",
+		base:                5,
+		consecutiveFailures: 20,
+		cycle:               31 * time.Second,
+		want:                5, // 5<<6 = 320 ticks = ~2.7h if the cap is skipped
+	}, {
+		name:                "failures beyond the shift limit stop doubling",
+		base:                5,
+		consecutiveFailures: maxFailureBackoffShift + 4,
+		cycle:               10 * time.Millisecond,
+		want:                320, // 5<<6; the 3000-tick wall-clock cap is not reached
+	}, {
+		name:                "at the shift limit itself the answer is the same",
+		base:                5,
+		consecutiveFailures: maxFailureBackoffShift,
+		cycle:               10 * time.Millisecond,
+		want:                320,
+	}, {
+		name:                "short cycle: the wall-clock cap binds before the shift limit",
+		base:                5,
+		consecutiveFailures: 4,
+		cycle:               time.Second,
+		want:                30, // 5<<4 = 80 ticks, capped to 30s/1s
+	}, {
+		name:                "sub-base cap and no failures is still the base",
+		base:                7,
+		consecutiveFailures: 0,
+		cycle:               time.Minute,
+		want:                7,
+	}, {
+		name:                "a non-positive cycle cannot divide, so no backoff is applied",
+		base:                5,
+		consecutiveFailures: 3,
+		cycle:               0,
+		want:                5,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := heartbeatAllowedTicks(tt.base, tt.consecutiveFailures, tt.cycle)
+			if got != tt.want {
+				t.Errorf("heartbeatAllowedTicks(base=%d, failures=%d, cycle=%v) = %d, want %d",
+					tt.base, tt.consecutiveFailures, tt.cycle, got, tt.want)
+			}
+			// The window may never shrink below the base: that is backoff running
+			// backwards, and it is what the missing floor did at long cycles.
+			if got < tt.base {
+				t.Errorf("heartbeatAllowedTicks(base=%d, failures=%d, cycle=%v) = %d, want >= base %d",
+					tt.base, tt.consecutiveFailures, tt.cycle, got, tt.base)
+			}
+			// And it may never exceed the wall-clock budget by more than the one tick
+			// the base floor is allowed to cost.
+			if wall := time.Duration(got) * tt.cycle; tt.cycle > 0 && wall > maxHeartbeatRecoveryBackoff &&
+				got > tt.base {
+				t.Errorf("heartbeatAllowedTicks(base=%d, failures=%d, cycle=%v) = %d ticks = %v, want <= %v",
+					tt.base, tt.consecutiveFailures, tt.cycle, got, wall, maxHeartbeatRecoveryBackoff)
+			}
+		})
+	}
+}
