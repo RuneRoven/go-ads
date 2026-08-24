@@ -36,6 +36,7 @@ import (
 // TestPeerRoute_ResponsesOnInboundConnection: with the peer listener enabled, a
 // device that answers only on its own connection must work normally.
 func TestPeerRoute_ResponsesOnInboundConnection(t *testing.T) {
+	isolatePeerRouteCache(t)
 	srv := startScriptableServer(t)
 	defer srv.stop()
 
@@ -78,6 +79,7 @@ func TestPeerRoute_ResponsesOnInboundConnection(t *testing.T) {
 // fallback binds — Connect must fail with a diagnosis rather than a bare timeout,
 // and must not leave a session reporting healthy.
 func TestPeerRoute_DisabledStillFailsClearly(t *testing.T) {
+	isolatePeerRouteCache(t)
 	srv := startScriptableServer(t)
 	defer srv.stop()
 
@@ -133,6 +135,7 @@ func TestPeerRoute_DisabledStillFailsClearly(t *testing.T) {
 // sockets are closed first the wait never returns — observed hanging a real
 // session against .224 after the route-table probe finished.
 func TestPeerRoute_CloseDoesNotHangWithAdoptedConnection(t *testing.T) {
+	isolatePeerRouteCache(t)
 	srv := startScriptableServer(t)
 	defer srv.stop()
 	srv.onRead(GroupSymbolVersion, func(_, _, _ uint32) (ReturnCode, []byte) {
@@ -165,6 +168,68 @@ func TestPeerRoute_CloseDoesNotHangWithAdoptedConnection(t *testing.T) {
 	}
 }
 
+// isolatePeerRouteCache gives one test the process-wide peerRouteHosts cache to
+// itself, and hands it back exactly as it was found.
+//
+// peerRouteHosts is a package-level sync.Map keyed by "host:port" that lives for
+// the whole process, and nothing in a test binary ever expires it: the only
+// self-invalidation (forgetPeerRouteHost) sits in Connect's route-registration
+// branch, which a test without WithRoute never reaches. So every rescued session
+// leaves an entry behind — measured at two per run of this file, from
+// TestPeerRoute_AutomaticFallback and TestPeerRoute_FallbackCanBeDisabled's first
+// arm — and every stub in the binary lives on 127.0.0.1, so a later stub that the
+// OS hands a recycled ephemeral port INHERITS that entry.
+//
+// The consequence is not subtle, and is not confined to this file. Connect
+// pre-binds the inbound listener for a host it believes needs one, and with no
+// WithAmsPeerListen that listener is wildcard :48898. Measured: seeding one entry
+// for a stub's own address makes a session against a perfectly HEALTHY device
+// seize :48898 for its entire lifetime — which is then the port these two tests
+// need. Nothing in the failing test names the cause, and the trigger is a port
+// collision, so it reproduces roughly never.
+//
+// Clearing on the way in as well as on the way out is deliberate: restoring alone
+// would stop this file from poisoning others, but would leave these tests at the
+// mercy of residue from whatever ran before them.
+func isolatePeerRouteCache(t *testing.T) {
+	t.Helper()
+	inherited := map[string]struct{}{}
+	peerRouteHosts.Range(func(k, _ any) bool {
+		if key, ok := k.(string); ok {
+			inherited[key] = struct{}{}
+			peerRouteHosts.Delete(key)
+		}
+		return true
+	})
+	t.Cleanup(func() {
+		peerRouteHosts.Range(func(k, _ any) bool {
+			if key, ok := k.(string); ok {
+				peerRouteHosts.Delete(key)
+			}
+			return true
+		})
+		for key := range inherited {
+			rememberPeerRouteHost(key)
+		}
+	})
+}
+
+// protocolPortIsBindable reports whether the fallback could bind the AMS port.
+//
+// Wildcard, because that is what startPeerListener binds. A 127.0.0.1 probe is
+// worse than no probe at all: on macOS SO_REUSEADDR lets a loopback bind succeed
+// while another socket in this very process holds :48898 wildcard, so the guard
+// reports "clear", the test proceeds, and the bind it was guarding then fails.
+// Measured directly — 127.0.0.1:48898 accepted a listener while :48898 was held.
+func protocolPortIsBindable(t *testing.T) error {
+	t.Helper()
+	probe, err := net.Listen("tcp4", net.JoinHostPort("", strconv.Itoa(amsPeerListenPort)))
+	if err != nil {
+		return err
+	}
+	return probe.Close()
+}
+
 // skipIfPortTaken turns a lost race for the protocol port into a skip.
 //
 // The fallback binds 48898 by definition, and the port is a single system-wide
@@ -172,6 +237,16 @@ func TestPeerRoute_CloseDoesNotHangWithAdoptedConnection(t *testing.T) {
 // run, and these tests share the binary. Probing the port up front is not enough,
 // because it can be taken between the probe and the bind — which is exactly what
 // happened during a sweep against 192.168.3.224.
+//
+// This is the one coupling in this file that cannot be engineered away.
+// TestPeerRoute_AutomaticFallback and TestPeerRoute_FallbackCanBeDisabled bind
+// :48898 for real, because refusing to bind it is the behaviour under test, and
+// a port is a property of the machine rather than of the test. The two are
+// therefore mutually exclusive with each other, with any other binder of :48898
+// in this binary, and with a local TwinCAT router — so they must stay serial, and
+// must be excluded from any future t.Parallel() sweep. Every other test in this
+// file binds only an ephemeral port from freeLocalPort and has no such
+// constraint.
 func skipIfPortTaken(t *testing.T, err error) {
 	t.Helper()
 	if err != nil && strings.Contains(err.Error(), "address already in use") {
@@ -188,12 +263,11 @@ func skipIfPortTaken(t *testing.T, err error) {
 // This is the path that matters in production: the benthos plugin only ever calls
 // Connect, so a session that needs this has no way to ask for it.
 func TestPeerRoute_AutomaticFallback(t *testing.T) {
+	isolatePeerRouteCache(t)
 	// The fallback binds the protocol port, so the stub has to answer there.
-	probe, err := net.Listen("tcp4", localAddr(amsPeerListenPort))
-	if err != nil {
+	if err := protocolPortIsBindable(t); err != nil {
 		t.Skipf("port %d unavailable on this host (%v); the fallback cannot be exercised", amsPeerListenPort, err)
 	}
-	_ = probe.Close()
 
 	srv := startScriptableServer(t)
 	defer srv.stop()
@@ -240,12 +314,11 @@ func TestPeerRoute_AutomaticFallback(t *testing.T) {
 // fallback binds nothing too. The contrast is what discriminates: the same silent
 // device must be rescued without the option and refused with it.
 func TestPeerRoute_FallbackCanBeDisabled(t *testing.T) {
+	isolatePeerRouteCache(t)
 	// The default arm binds the protocol port, so skip if this host cannot.
-	probe, perr := net.Listen("tcp4", localAddr(amsPeerListenPort))
-	if perr != nil {
+	if perr := protocolPortIsBindable(t); perr != nil {
 		t.Skipf("port %d unavailable on this host (%v); the contrast cannot be exercised", amsPeerListenPort, perr)
 	}
-	_ = probe.Close()
 
 	newSilentDevice := func(t *testing.T) *scriptableServer {
 		t.Helper()
@@ -287,6 +360,16 @@ func TestPeerRoute_FallbackCanBeDisabled(t *testing.T) {
 	if rescuedLn == nil {
 		t.Error("rescued without binding a listener — then the rescue came from somewhere else and this test proves nothing")
 	}
+
+	// Hand :48898 back before arm B runs. Leaving arm A listening made arm B's
+	// refusal over-determined: arm A's accept loop swallowed arm B's stub's
+	// dial-back, so arm B saw silence whatever the option did, and if the option
+	// had been ignored arm B's own bind would merely have failed with "address
+	// already in use" — an error that reads like a busy host, not like a bug.
+	// Released, arm B's stub gets ECONNREFUSED, and an ignored WithoutAmsPeerFallback
+	// binds successfully and RESCUES arm B, which the assertions below then catch.
+	// Close is idempotent, so the t.Cleanup above still fires harmlessly.
+	_ = rescued.Close()
 
 	// Arm B — opted out: the same device must be refused, and nothing bound.
 	refused, err := connect(t, newSilentDevice(t), WithoutAmsPeerFallback())
@@ -460,6 +543,7 @@ func TestPeerListener_RetryAfterAFailedBind(t *testing.T) {
 // Disconnected, and Disconnected -> Connecting is legal) can never bind again —
 // hence the second arm.
 func TestConnect_ReleasesPeerListenerOnFailure(t *testing.T) {
+	isolatePeerRouteCache(t)
 	port := freeLocalPort(t)
 	ep := testEndpoint()
 	// Nothing serves TCP port 1 on loopback, so the dial fails immediately: this
