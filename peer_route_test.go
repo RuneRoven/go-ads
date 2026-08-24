@@ -5,7 +5,9 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -316,5 +318,81 @@ func TestPeerRoute_AdoptedConnectionIsClosedWhenItsReaderExits(t *testing.T) {
 			t.Fatalf("peerConns still holds %d entry after its reader exited: entries are never pruned, so they accumulate for the life of the Client", n)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestPeerListener_RetryAfterAFailedBind: a bind failure must not be latched.
+//
+// The listener used sync.Once, which runs its body once whether it succeeded or
+// not, and kept the error in a closure local — so after a failed bind every later
+// call returned nil with nothing listening. A Connect retry then believed the
+// listener was up, and tryPeerFallback went on to announce "listening for one it
+// may open to us" and probe a port it had never bound, swallowing the one hint that
+// names the real cause.
+func TestPeerListener_RetryAfterAFailedBind(t *testing.T) {
+	port := freeLocalPort(t)
+	// Bind the same address the listener will: on macOS occupying 127.0.0.1:port
+	// does not conflict with a wildcard bind, so the block has to be wildcard too.
+	blocker, err := net.Listen("tcp4", net.JoinHostPort("", strconv.Itoa(port)))
+	if err != nil {
+		t.Fatalf("occupy the port: %v", err)
+	}
+
+	sess := &Session{
+		logger:    getDefaultLogger(),
+		lifecycle: &sessionLifecycle{closedCh: make(chan struct{})},
+	}
+	sess.peerListenPort = port
+	t.Cleanup(func() { sess.stopPeerListener() })
+
+	if err := sess.startPeerListener(); err == nil {
+		t.Fatal("bind succeeded although the port was occupied")
+	}
+
+	// The port frees up — as it does when the local TwinCAT router is stopped, or
+	// simply between two Connect attempts.
+	_ = blocker.Close()
+
+	if err := sess.startPeerListener(); err != nil {
+		t.Fatalf("second attempt refused after the port was freed: %v", err)
+	}
+	sess.peerMu.Lock()
+	ln := sess.peerLn
+	sess.peerMu.Unlock()
+	if ln == nil {
+		t.Error("startPeerListener reported success with no listener: the failed bind was latched, so every later caller " +
+			"is told it is listening when nothing is")
+	}
+}
+
+// TestPeerListener_StopDoesNotHangWhenRacingStart: Close must not deadlock against
+// a Connect that is bringing the listener up.
+//
+// peerLn was a plain field written inside the Once, and Close reads it from another
+// goroutine with no happens-before edge. Reading nil made Close skip closing the
+// listener and then block forever in peerWG.Wait() — the accept loop is parked in
+// Accept, and its isClosed() escape only runs once a connection arrives, which on a
+// dead PLC never happens. Run with -race, this also pins the race itself.
+func TestPeerListener_StopDoesNotHangWhenRacingStart(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		sess := &Session{
+			logger:    getDefaultLogger(),
+			lifecycle: &sessionLifecycle{closedCh: make(chan struct{})},
+		}
+		sess.peerListenPort = freeLocalPort(t)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); _ = sess.startPeerListener() }()
+		go func() { defer wg.Done(); sess.stopPeerListener() }()
+
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: stopPeerListener hung — it read peerLn as nil, skipped the close, and waited on an accept loop nothing will wake", i)
+		}
+		sess.stopPeerListener() // idempotent, and cleans up if start won the race
 	}
 }

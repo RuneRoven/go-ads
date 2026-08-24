@@ -101,7 +101,15 @@ type sessionLifecycle struct {
 	reconnectOwner atomic.Bool
 
 	closedCh   chan struct{}
-	closedOnce sync.Once // guards close(closedCh) so Close() and Reconnect-exhaustion can both fire safely
+	closedOnce sync.Once
+	// spawnMu makes "is the session closed" and "register a goroutine" one atomic
+	// decision. A bare isClosed() check before waitGroup.Add is a TOCTOU: Close can
+	// run to completion in the gap, its Wait returns with the counter at 0, and the
+	// late Add is then exactly what sync.WaitGroup reports as
+	// "Add called concurrently with Wait" — a panic that takes the process down.
+	// Reachable from a user goroutine, not just internal ones: AddSymbolNotification
+	// -> endSubscribe -> replayEarlySamples -> dispatchSample -> tryOrphanDelete.
+	spawnMu sync.Mutex // guards close(closedCh) so Close() and Reconnect-exhaustion can both fire safely
 
 	// state is the explicit FSM state plus the unified epoch counter
 	// (docs/archive/specs/09-fsm-design.md). FSM is the source of truth for closed and
@@ -206,12 +214,18 @@ type Session struct {
 	// than on the connection we opened. See WithAmsPeerListen.
 	peerListenPort int
 	peerLn         net.Listener
-	peerOnce       sync.Once
 	// peerWG tracks the accept loop. Deliberately NOT lifecycle.waitGroup: that
 	// one is waited on by tearDownAndReset, which runs on every reconnect, while
 	// this listener lives for the whole session and only closes in Close — so
 	// sharing the group deadlocks the first teardown.
 	peerWG sync.WaitGroup
+	// peerMu guards peerLn. sync.Once orders only the goroutines that call Do, and
+	// Close never does: it reads peerLn from whatever goroutine called Close while
+	// a Connect may still be inside startPeerListener. Unsynchronised, Close can
+	// read nil, skip closing the listener, and then block forever in peerWG.Wait()
+	// on an accept loop nothing will ever wake — the loop's isClosed() escape only
+	// runs after a connection arrives, which on a dead PLC never happens.
+	peerMu sync.Mutex
 	// peerFallbackDisabled turns off the automatic attempt described in
 	// tryPeerFallback. See WithoutAmsPeerFallback.
 	peerFallbackDisabled bool
@@ -647,6 +661,10 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		sess.tx.connMu.Lock()
 		sess.source = result
 		sess.tx.connMu.Unlock()
+		// The Client was published before the handshake could run, holding a copy of
+		// the pre-handshake address; without this every later request goes out with
+		// the placeholder rather than what the router just told us to use.
+		newClient.setSource(result)
 	}
 
 	// A successful route-activation probe already carries the symbol version, so
@@ -1287,9 +1305,41 @@ func (sess *Session) reloadSymbolsAndResubscribe() error {
 	return sess.resubscribeNotifications()
 }
 
+// trackGoroutine registers a background goroutine with the session's WaitGroup and
+// starts it, refusing once the session is closed. Reports whether it started.
+//
+// Callers that hold resources for the goroutine (a semaphore slot, a throttle
+// entry) must release them when this returns false.
+func (sess *Session) trackGoroutine(fn func()) bool {
+	sess.lifecycle.spawnMu.Lock()
+	defer sess.lifecycle.spawnMu.Unlock()
+	// closedCh, not isClosed(): isClosed() reads the FSM, and closedCh is closed
+	// first (and by paths like giveUpReconnecting that signal shutdown before the
+	// state settles). The earliest signal is the one that has to gate the Add.
+	select {
+	case <-sess.lifecycle.closedCh:
+		return false
+	default:
+	}
+	if sess.isClosed() {
+		return false
+	}
+	sess.lifecycle.waitGroup.Add(1)
+	go func() {
+		defer sess.lifecycle.waitGroup.Done()
+		fn()
+	}()
+	return true
+}
+
 // markClosed closes the closedCh signal channel exactly once. Safe for
 // concurrent invocation from Close() and from Reconnect-exhaustion path.
 func (sess *Session) markClosed() {
+	// Under spawnMu so it pairs with trackGoroutine: once this returns, every
+	// subsequent registration attempt sees the session closed and declines, so the
+	// Wait that follows cannot race an Add.
+	sess.lifecycle.spawnMu.Lock()
+	defer sess.lifecycle.spawnMu.Unlock()
 	sess.lifecycle.closedOnce.Do(func() {
 		close(sess.lifecycle.closedCh)
 	})
@@ -2231,7 +2281,10 @@ func (sess *Session) tryPeerFallback(ctx context.Context) (rescued bool, why err
 	if sess.peerFallbackDisabled {
 		return false, fmt.Errorf("peer-route fallback disabled by WithoutAmsPeerFallback")
 	}
-	if sess.peerLn != nil {
+	sess.peerMu.Lock()
+	listening := sess.peerLn != nil
+	sess.peerMu.Unlock()
+	if listening {
 		// Already listening and still nothing: the silence is not this.
 		return false, fmt.Errorf("already listening for an inbound PLC connection and it answered nothing there either")
 	}
@@ -2281,26 +2334,35 @@ const amsPeerListenPort = 48898
 // Errors are returned rather than logged-and-ignored: a session that needs this
 // cannot work without it, and the usual cause (a local TwinCAT router already
 // owns the port) is worth saying out loud.
+// A mutex, not sync.Once. Once runs its body once whether it succeeded or not, and
+// the error was a closure local — so after a failed bind every later call returned
+// nil with nothing listening. A Connect retry (legal: the rollback leaves
+// Disconnected, and Disconnected -> Connecting is an allowed edge) then proceeded
+// believing the listener was up, and tryPeerFallback went on to log "listening for
+// one it may open to us" and probe three times against a port it had never bound,
+// swallowing the one hint that says a local TwinCAT router owns 48898.
 func (sess *Session) startPeerListener() error {
-	var err error
-	sess.peerOnce.Do(func() {
-		port := sess.peerListenPort
-		if port == 0 {
-			port = amsPeerListenPort
-		}
-		var ln net.Listener
-		ln, err = net.Listen("tcp4", net.JoinHostPort("", strconv.Itoa(port)))
-		if err != nil {
-			err = fmt.Errorf("listening for the PLC's own connection on port %d: %w "+
-				"(a local TwinCAT router or another ADS client may already own it)", port, err)
-			return
-		}
-		sess.peerLn = ln
-		sess.logger.Info("listening for inbound PLC connections (peer-route support)", "port", port)
-		sess.peerWG.Add(1)
-		go sess.peerAcceptLoop(ln)
-	})
-	return err
+	sess.peerMu.Lock()
+	defer sess.peerMu.Unlock()
+	if sess.peerLn != nil {
+		return nil // already listening
+	}
+	port := sess.peerListenPort
+	if port == 0 {
+		port = amsPeerListenPort
+	}
+	ln, err := net.Listen("tcp4", net.JoinHostPort("", strconv.Itoa(port)))
+	if err != nil {
+		// Deliberately retryable: the port may be free by the next attempt, and a
+		// caller who retries Connect is entitled to a real answer either way.
+		return fmt.Errorf("listening for the PLC's own connection on port %d: %w "+
+			"(a local TwinCAT router or another ADS client may already own it)", port, err)
+	}
+	sess.peerLn = ln
+	sess.logger.Info("listening for inbound PLC connections (peer-route support)", "port", port)
+	sess.peerWG.Add(1)
+	go sess.peerAcceptLoop(ln)
+	return nil
 }
 
 // peerAcceptLoop attaches every inbound connection to the current Client.
@@ -2330,8 +2392,11 @@ func (sess *Session) peerAcceptLoop(ln net.Listener) {
 
 // stopPeerListener closes the listener and waits for the accept loop to exit.
 func (sess *Session) stopPeerListener() {
-	if sess.peerLn != nil {
-		_ = sess.peerLn.Close()
+	sess.peerMu.Lock()
+	ln := sess.peerLn
+	sess.peerMu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
 	}
 	sess.peerWG.Wait()
 }
@@ -2351,6 +2416,9 @@ func (sess *Session) localHandshake() error {
 	sess.tx.connMu.Lock()
 	sess.source = result
 	sess.tx.connMu.Unlock()
+	if c := sess.client.Load(); c != nil {
+		c.setSource(result) // same reason as the Connect path
+	}
 	return nil
 }
 

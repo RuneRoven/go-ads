@@ -158,6 +158,21 @@ type Client struct {
 	peerClosed bool
 }
 
+// setSource replaces the source AMS address this Client stamps on every request.
+//
+// Local mode learns its real address from the router only AFTER the Client has been
+// published (the handshake is a request, so it needs a live Client to send it). The
+// Client held a by-value copy taken at construction, and nothing ever updated it —
+// so every request for the rest of the session carried the auto-derived placeholder
+// (127.0.0.1.1.1 and a random port) instead of the address the router assigned.
+// This is also what makes encode's connMu snapshot of c.source meaningful; before
+// this existed, that lock guarded a field nobody wrote.
+func (c *Client) setSource(addr AMSAddress) {
+	c.tx.connMu.Lock()
+	c.source = addr
+	c.tx.connMu.Unlock()
+}
+
 // markDropped releases every request waiting on this client's connection.
 // Idempotent: a drop can be observed by listen and the transmit worker both.
 func (c *Client) markDropped() {

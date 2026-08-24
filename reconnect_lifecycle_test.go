@@ -908,3 +908,73 @@ func TestConnect_FailedRouteActivationLeavesNothingRunning(t *testing.T) {
 			"so the route stage redialed on top of it", got)
 	}
 }
+
+// TestTrackGoroutine_RefusesAfterClose: registering a background goroutine and
+// deciding whether the session is closed must be one atomic step.
+//
+// A bare isClosed() check before waitGroup.Add is a TOCTOU. Close can run to
+// completion in the gap — its Wait returns with the counter at 0 — and the late Add
+// is then exactly what sync.WaitGroup reports as "Add called concurrently with
+// Wait", which panics the process rather than failing anything gracefully. The
+// orphan-delete path reaches this from a USER goroutine (AddSymbolNotification ->
+// endSubscribe -> replayEarlySamples -> dispatchSample -> tryOrphanDelete), so it
+// is not confined to internal timing.
+func TestTrackGoroutine_RefusesAfterClose(t *testing.T) {
+	sess := &Session{
+		logger:    getDefaultLogger(),
+		lifecycle: &sessionLifecycle{closedCh: make(chan struct{})},
+	}
+
+	ran := make(chan struct{}, 1)
+	if !sess.trackGoroutine(func() { ran <- struct{}{} }) {
+		t.Fatal("refused to start a goroutine on a live session")
+	}
+	select {
+	case <-ran:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tracked goroutine never ran")
+	}
+	sess.lifecycle.waitGroup.Wait()
+
+	sess.markClosed()
+	if sess.trackGoroutine(func() { t.Error("goroutine started on a closed session") }) {
+		t.Error("trackGoroutine started a goroutine after the session was closed: the Add can land after Close's Wait has " +
+			"already returned, which is WaitGroup misuse and panics the process")
+	}
+}
+
+// TestOrphanDelete_NotStartedAfterClose: the orphan reaper is the path that reaches
+// trackGoroutine from a user goroutine, so it gets its own check — including that a
+// refusal releases what it reserved, or a genuinely leaked handle stays locked out
+// of the reaper for the whole throttle window.
+func TestOrphanDelete_NotStartedAfterClose(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	var deletes atomic.Int32
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode {
+		deletes.Add(1)
+		return ReturnCodeNoErrors
+	})
+
+	sess, c := newWiredTestSession(t, srv, WithoutNotificationHeartbeat())
+	c.SetNotificationHandler(sess.handleNotification)
+	sess.markClosed()
+
+	const unknown = uint32(0xDEAD10CC)
+	sess.tryOrphanDelete(unknown)
+	time.Sleep(300 * time.Millisecond)
+
+	if got := deletes.Load(); got != 0 {
+		t.Errorf("%d orphan delete(s) issued after the session was closed", got)
+	}
+	sess.notifications.orphanMu.Lock()
+	_, throttled := sess.notifications.orphanSeen[unknown]
+	sess.notifications.orphanMu.Unlock()
+	if throttled {
+		t.Error("the refused attempt left its throttle entry behind: a genuinely leaked handle would go unreaped for the " +
+			"whole window because it happened to fire as the session closed")
+	}
+	if len(sess.notifications.orphanSem) != 0 {
+		t.Errorf("the refused attempt leaked a semaphore slot (%d held)", len(sess.notifications.orphanSem))
+	}
+}

@@ -841,10 +841,11 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 	mgr.orphanSeen[handle] = now
 	mgr.orphanMu.Unlock()
 
-	// Track goroutine so Close waits for in-flight orphan deletes.
-	sess.lifecycle.waitGroup.Add(1)
-	go func() {
-		defer sess.lifecycle.waitGroup.Done()
+	// Track the goroutine so Close waits for in-flight orphan deletes. Via
+	// trackGoroutine, because the isClosed() check far above is a TOCTOU: Close can
+	// finish in the gap and its Wait return before this Add lands, which panics the
+	// process. Refusal means releasing what was reserved for the goroutine.
+	started := sess.trackGoroutine(func() {
 		defer func() { <-mgr.orphanSem }()
 		defer func() {
 			if r := recover(); r != nil {
@@ -911,7 +912,17 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 		sess.logger.Info("deleted a PLC notification handle this session does not own",
 			"handle", handle,
 			"hint", "usually a subscription left behind by an earlier process sharing this source NetID and port")
-	}()
+	})
+	if !started {
+		// Release what was reserved for a goroutine that will not run: the semaphore
+		// slot, and the throttle entry — a genuinely leaked handle should not be
+		// locked out for the whole window because it fired as the session closed.
+		<-mgr.orphanSem
+		mgr.orphanMu.Lock()
+		delete(mgr.orphanSeen, handle)
+		mgr.orphanMu.Unlock()
+		sess.logger.Debug("orphan delete not started: the session is closed", "handle", handle)
+	}
 }
 
 // Heartbeat: proving the caller's subscriptions are still alive without asking the

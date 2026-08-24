@@ -273,6 +273,26 @@ func TestManualRestartRecovery(t *testing.T) {
 	timeline("updates resumed after %v", time.Since(stoppedAt).Round(time.Second))
 
 	// Phase 4 — the session must be genuinely healthy, not merely streaming.
+	//
+	// Wait for it to settle first. The first update arrives while the recovery is
+	// still committing the rest of the batch, so sampling here directly reads a
+	// half-finished reconnect: measured against 192.168.3.70 with 40 symbols, this
+	// read "state = Reconnecting, bound = 21" one second before the same reconnect
+	// logged success with all 40 bound. That is the observer being early, not the
+	// session being wrong — but it looks identical to a partial recovery, so the
+	// wait has to be explicit rather than a sleep.
+	settleDeadline := time.Now().Add(60 * time.Second)
+	for {
+		state := sess.lifecycle.state.load()
+		if state == SessionStateConnected || sess.IsClosed() {
+			break
+		}
+		if time.Now().After(settleDeadline) {
+			t.Fatalf("session still %v 60s after updates resumed", state)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	timeline("session settled after %v", time.Since(stoppedAt).Round(time.Second))
 	if sess.IsClosed() {
 		t.Error("session reports closed although updates resumed")
 	}

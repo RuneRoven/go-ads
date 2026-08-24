@@ -1128,3 +1128,46 @@ func TestWriteProcessOutputBit_ByteOffsetOverflow(t *testing.T) {
 		t.Errorf("expected overflow error mentioning overflow or byteOffset, got: %v", err)
 	}
 }
+
+// TestSetSource_TakesEffectOnTheWire: what the local-mode handshake learns has to
+// reach the packets.
+//
+// The Client holds the source AMS address by value, copied at construction. In
+// local mode the handshake cannot run until the Client exists (it is itself a
+// request), so the address the router assigns arrives afterwards — and nothing
+// propagated it. Every request for the rest of the session went out with the
+// auto-derived placeholder (127.0.0.1.1.1 and a random port) instead.
+func TestSetSource_TakesEffectOnTheWire(t *testing.T) {
+	placeholder := AMSAddress{NetID: [6]byte{127, 0, 0, 1, 1, 1}, Port: 33333}
+	assigned := AMSAddress{NetID: [6]byte{192, 168, 3, 52, 1, 1}, Port: 32905}
+
+	c := &Client{
+		tx:     &transport{},
+		logger: getDefaultLogger(),
+		target: AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851},
+		source: placeholder,
+	}
+
+	before, err := c.encode(CommandIDRead, []byte{1, 2, 3, 4}, 1)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	c.setSource(assigned)
+	after, err := c.encode(CommandIDRead, []byte{1, 2, 3, 4}, 2)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	// Source AMS address sits after the 6-byte AMS/TCP header and the 8-byte target.
+	const sourceOffset = 6 + 8
+	gotBefore := before[sourceOffset : sourceOffset+6]
+	gotAfter := after[sourceOffset : sourceOffset+6]
+	if !bytes.Equal(gotBefore, placeholder.NetID[:]) {
+		t.Fatalf("source before = % x, want the placeholder % x — test is reading the wrong offset",
+			gotBefore, placeholder.NetID[:])
+	}
+	if !bytes.Equal(gotAfter, assigned.NetID[:]) {
+		t.Errorf("source on the wire = % x after setSource(%v): requests still carry the pre-handshake address, so the PLC "+
+			"answers a NetID this session is not using", gotAfter, assigned)
+	}
+}

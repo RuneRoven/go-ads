@@ -131,9 +131,9 @@ func (a AMSAddress) Equal(other AMSAddress) bool {
 // encode lives on *Client. Session callers reach it via s.client.encode
 // at the rare sites still on Session.
 func (c *Client) encode(command CommandID, data []byte, invokeID uint32) ([]byte, error) {
-	// Snapshot source under lock to avoid race with Session writing c.source
-	// during reconnect's auto-derive path. target is set at construction
-	// and never mutated after that.
+	// Snapshot source under lock: setSource replaces it after a local-mode
+	// handshake, which can land while requests are already in flight. target is set
+	// at construction and never mutated after that.
 	c.tx.connMu.Lock()
 	source := c.source
 	c.tx.connMu.Unlock()
