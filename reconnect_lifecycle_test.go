@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -534,11 +535,18 @@ func TestReconnect_RefusedDialKeepsFastRetries(t *testing.T) {
 	go func() { _ = sess.Reconnect(context.Background()); close(done) }()
 	t.Cleanup(func() { _ = sess.Close(); <-done })
 
-	// fastBackoff is 50ms, so a second is worth many attempts.
-	time.Sleep(time.Second)
-	if got := sess.lifecycle.reconnectAttemptsForTest(); got < 5 {
-		t.Errorf("only %d attempts in 1s against a refused port; a refused dial must not enter the unserved cooldown", got)
+	// fastBackoff is 50ms, so 5 attempts is ~250ms of work. Polled rather than
+	// slept: the assertion is the attempt count, and a fixed second spent waiting
+	// for it proves nothing the poll does not.
+	deadline := time.Now().Add(time.Second)
+	var got int64
+	for time.Now().Before(deadline) {
+		if got = sess.lifecycle.reconnectAttemptsForTest(); got >= 5 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Errorf("only %d attempts in 1s against a refused port; a refused dial must not enter the unserved cooldown", got)
 }
 
 // TestConnect_VerifiesTheLinkAnswersEvenWithoutRouteRegistration: Connect must
@@ -1147,5 +1155,75 @@ func TestTearDownAndReset_ReleasesWaitersImmediately(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Error("an in-flight request was not released by the teardown: it will wait out its full request timeout instead of " +
 			"learning the transport is gone")
+	}
+}
+
+// TestGiveUpReconnecting_TearsDownTheTransport: giving up must actually tear the
+// session down, not merely flip the FSM to Closed.
+//
+// The bug this pins: giveUpReconnecting released PLC-side resources only, gated on
+// winning the transition to Closed — no context cancel, no socket close, no peer
+// listener release. The user's later Close() then found the FSM already Closed and
+// returned nil having done nothing, so port 48898, the transmit worker and every
+// recv worker stayed alive for the life of the process. Reachable from any
+// WithMaxReconnectAttempts session whose PLC does not come back.
+func TestGiveUpReconnecting_TearsDownTheTransport(t *testing.T) {
+	srv := startScriptableServer(t)
+	sess := newDialableTestSession(t, srv.host, srv.port, 1)
+	if err := sess.dialAndStart(); err != nil {
+		t.Fatalf("dialAndStart: %v", err)
+	}
+	c := sess.client.Load()
+
+	// A bound listener stands in for the inbound-route port: the observable proof
+	// that stopPeerListener ran, without needing a real PLC to connect back.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	sess.peerMu.Lock()
+	sess.peerLn = ln
+	sess.peerMu.Unlock()
+
+	// Nothing to reconnect to: one attempt, one refusal, then give up.
+	srv.stop()
+	sess.transitionState(SessionStateDisconnected)
+	if rerr := sess.Reconnect(context.Background()); rerr == nil {
+		t.Fatalf("Reconnect = nil, want an error after exhausting attempts")
+	}
+
+	if lctx := sess.currentLifecycleCtx(); lctx.Err() == nil {
+		t.Error("lifecycle context is still live after giving up: nothing keyed on it will ever stop")
+	}
+	// Deadline so a listener that is still open fails the assertion instead of
+	// blocking here until the whole test binary times out.
+	if tl, ok := ln.(*net.TCPListener); ok {
+		_ = tl.SetDeadline(time.Now().Add(2 * time.Second))
+	}
+	if _, aerr := ln.Accept(); !errors.Is(aerr, net.ErrClosed) {
+		t.Errorf("peer listener Accept = %v, want net.ErrClosed: the inbound port is still bound", aerr)
+	}
+	if !sess.IsClosed() {
+		t.Error("IsClosed() = false after giving up: the consumer's only signal never fires")
+	}
+
+	// And the user's Close must still complete the blocking half.
+	done := make(chan error, 1)
+	go func() { done <- sess.Close() }()
+	select {
+	case cerr := <-done:
+		if cerr != nil {
+			t.Errorf("Close after giving up = %v, want nil", cerr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close hung after giving up")
+	}
+
+	workers := make(chan struct{})
+	go func() { c.waitGroup.Wait(); close(workers) }()
+	select {
+	case <-workers:
+	case <-time.After(5 * time.Second):
+		t.Error("client workers still running after give-up + Close")
 	}
 }

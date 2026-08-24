@@ -102,6 +102,13 @@ type sessionLifecycle struct {
 
 	closedCh   chan struct{}
 	closedOnce sync.Once
+	// shutdownOnce guards the terminal teardown (see Session.shutdownTransport).
+	// It exists because that work has two entry points — Close() and
+	// giveUpReconnecting() — and gating it on winning the FSM transition to Closed
+	// meant whichever lost did nothing at all: a give-up left the socket, the 48898
+	// listener and every worker in place, and the user's later Close() returned nil
+	// without touching them.
+	shutdownOnce sync.Once
 	// spawnMu makes "is the session closed" and "register a goroutine" one atomic
 	// decision. A bare isClosed() check before waitGroup.Add is a TOCTOU: Close can
 	// run to completion in the gap, its Wait returns with the counter at 0, and the
@@ -543,8 +550,9 @@ func (sess *Session) applyTargetCheck(id RemoteIdentity) error {
 // moves it; WithoutAmsPeerFallback() refuses it entirely.
 //
 // A failed Connect leaves the session usable for a retry (the FSM rolls back to
-// Disconnected), but Close is still the caller's responsibility: a listener or
-// transport this attempt opened is released by Close, not by the failure.
+// Disconnected) and releases the inbound listener it bound, so a caller who
+// discards the session after an error leaks neither the port nor its goroutines.
+// Close is still the caller's responsibility for everything else.
 //
 // Not safe for concurrent invocation on the same Session — the FSM gate via
 // transitionToOnce(Connecting) serializes callers, but races on sess.tx /
@@ -564,6 +572,21 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	defer func() {
 		if retErr != nil && sess.lifecycle.state.load() == SessionStateConnecting {
 			sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+		}
+	}()
+	// Release the inbound listener on every error return, and only on those. Connect
+	// binds it in three places (the WithAmsPeerListen pre-bind below, the
+	// known-peer-host pre-bind after the dial, and tryPeerFallback), and a Connect
+	// that then fails used to leave all of them: port 48898 held plus the accept
+	// loop and the workers it feeds, once per attempt. Callers treat a Connect error
+	// as "throw the session away and build a new one" — nobody calls Close on it —
+	// so the leak was unbounded.
+	//
+	// releasePeerListener, NOT stopPeerListener: the latter latches peerStopped and
+	// would turn a legal retry from Disconnected into a permanent bind refusal.
+	defer func() {
+		if retErr != nil {
+			sess.releasePeerListener()
 		}
 	}()
 	// Before dialing: some devices answer only on a connection they open to us,
@@ -591,7 +614,11 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	}
 	tcpConn, err := sess.dialTCP()
 	if err != nil {
-		sess.logger.Error("Error connecting", "error", err)
+		// Warn, not Error: the error is also returned, the session stays retryable
+		// (the deferred rollback restores Disconnected), and a reconnecting caller
+		// dials again — so this is a transient condition being retried, not
+		// something only a human can clear.
+		sess.logger.Warn("could not dial the PLC", "ip", sess.ip, "port", sess.port, "error", err)
 		return err
 	}
 	sess.tx.connMu.Lock()
@@ -1543,11 +1570,52 @@ func (sess *Session) releasePLCResources(wasDisconnected bool) {
 	}
 }
 
+// shutdownTransport performs the terminal half of teardown that never blocks:
+// PLC-side resource release, peer listener stop, context cancel, socket close and
+// peer-connection close. Everything here is what makes the workers return on their
+// own, so a caller that cannot wait for them (giveUpReconnecting runs *inside* the
+// Reconnect goroutine, and Close's waits include reconnectDone) still leaves nothing
+// behind.
+//
+// Runs exactly once per session, whichever path gets here first.
+func (sess *Session) shutdownTransport(wasDisconnected bool) {
+	sess.lifecycle.shutdownOnce.Do(func() {
+		// Stop accepting inbound PLC connections before tearing the transport down,
+		// so the accept loop cannot hand one to a Client that is going away.
+		sess.stopPeerListener()
+		// releasePLCResources collects the heartbeat along with the caller's handles
+		// (see takeNotificationHandles), so it does not need releasing separately.
+		sess.releasePLCResources(wasDisconnected)
+		// Capture cancel under RLock then release before invoking — see
+		// tearDownAndReset for the symmetric pattern. Holding RLock across the
+		// cancel() blocks tearDownAndReset's ctxMu.Lock replacement.
+		sess.lifecycle.ctxMu.RLock()
+		cancel := sess.lifecycle.shutdown
+		sess.lifecycle.ctxMu.RUnlock()
+		if cancel != nil {
+			cancel()
+		}
+		// Close the TCP connection to unblock listen(), which may be stuck in ReadFull.
+		sess.tx.connMu.Lock()
+		if sess.tx.connection != nil {
+			_ = sess.tx.connection.Close()
+		}
+		sess.tx.connMu.Unlock()
+		if c := sess.client.Load(); c != nil {
+			c.markDropped() // same reason as in tearDownAndReset
+			// Adopted inbound connections have their own readers; closing the sockets
+			// is what lets those readers return.
+			c.closePeerConns()
+		}
+	})
+}
+
 // Close releases PLC-side notification subscriptions, releases the cached
 // PLC-side symbol handles when transport is still alive, cancels the
 // session context, closes the underlying TCP socket, and waits for the
-// listen + transmit + recv workers to exit. Idempotent — subsequent calls
-// return nil without re-running cleanup.
+// listen + transmit + recv workers to exit. Idempotent — the teardown itself
+// runs once (shutdownTransport), and a repeat call only re-waits on workers
+// that have already finished.
 //
 // Returns nil on success; future implementations may surface specific
 // failure modes via the error return (TCP close failure, PLC handle
@@ -1558,30 +1626,15 @@ func (sess *Session) Close() error {
 	// network ops; once state is Closed, isDisconnected() returns false even
 	// if the transport was already gone.
 	wasDisconnected := sess.isDisconnected()
-	if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateClosed); !ok {
-		return nil // already closed (or transition not permitted from current state)
-	}
+	// Deliberately NOT gated on winning this transition. giveUpReconnecting may
+	// already have moved the FSM to Closed, and returning early there left the
+	// socket, the 48898 listener and every worker in place: the caller's Close is
+	// the only place that can wait for those workers, because giveUpReconnecting
+	// runs inside the very goroutine this function waits for.
+	sess.lifecycle.state.transitionToOnce(SessionStateClosed)
 	sess.markClosed()
 	sess.logger.Info("Close called, shutting down")
-	// Stop accepting inbound PLC connections before tearing the transport down,
-	// so the accept loop cannot hand one to a Client that is going away.
-	sess.stopPeerListener()
-	// releasePLCResources collects the heartbeat along with the caller's handles
-	// (see takeNotificationHandles), so it no longer needs releasing here.
-	sess.releasePLCResources(wasDisconnected)
-	// Capture cancel under RLock then release before invoking — see
-	// tearDownAndReset for the symmetric pattern. Holding RLock across the
-	// cancel() blocks tearDownAndReset's ctxMu.Lock replacement.
-	sess.lifecycle.ctxMu.RLock()
-	cancel := sess.lifecycle.shutdown
-	sess.lifecycle.ctxMu.RUnlock()
-	cancel()
-	// Close the TCP connection to unblock listen() which may be stuck in ReadFull
-	sess.tx.connMu.Lock()
-	if sess.tx.connection != nil {
-		sess.tx.connection.Close()
-	}
-	sess.tx.connMu.Unlock()
+	sess.shutdownTransport(wasDisconnected)
 	// Wait for any in-progress reconnect to stop BEFORE waiting on the
 	// goroutine waitGroup. Reconnect's retry loop may call waitGroup.Add(2)
 	// after we Close — calling Wait first would race with that Add and
@@ -1603,9 +1656,10 @@ func (sess *Session) Close() error {
 	sess.stateWG.Wait()
 	sess.logger.Info("Waiting for workers to close")
 	if c := sess.client.Load(); c != nil {
-		c.markDropped() // same reason as in tearDownAndReset
-		// Adopted inbound connections have their own readers; closing the sockets
-		// is what lets those readers return, so it must happen BEFORE the wait.
+		// Repeated from shutdownTransport on purpose: a reconnect in flight when the
+		// teardown ran may have swapped in a different *Client, and waiting on one
+		// whose sockets are still open never returns.
+		c.markDropped()
 		c.closePeerConns()
 		c.waitGroup.Wait()
 	}
@@ -1725,14 +1779,20 @@ func (sess *Session) coolDownAfterUnserved(ctx context.Context, attempts int, ca
 // only liveness signal is IsClosed(), so "gave up but still alive" is a state it
 // can neither observe nor recover from.
 func (sess *Session) giveUpReconnecting(cause error) error {
-	// transitionToOnce so a concurrent Close() wins cleanly; the winner owns the
-	// PLC-side cleanup, because a later user Close() short-circuits and would
-	// otherwise skip it entirely.
-	if _, ok := sess.lifecycle.state.transitionToOnce(SessionStateClosed); ok {
-		sess.releasePLCResources(true) // transport is gone by the time we give up
-	}
+	sess.lifecycle.state.transitionToOnce(SessionStateClosed)
 	// Idempotent via closedOnce, whichever of Close() and this ran first.
 	sess.markClosed()
+	// Full teardown, not just the PLC-side release: this path is reachable without
+	// the user ever calling Close (WithMaxReconnectAttempts, a cancelled Reconnect),
+	// and leaving the socket and the 48898 listener open then leaked them for the
+	// life of the process. wasDisconnected=true: the transport is gone by
+	// definition once we give up on it.
+	//
+	// The blocking half of Close's teardown stays in Close. This runs inside the
+	// Reconnect goroutine, so waiting for reconnectDone here would deadlock — but
+	// the workers need no waiting to exit, only the cancel and the socket close
+	// that shutdownTransport performs.
+	sess.shutdownTransport(true)
 	return cause
 }
 
@@ -2611,18 +2671,38 @@ func (sess *Session) peerAcceptLoop(ln net.Listener) {
 	}
 }
 
-// stopPeerListener closes the listener and waits for the accept loop to exit.
+// stopPeerListener closes the listener, latches the session against ever binding
+// again, and waits for the accept loop to exit. For terminal teardown only.
 func (sess *Session) stopPeerListener() {
 	sess.peerMu.Lock()
-	ln := sess.peerLn
-	sess.peerLn = nil
 	// Latch, so a Connect that was about to bind cannot do so after this returns.
 	// Without it: a Connect descheduled just before the bind, a concurrent Close
 	// reading peerLn as nil and waiting on an empty peerWG, and then the bind
 	// landing — leaving 48898 held and an accept loop running in a session the
 	// caller believes is fully closed. The accept loop's own isClosed() escape only
 	// runs after a connection arrives, which on a dead PLC never happens.
+	//
+	// Set BEFORE releasePeerListener takes the lock: startPeerListener holds peerMu
+	// across its net.Listen, so once the latch is visible any bind either already
+	// completed (and releasePeerListener sees the listener) or is refused.
 	sess.peerStopped = true
+	sess.peerMu.Unlock()
+	sess.releasePeerListener()
+}
+
+// releasePeerListener closes the listener and waits for the accept loop to exit,
+// WITHOUT latching peerStopped.
+//
+// This is what a failed Connect needs. The session stays usable for a retry (the
+// FSM rolls back to Disconnected, and Disconnected -> Connecting is a legal edge),
+// so latching here would permanently refuse the bind and make every retry fail
+// with "session is shutting down" — while NOT releasing at all left port 48898
+// held and its accept loop running per failed attempt, which callers that respond
+// to a Connect error by discarding the session then leaked for the process's life.
+func (sess *Session) releasePeerListener() {
+	sess.peerMu.Lock()
+	ln := sess.peerLn
+	sess.peerLn = nil
 	sess.peerMu.Unlock()
 	if ln != nil {
 		_ = ln.Close()

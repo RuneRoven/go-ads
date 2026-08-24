@@ -90,11 +90,13 @@ func TestPeerRoute_DisabledStillFailsClearly(t *testing.T) {
 	// Its own port, not the protocol default: this test used to bind
 	// 0.0.0.0:48898 — the host's real AMS port — as a side effect.
 	fallbackPort := freeLocalPort(t)
+	logs := &testLogHandler{}
 	sess, err := NewSession(context.Background(),
 		AMSEndpoint{IP: srv.host, Port: srv.port, AMS: AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851}},
 		WithRequestTimeout(300*time.Millisecond),
 		WithTargetCheck(TargetCheckOff),
 		WithAutoReconnect(false),
+		WithLogger(slog.New(logs)),
 		WithAmsPeerListen(fallbackPort),
 	)
 	if err != nil {
@@ -113,10 +115,11 @@ func TestPeerRoute_DisabledStillFailsClearly(t *testing.T) {
 	// only "Connect failed" passed even with tryPeerFallback gutted to an
 	// unconditional error, and would also pass on a host where the port is simply
 	// taken.
-	sess.peerMu.Lock()
-	ln := sess.peerLn
-	sess.peerMu.Unlock()
-	if ln == nil {
+	//
+	// Evidence is the bind log line, not a surviving sess.peerLn: a failed Connect
+	// releases the listener now (see the defer in Connect), so the live field says
+	// nothing about whether the fallback ran.
+	if rec := logs.findByMessage("listening for inbound PLC connections"); rec == nil {
 		t.Error("no listener was ever bound: the fallback did not run, so this test would pass with it deleted")
 	}
 	if !strings.Contains(err.Error(), "answered neither GetSymbolVersion nor ReadState") {
@@ -441,6 +444,65 @@ func TestPeerListener_RetryAfterAFailedBind(t *testing.T) {
 	if ln == nil {
 		t.Error("startPeerListener reported success with no listener: the failed bind was latched, so every later caller " +
 			"is told it is listening when nothing is")
+	}
+}
+
+// TestConnect_ReleasesPeerListenerOnFailure: a Connect that fails must not leave
+// the inbound AMS listener bound.
+//
+// Connect binds it before dialing (WithAmsPeerListen), and the rollback only
+// restored the FSM — so every failed attempt left the port held plus its accept
+// loop running. Callers respond to a Connect error by discarding the session and
+// building a new one, never by calling Close, so with a retry loop the leak is
+// unbounded: measured as one held port and ~19 surviving goroutines per attempt.
+//
+// The release must be non-latching, or the documented retry (the FSM rolls back to
+// Disconnected, and Disconnected -> Connecting is legal) can never bind again —
+// hence the second arm.
+func TestConnect_ReleasesPeerListenerOnFailure(t *testing.T) {
+	port := freeLocalPort(t)
+	ep := testEndpoint()
+	// Nothing serves TCP port 1 on loopback, so the dial fails immediately: this
+	// test must never depend on a timeout.
+	ep.Port = 1
+
+	sess, err := NewSession(context.Background(), ep,
+		WithRequestTimeout(500*time.Millisecond),
+		WithTargetCheck(TargetCheckOff),
+		WithAutoReconnect(false),
+		WithAmsPeerListen(port),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	if err := sess.Connect(context.Background()); err == nil {
+		t.Fatal("Connect succeeded against a closed port")
+	}
+
+	sess.peerMu.Lock()
+	ln, stopped := sess.peerLn, sess.peerStopped
+	sess.peerMu.Unlock()
+	if ln != nil {
+		t.Error("the inbound listener is still bound after a failed Connect: the port and its accept loop leak per attempt")
+	}
+	// Independent of the field: the port itself has to be free again, and the accept
+	// loop gone. A wildcard bind, because that is what startPeerListener uses — on
+	// macOS a 127.0.0.1 bind does not conflict with a wildcard one.
+	rebind, err := net.Listen("tcp4", net.JoinHostPort("", strconv.Itoa(port)))
+	if err != nil {
+		t.Fatalf("port %d is still bound after a failed Connect: %v", port, err)
+	}
+	_ = rebind.Close()
+
+	// Second arm: released, not latched. A retry has to be able to bind.
+	if stopped {
+		t.Fatal("peerStopped was latched by a failed Connect: every retry will be refused with " +
+			"\"session is shutting down\" instead of binding")
+	}
+	if err := sess.startPeerListener(); err != nil {
+		t.Fatalf("a retry cannot bind the inbound port after a failed Connect: %v", err)
 	}
 }
 
