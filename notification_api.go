@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -775,7 +776,21 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		}
 		if r.Error != ReturnCodeNoErrors {
 			results[info.configIndex] = r
-			sess.logger.Error("error adding notification in batch",
+			// Level by whether anyone has to act. A code in the stale-detection set
+			// is the expected answer after a runtime restart: detection fires, the
+			// handle is invalidated, and the next call re-resolves it. Measured on a
+			// TC3 box, logging those at Error turned one ordinary restart into 22
+			// ERROR lines in a second for a condition that healed immediately —
+			// the log-flood shape this branch has already fixed twice elsewhere.
+			// Anything else is something the library cannot resolve on its own.
+			//
+			// The code reaches the caller in results either way, so demoting costs
+			// no signal.
+			level := slog.LevelError
+			if stale, _ := detectStaleCache(r.Error); stale {
+				level = slog.LevelWarn
+			}
+			sess.logger.Log(context.Background(), level, "error adding notification in batch",
 				"symbol", info.config.SymbolName,
 				"errorCode", uint32(r.Error))
 			return

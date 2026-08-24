@@ -1223,3 +1223,78 @@ func TestIsBestEffortDeleteSuccess(t *testing.T) {
 		})
 	}
 }
+
+// TestAddSymbolNotifications_StaleItemLogsAtWarnNotError: a per-item code that the
+// library is about to recover from on its own belongs at Warn; one nobody can fix
+// without a human belongs at Error.
+//
+// Measured on 192.168.3.118: restarting the TwinCAT runtime made a routine
+// resubscribe emit 22 ERROR lines in one second, one per stale handle, for a
+// condition that healed a second later — the same log-flood shape as the 1468-line
+// episode this branch already fixed elsewhere. The per-item code reaches the caller
+// in the results either way, so nothing is lost by demoting it.
+//
+// Asserts BOTH directions on purpose: a blanket demotion to Warn would satisfy the
+// first half and quietly gag the codes an operator does need to see.
+func TestAddSymbolNotifications_StaleItemLogsAtWarnNotError(t *testing.T) {
+	cases := []struct {
+		name      string
+		code      ReturnCode
+		wantLevel slog.Level
+		why       string
+	}{
+		{
+			name:      "stale handle after a runtime restart",
+			code:      ReturnCodeDeviceSymbolNoFound, // 0x710, in the stale-detection set
+			wantLevel: slog.LevelWarn,
+			why:       "the library invalidates the handle and the next call re-resolves it",
+		},
+		{
+			name:      "symbol version invalid",
+			code:      ReturnCodeDeviceSymbolVersionInvalid, // 0x711, also self-healing
+			wantLevel: slog.LevelWarn,
+			why:       "same: detection fires and the cache reloads",
+		},
+		{
+			name:      "service not supported",
+			code:      ReturnCodeDeviceServiceNotSupported, // 0x701, not recoverable here
+			wantLevel: slog.LevelError,
+			why:       "nothing in the library can make this succeed; an operator has to look",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := startScriptableServer(t)
+			defer srv.stop()
+
+			logs := &testLogHandler{}
+			var handleLookups, staleAdds, uploadInfoReads atomic.Int32
+			sess, _ := seedStaleSymbol(t, srv, &handleLookups, &staleAdds, &uploadInfoReads,
+				WithLogger(slog.New(logs)))
+
+			srv.onWriteRead(GroupSumupAddDeviceNotification, func(_ []byte) []byte {
+				return buildSumAddNotifPayload([]sumNotifResponse{{Error: tc.code}})
+			})
+
+			ch := make(chan *Update, 1)
+			cfg := NotificationConfig{SymbolName: "MAIN.a", CycleTime: time.Second, TransmissionMode: TransModeServerOnChange}
+			if _, err := sess.AddSymbolNotifications(context.Background(), []NotificationConfig{cfg}, ch); err != nil {
+				t.Fatalf("batch subscribe: %v", err)
+			}
+
+			rec := logs.findByMessage("error adding notification in batch")
+			if rec == nil {
+				rec = logs.findByMessage("notification batch: item rejected")
+			}
+			if rec == nil {
+				t.Fatalf("no per-item log record for code %v; the code still reaches the caller in the results, "+
+					"but the operator-facing signal disappeared entirely", tc.code)
+			}
+			if rec.Level != tc.wantLevel {
+				t.Errorf("per-item log for %v logged at %v, want %v — %s",
+					tc.code, rec.Level, tc.wantLevel, tc.why)
+			}
+		})
+	}
+}
