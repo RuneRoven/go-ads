@@ -402,6 +402,10 @@ func (s *scriptableServer) handle(c net.Conn) {
 			continue
 		}
 		if err := writeResponse(out, body, cmd, invokeID, respPayload, amsErr); err != nil {
+			// A failed write to the stub's OWN peer connection has to invalidate it,
+			// or the cached conn keeps being handed out and every later response goes
+			// nowhere — one broken dial-back poisoning the rest of the test.
+			s.discardPeerConn(out)
 			return
 		}
 
@@ -447,6 +451,18 @@ func (s *scriptableServer) responseWriter(client net.Conn) (net.Conn, error) {
 	}
 	s.peerConn = c
 	return c, nil
+}
+
+// discardPeerConn drops the cached peer connection if it is the one that just
+// failed, so the next response redials instead of writing into a dead socket.
+// Compares identity: another goroutine may already have replaced it.
+func (s *scriptableServer) discardPeerConn(failed net.Conn) {
+	s.peerMu.Lock()
+	defer s.peerMu.Unlock()
+	if s.peerConn != nil && s.peerConn == failed {
+		_ = s.peerConn.Close()
+		s.peerConn = nil
+	}
 }
 
 // answerThenClose answers the nth occurrence of cmd (1-based) and then closes

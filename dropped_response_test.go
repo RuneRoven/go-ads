@@ -43,4 +43,11 @@ func TestDroppedDoesNotDiscardArrivedReply(t *testing.T) {
 	if lost > 0 {
 		t.Errorf("%d of %d replies were discarded despite having arrived", lost, runs)
 	}
+	// Without this the test passes while proving nothing: an unexpected error on
+	// every run leaves got and lost both at 0, the default branch only logs, and
+	// the check above is satisfied by never having delivered anything.
+	if got+lost != runs {
+		t.Errorf("only %d of %d runs reached a known outcome (%d delivered, %d lost); the rest failed some other way "+
+			"and this test cannot speak to the behaviour it exists to pin", got+lost, runs, got, lost)
+	}
 }

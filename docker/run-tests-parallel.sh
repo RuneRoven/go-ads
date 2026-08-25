@@ -50,6 +50,7 @@ fi
 # ── Resolve arguments to env files, fail before starting anything ──
 SUFFIXES=()
 ENV_FILES=()
+PLC_IPS=()
 for arg in "${ARGS[@]}"; do
     if [[ -f "$arg" ]]; then
         env_file="$arg"
@@ -62,16 +63,36 @@ for arg in "${ARGS[@]}"; do
     fi
     suffix=$(basename "$env_file" | sed 's/\.env\.integration\.//')
     # One run per PLC, always. Two concurrent runs against the same device break
-    # its AMS router, so a repeated argument (or two paths resolving to the same
-    # env file) is refused rather than quietly launched twice.
-    for seen in ${SUFFIXES[@]+"${SUFFIXES[@]}"}; do
-        if [[ "$seen" == "$suffix" ]]; then
-            echo -e "${RED}Error: PLC .${suffix} listed more than once — never run two test runs against one PLC concurrently${RESET}" >&2
+    # its AMS router, so a duplicate is refused rather than quietly launched twice.
+    #
+    # Compared by ADS_PLC_IP, not by file name: two env files can differ in name
+    # and target the same device (a copy made to vary route credentials, symbol
+    # names or ports), and that is the case a name check waves straight through.
+    plc_ip="$(
+        set -a
+        # shellcheck disable=SC1090 # path is a runtime argument
+        . "$env_file"
+        set +a
+        printf '%s' "${ADS_PLC_IP:-}"
+    )"
+    if [[ -z "$plc_ip" ]]; then
+        echo -e "${RED}Error: $env_file sets no ADS_PLC_IP${RESET}" >&2
+        exit 1
+    fi
+    # Plain length check then index loop. `${!PLC_IPS[@]+...}` mixes index
+    # expansion with the alternate-value form, expands to nothing, and silently
+    # skips the comparison entirely — which is how an earlier version of this
+    # guard let two concurrent runs at one PLC straight through.
+    for ((i = 0; i < ${#PLC_IPS[@]}; i++)); do
+        if [[ "${PLC_IPS[$i]}" == "$plc_ip" ]]; then
+            echo -e "${RED}Error: $env_file and .env.integration.${SUFFIXES[$i]} both target ${plc_ip}${RESET}" >&2
+            echo -e "${RED}       never run two test runs against one PLC concurrently — it breaks its AMS router${RESET}" >&2
             exit 1
         fi
     done
     ENV_FILES+=("$env_file")
     SUFFIXES+=("$suffix")
+    PLC_IPS+=("$plc_ip")
 done
 
 TS=$(date +%Y%m%d-%H%M%S)

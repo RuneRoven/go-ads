@@ -53,6 +53,7 @@ func (c *capabilities) SumDeleteNotifStateStore(v uint32) {
 func (c *capabilities) SumDeleteNotifStateCAS(old, new uint32) bool {
 	return c.sumDeleteNotifState.CompareAndSwap(old, new)
 }
+
 func (c *capabilities) ChunkedDownloadCheckedLoad() bool   { return c.chunkedDownloadChecked.Load() }
 func (c *capabilities) ChunkedDownloadCheckedStore(v bool) { c.chunkedDownloadChecked.Store(v) }
 func (c *capabilities) ChunkedDownloadSupportedLoad() bool {

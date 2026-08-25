@@ -364,7 +364,7 @@ func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestam
 		notificationTime = time.Now()
 	} else {
 		timeStamp := int64(timestamp)/windowsTick - secToUnixEpoch
-		notificationTime = time.Unix(timeStamp, int64(timestamp)%(windowsTick)*100)
+		notificationTime = time.Unix(timeStamp, int64(timestamp)%windowsTick*100)
 	}
 	// cache.lock for parse() — symbol fields live in cache.symbols and parse
 	// mutates Value/Valid. Lock ordering: cache after notifications release
@@ -1052,6 +1052,12 @@ func (sess *Session) establishHeartbeat(ctx context.Context) {
 		if derr := c.DeleteDeviceNotification(ctx, handle); derr != nil {
 			sess.logger.Debug("releasing the colliding heartbeat handle failed", "error", derr)
 		}
+		// Same reason as the establish-failure path above: returning without a
+		// watcher leaves this session with no watchdog for its entire life, so
+		// nothing retries the beat and a later silent subscription death goes
+		// unnoticed. The collision itself is transient — the next attempt asks the
+		// PLC for a fresh handle.
+		sess.startHeartbeatWatch()
 		return
 	}
 	// CompareAndSwap, not Store: two concurrent first subscribes both see no

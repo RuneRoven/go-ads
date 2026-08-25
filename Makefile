@@ -23,8 +23,11 @@ hardware-log:
 lint:
 	golangci-lint run
 
+# go run rather than a local binary: CI's golangci-lint-action resolves `latest`,
+# and a locally-installed gofumpt that is even slightly older disagrees with it.
+# That is how two pre-existing formatting nits passed here and failed CI.
 fmt:
-	gofumpt -w .
+	go run mvdan.cc/gofumpt@latest -w .
 	golangci-lint fmt
 
 # Second pass compiles the integration-tagged files, which the normal

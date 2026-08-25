@@ -183,6 +183,7 @@ func TestIntegrationLinkLossBlackhole(t *testing.T) {
 	t.Logf("streaming %d symbols through %s", bound, p)
 
 	// Sever.
+	darkAt := time.Now()
 	p.blackhole()
 	if !awaitQuiet(ch, 3*time.Second, 30*time.Second) {
 		// A device that answers on a connection IT opens to us bypasses the proxy
@@ -200,7 +201,10 @@ func TestIntegrationLinkLossBlackhole(t *testing.T) {
 		t.Fatal("updates never stopped after blackholing the link")
 	}
 	downAt := time.Now()
-	t.Logf("stream stopped %v after the link went dark", time.Since(downAt).Round(time.Millisecond))
+	// Measured from when the link was blackholed, not from now: time.Since(downAt)
+	// on the line after downAt is assigned always printed ~0, which made the one
+	// number this phase produces useless.
+	t.Logf("stream stopped %v after the link went dark", downAt.Sub(darkAt).Round(time.Millisecond))
 
 	// Stay down long enough for the library to notice and start retrying, but
 	// well inside the PLC's route-idle timeout so its handle table still holds

@@ -1472,3 +1472,78 @@ func TestHeartbeatAllowedTicks(t *testing.T) {
 		})
 	}
 }
+
+// TestHeartbeat_RetriesAfterAHandleCollision: sibling of the test above, for the
+// other branch that abandons the beat.
+//
+// A PLC that hands back a handle already in use by a caller's subscription is
+// refused deliberately — every sample for that subscription would look like a beat
+// and be swallowed. But the collision path returned without starting the watcher,
+// so the outcome was the same failure the establish-failure path was fixed to
+// avoid: heartbeatHandle left at 0, nothing ever retrying, and a later silent
+// subscription death unnoticed for the life of the session.
+//
+// No real firmware issues duplicate handles, which is exactly why this needs a
+// test: the branch is unreachable on the bench and its consequence is permanent.
+func TestHeartbeat_RetriesAfterAHandleCollision(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	// The NOTIFICATION handle the caller's subscription is given, which the stub
+	// then hands back for the beat. It has to be the notification handle, not the
+	// symbol handle: the collision check looks in activeNotifications.
+	const collidingHandle = 0xAB01
+
+	var collide atomic.Bool
+	collide.Store(true)
+	var cyclicAttempts atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xCD00)
+	srv.onAddDeviceNotification(func(req addNotifRequest) addNotifResponse {
+		if Group(req.Group) == GroupSymbolVersion && req.TransMode == uint32(TransModeServerCycle) {
+			cyclicAttempts.Add(1)
+			if collide.Load() {
+				// The caller's own notification handle, handed back for the beat.
+				return addNotifResponse{Handle: collidingHandle}
+			}
+			return addNotifResponse{Handle: nextHandle.Add(1)}
+		}
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	sess, c := newWiredTestSession(t, srv, WithNotificationHeartbeat(100*time.Millisecond, 2))
+	c.SetNotificationHandler(sess.handleNotification)
+	preSeedTypedSymbol(sess, "MAIN.collide", 0xFF10)
+	ch := make(chan *Update, 4)
+	// A subscription must already be COMMITTED for the collision check to see it:
+	// establishHeartbeat runs immediately after the PLC's Add and before the
+	// caller's own handle reaches activeNotifications, so a first subscribe can
+	// never collide with itself.
+	seedLiveNotification(sess, "MAIN.already", collidingHandle, ch)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.collide", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Fatalf("AddSymbolNotification: %v", err)
+	}
+	if got := sess.notifications.heartbeatHandle.Load(); got != 0 {
+		t.Fatalf("heartbeatHandle = 0x%X, want 0: the colliding handle was supposed to be refused", got)
+	}
+	if cyclicAttempts.Load() == 0 {
+		t.Fatal("no cyclic subscribe was attempted; the test proves nothing")
+	}
+
+	// The PLC stops colliding. Nobody subscribes again, so only a watcher can pick
+	// this up — which is the whole point.
+	collide.Store(false)
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		if hb := sess.notifications.heartbeatHandle.Load(); hb != 0 && hb != collidingHandle {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the heartbeat was never re-attempted after the collision (%d cyclic attempts): the session has no "+
+				"watchdog and will not notice its subscriptions dying", cyclicAttempts.Load())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
