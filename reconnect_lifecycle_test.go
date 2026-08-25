@@ -1494,3 +1494,36 @@ func TestReconnect_DropDuringTheTailIsNotErased(t *testing.T) {
 		}
 	}
 }
+
+// TestConnect_ResetNamesTheRouteAsALikelyCause: the error a caller RECEIVES has to
+// carry the diagnosis, not just the log line.
+//
+// Measured against 192.168.3.118 with its route table wiped: discovery resolved
+// the target correctly, Connect then failed, and the caller got
+// "transport dropped during connect: ... client transport closed" — nothing about
+// routes. The useful sentence existed only in a log record at ERROR, so a consumer
+// that surfaces err (which is what the Benthos plugin does) was back to guessing at
+// exactly the failure this library exists to make legible.
+func TestConnect_ResetNamesTheRouteAsALikelyCause(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	// Accept the TCP connection, then drop it on the first request — the wire
+	// signature of a PLC with no route for our NetID.
+	srv.dropConnAfter(CommandIDRead, 1)
+
+	sess := newDialableTestSession(t, srv.host, srv.port, 1)
+	t.Cleanup(func() { _ = sess.Close() })
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+
+	err := sess.Connect(context.Background())
+	if err == nil {
+		t.Fatal("Connect succeeded against a stub that drops the first request")
+	}
+	msg := err.Error()
+	for _, want := range []string{"route", "NetID"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("Connect error does not mention %q: %v\n"+
+				"a caller that logs only this error cannot tell a missing route from a dead PLC", want, err)
+		}
+	}
+}

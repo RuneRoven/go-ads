@@ -959,9 +959,16 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		case errors.Is(err, ErrTransportClosed):
 			// The link died while we were connecting. Reporting success here hands
 			// the caller a Session whose transport is already gone.
+			// The addressing guidance goes in the RETURNED error, not only in the
+			// log line the listen goroutine wrote. A consumer that surfaces err and
+			// not this library's logger otherwise sees "client transport closed" and
+			// nothing else — measured against a PLC with its route table wiped,
+			// where the cause was a missing route and the message said so only in a
+			// log record the plugin never shows.
+			hint := resetAfterConnectHint(sess.sourceAddr(), sess.target)
 			sess.tearDownAndReset()
 			sess.transitionState(SessionStateDisconnected)
-			return fmt.Errorf("transport dropped during connect to %s: %w", sess.ip, err)
+			return fmt.Errorf("transport dropped during connect to %s: %w (%s)", sess.ip, err, hint)
 		case isUnservedError(err):
 			// Second opinion before condemning the link: ReadState is the most
 			// universally supported service there is, so if THAT is also met with

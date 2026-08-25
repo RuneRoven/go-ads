@@ -58,6 +58,26 @@ const droppedResponseGrace = 100 * time.Millisecond
 // Callers reconstruct a new *Client to re-establish.
 var ErrTransportClosed = errors.New("ads: client transport closed")
 
+// resetAfterConnectHint explains a TCP reset that lands right after a successful
+// connect. Shared by the transport-fault log line and by the error Connect returns,
+// so the two cannot drift — and because the log line alone is not enough: a consumer
+// that surfaces the error and not this library's logger otherwise sees only
+// "client transport closed", which is the exact ambiguity this package exists to
+// remove. Measured against a PLC whose route table had been wiped.
+//
+// Four plausible causes, named in the order they are worth checking. Listing only
+// the route one has previously sent people after a mistyped NetID, so all four stay.
+// Both ends of the addressing go in the message, so the reader can check them
+// without reconstructing the config.
+func resetAfterConnectHint(source, target AMSAddress) string {
+	return fmt.Sprintf("a reset right after TCP connect means one of: "+
+		"no route is registered on the PLC for our NetID (%s), "+
+		"the target NetID (%s) does not exist on this PLC, "+
+		"the route credentials were rejected, "+
+		"or AMS port %d addresses no running runtime (expect 851 on TwinCAT 3, 801 on TwinCAT 2)",
+		source.NetIDString(), target.NetIDString(), target.Port)
+}
+
 // isLikelyMissingRoute returns true if err indicates a likely missing-AMS-route
 // condition (PLC closed the TCP connection because no route exists for our
 // NetID). Detects wrapped io.EOF and ECONNRESET via the standard
@@ -531,27 +551,16 @@ func (c *Client) readFrames(conn net.Conn, primary bool) {
 			}
 			hint := ""
 			if isLikelyMissingRoute(err) {
-				// A reset straight after a successful TCP connect has three
-				// plausible causes, and naming only the route one has sent
-				// people down the wrong path for a mistyped target NetID.
-				// Report all three, and log both ends of the addressing so the
-				// reader can check them without reconstructing the config.
-				hint = "a reset right after TCP connect means one of: " +
-					"the target NetID does not exist on this PLC, " +
-					"the route credentials were rejected, " +
-					"or the AMS port addresses no running runtime (851 for TC3, 801 for TC2)"
+				hint = resetAfterConnectHint(c.sourceAddr(), c.target)
 			}
 			if !primary {
 				c.logger.Debug("inbound PLC connection closed", "error", err)
 				return
 			}
 			if hint != "" {
-				// Snapshot once into a local: a local-mode handshake can be
-				// assigning c.source right now from the Connect goroutine.
-				source := c.sourceAddr()
 				c.logger.Log(c.ctx, c.transportFaultLevel(), "PLC closed connection, transport down",
 					"error", err, "hint", hint,
-					"sourceNetID", source.NetIDString(),
+					"sourceNetID", c.sourceAddr().NetIDString(),
 					"targetNetID", c.target.NetIDString(),
 					"targetPort", c.target.Port)
 			} else {

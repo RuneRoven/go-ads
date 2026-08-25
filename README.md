@@ -8,6 +8,9 @@ A pure Go library for communicating with Beckhoff TwinCAT PLCs using the ADS (Au
 
 ## Features
 
+- **Connect with only an IP** — the target AmsNetId and AMS port are probed
+  from the device when omitted (no route, no credentials needed for the probe).
+
 - Connect to TwinCAT 2 and TwinCAT 3 PLCs over TCP
 - Two-layer API: a Beckhoff-equivalent raw `Client` for one-shot consumers and a managed `Session` that adds caching, notification persistence, and auto-reconnect
 - Read/write PLC symbols by name
@@ -62,6 +65,132 @@ func main() {
 	fmt.Printf("Total symbols: %d\n", len(symbols))
 }
 ```
+
+## Target discovery — connecting without an AmsNetId
+
+A wrong or absent NetID is the most common ADS misconfiguration, and the hardest
+to recognise: the router accepts the TCP socket and then silently drops every
+request, which looks nothing like an addressing mistake. So the address is
+optional — omit `AMS` and the device is asked for it.
+
+```go
+// No AMS field at all: NetID and AMS port both come from the device.
+sess, err := ads.NewSession(ctx, ads.AMSEndpoint{IP: "192.168.1.100"},
+    ads.WithRoute("my-route", "Administrator", "1"),
+)
+```
+
+The probe is the AMS router's identify service — UDP on the route-registration
+port (48899), service id 1. It **registers nothing, needs no route and no
+credentials**, and it answers before any route exists, which is what makes it
+usable to bootstrap a connection rather than only to inspect one. Verified
+against TwinCAT 2.10 (CX), TwinCAT 3.1.4024 (CX) and TwinCAT 3.1.4026 on TC/RTOS,
+all three answering a request that carries a zero source NetID — so discovery
+needs no local configuration either.
+
+What you get, logged at Info so an operator learns the device's identity from one
+line even when they supplied nothing:
+
+```
+INFO discovered target AMS address host=192.168.3.118 netID=5.66.133.203.1.1
+     port=851 hostName=CX-4285CB twinCAT=3.1.4024
+```
+
+Cold bootstrap, measured end to end against a PLC with an empty route table and a
+fresh boot (~1s):
+
+```
+discovered target AMS address netID=5.66.133.203.1.1 port=851 twinCAT=3.1.4024
+route probe failed, registering route      <- no route yet, detected by trying
+registering route localNetID=192.168.3.52.1.1 routeName=my-route
+route registration successful
+TCP reconnected after route registration
+connected: symbol version 1
+```
+
+Two deliberate refusals:
+
+- **The AMS port is inferred from the reported TwinCAT version, never guessed.**
+  If a device reports no version, `NewSession` fails and tells you to set
+  `AMS.Port` explicitly rather than planting 851 and addressing a runtime that may
+  not exist. Multi-runtime projects (811, 852, …) must set it anyway — the
+  inferred port is logged so that is visible.
+- **The response is the identity of the router answering at that IP**, not "the
+  NetID of the PLC behind it". On an embedded target (a CX, where router and
+  runtime are the same device) those coincide. On an engineering PC or a gateway
+  fronting other PLCs it is that machine's NetID and the PLC you want is an entry
+  in its route table. Nothing in the response distinguishes the two, so nothing
+  here pretends to.
+
+Without credentials and without a route, `Connect` fails — and says why, in the
+error itself rather than only in a log line:
+
+```
+transport dropped during connect to 192.168.3.118: ads: client transport closed
+(a reset right after TCP connect means one of: no route is registered on the PLC
+for our NetID (192.168.3.52.1.1), the target NetID (5.66.133.203.1.1) does not
+exist on this PLC, the route credentials were rejected, or AMS port 851 addresses
+no running runtime)
+```
+
+Use `WithTargetCheck` to verify a NetID you *did* supply against the device — see
+[Connection options](#connection-options).
+
+### Routes are matched by NetID, not by name
+
+A route entry on the PLC authorises a **source AmsNetId** (and the IP it comes
+from). The name is a PLC-side label, so it is needed only to *create* a route —
+never to use one that already exists:
+
+```go
+// Already-provisioned device: no NetID, no route name, no credentials.
+sess, err := ads.NewSession(ctx, ads.AMSEndpoint{IP: "192.168.1.100"})
+```
+
+Consequences worth knowing, all measured on TwinCAT 2.10 and TwinCAT 3.1.4024:
+
+- **Passing a different route name does not create a second entry.** With a route
+  already present for your NetID the probe succeeds and registration is skipped —
+  logged as `route already exists on PLC, skipping registration`. Duplicate entries
+  are one of the ways these devices go mute, so this matters more than it looks.
+- **What must line up is your source NetID.** Without `WithLocalAMS` the library
+  derives it from the host IP, so a pre-registered route has to have been created
+  for *that* NetID. If it was not, the PLC resets the connection and the error names
+  it: `no route is registered on the PLC for our NetID (…)`.
+- **A single failed probe is not taken as proof a route is missing** — it is retried
+  once before falling back to registration, because the first transport attempt
+  after a PLC boot is unreliable (observed on TC2).
+
+Cold bootstrap timings against an empty route table, for reference: ~1.0s on
+TwinCAT 3.1.4024, ~1.2s on TwinCAT 2.10 (including the retry above).
+
+### If UDP 48899 is blocked
+
+The identify service and route registration share that port, so a firewall in front
+of it removes both — while ordinary ADS traffic, which is TCP 48898 only, keeps
+working. Measured behaviour:
+
+| capability | UDP 48899 blocked |
+|---|---|
+| NetID / port discovery | unavailable — pass `AMS` explicitly |
+| route registration | unavailable — pre-register the route on the PLC, or pass `WithSkipRouteRegistration()` |
+| `WithTargetCheck` verification | skipped, never fatal (see below) |
+| reads, writes, notifications | unaffected |
+
+Discovery fails fast rather than handing back a session that would silently drop
+every request — three attempts inside a 3s budget, then `NewSession` returns:
+
+```
+ads: NewSession: target AMS address incomplete and discovery failed (set remote.AMS
+explicitly if the device does not answer the identify service): identify 192.0.2.1:
+no answer after 3 attempts: ... i/o timeout
+```
+
+Verification is different on purpose: **an unanswered probe is never a failure, in
+any `TargetCheck` mode.** A Windows TwinCAT host was observed serving ADS on TCP
+with UDP 48899 firewalled off, and refusing those sessions over a check that could
+not run would trade a real capability for a diagnostic. Only a definite mismatch is
+reported. The skip is logged at Info, so silence never reads as "verified".
 
 ## Two layers
 
