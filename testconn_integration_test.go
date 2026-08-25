@@ -4,6 +4,7 @@ package ads
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -18,8 +19,10 @@ type connDefaults struct {
 	routeName string // route name registered on PLC
 }
 
-// setupConnectionWithDefaults creates a PLC connection using env vars with provided fallbacks.
-func setupConnectionWithDefaults(t *testing.T, d connDefaults) *Session {
+// setupConnectionWithDefaults creates a PLC connection using env vars with
+// provided fallbacks. extra SessionOptions are appended last, so a test can
+// override anything derived from the environment (e.g. WithLogger).
+func setupConnectionWithDefaults(t *testing.T, d connDefaults, extra ...SessionOption) *Session {
 	t.Helper()
 
 	ip := getEnvOrDefault("ADS_PLC_IP", d.ip)
@@ -35,6 +38,20 @@ func setupConnectionWithDefaults(t *testing.T, d connDefaults) *Session {
 	hostIP := os.Getenv("ADS_HOST_IP")
 	if hostIP != "" {
 		opts = append(opts, WithHostIP(hostIP))
+	}
+	// ADS_LOCAL_BIND_IP forces the outbound source IP. Needed on a multi-homed
+	// host: with wifi and ethernet on the same subnet the OS picks one by route
+	// metric, so testing the other NIC deliberately means binding to it. Leaving
+	// it unset keeps OS-default routing, which is what production usually wants.
+	if bindIP := os.Getenv("ADS_LOCAL_BIND_IP"); bindIP != "" {
+		opts = append(opts, WithLocalBindIP(bindIP))
+	}
+	// ADS_TEST_DEBUG=1 turns on Debug logging for the session under test. The
+	// reconnect path logs its decisions at Debug, and without them a stall inside a
+	// step is invisible — which cost real time diagnosing one.
+	if os.Getenv("ADS_TEST_DEBUG") != "" {
+		opts = append(opts, WithLogger(slog.New(slog.NewTextHandler(os.Stderr,
+			&slog.HandlerOptions{Level: slog.LevelDebug}))))
 	}
 	routeUser := os.Getenv("ADS_ROUTE_USER")
 	routePass := os.Getenv("ADS_ROUTE_PASS")
@@ -71,6 +88,7 @@ func setupConnectionWithDefaults(t *testing.T, d connDefaults) *Session {
 		}
 		opts = append(opts, WithLocalAMS(local))
 	}
+	opts = append(opts, extra...)
 	conn, err := NewSession(context.Background(), AMSEndpoint{IP: ip, Port: 48898, AMS: target}, opts...)
 	if err != nil {
 		t.Fatalf("NewConnection failed: %v", err)

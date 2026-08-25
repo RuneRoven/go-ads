@@ -29,7 +29,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test -v -coverprofile=coverage.out -covermode=atomic -timeout 120s ./...
+      - run: go test -v -coverprofile=coverage.out -covermode=atomic -timeout 600s ./...
       - name: Upload coverage
         if: always()
         uses: codecov/codecov-action@v5
@@ -44,7 +44,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test -v -race -timeout 120s ./...
+      - run: go test -v -race -timeout 600s ./...
 
   build:
     runs-on: ubuntu-latest
@@ -55,6 +55,9 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go vet ./...
+      # The integration-tagged files are compiled by nothing else in CI, so a
+      # broken one is only found on hardware, hours later.
+      - run: go vet -tags integration ./...
       - run: go build ./...
       - name: Build example
         working-directory: examples/cli

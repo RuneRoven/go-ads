@@ -69,10 +69,22 @@ func TestZeroOldSymbolHandles(t *testing.T) {
 	}
 }
 
-// Nil and empty input must not panic. Validates: R-CACHE-004 (defensive).
+// Nil and empty input must not panic, and a nil map ENTRY must be skipped
+// rather than dereferenced. The nil/empty calls alone asserted nothing: ranging
+// a nil map is a language guarantee, so deleting the `if s != nil` guard in
+// zeroOldSymbolHandles left the old version green. The real entry also pins
+// "every field is cleared", which the old version missed too.
+//
+// Validates: R-CACHE-004 (defensive).
 func TestZeroOldSymbolHandles_NilSafe(t *testing.T) {
 	zeroOldSymbolHandles(nil)
 	zeroOldSymbolHandles(map[string]*symbol{})
+
+	sym := &symbol{Handle: 7, Value: "1", Valid: true, ValueParsed: true, LastUpdateTime: time.Now()}
+	zeroOldSymbolHandles(map[string]*symbol{"gone": nil, "MAIN.x": sym})
+	if sym.Handle != 0 || sym.Value != "" || sym.Valid || sym.ValueParsed || !sym.LastUpdateTime.IsZero() {
+		t.Errorf("stale symbol not fully zeroed: %+v", sym)
+	}
 }
 
 // TestNewSession_TotalConstruction asserts NewSession does no I/O, spawns
@@ -599,6 +611,13 @@ func TestSession_AutoReload_SingleFlight(t *testing.T) {
 		WithSymbolVersionReloadWindow(60*time.Second),
 	)
 
+	// Make the reload outlast the window in which the N detections arrive.
+	// Without this the guard is only exercised if the goroutines happen to
+	// overlap a reload that fails in microseconds against the stub — so the test
+	// passed or failed on scheduling luck rather than on the guard, and it did
+	// flake (~1 in 16). The delay makes the overlap a property of the test.
+	srv.delayBefore(CommandIDRead, uint32(GroupSymbolUploadInfo), 300*time.Millisecond)
+
 	preEpoch := sess.epoch()
 
 	const N = 5
@@ -1067,5 +1086,99 @@ func TestIsProbeRetryable_TransportLevel(t *testing.T) {
 				t.Errorf("isProbeRetryable(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestReadFromSymbol_SymbolNotFoundReResolvesTheCachedHandle pins the TC3
+// runtime-restart case end to end.
+//
+// Measured on hardware: after a TC3 restart the PLC refuses a cached symbol
+// handle with 0x710 (symbol not found) and — unlike TC2, which answers 0x711 —
+// does NOT bump the symbol version. So nothing version-driven can save the
+// session: the ONLY signal is the 0x710 on the read itself, and if that does not
+// invalidate the handle, every later ReadFromSymbol repeats the same doomed read
+// against the same dead handle forever.
+//
+// The wiring under test: read-by-handle gets 0x710 → handleStaleDetection →
+// AutoReload zeroes the cached handles → the next ReadFromSymbol sees Handle==0
+// and re-resolves via GetHandleByName. The symbol upload is refused on purpose,
+// so the reload's LoadSymbols FAILS: recovery must come from the on-demand
+// re-resolve, not from a reload that happened to succeed.
+func TestReadFromSymbol_SymbolNotFoundReResolvesTheCachedHandle(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	const (
+		staleHandle uint32 = 0x1111
+		freshHandle uint32 = 0x2222
+	)
+	var handleLookups, staleReads atomic.Int32
+	srv.onWriteRead(GroupSymbolHandleByName, func(_ []byte) []byte {
+		handleLookups.Add(1)
+		return buildHandlePayload(freshHandle)
+	})
+	srv.onRead(GroupSymbolValueByHandle, func(_, offset, _ uint32) (ReturnCode, []byte) {
+		if offset == staleHandle {
+			staleReads.Add(1)
+			return ReturnCodeDeviceSymbolNoFound, nil
+		}
+		return ReturnCodeNoErrors, []byte{7, 0}
+	})
+	// A TC3 restart does not bump the symbol version, so the version must never be
+	// what rescues this. Refuse the upload too, so the reload cannot rescue it either.
+	srv.onRead(GroupSymbolUploadInfo, func(_, _, _ uint32) (ReturnCode, []byte) {
+		return ReturnCodeDeviceError, nil
+	})
+
+	sess, _ := newWiredTestSession(t, srv)
+	// Mirrors NewSession's defaults (session.go): the helper leaves them zero, and
+	// maxReloadAttempts=0 means the cap is exhausted on the first attempt, which
+	// would skip the invalidation for a reason that never happens in production.
+	sess.maxReloadAttempts = 3
+	sess.reloadWindow = 60 * time.Second
+
+	sym := &symbol{
+		Name: "MAIN.a", FullName: "MAIN.a", DataType: "INT",
+		Length: 2, Handle: staleHandle, Value: "1", Valid: true,
+	}
+	sess.cache.lock.Lock()
+	sess.cache.symbols[symbolKey("MAIN.a")] = sym
+	sess.cache.lock.Unlock()
+
+	ctx := context.Background()
+	if _, err := sess.ReadFromSymbol(ctx, "MAIN.a"); err == nil {
+		t.Fatal("read against the stale handle succeeded; the stub was supposed to refuse it with 0x710")
+	}
+	if got := staleReads.Load(); got != 1 {
+		t.Fatalf("reads against the stale handle = %d, want 1", got)
+	}
+
+	// The invalidation is asynchronous (handleStaleDetection spawns the reload), so
+	// poll — but bounded, and short: this must never lean on the package timeout.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		sess.cache.lock.Lock()
+		h := sym.Handle
+		sess.cache.lock.Unlock()
+		if h == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cached handle is still 0x%X after a 0x710 read: nothing invalidates it, "+
+				"and since TC3 does not bump the symbol version every later read repeats the same dead handle", h)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// And the recovery has to be real: the next read re-resolves and succeeds.
+	got, err := sess.ReadFromSymbol(ctx, "MAIN.a")
+	if err != nil {
+		t.Fatalf("read after invalidation: %v", err)
+	}
+	if got != "7" {
+		t.Errorf("value after re-resolve = %q, want %q", got, "7")
+	}
+	if n := handleLookups.Load(); n != 1 {
+		t.Errorf("GetHandleByName calls = %d, want 1 (the handle must be re-resolved exactly once)", n)
 	}
 }

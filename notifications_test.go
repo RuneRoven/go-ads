@@ -52,6 +52,21 @@ func preSeedSymbol(sess *Session, name string) *symbol {
 	return sym
 }
 
+// seedLiveNotification stages a symbol as fully subscribed: a committed handle in
+// activeNotifications plus its entry on file, which is what makes a further
+// subscribe of that symbol a duplicate.
+//
+// Staging the config alone is NOT enough and never was a duplicate in any sense the
+// API claims — an entry with no handle is a resubscribe retry the caller is entitled
+// to re-declare (see notificationManager.hasLiveNotification).
+func seedLiveNotification(sess *Session, name string, handle uint32, ch chan *Update) {
+	sym := preSeedSymbol(sess, name)
+	sess.notifications.lock.Lock()
+	defer sess.notifications.lock.Unlock()
+	sess.notifications.activeNotifications[handle] = activeNotification{Sym: sym, Ch: ch}
+	sess.notifications.addConfig(NotificationConfig{SymbolName: name})
+}
+
 // TestAddSymbolNotification_ChannelMismatchRejected pre-seeds a notifications
 // channel, then calls AddSymbolNotification with a DIFFERENT channel. The
 // pre-check inside AddSymbolNotification (under notifications.lock, BEFORE
@@ -96,13 +111,10 @@ func TestAddSymbolNotification_ChannelMismatchRejected(t *testing.T) {
 func TestAddSymbolNotifications_DuplicateRejected(t *testing.T) {
 	t.Run("cross_batch_existing", func(t *testing.T) {
 		sess := newNotifTestSession()
-		preSeedSymbol(sess, "MAIN.x")
 
 		ch := make(chan *Update, 1)
-		// Pre-stage one config so the pre-check rejects on second batch.
-		sess.notifications.lock.Lock()
-		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.x"})
-		sess.notifications.lock.Unlock()
+		// Pre-stage one LIVE subscription so the pre-check rejects the second batch.
+		seedLiveNotification(sess, "MAIN.x", 0x1001, ch)
 
 		results, err := sess.AddSymbolNotifications(context.Background(), []NotificationConfig{
 			{SymbolName: "MAIN.x", TransmissionMode: TransModeServerOnChange},
@@ -122,17 +134,14 @@ func TestAddSymbolNotifications_DuplicateRejected(t *testing.T) {
 
 	t.Run("in_batch", func(t *testing.T) {
 		sess := newNotifTestSession()
-		preSeedSymbol(sess, "MAIN.dup")
 
 		ch := make(chan *Update, 1)
-		// Pre-seed an existing config so the FIRST entry is rejected as
+		// Pre-seed a LIVE subscription so the FIRST entry is rejected as
 		// already-subscribed; the second entry hits the in-batch dup
 		// branch. Both are Skipped at the pre-check stage so requests[]
 		// stays empty and SumAddDeviceNotification is not invoked
 		// (nil client would panic).
-		sess.notifications.lock.Lock()
-		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.dup"})
-		sess.notifications.lock.Unlock()
+		seedLiveNotification(sess, "MAIN.dup", 0x1002, ch)
 
 		results, err := sess.AddSymbolNotifications(context.Background(), []NotificationConfig{
 			{SymbolName: "MAIN.dup", TransmissionMode: TransModeServerOnChange},
@@ -493,13 +502,11 @@ func TestNotificationChannel_SetOnFirstSuccess(t *testing.T) {
 
 	t.Run("all_skipped_no_channel_set", func(t *testing.T) {
 		sess := newNotifTestSession()
-		preSeedSymbol(sess, "MAIN.dup")
 
+		// Pre-stage a live subscription so every config is rejected as duplicate.
+		// Its channel is not the one under test below.
+		seedLiveNotification(sess, "MAIN.dup", 0x1003, make(chan *Update, 1))
 		ch := make(chan *Update, 1)
-		// Pre-stage so every config is rejected as duplicate.
-		sess.notifications.lock.Lock()
-		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.dup"})
-		sess.notifications.lock.Unlock()
 
 		_, _ = sess.AddSymbolNotifications(context.Background(), []NotificationConfig{
 			{SymbolName: "MAIN.dup", TransmissionMode: TransModeServerOnChange},
@@ -517,17 +524,16 @@ func TestNotificationChannel_SetOnFirstSuccess(t *testing.T) {
 
 	t.Run("concurrent_calls_no_channel_race", func(t *testing.T) {
 		sess := newNotifTestSession()
-		preSeedSymbol(sess, "MAIN.x")
 
-		// Pre-set channel + pre-stage an existing config so every
+		// Pre-set channel + pre-stage a LIVE subscription so every
 		// concurrent AddSymbolNotifications call results in all-Skipped
 		// (no PLC roundtrip needed). The race detector watches the
 		// notificationChannel field for torn writes during the
 		// concurrent pre-checks.
 		ch := make(chan *Update, 1)
+		seedLiveNotification(sess, "MAIN.x", 0x1004, ch)
 		sess.notifications.lock.Lock()
 		sess.notifications.notificationChannel = ch
-		sess.notifications.addConfig(NotificationConfig{SymbolName: "MAIN.x"})
 		sess.notifications.lock.Unlock()
 
 		var wg sync.WaitGroup
@@ -861,6 +867,341 @@ func TestResubscribeNotifications_RollbackOnError(t *testing.T) {
 	_ = err
 }
 
+// TestResubscribe_NilChannelKeepsTheDeclaredIntent: a re-subscribe that has no
+// channel to deliver to is a no-op, and a no-op must not destroy the caller's
+// declared subscriptions.
+//
+// resubscribeNotificationsLocked cleared pending BEFORE its "nothing to do" guard
+// and then returned nil, so M symbols the caller never cancelled were dropped from
+// the resubscribe set silently, with a "reconnect successful" logged over the top.
+// The state is reachable: a resubscribe re-queues entries the PLC refused with a
+// retryable reason (they have no handle), and the caller then deletes its remaining
+// LIVE subscriptions by handle — the last delete nils notificationChannel while
+// those re-queued entries are still on file.
+func TestResubscribe_NilChannelKeepsTheDeclaredIntent(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	sess, _ := newWiredTestSession(t, srv)
+
+	// Declared intent with no channel bound and nothing live — exactly the state a
+	// re-queued entry plus a full user teardown leaves behind.
+	sess.notifications.lock.Lock()
+	sess.notifications.addPending(pendingNotification{Config: NotificationConfig{SymbolName: "MAIN.stranded"}})
+	sess.notifications.notificationChannel = nil
+	sess.notifications.lock.Unlock()
+
+	if err := sess.resubscribeNotifications(); err != nil {
+		t.Fatalf("resubscribe with no bound channel = %v, want nil: a no-op must still report success", err)
+	}
+
+	sess.notifications.lock.Lock()
+	pending := len(sess.notifications.pending)
+	mirrored := sess.notifications.hasConfig("MAIN.stranded")
+	sess.notifications.lock.Unlock()
+	if pending != 1 {
+		t.Errorf("pending = %d after a resubscribe with no bound channel, want 1: the caller's declared intent must survive a no-op resubscribe", pending)
+	}
+	if !mirrored {
+		t.Error("configsByKey no longer mirrors pending: the two must move in lockstep")
+	}
+}
+
+// TestAddSymbolNotification_DeclaredButNotLiveSymbolIsNotADuplicate: a symbol that
+// is on file but has no live handle must still be subscribable.
+//
+// This is the other half of the nil-channel fix, and a defect in its own right.
+// pending is the declared intent and legitimately outlives a handle — a resubscribe
+// re-queues whatever the PLC refused for a retryable reason — but the duplicate
+// check asked pending, not activeNotifications. So a re-queued entry answered
+// "symbol already has an active notification" for a symbol with no notification at
+// all, and DeleteDeviceNotification works by handle, so the caller had no way to
+// clear it: the symbol was soft-locked for the life of the session.
+//
+// Retaining the intent (the test above) is what makes this state persist rather
+// than being accidentally cleaned up, so the two must land together.
+func TestAddSymbolNotification_DeclaredButNotLiveSymbolIsNotADuplicate(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	const fakeHandle uint32 = 0x22220002
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		return addNotifResponse{Handle: fakeHandle, Error: ReturnCodeNoErrors}
+	})
+
+	sess, _ := newWiredTestSession(t, srv)
+	preSeedSymbol(sess, "MAIN.stranded")
+
+	// On file, nothing live, no channel: the state a re-queued entry leaves.
+	sess.notifications.lock.Lock()
+	sess.notifications.addPending(pendingNotification{Config: NotificationConfig{SymbolName: "MAIN.stranded"}})
+	sess.notifications.lock.Unlock()
+
+	ch := make(chan *Update, 1)
+	h, err := sess.AddSymbolNotification(context.Background(), "MAIN.stranded", 0, 0, TransModeServerOnChange, ch)
+	if err != nil {
+		t.Fatalf("AddSymbolNotification on a declared-but-not-live symbol: %v — the caller cannot clear a pending-only entry, so this is a permanently dead symbol", err)
+	}
+	if h != fakeHandle {
+		t.Fatalf("handle = 0x%X, want 0x%X", h, fakeHandle)
+	}
+
+	sess.notifications.lock.Lock()
+	pending := len(sess.notifications.pending)
+	_, live := sess.notifications.activeNotifications[h]
+	boundChannel := sess.notifications.notificationChannel
+	sess.notifications.lock.Unlock()
+	if !live {
+		t.Error("the handle was never committed to activeNotifications")
+	}
+	// One entry, not two: configsByKey cannot hold a second entry for one symbol,
+	// and a duplicated pending entry would make the next resubscribe register the
+	// symbol twice on the PLC.
+	if pending != 1 {
+		t.Errorf("pending = %d after re-declaring a symbol already on file, want 1", pending)
+	}
+	if boundChannel != ch {
+		t.Errorf("notificationChannel = %v, want the channel this subscribe supplied", boundChannel)
+	}
+
+	// And a genuine duplicate — the symbol now HAS a live handle — must still be
+	// refused, or this fix has simply deleted the duplicate check.
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.stranded", 0, 0, TransModeServerOnChange, ch); err == nil {
+		t.Error("a second subscribe of a LIVE symbol succeeded; duplicate detection is gone")
+	}
+}
+
+// seedStaleSymbol wires the scriptable stub for the TC3 runtime-restart case and
+// returns a live Session plus the cached symbol carrying the dead handle.
+//
+// The stub answers every AddDeviceNotification that carries staleHandle with
+// 0x710 and counts it, resolves the name to freshHandle and counts that, and
+// REFUSES the symbol upload so a reload can never be what rescues the session —
+// recovery has to come from the on-demand re-resolve. uploadInfoReads therefore
+// counts reload attempts, which is how the no-storm assertions are made.
+func seedStaleSymbol(t *testing.T, srv *scriptableServer, handleLookups, staleAdds, uploadInfoReads *atomic.Int32, opts ...SessionOption) (*Session, *symbol) {
+	t.Helper()
+	srv.onWriteRead(GroupSymbolHandleByName, func(_ []byte) []byte {
+		handleLookups.Add(1)
+		return buildHandlePayload(staleTestFreshHandle)
+	})
+	srv.onAddDeviceNotification(func(req addNotifRequest) addNotifResponse {
+		if req.Offset == staleTestStaleHandle {
+			staleAdds.Add(1)
+			return addNotifResponse{Error: ReturnCodeDeviceSymbolNoFound}
+		}
+		return addNotifResponse{Handle: staleTestNotifHandle}
+	})
+	srv.onRead(GroupSymbolUploadInfo, func(_, _, _ uint32) (ReturnCode, []byte) {
+		uploadInfoReads.Add(1)
+		return ReturnCodeDeviceError, nil
+	})
+
+	// The heartbeat is off so the only AddDeviceNotification traffic in the test is
+	// the caller's: the internal beat subscribes on GroupSymbolVersion, which would
+	// add a second registration and a second failure path to reason about here.
+	sess, _ := newWiredTestSession(t, srv, append([]SessionOption{WithoutNotificationHeartbeat()}, opts...)...)
+	// Mirrors NewSession's defaults (session.go): the helper leaves them zero, and
+	// maxReloadAttempts=0 means the cap is exhausted on the first attempt, which
+	// would skip the invalidation for a reason that never happens in production.
+	sess.maxReloadAttempts = 3
+	sess.reloadWindow = 60 * time.Second
+
+	sym := &symbol{
+		Name: "MAIN.a", FullName: "MAIN.a", DataType: "INT",
+		Length: 2, Handle: staleTestStaleHandle, Valid: true,
+	}
+	sess.cache.lock.Lock()
+	sess.cache.symbols[symbolKey("MAIN.a")] = sym
+	sess.cache.lock.Unlock()
+	return sess, sym
+}
+
+const (
+	staleTestStaleHandle uint32 = 0x1111
+	staleTestFreshHandle uint32 = 0x2222
+	staleTestNotifHandle uint32 = 0x9001
+)
+
+// awaitHandleZeroed polls the cached handle until it is invalidated, bounded and
+// short so a regression fails fast instead of hanging to the package timeout.
+func awaitHandleZeroed(t *testing.T, sess *Session, sym *symbol) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		sess.cache.lock.Lock()
+		h := sym.Handle
+		sess.cache.lock.Unlock()
+		if h == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cached handle is still 0x%X after a 0x710 on AddDeviceNotification: nothing invalidates it, "+
+				"and since TC3 does not bump the symbol version every later subscribe repeats the same dead handle", h)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestAddSymbolNotification_SymbolNotFoundInvalidatesTheCachedHandle pins the
+// TC3 runtime-restart case on the SINGLE-symbol subscribe path.
+//
+// Measured on hardware: after a TC3 restart the PLC refuses a cached symbol
+// handle with 0x710 (symbol not found) and does NOT bump the symbol version. So
+// nothing version-driven can save the session — not checkSymbolVersion, not the
+// heartbeat watcher. The 0x710 on the subscribe itself is the only signal there
+// is, and if it does not invalidate the handle, every later AddSymbolNotification
+// repeats the same doomed request forever, with no callback and no Update.
+//
+// The wiring under test: AddDeviceNotification gets 0x710 → handleStaleDetection
+// → AutoReload zeroes the cached handles → the next AddSymbolNotification sees
+// Handle==0 and re-resolves via GetHandleByName.
+//
+// Detection only, no retry: subscribe is not idempotent, so the first caller
+// after the restart still legitimately gets the error — the reload is async.
+// Self-healing lands on the NEXT call. That two-call shape is the contract, and
+// it is what this test asserts.
+func TestAddSymbolNotification_SymbolNotFoundInvalidatesTheCachedHandle(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var handleLookups, staleAdds, uploadInfoReads atomic.Int32
+	sess, sym := seedStaleSymbol(t, srv, &handleLookups, &staleAdds, &uploadInfoReads)
+
+	ctx := context.Background()
+	ch := make(chan *Update, 1)
+
+	_, err := sess.AddSymbolNotification(ctx, "MAIN.a", 0, time.Second, TransModeServerOnChange, ch)
+	if err == nil {
+		t.Fatal("subscribe against the stale handle succeeded; the stub was supposed to refuse it with 0x710")
+	}
+	var rc ReturnCode
+	if !errors.As(err, &rc) || rc != ReturnCodeDeviceSymbolNoFound {
+		t.Fatalf("first subscribe error = %v, want one carrying %v", err, ReturnCodeDeviceSymbolNoFound)
+	}
+	if got := staleAdds.Load(); got != 1 {
+		t.Fatalf("subscribes against the stale handle = %d, want 1", got)
+	}
+
+	awaitHandleZeroed(t, sess, sym)
+
+	// And the recovery has to be real: the next subscribe re-resolves and succeeds.
+	handle, err := sess.AddSymbolNotification(ctx, "MAIN.a", 0, time.Second, TransModeServerOnChange, ch)
+	if err != nil {
+		t.Fatalf("subscribe after invalidation: %v", err)
+	}
+	if handle != staleTestNotifHandle {
+		t.Errorf("notification handle = 0x%X, want 0x%X", handle, staleTestNotifHandle)
+	}
+	if n := handleLookups.Load(); n != 1 {
+		t.Errorf("GetHandleByName calls = %d, want 1 (the handle must be re-resolved exactly once)", n)
+	}
+	if n := staleAdds.Load(); n != 1 {
+		t.Errorf("subscribes against the stale handle = %d, want 1 (the second one must carry the fresh handle)", n)
+	}
+	// No reload storm: N triggers collapse to one reload via the reloadInProgress
+	// CAS, and the 3-per-60s cap bounds anything landing after it.
+	if n := uploadInfoReads.Load(); n != 1 {
+		t.Errorf("symbol-upload requests = %d, want 1 (one reload, not a storm)", n)
+	}
+}
+
+// TestAddSymbolNotifications_SymbolNotFoundInvalidatesTheCachedHandle is the
+// batch half of the same scenario. It is green before the single-symbol fix and
+// documents the asymmetry that motivated it: a caller using the batch API
+// recovered on its next call while a caller subscribing one symbol at a time was
+// stuck forever. Kept alongside so a later refactor cannot level the two paths
+// down instead of up.
+func TestAddSymbolNotifications_SymbolNotFoundInvalidatesTheCachedHandle(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var handleLookups, staleAdds, uploadInfoReads atomic.Int32
+	sess, sym := seedStaleSymbol(t, srv, &handleLookups, &staleAdds, &uploadInfoReads)
+
+	var sumAdds atomic.Int32
+	srv.onWriteRead(GroupSumupAddDeviceNotification, func(_ []byte) []byte {
+		if sumAdds.Add(1) == 1 {
+			return buildSumAddNotifPayload([]sumNotifResponse{{Error: ReturnCodeDeviceSymbolNoFound}})
+		}
+		return buildSumAddNotifPayload([]sumNotifResponse{{Handle: staleTestNotifHandle}})
+	})
+
+	ctx := context.Background()
+	ch := make(chan *Update, 1)
+	cfg := NotificationConfig{SymbolName: "MAIN.a", CycleTime: time.Second, TransmissionMode: TransModeServerOnChange}
+
+	results, err := sess.AddSymbolNotifications(ctx, []NotificationConfig{cfg}, ch)
+	if err != nil {
+		t.Fatalf("batch subscribe: %v", err)
+	}
+	if len(results) != 1 || results[0].Error != ReturnCodeDeviceSymbolNoFound {
+		t.Fatalf("batch results = %+v, want one entry carrying %v", results, ReturnCodeDeviceSymbolNoFound)
+	}
+
+	awaitHandleZeroed(t, sess, sym)
+
+	results, err = sess.AddSymbolNotifications(ctx, []NotificationConfig{cfg}, ch)
+	if err != nil {
+		t.Fatalf("batch subscribe after invalidation: %v", err)
+	}
+	if len(results) != 1 || results[0].Error != ReturnCodeNoErrors || results[0].Handle != staleTestNotifHandle {
+		t.Fatalf("batch results after invalidation = %+v, want one committed entry with handle 0x%X", results, staleTestNotifHandle)
+	}
+	if n := handleLookups.Load(); n != 1 {
+		t.Errorf("GetHandleByName calls = %d, want 1", n)
+	}
+	if n := uploadInfoReads.Load(); n != 1 {
+		t.Errorf("symbol-upload requests = %d, want 1 (one reload, not a storm)", n)
+	}
+}
+
+// TestAddSymbolNotification_SymbolNotFoundIgnoreKeepsTheCachedHandle guards the
+// strategy contract, which is the easy thing to break when someone later
+// "simplifies" the detection into an unconditional invalidation.
+//
+// SymbolVersionIgnore means the PLC error surfaces verbatim and the handles are
+// left alone (samples get flagged Stale instead) — that is its documented
+// meaning, not a bug. So: callback fires, handle unchanged, no reload.
+func TestAddSymbolNotification_SymbolNotFoundIgnoreKeepsTheCachedHandle(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	reasons := make(chan Reason, 4)
+	var handleLookups, staleAdds, uploadInfoReads atomic.Int32
+	sess, sym := seedStaleSymbol(t, srv, &handleLookups, &staleAdds, &uploadInfoReads,
+		WithSymbolVersionStrategy(SymbolVersionIgnore),
+		WithOnSymbolVersionChanged(func(r Reason) { reasons <- r }))
+
+	ch := make(chan *Update, 1)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.a", 0, time.Second, TransModeServerOnChange, ch); err == nil {
+		t.Fatal("subscribe against the stale handle succeeded; the stub was supposed to refuse it with 0x710")
+	}
+
+	// Wait on the callback rather than a sleep: it is the observable proof that
+	// detection ran, so what follows is not a race against work not yet done.
+	select {
+	case got := <-reasons:
+		if got != ReasonSymbolNotFound {
+			t.Errorf("callback reason = %q, want %q", got, ReasonSymbolNotFound)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SymbolVersionIgnore: OnSymbolVersionChanged never fired after a 0x710 subscribe")
+	}
+
+	sess.cache.lock.Lock()
+	h := sym.Handle
+	sess.cache.lock.Unlock()
+	if h != staleTestStaleHandle {
+		t.Errorf("cached handle = 0x%X, want it left at 0x%X: SymbolVersionIgnore must not invalidate", h, staleTestStaleHandle)
+	}
+	if n := uploadInfoReads.Load(); n != 0 {
+		t.Errorf("symbol-upload requests = %d, want 0: SymbolVersionIgnore must not reload", n)
+	}
+	if n := handleLookups.Load(); n != 0 {
+		t.Errorf("GetHandleByName calls = %d, want 0: nothing should be re-resolved under Ignore", n)
+	}
+}
+
 func TestIsBestEffortDeleteSuccess(t *testing.T) {
 	cases := []struct {
 		name string
@@ -878,6 +1219,81 @@ func TestIsBestEffortDeleteSuccess(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isBestEffortDeleteSuccess(tc.code); got != tc.want {
 				t.Errorf("isBestEffortDeleteSuccess(%v) = %v, want %v", tc.code, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAddSymbolNotifications_StaleItemLogsAtWarnNotError: a per-item code that the
+// library is about to recover from on its own belongs at Warn; one nobody can fix
+// without a human belongs at Error.
+//
+// Measured on 192.168.3.118: restarting the TwinCAT runtime made a routine
+// resubscribe emit 22 ERROR lines in one second, one per stale handle, for a
+// condition that healed a second later — the same log-flood shape as the 1468-line
+// episode this branch already fixed elsewhere. The per-item code reaches the caller
+// in the results either way, so nothing is lost by demoting it.
+//
+// Asserts BOTH directions on purpose: a blanket demotion to Warn would satisfy the
+// first half and quietly gag the codes an operator does need to see.
+func TestAddSymbolNotifications_StaleItemLogsAtWarnNotError(t *testing.T) {
+	cases := []struct {
+		name      string
+		code      ReturnCode
+		wantLevel slog.Level
+		why       string
+	}{
+		{
+			name:      "stale handle after a runtime restart",
+			code:      ReturnCodeDeviceSymbolNoFound, // 0x710, in the stale-detection set
+			wantLevel: slog.LevelWarn,
+			why:       "the library invalidates the handle and the next call re-resolves it",
+		},
+		{
+			name:      "symbol version invalid",
+			code:      ReturnCodeDeviceSymbolVersionInvalid, // 0x711, also self-healing
+			wantLevel: slog.LevelWarn,
+			why:       "same: detection fires and the cache reloads",
+		},
+		{
+			name:      "service not supported",
+			code:      ReturnCodeDeviceServiceNotSupported, // 0x701, not recoverable here
+			wantLevel: slog.LevelError,
+			why:       "nothing in the library can make this succeed; an operator has to look",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := startScriptableServer(t)
+			defer srv.stop()
+
+			logs := &testLogHandler{}
+			var handleLookups, staleAdds, uploadInfoReads atomic.Int32
+			sess, _ := seedStaleSymbol(t, srv, &handleLookups, &staleAdds, &uploadInfoReads,
+				WithLogger(slog.New(logs)))
+
+			srv.onWriteRead(GroupSumupAddDeviceNotification, func(_ []byte) []byte {
+				return buildSumAddNotifPayload([]sumNotifResponse{{Error: tc.code}})
+			})
+
+			ch := make(chan *Update, 1)
+			cfg := NotificationConfig{SymbolName: "MAIN.a", CycleTime: time.Second, TransmissionMode: TransModeServerOnChange}
+			if _, err := sess.AddSymbolNotifications(context.Background(), []NotificationConfig{cfg}, ch); err != nil {
+				t.Fatalf("batch subscribe: %v", err)
+			}
+
+			rec := logs.findByMessage("error adding notification in batch")
+			if rec == nil {
+				rec = logs.findByMessage("notification batch: item rejected")
+			}
+			if rec == nil {
+				t.Fatalf("no per-item log record for code %v; the code still reaches the caller in the results, "+
+					"but the operator-facing signal disappeared entirely", tc.code)
+			}
+			if rec.Level != tc.wantLevel {
+				t.Errorf("per-item log for %v logged at %v, want %v — %s",
+					tc.code, rec.Level, tc.wantLevel, tc.why)
 			}
 		})
 	}

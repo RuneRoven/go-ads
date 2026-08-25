@@ -3,9 +3,12 @@ package ads
 import (
 	cryptorand "crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -24,6 +27,34 @@ const (
 	tagResponseError uint16 = 1
 )
 
+// splitHostRouterPort accepts either a bare host or host:port and returns the
+// host with the router UDP port to use. A PLC behind NAT answers on a forwarded
+// port that cannot be derived from anything else, and these standalone helpers
+// take no port argument — so they read it off the host string rather than
+// forcing callers into the Session API for a one-shot probe.
+//
+// A port that is present but unusable is an error, not a fallback. Folding it
+// back into the hostname made a mistyped port surface as a name-resolution
+// failure for an address nobody typed, and silently substituting 48899 for a
+// forwarded port can reach an entirely different device on a NAT host.
+func splitHostRouterPort(host string) (string, int, error) {
+	h, portStr, err := net.SplitHostPort(host)
+	if err != nil {
+		// No port in there at all (a bare host, or a bare IPv6 literal): use the
+		// protocol's own port. A genuinely malformed host is diagnosed by the
+		// resolver, which can say more about it than this can.
+		return host, routePort, nil
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("host %q: router port %q is not a number", host, portStr)
+	}
+	if port <= 0 || port > 65535 {
+		return "", 0, fmt.Errorf("host %q: router port %d is out of range", host, port)
+	}
+	return h, port, nil
+}
+
 // AddRemoteRoute registers a route on the remote PLC via the Beckhoff UDP protocol (port 48899).
 // This tells the PLC how to reach this client's AmsNetId.
 //
@@ -32,7 +63,8 @@ const (
 // Ensure this is only called on trusted networks.
 //
 // Parameters:
-//   - remoteHost: IP or hostname of the PLC
+//   - remoteHost: IP or hostname of the PLC, optionally with the router's UDP
+//     port ("10.0.0.5:6499") when the PLC is reached through NAT forwarding
 //   - localNetID: the AMS NetID this client will use as source
 //   - routeName: name for the route entry on the PLC
 //   - computerName: the IP/hostname the PLC should use to connect back to this client
@@ -44,6 +76,25 @@ func AddRemoteRoute(remoteHost string, localNetID [6]byte, routeName string, com
 
 // AddRemoteRouteWithLogger is like AddRemoteRoute but accepts an explicit logger.
 func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
+	host, port, err := splitHostRouterPort(remoteHost)
+	if err != nil {
+		return fmt.Errorf("add route: %w", err)
+	}
+	return addRemoteRouteFrom(logger, nil, host, port, localNetID, routeName, computerName, username, password)
+}
+
+// addRemoteRouteFrom is AddRemoteRouteWithLogger with an explicit local source
+// IP for the UDP socket.
+//
+// This matters on a multi-homed host: TwinCAT records the route against the UDP
+// SOURCE IP of the registration, not the computerName tag it carries (TC2 uses
+// the tag, TC3 does not). Letting the OS pick the interface therefore registers
+// the route for whichever NIC wins the route metric, and a session bound to the
+// other one is then reset by the PLC — the registration reports success and
+// nothing is ever served. localIP nil keeps OS-default routing.
+// port is the router's UDP port; production passes the session's, which is
+// routePort unless the PLC sits behind NAT with port forwarding.
+func addRemoteRouteFrom(logger *slog.Logger, localIP net.IP, remoteHost string, port int, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
 	if logger == nil {
 		logger = getDefaultLogger()
 	}
@@ -53,12 +104,19 @@ func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID
 		"computerName", computerName,
 		"routeName", routeName,
 		"hasAuth", username != "")
-	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", remoteHost, routePort))
+	if port <= 0 {
+		port = routePort
+	}
+	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", remoteHost, port))
 	if err != nil {
 		return fmt.Errorf("failed to resolve remote host: %w", err)
 	}
 
-	conn, err := net.DialUDP("udp4", nil, addr)
+	var laddr *net.UDPAddr
+	if localIP != nil {
+		laddr = &net.UDPAddr{IP: localIP}
+	}
+	conn, err := net.DialUDP("udp4", laddr, addr)
 	if err != nil {
 		return fmt.Errorf("failed to dial UDP: %w", err)
 	}
@@ -77,22 +135,106 @@ func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID
 	// Build the route request packet
 	packet := buildRoutePacket(localNetID, routeName, computerName, username, password, invokeID)
 
-	_, err = conn.Write(packet)
-	if err != nil {
-		return fmt.Errorf("failed to send route request: %w", err)
+	// Retransmit, like identify does, and for the measured reason: a single dropped
+	// datagram was seen failing NewSession outright, and this runs on the same plant
+	// networks over the same shared port 48899. Registration is the costlier failure
+	// of the two, because Connect aborts on it.
+	//
+	// Same invokeID across attempts, so a late answer to an earlier one still counts;
+	// and unrelated datagrams on the shared port are skipped rather than parsed,
+	// which previously turned somebody else's identify reply into a registration
+	// failure.
+	respBuf := make([]byte, 2048)
+	deadline := time.Now().Add(routeRegisterTotalBudget)
+	var lastErr error
+	for attempt := 1; attempt <= routeRegisterAttempts; attempt++ {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		window := remaining / time.Duration(routeRegisterAttempts-attempt+1)
+		if attempt == routeRegisterAttempts {
+			window = remaining
+		}
+		if _, err = conn.Write(packet); err != nil {
+			return fmt.Errorf("failed to send route request: %w", err)
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(window)); err != nil {
+			return fmt.Errorf("failed to set read deadline: %w", err)
+		}
+		for {
+			n, rerr := conn.Read(respBuf)
+			if rerr != nil {
+				lastErr = rerr
+				if !errors.Is(rerr, os.ErrDeadlineExceeded) {
+					// Not the window closing. On a connected UDP socket an ICMP
+					// port-unreachable arrives as an immediate error, so retransmitting
+					// would fire all three attempts in milliseconds and report a
+					// timeout for what is really "nothing is listening there".
+					return fmt.Errorf("route registration: %w", rerr)
+				}
+				break // window expired: retransmit
+			}
+			if n == len(respBuf) {
+				return fmt.Errorf("route response of %d bytes filled the read buffer", n)
+			}
+			if !routeResponseIsOurs(respBuf[:n], invokeID) {
+				// Not an answer to this request: keep reading inside the window.
+				// Rare on a connected socket, which only receives from the address we
+				// dialled, but a late duplicate of an earlier attempt lands here.
+				logger.Debug("route registration: ignoring a datagram that is not our answer",
+					"bytes", n)
+				continue
+			}
+			perr := parseRouteResponse(logger, respBuf[:n], invokeID)
+			if perr == nil {
+				if attempt > 1 {
+					logger.Info("route registered after a retransmit", "attempts", attempt)
+				}
+				return nil
+			}
+			// Ours, and it says no. Retransmitting cannot change that answer, and
+			// doing so put the route password on the wire twice more and made the
+			// caller wait out the whole budget for a verdict already in hand.
+			return perr
+		}
 	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no answer")
+	}
+	return fmt.Errorf("route registration got no usable answer in %v over %d attempts: %w",
+		routeRegisterTotalBudget, routeRegisterAttempts, lastErr)
+}
 
-	// Wait for response
-	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return fmt.Errorf("failed to set read deadline: %w", err)
-	}
-	respBuf := make([]byte, 1024)
-	n, err := conn.Read(respBuf)
-	if err != nil {
-		return fmt.Errorf("failed to read route response: %w", err)
-	}
+const (
+	// routeRegisterAttempts / routeRegisterTotalBudget mirror identify's retransmit
+	// policy. UDP on a plant network drops datagrams, and a single loss here used to
+	// fail the whole connect.
+	routeRegisterAttempts    = 3
+	routeRegisterTotalBudget = 6 * time.Second
+)
 
-	return parseRouteResponse(logger, respBuf[:n], invokeID)
+// routeResponseIsOurs reports whether a datagram is the answer to OUR registration
+// request, independent of whether that answer is success or refusal.
+//
+// identify.go keeps this split deliberately: ownership is a header question
+// (cookie, invokeID, service id), and only once a datagram is ours does its
+// content decide the outcome. Conflating the two meant a refusal — a wrong
+// password, say — was treated as somebody else's traffic and retransmitted until
+// the budget ran out.
+func routeResponseIsOurs(data []byte, invokeID uint32) bool {
+	if len(data) < 12 {
+		return false
+	}
+	if binary.LittleEndian.Uint32(data[0:4]) != routeCookie {
+		return false
+	}
+	if binary.LittleEndian.Uint32(data[4:8]) != invokeID {
+		return false
+	}
+	service := binary.LittleEndian.Uint32(data[8:12])
+	// The RESPONSE flag, as parseRouteResponse below also checks.
+	return service == (0x80000000 | routeServiceAdd)
 }
 
 // buildRoutePacket constructs a UDP route registration packet.
@@ -221,8 +363,45 @@ type routeManager struct {
 	username               string
 	password               secret
 	forceRouteRegistration bool
-	skipRegistration       bool // set via WithSkipRouteRegistration — caller manages routes externally
-	routeProbeFailures     atomic.Int32
+	// activationTimeout caps the post-registration wait for the PLC's router
+	// to start serving the new route. 0 means use defaultRouteActivationTimeout;
+	// set via WithRouteActivationTimeout.
+	activationTimeout  time.Duration
+	skipRegistration   bool // set via WithSkipRouteRegistration — caller manages routes externally
+	routeProbeFailures atomic.Int32
+
+	// registered records that this session has already registered its route, so
+	// an ordinary reconnect storm does not register again and again.
+	//
+	// Not an absolute once-per-session rule, because re-registering the CORRECT
+	// route is the documented recovery for a router that has stopped answering.
+	// Measured: two TC3 devices (3.1.4024 and 3.1.4026) mute after a foreign NetID
+	// claimed the address they route to us, both restored to normal service by one
+	// re-registration of our own NetID at our own address. TwinCAT keys the TC3
+	// route table by ADDRESS, so registering the right NetID for an address rebinds
+	// it; registering a NetID that does not own the address is what broke them.
+	//
+	// So the flag is cleared whenever the session concludes the PLC has stopped
+	// answering (see Session.coolDownAfterUnserved), which permits exactly one
+	// healing registration per cooldown cycle and no more.
+	registered atomic.Bool
+}
+
+// mayRegister reports whether this session may register its route. True exactly
+// once; see routeManager.registered for why that is the rule.
+func (r *routeManager) mayRegister() bool {
+	return !r.registered.Load()
+}
+
+// markRegistered records that this session has registered its route.
+func (r *routeManager) markRegistered() {
+	r.registered.Store(true)
+}
+
+// allowHealingRegistration permits one further registration, for use when the PLC
+// has stopped answering and re-registering the correct route is the way back.
+func (r *routeManager) allowHealingRegistration() {
+	r.registered.Store(false)
 }
 
 // shouldSkip reports whether route registration must be bypassed entirely.

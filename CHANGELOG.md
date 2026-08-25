@@ -6,6 +6,176 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) a
 [go-semantic-release](https://github.com/go-semantic-release/semantic-release) for
 automated versioning and changelog generation.
 
+## Unreleased: target NetID discovery, and a pre-release correctness pass
+
+### Upgrade notes — read before bumping
+
+This is a **minor** release: it connects, reads, writes and subscribes the way it
+always did, and nothing here is a compile break. But five behaviours changed in ways
+a caller can notice at runtime, and none of them will fail to build, so they are
+listed first rather than buried.
+
+1. **A partial batch is now an error.** `ReadMultipleSymbols` and
+   `WriteMultipleSymbols` return a `*BatchError` when any item fails, with the map
+   still holding everything that succeeded. **Callers that do
+   `if err != nil { return err }` will treat a partial batch as fatal** where they
+   previously carried on with a short map — which, before this release, is also how a
+   caller silently lost data after a runtime restart. Branch on the error to keep the
+   old shape:
+
+   ```go
+   values, err := sess.ReadMultipleSymbols(ctx, names)
+   var batchErr *ads.BatchError
+   if errors.As(err, &batchErr) {
+       // values holds every symbol that succeeded; batchErr.Items says what did not
+       // and whether the library skipped it or the PLC refused it.
+   } else if err != nil {
+       // transport failure: no item's outcome is known
+   }
+   ```
+
+2. **"Duplicate subscription" now means "has a live handle"**, not "is on file". A
+   symbol sitting in the resubscribe retry queue can be subscribed again; previously
+   it was refused with no way for the caller to clear it.
+3. **A transport abort mid-batch reports `ReturnCodeDeviceError`** in the per-item
+   code, not `0x06`. Router-level failures are now `AMSError` and no longer satisfy
+   `errors.As(err, &ReturnCode{})` — if you type-switch on `ReturnCode` to detect
+   transport problems, match `AMSError` instead.
+4. **`Connect` no longer self-heals from a reset during its probe phase.** It returns
+   an error, fires `onDisconnect`, and the session is retryable — and the retry now
+   actually works, which it did not before.
+5. **`WithForceRouteRegistration` now registers on every reconnect**, as its
+   documentation always claimed. Sessions that do not set it are unaffected.
+
+No dependency or toolchain changes: this module still has zero dependencies.
+
+
+This branch started as target-NetID discovery and became a hardening pass. Two
+review rounds plus a spec-and-verify round found fifteen candidate defects; five
+were refuted or materially corrected by measurement rather than implemented, and
+two of the worst were found while checking something else. Every fix here has a
+test that was watched failing first, and every test was mutation-verified.
+
+### Breaking / consumer-visible
+
+- **Batch reads and writes now report per-item failures.** `ReadMultipleSymbols`
+  dropped any item it could not produce a value for and returned the short map
+  with a nil error; after a TwinCAT 3 runtime restart every cached handle is
+  refused, so the caller got an **empty map and no error**. `WriteMultipleSymbols`
+  had the same hole from the other side, because `ReturnCodeNoErrors` is zero and a
+  never-sent item read as success.
+  Signatures are unchanged. The detail rides in a new `*BatchError` that
+  `errors.As` unwraps, returned only when at least one item failed, and the map
+  still holds everything that succeeded. Per item, in the same three-state shape
+  `SumNotificationResult` already used: `Skipped != nil` means the library is why
+  there is no value; `Skipped == nil` with a non-zero `Error` is a PLC verdict on
+  that entry, where a genuinely absent symbol lands.
+  Deliberately not all-or-nothing: reading 40 symbols of which one is misspelled
+  still yields 39 values plus an error naming the one that failed, and batch size
+  does not change the shape. **Callers that do `if err != nil { return err }` will
+  treat a partial batch as fatal until they branch on `*BatchError`.**
+- **New `AMSError`, and AMS router codes are no longer ADS device verdicts.** The
+  AMS header's ErrorCode was wrapped as a bare `ReturnCode`, so a transport
+  failure was indistinguishable from a per-item answer about a symbol. With a PLC
+  dropping into CONFIG at item 3 of a 40-symbol subscribe, 37 items came back
+  shaped as PLC verdicts and the call returned `nil` — `ErrNotificationTransportFailure`,
+  documented as the retry signal, was never set. `AMSError` has `Is` and
+  deliberately no `Unwrap`, which is what stops `errors.As(&ReturnCode{})`
+  matching while `errors.Is` keeps working.
+- **Per-item code for a transport abort** in `sumReadFallback`/`sumWriteFallback`
+  is now `ReturnCodeDeviceError` rather than `0x06`.
+- **"Duplicate subscription" now means "has a live handle"**, not "is on file". A
+  symbol sitting in the resubscribe retry queue is re-subscribable; a symbol with
+  a live handle is still refused.
+- **`WithForceRouteRegistration` now forces on reconnect too**, which is what its
+  godoc always claimed. Cost: one route registration per reconnect for sessions
+  that opt in. Sessions that do not set it are unaffected.
+- **`Connect` no longer self-heals from a reset during its probe phase.** It
+  returns an error, fires `onDisconnect`, and is retryable — and the retry now
+  actually works, which it previously did not.
+- **`SymbolVersionClose` now closes the session on a failed single subscribe**, and
+  **`SymbolVersionIgnore` now fires `OnSymbolVersionChanged`** where it was
+  previously silent.
+- **`consecutiveFailures` resets per connection**, so a PLC flapping faster than
+  the heartbeat recovery window regains the un-backed-off retry rate on each
+  reconnect, bounded by `reconnectSleep`.
+
+### Silent-failure fixes
+
+- **A drop during the reconnect tail was erased on the way out.** `Reconnect`
+  stored `disconnected = false` just before announcing Connected — a no-op on the
+  happy path, since `dialAndStart` had already cleared it, so its only effect was
+  to forget a drop that landed in between. `tx.disconnected` is the sole record of
+  such a drop (the FSM has no `Reconnecting → Disconnected` edge), so the session
+  sat Connected on a dead socket with `IsClosed()` false: no data, and no signal.
+- **A reset during `Connect`'s probe spawned a rival reconnect** that ran
+  `tearDownAndReset` concurrently with `Connect` on the shared transport, leaving a
+  session that reported Connected after `Connect` returned an error, with a live
+  client, two accepted connections and an unbounded reconnect loop — unrecoverable
+  in place, because a retry was refused with "Connect already in progress".
+- **A reconnect inherited the silence that preceded it.** `quietTicks`, `lastBeats`
+  and `consecutiveFailures` survived a disconnect, so a session that dropped one
+  tick short of its window tore down its subscriptions on the first tick after a
+  completely successful reconnect — worst case leaving a Connected session with no
+  subscriptions and no data.
+- **A stale handle on subscribe left the symbol dead forever.** Single-symbol
+  `AddSymbolNotification` returned the PLC's refusal without the stale-cache
+  detection the read and write paths do. On TC3 a runtime restart answers 0x710
+  and does not bump the symbol version, so nothing else ever triggered a reload.
+- **A symbol awaiting resubscribe could not be subscribed again**, and the
+  destructive intent reset that masked it also destroyed declared intent ahead of a
+  success return.
+- **`giveUpReconnecting` closed the FSM without tearing anything down**, and
+  `Close()` then found the session already Closed and returned nil having done
+  nothing — leaking the socket, the 48898 listener and every worker for the life of
+  the process. Reachable from any `WithMaxReconnectAttempts` session whose PLC does
+  not come back.
+- **A failed `Connect` leaked the inbound listener** it had bound, once per attempt,
+  for callers that respond to an error by discarding the session.
+- **A repaired device stayed remembered for the life of the process.** The
+  peer-route cache was only invalidated from `Connect`'s route-registration branch,
+  so a session without `WithRoute` never forgot a host and every later session
+  pre-bound wildcard `:48898` for it.
+- **Heartbeat recovery backoff ran backwards**, and above a 30s cycle not at all:
+  converting an absolute cap to ticks could yield fewer ticks than the base window,
+  so the first failure *shrank* the tolerated silence (50s → 30s at a 10s cycle),
+  and once the cycle reached the cap the division truncated to zero and the window
+  grew to hours.
+
+### Races
+
+- `Client.source`, written under `connMu` and read bare in the transport-fault log
+  line on the Client's own listen goroutine.
+- `getSymbol` logged a `*symbol` **by reflection after dropping `cache.lock`**, so
+  slog read the exact fields `dispatchSample` writes under that lock. `-race` was
+  green only because slog skips its args at a disabled level and no test had ever
+  enabled trace logging while notifications flowed — it fires in production, not in
+  CI.
+- `AddRoute`'s detached goroutine read the source NetID without its lock; a torn
+  NetID there registers the junk route entry this repo already blames for muting
+  two TC3 devices.
+
+A sweep of all fifteen mutexes in the package established these three were the
+complete set of bare accesses to a mutated guarded field.
+
+### Tooling and tests
+
+- CI and Makefile test timeouts 120s → 600s (both jobs were failing on time, not on
+  a test), and `go vet -tags integration ./...` now runs in CI and `make vet` —
+  over 20 integration files were compiled by nothing.
+- `make hardware-parallel` runs one test run per PLC concurrently across all three
+  devices. Two concurrent runs against a *single* PLC break its AMS router, so a
+  repeated argument is refused rather than launched.
+- `-race` suite 67s → 54s: the wire stub now closes accepted connections and its
+  injected delays are interruptible, so tests stopped paying a 2s teardown cap each.
+- Four tests that could not fail were fixed or deleted, each confirmed by mutation;
+  one test that sent a real route-registration datagram to `127.0.0.1:48899` (6s in
+  any environment where ICMP is suppressed) now uses the in-process responder.
+- The integration suite understands the new batch contract, names the failing symbol
+  and whether the library or the PLC is responsible, and restore steps that
+  previously discarded their error now say which symbols were left holding test
+  values.
+
 ## v2.2.0: context propagation, type safety, ergonomic constructor (breaking)
 
 v2.2 bundles the v2.1 self-review findings into a single break: every RPC

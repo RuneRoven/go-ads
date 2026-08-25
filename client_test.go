@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"runtime"
@@ -552,12 +553,12 @@ func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 	conn := &Session{
 		lifecycle: &sessionLifecycle{ctx: ctx},
 		logger:    getDefaultLogger(),
-		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
+		tx:        &transport{activeRequests: make(map[uint32]chan amsReply)},
 	}
 	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
 
 	// Register a response channel for invokeID 42
-	ch := make(chan []byte, 1)
+	ch := make(chan amsReply, 1)
 	conn.tx.activeRequestLock.Lock()
 	conn.tx.activeRequests[42] = ch
 	conn.tx.activeRequestLock.Unlock()
@@ -579,9 +580,12 @@ func TestHandleReceive_RoutesToCorrectChannel(t *testing.T) {
 	conn.client.Load().handleReceive(ctx, buf.Bytes())
 
 	select {
-	case resp := <-ch:
-		if !bytes.Equal(resp, []byte{0xDE, 0xAD, 0xBE, 0xEF}) {
-			t.Errorf("response = %v, want [0xDE 0xAD 0xBE 0xEF]", resp)
+	case reply := <-ch:
+		if reply.amsErr != 0 {
+			t.Errorf("amsErr = %v, want 0 for a successful response", reply.amsErr)
+		}
+		if !bytes.Equal(reply.data, []byte{0xDE, 0xAD, 0xBE, 0xEF}) {
+			t.Errorf("response = %v, want [0xDE 0xAD 0xBE 0xEF]", reply.data)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for response")
@@ -594,7 +598,7 @@ func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 	conn := &Session{
 		lifecycle: &sessionLifecycle{ctx: ctx},
 		logger:    getDefaultLogger(),
-		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
+		tx:        &transport{activeRequests: make(map[uint32]chan amsReply)},
 	}
 	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
 
@@ -613,18 +617,33 @@ func TestHandleReceive_UnknownInvokeID(t *testing.T) {
 	conn.client.Load().handleReceive(ctx, buf.Bytes())
 }
 
+// TestHandleReceive_TooShort pins WHICH branch a sub-header-sized packet takes.
+// The bare call asserted nothing, and the length guard is redundant behind
+// binary.Read (which fails with ErrUnexpectedEOF on 5 bytes), so deleting the
+// guard left the old version green. Asserting the log record kills that mutant:
+// without the guard the message is "Error parsing header" instead. The guard is
+// still worth pinning — it is the only thing between a future header-size change
+// and the unguarded data[32:] slice.
 func TestHandleReceive_TooShort(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	logs := &testLogHandler{}
 	conn := &Session{
 		lifecycle: &sessionLifecycle{ctx: ctx},
-		logger:    getDefaultLogger(),
-		tx:        &transport{activeRequests: make(map[uint32]chan []byte)},
+		logger:    slog.New(logs),
+		tx:        &transport{activeRequests: make(map[uint32]chan amsReply)},
 	}
 	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
 
 	// Less than 32 bytes — should return early
 	conn.client.Load().handleReceive(ctx, []byte{1, 2, 3, 4, 5})
+
+	if logs.findByMessage("header too short") == nil {
+		t.Error("short packet did not hit the length guard; it fell through to header decode")
+	}
+	if len(conn.tx.activeRequests) != 0 {
+		t.Errorf("short packet touched activeRequests: %d entries", len(conn.tx.activeRequests))
+	}
 }
 
 // ==========================================================================
@@ -890,24 +909,55 @@ func TestClient_ClosedReturnsErrTransportClosed(t *testing.T) {
 	}
 }
 
+// clientWorkerFrames are the entry points of the goroutines startWorkers spawns.
+// Counting these frames in a full goroutine dump identifies this package's workers
+// specifically, unlike runtime.NumGoroutine, which counts every goroutine in the
+// test binary — including whatever an unrelated test happens to be running.
+var clientWorkerFrames = []string{
+	"(*Client).listen(",
+	"(*Client).transmitWorker(",
+	"(*Client).recvWorker(",
+}
+
+// countClientWorkers returns how many Client worker goroutines exist right now,
+// across the whole process.
+func countClientWorkers(t *testing.T) int {
+	t.Helper()
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	dump := string(buf)
+	total := 0
+	for _, frame := range clientWorkerFrames {
+		total += strings.Count(dump, frame)
+	}
+	return total
+}
+
 // TestClient_GoroutineCountBoundedAfterClose asserts that Dial spawns exactly
 // 1 listen + 1 transmit + recvWorkerCount recv workers, and that Close
-// terminates them all. We measure NumGoroutine before Dial, after Dial, and
-// after Close.
+// terminates them all.
+//
+// It used to assert an absolute runtime.NumGoroutine() delta in a shared test
+// process, which made it flaky by construction: any unrelated test's goroutines
+// inflate the baseline between the two samples and shrink the observed delta. It
+// failed once under load at delta 16 against a want of 18 while passing in
+// isolation. Both halves are now pinned on the Client's own machinery instead —
+// its worker stack frames, and its waitGroup via Close — so the assertion is
+// independent of the rest of the binary and stays valid under t.Parallel().
 //
 // Validates: R-CL-004 (goroutines bounded), R-CL-001 (Close cleans up).
 func TestClient_GoroutineCountBoundedAfterClose(t *testing.T) {
 	host, port, stop := startStubTCPServer(t)
 	defer stop()
 
-	// Allow background runtime goroutines (GC, etc.) to settle slightly.
-	runtimeGosched := func() {
-		for i := 0; i < 5; i++ {
-			runtime.Gosched()
-		}
-	}
-	runtimeGosched()
-	baseline := runtime.NumGoroutine()
+	baseline := countClientWorkers(t)
 
 	c, err := Dial(host, port, AMSAddress{}, AMSAddress{}, time.Second)
 	if err != nil {
@@ -915,39 +965,53 @@ func TestClient_GoroutineCountBoundedAfterClose(t *testing.T) {
 	}
 
 	// listen + transmit + recvWorkerCount.
-	wantDelta := 2 + recvWorkerCount
-	// Give workers a moment to actually start.
-	deadline := time.Now().Add(time.Second)
-	var dialed int
+	wantWorkers := 2 + recvWorkerCount
+	deadline := time.Now().Add(2 * time.Second)
+	started := 0
 	for time.Now().Before(deadline) {
-		dialed = runtime.NumGoroutine()
-		if dialed-baseline >= wantDelta {
+		started = countClientWorkers(t) - baseline
+		if started >= wantWorkers {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if dialed-baseline < wantDelta {
-		t.Errorf("after Dial: NumGoroutine delta = %d, want at least %d", dialed-baseline, wantDelta)
+	if started < wantWorkers {
+		t.Fatalf("after Dial: %d Client worker goroutines started, want %d (baseline %d)",
+			started, wantWorkers, baseline)
 	}
 
-	if err := c.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	// Close cancels the worker context and then waits on the Client's own
+	// waitGroup, which every worker is registered in before it is spawned. So a
+	// worker that ignores its exit signal blocks Close forever: bound the wait so
+	// that failure lands here with a diagnosis instead of as a package timeout.
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return within 10s: its waitGroup never drained, so at least one " +
+			"worker ignored ctx.Done / the closed connection")
 	}
-	// Allow the connection's accept-side goroutine on the stub to exit too;
-	// runtime may report a transient extra. Loop with a short bound.
+
+	// Close's Wait returning proves every registered worker called Done. Poll the
+	// frame count back to the baseline as well, which additionally catches a worker
+	// goroutine that leaked without being registered in the waitGroup, plus the
+	// brief window where a goroutine has run its deferred Done but not yet unwound.
 	deadline = time.Now().Add(2 * time.Second)
-	var post int
+	remaining := 0
 	for time.Now().Before(deadline) {
-		runtimeGosched()
-		post = runtime.NumGoroutine()
-		if post <= baseline+1 { // tolerate one runtime-noise goroutine
+		remaining = countClientWorkers(t) - baseline
+		if remaining <= 0 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if post > baseline+2 {
-		t.Errorf("after Close: NumGoroutine = %d, baseline = %d (delta %d > 2 — workers may have leaked)",
-			post, baseline, post-baseline)
+	if remaining > 0 {
+		t.Errorf("after Close: %d Client worker goroutines still running (baseline %d) — workers leaked",
+			remaining, baseline)
 	}
 }
 
@@ -1022,7 +1086,7 @@ func TestClient_OnDropFiresExactlyOnce(t *testing.T) {
 			sendChannel:    make(chan []byte),
 			systemResponse: make(chan []byte),
 			recvQueue:      make(chan []byte, 8),
-			activeRequests: map[uint32]chan []byte{},
+			activeRequests: map[uint32]chan amsReply{},
 		},
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
@@ -1068,7 +1132,10 @@ func TestWithOnDrop_RegistersCallback(t *testing.T) {
 	called := make(chan struct{}, 1)
 	opt := WithOnDrop(func() { called <- struct{}{} })
 
-	c := &Client{}
+	// A real transport: callOnDrop marks it down and releases waiters, so the
+	// zero-value Client this test used to build is not a shape that exists
+	// (Dial and NewSession both construct tx).
+	c := &Client{tx: &transport{}, dropped: make(chan struct{})}
 	opt(c)
 
 	c.callOnDrop()
@@ -1123,5 +1190,307 @@ func TestWriteProcessOutputBit_ByteOffsetOverflow(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "overflow") && !strings.Contains(err.Error(), "byteOffset") {
 		t.Errorf("expected overflow error mentioning overflow or byteOffset, got: %v", err)
+	}
+}
+
+// TestSetSource_TakesEffectOnTheWire: what the local-mode handshake learns has to
+// reach the packets.
+//
+// The Client holds the source AMS address by value, copied at construction. In
+// local mode the handshake cannot run until the Client exists (it is itself a
+// request), so the address the router assigns arrives afterwards — and nothing
+// propagated it. Every request for the rest of the session went out with the
+// auto-derived placeholder (127.0.0.1.1.1 and a random port) instead.
+func TestSetSource_TakesEffectOnTheWire(t *testing.T) {
+	placeholder := AMSAddress{NetID: [6]byte{127, 0, 0, 1, 1, 1}, Port: 33333}
+	assigned := AMSAddress{NetID: [6]byte{192, 168, 3, 52, 1, 1}, Port: 32905}
+
+	c := &Client{
+		tx:     &transport{},
+		logger: getDefaultLogger(),
+		target: AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851},
+		source: placeholder,
+	}
+
+	before, err := c.encode(CommandIDRead, []byte{1, 2, 3, 4}, 1)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	c.setSource(assigned)
+	after, err := c.encode(CommandIDRead, []byte{1, 2, 3, 4}, 2)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	// Source AMS address sits after the 6-byte AMS/TCP header and the 8-byte target.
+	const sourceOffset = 6 + 8
+	gotBefore := before[sourceOffset : sourceOffset+6]
+	gotAfter := after[sourceOffset : sourceOffset+6]
+	if !bytes.Equal(gotBefore, placeholder.NetID[:]) {
+		t.Fatalf("source before = % x, want the placeholder % x — test is reading the wrong offset",
+			gotBefore, placeholder.NetID[:])
+	}
+	if !bytes.Equal(gotAfter, assigned.NetID[:]) {
+		t.Errorf("source on the wire = % x after setSource(%v): requests still carry the pre-handshake address, so the PLC "+
+			"answers a NetID this session is not using", gotAfter, assigned)
+	}
+}
+
+// TestReadFrames_SourceRaceWithLocalHandshake: the transport-fault log line reads
+// c.source from the listen goroutine while the local-mode handshake writes it.
+//
+// setSource holds tx.connMu; the "PLC closed connection" log line read the field
+// bare. Both setSource callers publish the Client — and so start listen — before
+// the handshake runs, because the handshake is itself an ADS request. So the two
+// accesses genuinely overlap, and this test is the configuration no existing test
+// had: live workers plus setSource on the same Client. The race detector is the
+// oracle; the log assertion only proves the branch under test executed.
+func TestReadFrames_SourceRaceWithLocalHandshake(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		_ = ln.Close()
+		t.Fatalf("unexpected addr type: %T", ln.Addr())
+	}
+	// The server holds the accepted connection until dropConn, then closes it:
+	// readFrames sees io.EOF, which isLikelyMissingRoute accepts, so the log
+	// line that reads c.source runs.
+	dropConn := make(chan struct{})
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		<-dropConn
+		_ = conn.Close()
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-served
+	})
+
+	handler := &testLogHandler{}
+	placeholder := AMSAddress{NetID: [6]byte{127, 0, 0, 1, 1, 1}, Port: 33333}
+	c, err := Dial(addr.IP.String(), addr.Port, AMSAddress{NetID: [6]byte{5, 1, 2, 3, 1, 1}, Port: 851},
+		placeholder, time.Second, WithClientLogger(slog.New(handler)))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	// Differ in every byte from the placeholder so a torn read is also visible
+	// as a value, not only to the detector.
+	assigned := AMSAddress{NetID: [6]byte{192, 168, 3, 52, 2, 2}, Port: 32905}
+	stop := make(chan struct{})
+	var writer sync.WaitGroup
+	writer.Add(1)
+	go func() {
+		defer writer.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if i%2 == 0 {
+				c.setSource(assigned)
+			} else {
+				c.setSource(placeholder)
+			}
+		}
+	}()
+
+	close(dropConn)
+	deadline := time.Now().Add(2 * time.Second)
+	logged := false
+	for time.Now().Before(deadline) {
+		if handler.findByMessage("PLC closed connection, transport down") != nil {
+			logged = true
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	close(stop)
+	writer.Wait()
+	if !logged {
+		t.Fatal("readFrames never logged the transport-fault line, so the racing read never ran — " +
+			"the stub's close did not surface as an isLikelyMissingRoute error")
+	}
+}
+
+// TestGetSymbol_TraceLogDoesNotRaceNotificationWriter: the trace line at the end of
+// getSymbol must not hand the live *symbol to the logger.
+//
+// slog formats a *symbol by reflection and reads Value / Valid / ValueParsed /
+// LastUpdateTime. Those are written by updateValue under cache.lock, from the
+// Client's recvWorker via handleNotification → dispatchSample. getSymbol logged the
+// pointer after releasing cache.lock, so a subscribed session with trace logging on
+// read a string header and a multi-word time.Time unsynchronised.
+//
+// The configuration no other test had is the enabled LevelTrace handler: slog skips
+// its args at a disabled level, which is the only reason the suite was green. So this
+// test enables LevelTrace while notifications flow. -race is the oracle.
+//
+// Lives in client_test.go rather than beside getSymbol only because of file ownership
+// during the concurrent fix waves.
+func TestGetSymbol_TraceLogDoesNotRaceNotificationWriter(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	srv.onWriteRead(GroupSymbolInfoByNameEx, func(req []byte) []byte {
+		name := strings.TrimRight(string(req), "\x00")
+		return buildSymbolInfoPayload(name, "INT", "", 0x4040, 0x100, 2, ADSTInt16, 0)
+	})
+	var nextHandle atomic.Uint32
+	srv.onWriteRead(GroupSymbolHandleByName, func(_ []byte) []byte {
+		return buildHandlePayload(nextHandle.Add(1))
+	})
+
+	sess, client := newWiredTestSession(t, srv)
+	// An ENABLED trace handler that actually formats its attrs. io.Discard keeps
+	// the output cost off the test, but the reflection over the attr still happens.
+	sess.logger = slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: LevelTrace}))
+	client.SetNotificationHandler(sess.handleNotification)
+	ctx := context.Background()
+
+	const symbolName = "MAIN.traced"
+	const notifHandle uint32 = 0x0BAD0002
+	sym, err := sess.getSymbol(ctx, symbolName)
+	if err != nil {
+		t.Fatalf("resolving %s: %v", symbolName, err)
+	}
+	updates := make(chan *Update, 1)
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[notifHandle] = activeNotification{Sym: sym, Ch: updates}
+	sess.notifications.lock.Unlock()
+
+	sample := make([]byte, 2)
+	binary.LittleEndian.PutUint16(sample, 7)
+	packet := buildNotificationPacket(notifHandle, 0, sample)
+
+	const (
+		readers     = 4
+		dispatchers = 4
+		iterations  = 200
+	)
+	var wg sync.WaitGroup
+	var readErr atomic.Value
+
+	// Readers — production getSymbol on a cached symbol reaches the trace line.
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				got, err := sess.getSymbol(ctx, symbolName)
+				switch {
+				case err != nil:
+					readErr.Store(err)
+					return
+				case got != sym:
+					readErr.Store(fmt.Errorf("getSymbol returned %p, want the cached %p", got, sym))
+					return
+				}
+			}
+		}()
+	}
+	// Writers — production dispatch mutates Value / Valid / LastUpdateTime under cache.lock.
+	for i := 0; i < dispatchers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				if err := sess.drivePacket(ctx, packet); err != nil {
+					readErr.Store(fmt.Errorf("drivePacket: %w", err))
+					return
+				}
+			}
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("getSymbol / dispatch workers did not finish in 30s — a lock-order inversion, not a race")
+	}
+	if err, ok := readErr.Load().(error); ok && err != nil {
+		t.Fatalf("worker failed: %v", err)
+	}
+	if !sym.ValueParsed {
+		t.Error("no notification sample was ever parsed, so the writer half never ran")
+	}
+}
+
+// TestHandleReceive_AMSErrorSurfacesAsItself: an AMS-level rejection must reach the
+// caller as that error, not as a guess parsed from the body.
+//
+// AMSHeader.ErrorCode was only ever written, never read. So when the router refused
+// a request — target port not found, no runtime, invalid NetID — the library parsed
+// the accompanying body as though it were a response. Measured against a TC3.1.4024
+// system in CONFIG, where every request to the runtime port comes back with
+// ErrorCode 6: a read of index group 0xF008 was reported as
+// "ADS error in Read: 0xF008: unknown error code". That is the index group echoed
+// back, formatted as a return code. Every "unknown error code" in this project's
+// logs came from this, and it sent two diagnoses down the wrong path.
+func TestHandleReceive_AMSErrorSurfacesAsItself(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &Session{
+		lifecycle: &sessionLifecycle{ctx: ctx},
+		logger:    getDefaultLogger(),
+		tx:        &transport{activeRequests: make(map[uint32]chan amsReply)},
+	}
+	conn.client.Store(&Client{tx: conn.tx, logger: conn.logger, ctx: ctx})
+
+	ch := make(chan amsReply, 1)
+	conn.tx.activeRequestLock.Lock()
+	conn.tx.activeRequests[7] = ch
+	conn.tx.activeRequestLock.Unlock()
+
+	// What a system in CONFIG actually sends: ErrorCode 6, and a body that is the
+	// echoed request rather than a response.
+	header := AMSHeader{
+		Command:   CommandIDRead,
+		State:     5,
+		Length:    4,
+		ErrorCode: uint32(ReturnCodeGlobalTargetPortNotFound),
+		InvokeID:  7,
+	}
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, header); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	buf.Write([]byte{0x08, 0xF0, 0x00, 0x00}) // 0xF008, the index group, echoed
+	conn.client.Load().handleReceive(ctx, buf.Bytes())
+
+	select {
+	case reply := <-ch:
+		if reply.amsErr != ReturnCodeGlobalTargetPortNotFound {
+			t.Errorf("amsErr = %v, want ReturnCodeGlobalTargetPortNotFound: the header's ErrorCode is being discarded", reply.amsErr)
+		}
+		data, err := reply.payload()
+		if err == nil {
+			t.Error("payload() returned no error for an AMS-rejected request: the body would be parsed as a response, " +
+				"which is how an index group ends up reported as a return code")
+		}
+		if data != nil {
+			t.Errorf("payload() returned %v alongside an AMS error; the body is not a response", data)
+		}
+		if !errors.Is(err, ReturnCodeGlobalTargetPortNotFound) {
+			t.Errorf("error %v does not wrap the code, so callers cannot branch on it", err)
+		}
+		if !strings.Contains(err.Error(), "target port") {
+			t.Errorf("error %q does not name the cause; an operator needs to read 'target port not found', "+
+				"which is what a PLC in CONFIG reports for its runtime port", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the reply")
 	}
 }

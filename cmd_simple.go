@@ -37,7 +37,7 @@ func (c *Client) Read(ctx context.Context, group uint32, offset uint32, length u
 	// Try to send the request
 	resp, err := c.sendRequest(ctx, CommandIDRead, request.Bytes())
 	if err != nil {
-		c.logger.Error("send request failed", "error", err)
+		c.logger.Log(ctx, c.transportFaultLevel(), "send request failed", "error", err)
 		return
 	}
 
@@ -93,7 +93,7 @@ func (c *Client) Write(ctx context.Context, group uint32, offset uint32, data []
 	// Try to send the request
 	resp, err := c.sendRequest(ctx, CommandIDWrite, request.Bytes())
 	if err != nil {
-		c.logger.Error("error during send request for write", "error", err)
+		c.logger.Log(ctx, c.transportFaultLevel(), "error during send request for write", "error", err)
 		return err
 	}
 	respBuffer := bytes.NewBuffer(resp)
@@ -172,10 +172,23 @@ type States struct {
 
 // ReadState issues ADS ReadState (cmd 4) and returns the PLC's ADS+device state.
 func (c *Client) ReadState(ctx context.Context) (response States, err error) {
+	return c.readStateOn(ctx, c.target)
+}
+
+// ReadStateOnPort reads the ADS state of another port on the same device. The
+// system service (PortSystemService) is the one that matters: it answers while the
+// system is in CONFIG, when the runtime ports do not exist at all.
+func (c *Client) ReadStateOnPort(ctx context.Context, port Port) (States, error) {
+	target := c.target
+	target.Port = uint16(port)
+	return c.readStateOn(ctx, target)
+}
+
+func (c *Client) readStateOn(ctx context.Context, target AMSAddress) (response States, err error) {
 	// Try to send the request
-	resp, err := c.sendRequest(ctx, CommandIDReadState, []byte{})
+	resp, err := c.sendRequestTo(ctx, target, CommandIDReadState, []byte{})
 	if err != nil {
-		c.logger.Error("Error during read state", "error", err)
+		c.logger.Log(ctx, c.transportFaultLevel(), "error during read state", "error", err)
 		return
 	}
 	c.logger.Log(context.Background(), LevelTrace, "response from plc for state", "data", resp)

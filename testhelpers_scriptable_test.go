@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -59,10 +60,23 @@ type scriptableServer struct {
 	host string
 	port int
 	ln   net.Listener
-	t    *testing.T
 	wg   sync.WaitGroup
 
+	stopOnce sync.Once
+	// quit is closed by stop() so a handler parked in an injected delay leaves
+	// immediately. An uninterruptible sleep ignores the socket close, so every test
+	// arming a long delayBefore used to pay stop()'s full 2s wait cap — the same
+	// mistake as the untracked connections above, on the other path.
+	quit chan struct{}
+
 	mu sync.Mutex // guards every field below
+
+	// conns are the accepted client connections, tracked so stop() can close
+	// them. Closing only the listener leaves every handle() goroutine blocked in
+	// io.ReadFull until the client happens to hang up, which cost each test using
+	// this stub the full 2s stop() timeout.
+	conns  map[net.Conn]struct{}
+	closed bool
 
 	// Per-cmd dispatch tables. key (group) used for Read/Write/WriteRead.
 	writeReadHandlers map[uint32]writeReadHandler
@@ -76,8 +90,50 @@ type scriptableServer struct {
 	// don't carry a group (AddDeviceNotification etc.) the group is 0.
 	delays map[delayKey]time.Duration
 
+	// dropAfter/dropSeen implement dropConnAfter: close the connection instead
+	// of answering the nth occurrence of a command.
+	dropAfter map[CommandID]int
+	dropSeen  map[CommandID]int
+
+	// amsErrAfter/amsErrCode/amsErrSeen implement amsErrorAfter: answer the nth
+	// and every later occurrence of a command with an AMS-header ErrorCode
+	// instead of a normal reply. Models a TwinCAT system dropping into CONFIG —
+	// the router keeps answering, the runtime port stops existing.
+	amsErrAfter map[CommandID]int
+	amsErrCode  map[CommandID]uint32
+	amsErrSeen  map[CommandID]int
+
+	// closeAfterReply implements answerThenClose: answer the nth occurrence of a
+	// command normally, then close the connection. Models the PLC behaviour that
+	// matters most here — a reply followed immediately by a route-idle close, a
+	// runtime restart, or an RST.
+	closeAfterReply map[CommandID]int
+
+	// adsState is what ReadState reports; zero means RUN. Lets a test put the stub
+	// "in CONFIG" the way a real system service reports it.
+	adsState  ADSState
+	replySeen map[CommandID]int
+
 	// Recorded inbound frames (full bytes including TCP header).
 	frameBuf [][]byte
+
+	// acceptCount is outside mu on purpose: a reconnect-storm test reads it while
+	// the accept loop is running.
+	acceptCount atomic.Int64
+
+	// peerAddr, when set, makes the stub answer on a connection IT opens to that
+	// address instead of on the client's connection — the behaviour measured on a
+	// TC/RTOS device, which treats a registered route as a peer router. Requests
+	// are still accepted on the client's connection.
+	peerAddr atomic.Pointer[string]
+	peerMu   sync.Mutex
+	peerConn net.Conn
+
+	// unanswered counts requests the stub processed but could not reply to
+	// because the peer connection was not up yet. It is a counter rather than a
+	// t.Logf because this goroutine can outlive the test, and logging after the
+	// test returns kills the whole binary.
+	unanswered atomic.Int64
 }
 
 type delayKey struct {
@@ -100,24 +156,64 @@ func startScriptableServer(t *testing.T) *scriptableServer {
 		host:              addr.IP.String(),
 		port:              addr.Port,
 		ln:                ln,
-		t:                 t,
 		writeReadHandlers: map[uint32]writeReadHandler{},
 		writeHandlers:     map[uint32]writeHandler{},
 		readHandlers:      map[uint32]readHandler{},
 		delays:            map[delayKey]time.Duration{},
+		conns:             map[net.Conn]struct{}{},
+		quit:              make(chan struct{}),
 	}
 	s.wg.Add(1)
 	go s.acceptLoop()
+	// Belt and braces: most callers `defer srv.stop()`, but a t.Fatalf before that
+	// line, or a test that forgets it, would otherwise leave the goroutines running
+	// for the rest of the process. stop() is idempotent, so both can fire.
+	t.Cleanup(s.stop)
 	return s
 }
 
+// stop closes the listener and every accepted connection, then waits for the
+// goroutines. Idempotent: callers both `defer srv.stop()` and get a t.Cleanup.
 func (s *scriptableServer) stop() {
-	_ = s.ln.Close()
-	done := make(chan struct{})
-	go func() { s.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
+	s.stopOnce.Do(func() {
+		close(s.quit) // first: releases any handler sitting in an injected delay
+		s.peerMu.Lock()
+		if s.peerConn != nil {
+			_ = s.peerConn.Close()
+			s.peerConn = nil
+		}
+		s.peerMu.Unlock()
+		_ = s.ln.Close()
+		s.mu.Lock()
+		s.closed = true
+		for c := range s.conns {
+			_ = c.Close()
+		}
+		s.conns = map[net.Conn]struct{}{}
+		s.mu.Unlock()
+		done := make(chan struct{})
+		go func() { s.wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	})
+}
+
+// closeClientConns closes every accepted client connection and leaves the
+// listener up, so the session's next dial is still served.
+//
+// stop() cannot stand in for this: it closes the listener too, so a session that
+// is supposed to redial after the drop has nothing to redial to.
+func (s *scriptableServer) closeClientConns() {
+	s.mu.Lock()
+	conns := make([]net.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
 	}
 }
 
@@ -159,6 +255,12 @@ func (s *scriptableServer) onDeleteDeviceNotification(fn func(handle uint32) Ret
 // delayBefore injects artificial latency for a particular (cmd, group)
 // before the handler runs. Pass group=0 for commands without an index group
 // (AddDeviceNotification, DeleteDeviceNotification, ReadDeviceInfo, ReadState).
+func (s *scriptableServer) setADSState(state ADSState) {
+	s.mu.Lock()
+	s.adsState = state
+	s.mu.Unlock()
+}
+
 func (s *scriptableServer) delayBefore(cmd CommandID, group uint32, d time.Duration) {
 	s.mu.Lock()
 	s.delays[delayKey{cmd: cmd, group: group}] = d
@@ -174,6 +276,12 @@ func (s *scriptableServer) frames() [][]byte {
 	return out
 }
 
+// accepts reports how many TCP connections the stub has accepted. A reconnect
+// loop that keeps dialing shows up here even when it never gets a reply.
+func (s *scriptableServer) accepts() int {
+	return int(s.acceptCount.Load())
+}
+
 func (s *scriptableServer) acceptLoop() {
 	defer s.wg.Done()
 	for {
@@ -181,6 +289,15 @@ func (s *scriptableServer) acceptLoop() {
 		if err != nil {
 			return
 		}
+		s.acceptCount.Add(1)
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			_ = c.Close()
+			return
+		}
+		s.conns[c] = struct{}{}
+		s.mu.Unlock()
 		s.wg.Add(1)
 		go s.handle(c)
 	}
@@ -189,6 +306,11 @@ func (s *scriptableServer) acceptLoop() {
 func (s *scriptableServer) handle(c net.Conn) {
 	defer s.wg.Done()
 	defer c.Close()
+	defer func() {
+		s.mu.Lock()
+		delete(s.conns, c)
+		s.mu.Unlock()
+	}()
 	for {
 		hdr := make([]byte, 6)
 		if _, err := io.ReadFull(c, hdr); err != nil {
@@ -228,16 +350,166 @@ func (s *scriptableServer) handle(c net.Conn) {
 		s.mu.Lock()
 		if d := s.delays[delayKey{cmd: cmd, group: group}]; d > 0 {
 			s.mu.Unlock()
-			time.Sleep(d)
+			// Interruptible: tests inject hour-long delays to hold a request in
+			// flight, and stop() must not have to outwait them.
+			select {
+			case <-time.After(d):
+			case <-s.quit:
+				return
+			}
 		} else {
 			s.mu.Unlock()
 		}
 
+		// Drop the connection instead of answering, once the configured number
+		// of this command has been seen. Models a PLC/link failure landing
+		// mid-operation, which no amount of canned error codes reproduces: the
+		// client sees EOF on a request it already sent.
+		s.mu.Lock()
+		dropAt, armed := s.dropAfter[cmd]
+		if armed {
+			s.dropSeen[cmd]++
+			if s.dropSeen[cmd] >= dropAt {
+				delete(s.dropAfter, cmd)
+				s.mu.Unlock()
+				return // deferred c.Close() drops it
+			}
+		}
+		s.mu.Unlock()
+
+		// Answer with an AMS-header ErrorCode from the nth occurrence of this
+		// command onward. Sticky, unlike dropAfter: a system in CONFIG does not
+		// come back on its own. The handler still runs, so a test can keep
+		// counting the requests that reached the stub.
+		s.mu.Lock()
+		var amsErr uint32
+		if amsErrAt, armed := s.amsErrAfter[cmd]; armed {
+			s.amsErrSeen[cmd]++
+			if s.amsErrSeen[cmd] >= amsErrAt {
+				amsErr = s.amsErrCode[cmd]
+			}
+		}
+		s.mu.Unlock()
+
 		respPayload := s.dispatch(cmd, group, payload)
-		if err := writeResponse(c, body, cmd, invokeID, respPayload); err != nil {
+		out, werr := s.responseWriter(c)
+		if werr != nil {
+			// Faithful to the measured device: the request was accepted and
+			// processed, the answer simply goes somewhere we cannot reach right
+			// now. The client connection stays OPEN — closing it would look like a
+			// transport drop, which is a different failure entirely.
+			s.unanswered.Add(1)
+			continue
+		}
+		if err := writeResponse(out, body, cmd, invokeID, respPayload, amsErr); err != nil {
+			// A failed write to the stub's OWN peer connection has to invalidate it,
+			// or the cached conn keeps being handed out and every later response goes
+			// nowhere — one broken dial-back poisoning the rest of the test.
+			s.discardPeerConn(out)
 			return
 		}
+
+		// Answer-then-close: the reply is already on the wire; dropping the
+		// connection now races the client's own response delivery.
+		s.mu.Lock()
+		closeAt, armed2 := s.closeAfterReply[cmd]
+		if armed2 {
+			s.replySeen[cmd]++
+			if s.replySeen[cmd] >= closeAt {
+				delete(s.closeAfterReply, cmd)
+				s.mu.Unlock()
+				return // deferred c.Close()
+			}
+		}
+		s.mu.Unlock()
 	}
+}
+
+// answerViaPeerConnection makes the stub deliver every response over a connection
+// it opens to addr, leaving the client's own connection silent.
+func (s *scriptableServer) answerViaPeerConnection(addr string) {
+	a := addr
+	s.peerAddr.Store(&a)
+}
+
+// responseWriter returns where a response should be written: the client's
+// connection normally, or the stub's own connection to the client when
+// answerViaPeerConnection is armed.
+func (s *scriptableServer) responseWriter(client net.Conn) (net.Conn, error) {
+	addr := s.peerAddr.Load()
+	if addr == nil {
+		return client, nil
+	}
+	s.peerMu.Lock()
+	defer s.peerMu.Unlock()
+	if s.peerConn != nil {
+		return s.peerConn, nil
+	}
+	c, err := net.DialTimeout("tcp4", *addr, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	s.peerConn = c
+	return c, nil
+}
+
+// discardPeerConn drops the cached peer connection if it is the one that just
+// failed, so the next response redials instead of writing into a dead socket.
+// Compares identity: another goroutine may already have replaced it.
+func (s *scriptableServer) discardPeerConn(failed net.Conn) {
+	s.peerMu.Lock()
+	defer s.peerMu.Unlock()
+	if s.peerConn != nil && s.peerConn == failed {
+		_ = s.peerConn.Close()
+		s.peerConn = nil
+	}
+}
+
+// answerThenClose answers the nth occurrence of cmd (1-based) and then closes
+// the connection, then disarms.
+func (s *scriptableServer) answerThenClose(cmd CommandID, n int) {
+	s.mu.Lock()
+	if s.closeAfterReply == nil {
+		s.closeAfterReply = map[CommandID]int{}
+		s.replySeen = map[CommandID]int{}
+	}
+	s.closeAfterReply[cmd] = n
+	s.replySeen[cmd] = 0
+	s.mu.Unlock()
+}
+
+// dropConnAfter closes the connection without answering the nth occurrence of
+// cmd (1-based), then disarms. Use to land a transport failure in the middle of
+// a multi-request operation.
+func (s *scriptableServer) dropConnAfter(cmd CommandID, n int) {
+	s.mu.Lock()
+	if s.dropAfter == nil {
+		s.dropAfter = map[CommandID]int{}
+		s.dropSeen = map[CommandID]int{}
+	}
+	s.dropAfter[cmd] = n
+	s.dropSeen[cmd] = 0
+	s.mu.Unlock()
+}
+
+// amsErrorAfter answers the nth occurrence of cmd (1-based) and every one after
+// it with code in the AMS header's ErrorCode field instead of a reply. Use to
+// land a router-level rejection — a TwinCAT system in CONFIG answers 0x06 for
+// every request to a runtime port — as opposed to dropConnAfter's dead socket.
+//
+// Deliberately sticky: unlike dropConnAfter this never disarms, because the
+// condition it models does not clear itself.
+func (s *scriptableServer) amsErrorAfter(cmd CommandID, n int, code ReturnCode) {
+	s.mu.Lock()
+	if s.amsErrAfter == nil {
+		s.amsErrAfter = map[CommandID]int{}
+		s.amsErrCode = map[CommandID]uint32{}
+		s.amsErrSeen = map[CommandID]int{}
+	}
+	s.amsErrAfter[cmd] = n
+	s.amsErrCode[cmd] = uint32(code)
+	s.amsErrSeen[cmd] = 0
+	s.mu.Unlock()
 }
 
 func (s *scriptableServer) dispatch(cmd CommandID, group uint32, payload []byte) []byte {
@@ -319,7 +591,11 @@ func (s *scriptableServer) dispatch(cmd CommandID, group uint32, payload []byte)
 	case CommandIDReadState:
 		// 8 bytes: 4 errCode + 2 ADSState + 2 DeviceState
 		out := make([]byte, 8)
-		binary.LittleEndian.PutUint16(out[4:6], uint16(ADSStateRun))
+		state := ADSStateRun
+		if s.adsState != 0 {
+			state = s.adsState
+		}
+		binary.LittleEndian.PutUint16(out[4:6], uint16(state))
 		return out
 	}
 	return respondErrorBytes(ReturnCodeDeviceServiceNotSupported)
@@ -425,7 +701,14 @@ func decodeAddNotifRequest(payload []byte) addNotifRequest {
 // writeResponse builds and writes a complete response frame.
 // reqBody is the original 32-byte AMS header (used to swap target/source).
 // respPayload is the post-header response data.
-func writeResponse(c net.Conn, reqBody []byte, cmd CommandID, invokeID uint32, respPayload []byte) error {
+//
+// amsErr, when non-zero, goes into the AMS header's ErrorCode field and the body
+// is dropped: an AMS rejection never carries a response, and client.go rejects
+// the frame outright unless Length matches the body actually written.
+func writeResponse(c net.Conn, reqBody []byte, cmd CommandID, invokeID uint32, respPayload []byte, amsErr uint32) error {
+	if amsErr != 0 {
+		respPayload = nil
+	}
 	respBody := make([]byte, 32+len(respPayload))
 	// Swap source/target so addressing looks right.
 	copy(respBody[0:8], reqBody[8:16]) // new Target = old Source
@@ -433,7 +716,7 @@ func writeResponse(c net.Conn, reqBody []byte, cmd CommandID, invokeID uint32, r
 	binary.LittleEndian.PutUint16(respBody[16:18], uint16(cmd))
 	binary.LittleEndian.PutUint16(respBody[18:20], 5) // State = response
 	binary.LittleEndian.PutUint32(respBody[20:24], uint32(len(respPayload)))
-	binary.LittleEndian.PutUint32(respBody[24:28], 0) // ErrorCode
+	binary.LittleEndian.PutUint32(respBody[24:28], amsErr) // ErrorCode
 	binary.LittleEndian.PutUint32(respBody[28:32], invokeID)
 	copy(respBody[32:], respPayload)
 
@@ -495,6 +778,12 @@ func newWiredTestSession(t *testing.T, srv *scriptableServer, opts ...SessionOpt
 		t.Fatalf("Dial scriptable server: %v", err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
+	// Sessions from this helper cannot be Close()d — the Client comes from Dial with
+	// a context of its own, so Close's wait for its workers never returns (see
+	// newDialableTestSession). Any background goroutine keyed on closedCh therefore
+	// outlives the test unless it is signalled here. Left unsignalled, a heartbeat
+	// watcher from one test kept running for the remainder of the process; in a real
+	// integration run that was 1468 warning lines across 666 later tests.
 
 	sess := &Session{
 		tx:            c.tx,
@@ -506,7 +795,11 @@ func newWiredTestSession(t *testing.T, srv *scriptableServer, opts ...SessionOpt
 	sess.client.Store(c)
 	// Pre-init ctx/shutdown so sess.Close() is safe in test paths that
 	// exercise the close lifecycle (e.g. SymbolVersionClose strategy).
-	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(context.Background())
+	// parentCtx too, matching NewSession: tearDownAndReset re-derives
+	// lifecycle.ctx from it, so a helper that leaves it nil diverges from
+	// production on every path that redials.
+	sess.lifecycle.parentCtx = context.Background()
+	sess.lifecycle.ctx, sess.lifecycle.shutdown = context.WithCancel(sess.lifecycle.parentCtx)
 	// Walk the FSM through Connecting → Connected so isClosed/isReconnecting
 	// readers see a live session. Direct atomic store keeps the test helper
 	// simple — production transitions go through transitionTo.
@@ -514,5 +807,9 @@ func newWiredTestSession(t *testing.T, srv *scriptableServer, opts ...SessionOpt
 	for _, opt := range opts {
 		opt(sess)
 	}
+	t.Cleanup(func() {
+		sess.markClosed() // see the note above the Client cleanup
+		sess.heartbeatWG.Wait()
+	})
 	return sess, c
 }

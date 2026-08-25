@@ -6,8 +6,11 @@ import (
 	"encoding/binary"
 	"log/slog"
 	"math"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -259,4 +262,153 @@ func testWriteRoundTrip(t *testing.T, dataType string, length uint32, value stri
 	if parsed != value {
 		t.Errorf("round-trip %q: wrote %q, got back %q", dataType, value, parsed)
 	}
+}
+
+// --- helpers for the AMS peer-listener tests ---
+
+// freeLocalPort reserves and releases a loopback port, returning its number. The
+// small race (something else could take it) is acceptable in tests and keeps the
+// stub and the listener agreeing on one number.
+func freeLocalPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		_ = ln.Close()
+		t.Fatalf("unexpected addr type %T", ln.Addr())
+	}
+	_ = ln.Close()
+	return addr.Port
+}
+
+func localAddr(port int) string {
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+}
+
+// --- stub AMS router: counts AddRoute requests and answers them ---
+
+// routeResponder is a UDP stub that speaks the AddRoute half of the AMS router
+// protocol, so tests can count how many times a session registers a route.
+type routeResponder struct {
+	// dropFirst silently swallows this many registration datagrams before
+	// answering, so a test can tell a retransmit from a single-shot send.
+	dropFirst atomic.Int32
+	// noiseFirst sends this many junk datagrams BEFORE the real reply. Injected
+	// here rather than from a third party because the client dials a connected UDP
+	// socket, which only ever receives from this responder's address — noise sent
+	// from anywhere else cannot reach the code that is supposed to skip it.
+	noiseFirst atomic.Int32
+
+	pc    *net.UDPConn
+	port  int
+	adds  atomic.Int64
+	done  chan struct{}
+	wg    sync.WaitGroup
+	reply atomic.Int64 // result code to answer with (0 = success)
+
+	// netIDMu guards netIDs, the source NetID carried by each registration. Kept
+	// so a test can assert on the identity that went on the wire and not only on
+	// how many datagrams did — a torn read of Session.source shows up here as a
+	// NetID that was never written.
+	netIDMu sync.Mutex
+	netIDs  [][6]byte
+}
+
+func startRouteResponder(t *testing.T) *routeResponder {
+	t.Helper()
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("route responder listen: %v", err)
+	}
+	addr, ok := pc.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		_ = pc.Close()
+		t.Fatalf("unexpected addr type %T", pc.LocalAddr())
+	}
+	r := &routeResponder{pc: pc, port: addr.Port, done: make(chan struct{})}
+	r.wg.Add(1)
+	go r.serve()
+	t.Cleanup(func() { close(r.done); _ = pc.Close(); r.wg.Wait() })
+	return r
+}
+
+func (r *routeResponder) serve() {
+	defer r.wg.Done()
+	buf := make([]byte, 2048)
+	for {
+		select {
+		case <-r.done:
+			return
+		default:
+		}
+		_ = r.pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		n, from, err := r.pc.ReadFromUDP(buf)
+		if err != nil || n < 24 {
+			continue
+		}
+		invokeID := binary.LittleEndian.Uint32(buf[4:8])
+		service := binary.LittleEndian.Uint32(buf[8:12])
+		if service != routeServiceAdd {
+			continue
+		}
+		r.adds.Add(1)
+		var netID [6]byte
+		copy(netID[:], buf[12:18])
+		r.netIDMu.Lock()
+		r.netIDs = append(r.netIDs, netID)
+		r.netIDMu.Unlock()
+		for r.noiseFirst.Load() > 0 {
+			r.noiseFirst.Add(-1)
+			_, _ = r.pc.WriteToUDP([]byte("junk on the shared AMS router port"), from)
+		}
+		if drop := r.dropFirst.Load(); drop > 0 {
+			// Model a lost datagram on a plant network: count it, answer nothing.
+			r.dropFirst.Add(-1)
+			continue
+		}
+		// cookie + invokeID + (RESPONSE|service) + AmsAddr + tagCount, then tag 1
+		// carrying the 4-byte result.
+		resp := make([]byte, 0, 40)
+		hdr := make([]byte, 24)
+		binary.LittleEndian.PutUint32(hdr[0:], routeCookie)
+		binary.LittleEndian.PutUint32(hdr[4:], invokeID)
+		binary.LittleEndian.PutUint32(hdr[8:], 0x80000000|routeServiceAdd)
+		binary.LittleEndian.PutUint32(hdr[20:], 1)
+		resp = append(resp, hdr...)
+		tag := make([]byte, 8)
+		binary.LittleEndian.PutUint16(tag[0:], tagResponseError)
+		binary.LittleEndian.PutUint16(tag[2:], 4)
+		binary.LittleEndian.PutUint32(tag[4:], uint32(r.reply.Load()))
+		resp = append(resp, tag...)
+		_, _ = r.pc.WriteToUDP(resp, from)
+	}
+}
+
+func (r *routeResponder) registrations() int64 { return r.adds.Load() }
+
+// registeredNetIDs returns the source NetID from every registration received.
+func (r *routeResponder) registeredNetIDs() [][6]byte {
+	r.netIDMu.Lock()
+	defer r.netIDMu.Unlock()
+	out := make([][6]byte, len(r.netIDs))
+	copy(out, r.netIDs)
+	return out
+}
+
+// countByMessage reports how many records contain msg. Separate from
+// findByMessage because "did this happen at all" and "did this happen once
+// rather than every tick" are different questions.
+func (h *testLogHandler) countByMessage(msg string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, r := range h.records {
+		if strings.Contains(r.Message, msg) {
+			n++
+		}
+	}
+	return n
 }

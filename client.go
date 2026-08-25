@@ -33,14 +33,50 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
+
+// droppedResponseGrace is how long a request already waiting for a reply keeps
+// waiting after the transport is observed dead.
+//
+// A drop is detected on the listen goroutine, which closes the dropped channel
+// immediately — but a reply it parsed a moment earlier is still travelling
+// recvQueue to a recvWorker. Without this grace the drop signal wins that race
+// and an answer we already received is thrown away: measured at 40/40 replies
+// lost against a stub that answers and then closes, which is exactly what a PLC
+// does on a route-idle timeout, a runtime restart, or an RST after answering.
+//
+// Only a request with a reply in flight pays it, and only once — a multi-request
+// operation aborts on the first failure — so the fast-fail this exists to
+// support keeps almost all of its benefit.
+const droppedResponseGrace = 100 * time.Millisecond
 
 // ErrTransportClosed is returned by every Client method after the underlying
 // TCP transport has been closed (Close called, drop detected, dial failed).
 // Callers reconstruct a new *Client to re-establish.
 var ErrTransportClosed = errors.New("ads: client transport closed")
+
+// resetAfterConnectHint explains a TCP reset that lands right after a successful
+// connect. Shared by the transport-fault log line and by the error Connect returns,
+// so the two cannot drift — and because the log line alone is not enough: a consumer
+// that surfaces the error and not this library's logger otherwise sees only
+// "client transport closed", which is the exact ambiguity this package exists to
+// remove. Measured against a PLC whose route table had been wiped.
+//
+// Four plausible causes, named in the order they are worth checking. Listing only
+// the route one has previously sent people after a mistyped NetID, so all four stay.
+// Both ends of the addressing go in the message, so the reader can check them
+// without reconstructing the config.
+func resetAfterConnectHint(source, target AMSAddress) string {
+	return fmt.Sprintf("a reset right after TCP connect means one of: "+
+		"no route is registered on the PLC for our NetID (%s), "+
+		"the target NetID (%s) does not exist on this PLC, "+
+		"the route credentials were rejected, "+
+		"or AMS port %d addresses no running runtime (expect 851 on TwinCAT 3, 801 on TwinCAT 2)",
+		source.NetIDString(), target.NetIDString(), target.Port)
+}
 
 // isLikelyMissingRoute returns true if err indicates a likely missing-AMS-route
 // condition (PLC closed the TCP connection because no route exists for our
@@ -105,6 +141,26 @@ type Client struct {
 	ondropMu sync.RWMutex
 	ondrop   func()
 
+	// handshaking counts route probe / registration regions in flight; see
+	// beginHandshake for why transport faults are demoted to Debug then. A
+	// counter rather than a flag so overlapping regions cannot have the inner
+	// one re-enable ERROR logging while the outer is still running — the same
+	// reason subscribeInFlight is a counter.
+	handshaking atomic.Int64
+
+	// dropped is closed when THIS client's connection is known to be gone.
+	// disconnected stops new requests; this releases the ones already blocked
+	// on a response that will never come, which a flag cannot do.
+	//
+	// Per-Client, not per-transport, and immutable for the client's lifetime:
+	// a Session reuses one transport across reconnects but allocates a fresh
+	// Client each time, so "this connection died" is a client-scoped fact. Held
+	// on the transport it was signalled by a stale client's listen goroutine
+	// after the replacement had already re-armed it, which killed every request
+	// on the new connection.
+	dropped  chan struct{}
+	dropOnce sync.Once
+
 	// Internal cancellation for the worker goroutines. Independent of any
 	// caller context — Close cancels this to stop workers.
 	ctx       context.Context
@@ -112,6 +168,50 @@ type Client struct {
 	waitGroup sync.WaitGroup
 
 	closeOnce sync.Once
+
+	// peerConns are inbound connections the PLC opened to us; see AcceptPeerConn.
+	// peerClosed latches once closePeerConns has run: the accept loop outlives a
+	// teardown by design, so it can still offer connections to a Client that is
+	// going away, and adopting one then breaks the wait for this Client's workers.
+	peerMu     sync.Mutex
+	peerConns  []net.Conn
+	peerClosed bool
+}
+
+// setSource replaces the source AMS address this Client stamps on every request.
+//
+// Local mode learns its real address from the router only AFTER the Client has been
+// published (the handshake is a request, so it needs a live Client to send it). The
+// Client held a by-value copy taken at construction, and nothing ever updated it —
+// so every request for the rest of the session carried the auto-derived placeholder
+// (127.0.0.1.1.1 and a random port) instead of the address the router assigned.
+// This is also what makes encode's connMu snapshot of c.source meaningful; before
+// this existed, that lock guarded a field nobody wrote.
+func (c *Client) setSource(addr AMSAddress) {
+	c.tx.connMu.Lock()
+	c.source = addr
+	c.tx.connMu.Unlock()
+}
+
+// sourceAddr returns the source AMS address under the mutex that guards it.
+// readFrames logs it from the listen goroutine while a local-mode handshake may
+// be writing it via setSource — both callers of setSource publish the Client,
+// and so start the workers, before the handshake that assigns the address.
+// encodeTo (ams.go) already takes connMu for the same reason.
+func (c *Client) sourceAddr() AMSAddress {
+	c.tx.connMu.Lock()
+	defer c.tx.connMu.Unlock()
+	return c.source
+}
+
+// markDropped releases every request waiting on this client's connection.
+// Idempotent: a drop can be observed by listen and the transmit worker both.
+func (c *Client) markDropped() {
+	c.dropOnce.Do(func() {
+		if c.dropped != nil {
+			close(c.dropped)
+		}
+	})
 }
 
 // Dial opens one TCP connection to ip:port, configures TCP keepalive, and
@@ -134,11 +234,12 @@ func Dial(
 		source:         source,
 		requestTimeout: requestTimeout,
 		logger:         slog.Default(),
+		dropped:        make(chan struct{}),
 		tx: &transport{
 			sendChannel:    make(chan []byte),
 			systemResponse: make(chan []byte, 1),
 			recvQueue:      make(chan []byte, recvQueueSize),
-			activeRequests: map[uint32]chan []byte{},
+			activeRequests: map[uint32]chan amsReply{},
 		},
 	}
 	for _, opt := range opts {
@@ -168,6 +269,8 @@ func Dial(
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		c.tx.disconnected.Store(true)
+		c.closePeerConns()
+		c.markDropped()
 		c.cancel()
 		c.tx.connMu.Lock()
 		if c.tx.connection != nil {
@@ -236,7 +339,80 @@ func (c *Client) SetOnDrop(fn func()) {
 	c.ondropMu.Unlock()
 }
 
+// beginHandshake marks a route probe / registration region as in flight. During the handshake a dropped connection and an unanswered request
+// are expected states, not faults: the normal cold-start flow is probe → PLC
+// rejects an unknown NetID → register route → redial → probe again. Logging
+// those at ERROR misreports a connect that is still progressing, and
+// downstream log-based health checks (umh-core's IsLogsFine fails a data-flow
+// component on any level=error line in its recent window) hold the component
+// in a starting state even though the PLC is connected and streaming.
+//
+// Errors are still returned to the caller unchanged — only the log level moves.
+func (c *Client) beginHandshake() {
+	c.handshaking.Add(1)
+}
+
+// endHandshake closes a region opened by beginHandshake. Pairs must match; a
+// count that never returns to zero would silence real faults for the life of
+// the client, so callers defer this immediately.
+func (c *Client) endHandshake() {
+	if c.handshaking.Add(-1) >= 0 {
+		return
+	}
+	// Unbalanced release: a negative count reads as "not handshaking" only by
+	// accident, and would then need two begins to demote again. Clamp with a CAS
+	// rather than a Store so a region opened AFTER this decision is not erased —
+	// note the narrower claim: a begin that raced the decrement itself is already
+	// folded into it by the Add, and this cannot recover that. The branch is only
+	// reachable via a begin/end imbalance, which is a programming error, so say so
+	// once instead of silently repairing it forever.
+	c.logger.Warn("endHandshake without a matching beginHandshake; clamping",
+		"count", c.handshaking.Load())
+	for {
+		n := c.handshaking.Load()
+		if n >= 0 {
+			return
+		}
+		if c.handshaking.CompareAndSwap(n, 0) {
+			return
+		}
+	}
+}
+
+// transportFaultLevel returns the level to log a transport fault at: Debug
+// while a handshake is in flight, Error otherwise.
+//
+// Use it for every TRANSPORT fault — the link went away, a request went
+// unanswered, a write failed — because all of those are expected states of the
+// probe → register → redial cold start. Do NOT use it for protocol or
+// programming faults (header/body parse, packet exceeds the sanity limit,
+// binary.Write failure): a handshake never legitimately produces those, and
+// demoting them would hide corruption. One un-gated transport site is enough to
+// re-trip a downstream log-based health check, so new fault paths need this
+// distinction made deliberately.
+func (c *Client) transportFaultLevel() slog.Level {
+	if c.handshaking.Load() > 0 {
+		return slog.LevelDebug
+	}
+	return slog.LevelError
+}
+
 func (c *Client) callOnDrop() {
+	// Release every request on THIS client — the ones already blocked as well as
+	// any issued later — so they fail fast with ErrTransportClosed instead of
+	// waiting out a timeout on a dead socket. Measured cost of not doing this: a
+	// 40-symbol notification batch that lost the link at symbol 3 took 3m10s to
+	// return, holding the subscribe window (and so disabling the orphan reaper)
+	// for all of it.
+	//
+	// Deliberately does NOT touch tx.disconnected. That flag lives on the
+	// transport, which a Session reuses across reconnects, and Session already
+	// owns it (triggerReconnect, Reconnect, resetForRetry, Close). Setting it
+	// here let a stale client's listen goroutine flip it back to true after the
+	// replacement had cleared it, which made every probe on the new connection
+	// fail instantly with ErrTransportClosed — route registration could then
+	// never complete.
+	c.markDropped()
 	c.ondropMu.RLock()
 	fn := c.ondrop
 	c.ondropMu.RUnlock()
@@ -260,7 +436,104 @@ func (c *Client) startWorkers() {
 
 func (c *Client) listen() {
 	defer c.waitGroup.Done()
-	reader := bufio.NewReader(c.tx.connection)
+	// Snapshot under the mutex that guards it. A reconnect writes tx.connection
+	// while dialing, and reading it bare here raced that write — reported by -race
+	// against the reconnect loop, which dials a fresh connection per attempt.
+	c.tx.connMu.Lock()
+	conn := c.tx.connection
+	c.tx.connMu.Unlock()
+	if conn == nil {
+		c.logger.Debug("listen: no connection to read from")
+		return
+	}
+	c.readFrames(conn, true)
+}
+
+// AcceptPeerConn adopts a TCP connection the PLC opened TO US and reads AMS
+// frames from it into the same response mux as our own connection.
+//
+// Some devices treat a registered route as a peer router: they accept and process
+// our requests on the connection we opened, then send every response over a
+// connection they open back to us on 48898. Measured on TC3.1.4026 (TC/RTOS);
+// TC2 2.10 and TC3.1.4024/CE answer on our connection instead. Beckhoff's own
+// Linux AdsLib never listens, so it cannot talk to a device in that state at all.
+//
+// Frames carry their own invokeID, so responses match up regardless of which
+// socket they arrive on, and notifications dispatch normally.
+func (c *Client) AcceptPeerConn(conn net.Conn) {
+	// Refuse once the adopted connections have been dropped for a teardown. The
+	// PLC re-dials after every drop, which is exactly when teardown runs, and
+	// tearDownAndReset does closePeerConns() and then waits on this WaitGroup:
+	// adopting here would append to a slice nobody will close again (a leaked fd
+	// and a half-open socket the PLC counts against its one-connection-per-IP
+	// limit), block that wait forever in io.ReadFull, and Add to a WaitGroup whose
+	// Wait may already be running at zero, which panics the process.
+	//
+	// The Add stays inside the same critical section as the flag check, so it
+	// cannot slip past a closePeerConns that has already returned.
+	c.peerMu.Lock()
+	if c.peerClosed || (c.ctx != nil && c.ctx.Err() != nil) {
+		c.peerMu.Unlock()
+		c.logger.Debug("refusing an inbound PLC connection: this client is being torn down (the PLC will dial again)",
+			"remote", conn.RemoteAddr().String())
+		_ = conn.Close()
+		return
+	}
+	c.peerConns = append(c.peerConns, conn)
+	c.waitGroup.Add(1)
+	c.peerMu.Unlock()
+
+	c.logger.Info("adopted an inbound connection from the PLC (peer-route behaviour)",
+		"remote", conn.RemoteAddr().String())
+	go func() {
+		defer c.waitGroup.Done()
+		// This reader owns the socket. readFrames returns on ctx.Done() and on any
+		// read error without touching conn, so without this every connection the
+		// PLC ever opened would cost an fd for the life of the Client.
+		defer func() {
+			_ = conn.Close()
+			c.forgetPeerConn(conn)
+		}()
+		c.readFrames(conn, false)
+	}()
+}
+
+// forgetPeerConn drops one adopted connection from the list. Without it the slice
+// only ever grows: a device that re-dials on each of its own drops would
+// accumulate an entry per connection for the life of the Client.
+func (c *Client) forgetPeerConn(conn net.Conn) {
+	c.peerMu.Lock()
+	defer c.peerMu.Unlock()
+	for i, existing := range c.peerConns {
+		if existing == conn {
+			c.peerConns = append(c.peerConns[:i], c.peerConns[i+1:]...)
+			return
+		}
+	}
+}
+
+// closePeerConns drops every adopted inbound connection and refuses further ones.
+// Called from Close and from tearDownAndReset so a reader blocked on one cannot
+// hold up the wait for this Client's workers.
+func (c *Client) closePeerConns() {
+	c.peerMu.Lock()
+	conns := c.peerConns
+	c.peerConns = nil
+	c.peerClosed = true
+	c.peerMu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+// readFrames pumps AMS frames from conn into the transport's queues.
+//
+// primary distinguishes our own connection from an adopted inbound one. Losing
+// the primary connection means the transport is down and reconnect must fire;
+// losing an inbound one does not — the PLC can simply dial again, and treating it
+// as a drop would tear down a working session.
+func (c *Client) readFrames(conn net.Conn, primary bool) {
+	reader := bufio.NewReader(conn)
 	const maxAMSPacket = 4 * 1024 * 1024
 	var hdrBytes [6]byte
 	for {
@@ -278,28 +551,38 @@ func (c *Client) listen() {
 			}
 			hint := ""
 			if isLikelyMissingRoute(err) {
-				hint = "PLC may not have an AMS route for this NetID — check route credentials or register route via WithRoute()"
+				hint = resetAfterConnectHint(c.sourceAddr(), c.target)
+			}
+			if !primary {
+				c.logger.Debug("inbound PLC connection closed", "error", err)
+				return
 			}
 			if hint != "" {
-				c.logger.Error("PLC closed connection, transport down",
+				c.logger.Log(c.ctx, c.transportFaultLevel(), "PLC closed connection, transport down",
 					"error", err, "hint", hint,
-					"sourceNetID", c.source.NetIDString())
+					"sourceNetID", c.sourceAddr().NetIDString(),
+					"targetNetID", c.target.NetIDString(),
+					"targetPort", c.target.Port)
 			} else {
-				c.logger.Error("listen read error, transport down", "error", err)
+				c.logger.Log(c.ctx, c.transportFaultLevel(), "listen read error, transport down", "error", err)
 			}
 			c.callOnDrop()
 			return
 		}
 		var tcpHeader amsTCPHeader
 		if err := binary.Read(bytes.NewReader(hdrBytes[:]), binary.LittleEndian, &tcpHeader); err != nil {
-			c.logger.Error("listen header decode error, transport down", "error", err)
-			c.callOnDrop()
+			c.logger.Error("listen header decode error, transport down", "error", err, "primary", primary)
+			if primary {
+				c.callOnDrop()
+			}
 			return
 		}
 		if tcpHeader.Length > maxAMSPacket {
 			c.logger.Error("AMS packet length exceeds sanity limit, transport down",
-				"length", tcpHeader.Length)
-			c.callOnDrop()
+				"length", tcpHeader.Length, "primary", primary)
+			if primary {
+				c.callOnDrop()
+			}
 			return
 		}
 		data := make([]byte, tcpHeader.Length)
@@ -314,7 +597,11 @@ func (c *Client) listen() {
 				return
 			default:
 			}
-			c.logger.Error("listen body read error, transport down", "error", err)
+			if !primary {
+				c.logger.Debug("inbound PLC connection failed mid-frame", "error", err)
+				return
+			}
+			c.logger.Log(c.ctx, c.transportFaultLevel(), "listen body read error, transport down", "error", err)
 			c.callOnDrop()
 			return
 		}
@@ -388,7 +675,7 @@ func (c *Client) handleReceive(ctx context.Context, data []byte) {
 				c.logger.Info("receive channel timed out",
 					"id", header.InvokeID, "command", header.Command)
 				return
-			case response <- adsData:
+			case response <- amsReply{data: adsData, amsErr: ReturnCode(header.ErrorCode)}:
 				c.logger.Log(context.Background(), LevelTrace, "Successfully delivered answer",
 					"id", header.InvokeID, "command", header.Command)
 			}
@@ -407,7 +694,14 @@ func (c *Client) handleReceive(ctx context.Context, data []byte) {
 
 func (c *Client) transmitWorker() {
 	defer c.waitGroup.Done()
-	writer := bufio.NewWriter(c.tx.connection)
+	c.tx.connMu.Lock()
+	conn := c.tx.connection
+	c.tx.connMu.Unlock()
+	if conn == nil {
+		c.logger.Debug("transmitWorker: no connection to write to")
+		return
+	}
+	writer := bufio.NewWriter(conn)
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -416,12 +710,12 @@ func (c *Client) transmitWorker() {
 		case data := <-c.tx.sendChannel:
 			c.logger.Log(context.Background(), LevelTrace, fmt.Sprintf("Sending %d bytes", len(data)))
 			if _, err := writer.Write(data); err != nil {
-				c.logger.Error("error sending data on conn, transport down", "error", err)
+				c.logger.Log(c.ctx, c.transportFaultLevel(), "error sending data on conn, transport down", "error", err)
 				c.callOnDrop()
 				return
 			}
 			if err := writer.Flush(); err != nil {
-				c.logger.Error("error flushing data on conn, transport down", "error", err)
+				c.logger.Log(c.ctx, c.transportFaultLevel(), "error flushing data on conn, transport down", "error", err)
 				c.callOnDrop()
 				return
 			}
@@ -483,23 +777,37 @@ func (c *Client) send(data []byte) ([]byte, error) {
 	sendCh := c.tx.sendChannel
 	sysCh := c.tx.systemResponse
 	c.tx.chanMu.RUnlock()
+	dropped := c.dropped
 	ctx, cancel := context.WithTimeout(c.ctx, c.requestTimeout)
 	defer cancel()
 	select {
 	case <-ctx.Done():
 		return nil, fmt.Errorf("send aborted, context canceled: %w", ctx.Err())
+	case <-dropped:
+		return nil, ErrTransportClosed
 	case sendCh <- data:
 	}
 	select {
 	case <-ctx.Done():
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			err := fmt.Errorf("request aborted, deadline exceeded: %w", ctx.Err())
-			c.logger.Error("send aborted due to timeout", "error", err)
+			c.logger.Log(ctx, c.transportFaultLevel(), "send aborted due to timeout", "error", err)
 			return nil, err
 		}
 		err := fmt.Errorf("request aborted, shutdown initiated: %w", ctx.Err())
-		c.logger.Error("send aborted due to shutdown", "error", err)
+		c.logger.Log(ctx, c.transportFaultLevel(), "send aborted due to shutdown", "error", err)
 		return nil, err
+	case <-dropped:
+		grace := time.NewTimer(droppedResponseGrace)
+		defer grace.Stop()
+		select {
+		case response := <-sysCh:
+			return response, nil
+		case <-grace.C:
+			return nil, ErrTransportClosed
+		case <-ctx.Done():
+			return nil, ErrTransportClosed
+		}
 	case response := <-sysCh:
 		return response, nil
 	}
@@ -519,12 +827,18 @@ func (c *Client) send(data []byte) ([]byte, error) {
 // surface as context.Canceled / DeadlineExceeded; Session wraps this with
 // wait-for-reconnect retry semantics in its own helpers.
 func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte) ([]byte, error) {
+	return c.sendRequestTo(ctx, c.target, command, data)
+}
+
+// sendRequestTo is sendRequest addressed to an explicit AMS target — used to reach
+// another port on the same device (the system service) over this one connection.
+func (c *Client) sendRequestTo(ctx context.Context, target AMSAddress, command CommandID, data []byte) ([]byte, error) {
 	if c.tx.disconnected.Load() {
 		return nil, ErrTransportClosed
 	}
 	c.tx.activeRequestLock.Lock()
 	id := c.tx.currentRequest.Add(1)
-	responseCh := make(chan []byte, 1)
+	responseCh := make(chan amsReply, 1)
 	c.tx.activeRequests[id] = responseCh
 	c.tx.activeRequestLock.Unlock()
 	defer func() {
@@ -535,7 +849,7 @@ func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte
 	c.logger.Log(context.Background(), LevelTrace, "encoding packet",
 		"command", command, "data", data, "id", id)
 
-	pack, err := c.encode(command, data, id)
+	pack, err := c.encodeTo(target, command, data, id)
 	if err != nil {
 		c.logger.Error("Error during sendRequest encode", "error", err)
 		return nil, err
@@ -543,6 +857,7 @@ func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte
 	c.tx.chanMu.RLock()
 	sendCh := c.tx.sendChannel
 	c.tx.chanMu.RUnlock()
+	dropped := c.dropped
 	// Merge caller ctx with c.requestTimeout. ctx==nil falls back to the
 	// Client's own ctx so callers passing context.Background() still get
 	// the configured request timeout AND respect Close-driven cancel.
@@ -554,23 +869,39 @@ func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte
 	select {
 	case <-ctx.Done():
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			c.logger.Error("sendRequest aborted due to timeout")
+			c.logger.Log(ctx, c.transportFaultLevel(), "sendRequest aborted due to timeout")
 		} else {
 			c.logger.Info("sendRequest aborted due to shutdown")
 		}
 		return nil, ctx.Err()
+	case <-dropped:
+		return nil, ErrTransportClosed
 	case sendCh <- pack:
 	}
 	select {
 	case <-ctx.Done():
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			c.logger.Error("sendRequest aborted due to timeout")
+			c.logger.Log(ctx, c.transportFaultLevel(), "sendRequest aborted due to timeout")
 		} else {
 			c.logger.Info("sendRequest aborted due to shutdown")
 		}
 		return nil, ctx.Err()
-	case response := <-responseCh:
-		return response, nil
+	case <-dropped:
+		// The transport died while this request was in flight. Give a reply that
+		// is already in the receive pipeline a bounded moment to land before
+		// giving up — see droppedResponseGrace.
+		grace := time.NewTimer(droppedResponseGrace)
+		defer grace.Stop()
+		select {
+		case reply := <-responseCh:
+			return reply.payload()
+		case <-grace.C:
+			return nil, ErrTransportClosed
+		case <-ctx.Done():
+			return nil, ErrTransportClosed
+		}
+	case reply := <-responseCh:
+		return reply.payload()
 	}
 }
 
