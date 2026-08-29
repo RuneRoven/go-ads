@@ -162,7 +162,7 @@ func (sess *Session) LoadSymbolsSlow(ctx context.Context, cfg SlowDiscoveryConfi
 			return fmt.Errorf("failed to download datatypes: %w", err)
 		}
 	}
-	datatypes, err := parseUploadSymbolInfoDataTypes(datatypesData)
+	datatypes, err := parseUploadSymbolInfoDataTypes(datatypesData, sess.logger)
 	if err != nil {
 		return fmt.Errorf("failed to parse datatypes: %w", err)
 	}
@@ -186,7 +186,7 @@ func (sess *Session) LoadSymbolsSlow(ctx context.Context, cfg SlowDiscoveryConfi
 			return fmt.Errorf("failed to download symbols: %w", err)
 		}
 	}
-	symbols, err := parseUploadSymbolInfoSymbols(symbolsData, datatypes)
+	symbols, err := parseUploadSymbolInfoSymbols(symbolsData, datatypes, sess.logger)
 	if err != nil {
 		return fmt.Errorf("failed to parse symbols: %w", err)
 	}
@@ -194,6 +194,10 @@ func (sess *Session) LoadSymbolsSlow(ctx context.Context, cfg SlowDiscoveryConfi
 	// Step 5: Store results
 	sess.cache.lock.Lock()
 	sess.cache.datatypes = datatypes
+	// Stamp the session's logger onto every symbol as the cache takes ownership,
+	// so records produced later while parsing or serialising them reach the
+	// caller's handler instead of stderr. See symbol.logger.
+	stampLoggerOnAll(symbols, sess.logger)
 	sess.cache.symbols = symbols
 	sess.cache.symbolsFullyLoaded = true
 	sess.cache.onDemandSymbols = map[string]bool{}
@@ -392,11 +396,17 @@ func (sess *Session) getSymbol(ctx context.Context, symbolName string) (*symbol,
 		}
 		return existing, nil
 	}
+	stampLogger(sym, sess.logger, 0)
 	sess.cache.symbols[symbolKey(symbolName)] = sym
 	sess.cache.onDemandSymbols[symbolKey(symbolName)] = true
 	sess.cache.lock.Unlock()
 
-	sess.logger.Info("symbol resolved on-demand",
+	// Debug, not Info: one record per symbol per resolution. A consumer with 40
+	// symbols got 40 of these against a handful of lines that actually describe the
+	// connection, which is what drove benthos-umh to filter any Info record
+	// carrying a symbol attribute. Per-item bookkeeping is Debug; per-connection
+	// events stay Info.
+	sess.logger.Debug("symbol resolved on-demand",
 		"symbol", symbolName,
 		"dataType", sym.DataType,
 		"length", sym.Length)
@@ -648,12 +658,16 @@ func (sess *Session) LoadSymbolList(ctx context.Context, cfg SlowDiscoveryConfig
 	}
 
 	// Parse without datatypes — no child expansion
-	symbols, err := parseUploadSymbolInfoSymbols(symbolsData, nil)
+	symbols, err := parseUploadSymbolInfoSymbols(symbolsData, nil, sess.logger)
 	if err != nil {
 		return fmt.Errorf("failed to parse symbols: %w", err)
 	}
 
 	sess.cache.lock.Lock()
+	// Stamp the session's logger onto every symbol as the cache takes ownership,
+	// so records produced later while parsing or serialising them reach the
+	// caller's handler instead of stderr. See symbol.logger.
+	stampLoggerOnAll(symbols, sess.logger)
 	sess.cache.symbols = symbols
 	sess.cache.symbolListLoaded = true
 	sess.cache.onDemandSymbols = map[string]bool{}
@@ -701,7 +715,7 @@ func (sess *Session) LoadDataTypes(ctx context.Context, cfg SlowDiscoveryConfig)
 		}
 	}
 
-	datatypes, err := parseUploadSymbolInfoDataTypes(datatypesData)
+	datatypes, err := parseUploadSymbolInfoDataTypes(datatypesData, sess.logger)
 	if err != nil {
 		return fmt.Errorf("failed to parse datatypes: %w", err)
 	}
@@ -740,7 +754,7 @@ func (sess *Session) rebuildSymbolChildrenLocked() {
 	for _, sym := range topLevel {
 		dt, ok := sess.cache.datatypes[sym.DataType]
 		if ok {
-			sym.Children = dt.addOffset(sym, sess.cache.datatypes, sym.Group)
+			sym.Children = dt.addOffset(sym, sess.cache.datatypes, sym.Group, sess.logger)
 			addChildren(sym, sess.cache.symbols)
 		}
 	}

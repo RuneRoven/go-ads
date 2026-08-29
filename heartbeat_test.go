@@ -843,7 +843,13 @@ func TestRuntimeState_PollReportsTheState(t *testing.T) {
 	defer srv.stop()
 	srv.setADSState(ADSStateConfig)
 
-	sess, _ := newWiredTestSession(t, srv, WithNotificationHeartbeat(100*time.Millisecond, 3))
+	// WithRuntimeStateWatch, not WithNotificationHeartbeat: the state poll used to
+	// run at the heartbeat cycle, so this test tuned the heartbeat purely to make
+	// the poll fast. The two are independent now (defaultStateWatchInterval), and
+	// this test wants a fast POLL.
+	sess, _ := newWiredTestSession(t, srv,
+		WithNotificationHeartbeat(100*time.Millisecond, 3),
+		WithRuntimeStateWatch(100*time.Millisecond))
 	if state, known := sess.knownRuntimeState(); known {
 		t.Fatalf("state already known before polling: %v", state)
 	}
@@ -1546,4 +1552,148 @@ func TestHeartbeat_RetriesAfterAHandleCollision(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// --- P3: silence as a duration, selectable recovery, decoupled state watch ---
+
+// TestNormalizeHeartbeatOptions_SilenceToMissed pins the conversion.
+//
+// Resolved once after the option loop rather than lazily at first use, and that is
+// not a style choice: heartbeatAllowedMisses() is read on EVERY tick by the watcher
+// goroutine, so a lazy write into heartbeatMissed would be a genuine data race —
+// for an ordering problem that is entirely contained in NewSession's
+// single-threaded option loop.
+func TestNormalizeHeartbeatOptions_SilenceToMissed(t *testing.T) {
+	tests := []struct {
+		name    string
+		silence time.Duration
+		cycle   time.Duration
+		want    int
+	}{
+		{name: "30s at the 2s default cycle", silence: 30 * time.Second, want: 15},
+		{name: "10s at a 2s cycle", silence: 10 * time.Second, cycle: 2 * time.Second, want: 5},
+		{name: "rounds up rather than concluding early", silence: 5 * time.Second, cycle: 2 * time.Second, want: 3},
+		{name: "floored at 2, a single late beat proves nothing", silence: time.Second, cycle: 2 * time.Second, want: 2},
+		{name: "a cycle longer than the timeout still floors at 2", silence: time.Second, cycle: time.Minute, want: 2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var sess Session
+			sess.heartbeatSilence = tc.silence
+			sess.heartbeatInterval = tc.cycle
+			sess.normalizeHeartbeatOptions()
+			if got := sess.heartbeatAllowedMisses(); got != tc.want {
+				t.Errorf("allowed misses = %d, want %d (silence=%v cycle=%v)",
+					got, tc.want, tc.silence, sess.heartbeatCycle())
+			}
+		})
+	}
+}
+
+// TestHeartbeatOptions_LastWins: two ways of saying the same thing, so the one the
+// caller wrote later decides.
+func TestHeartbeatOptions_LastWins(t *testing.T) {
+	t.Run("silence timeout after the missed argument", func(t *testing.T) {
+		var sess Session
+		WithNotificationHeartbeat(time.Second, 9)(&sess)
+		WithNotificationSilenceTimeout(4 * time.Second)(&sess)
+		sess.normalizeHeartbeatOptions()
+		if got := sess.heartbeatAllowedMisses(); got != 4 {
+			t.Errorf("allowed misses = %d, want 4 (the later option must win)", got)
+		}
+	})
+	t.Run("missed argument after the silence timeout", func(t *testing.T) {
+		var sess Session
+		WithNotificationSilenceTimeout(4 * time.Second)(&sess)
+		WithNotificationHeartbeat(time.Second, 9)(&sess)
+		sess.normalizeHeartbeatOptions()
+		if got := sess.heartbeatAllowedMisses(); got != 9 {
+			t.Errorf("allowed misses = %d, want 9 (the later option must win)", got)
+		}
+	})
+}
+
+// TestWithHeartbeatRecovery_Modes: the default must not move, and a typo must not
+// silently turn recovery off.
+func TestWithHeartbeatRecovery_Modes(t *testing.T) {
+	t.Run("default is immediate", func(t *testing.T) {
+		var sess Session
+		if got := sess.heartbeatRecoveryMode(); got != HeartbeatRecoveryImmediate {
+			t.Errorf("default mode = %v, want immediate", got)
+		}
+	})
+	for _, mode := range []HeartbeatRecovery{HeartbeatRecoveryImmediate, HeartbeatRecoveryConfirm, HeartbeatRecoveryObserve} {
+		t.Run("accepts "+mode.String(), func(t *testing.T) {
+			var sess Session
+			WithHeartbeatRecovery(mode)(&sess)
+			if got := sess.heartbeatRecoveryMode(); got != mode {
+				t.Errorf("mode = %v, want %v", got, mode)
+			}
+		})
+	}
+	t.Run("an unrecognised mode keeps the default", func(t *testing.T) {
+		sess := Session{logger: getDefaultLogger()}
+		WithHeartbeatRecovery(HeartbeatRecovery(99))(&sess)
+		if got := sess.heartbeatRecoveryMode(); got != HeartbeatRecoveryImmediate {
+			t.Errorf("mode = %v, want immediate — a typo must not disable recovery", got)
+		}
+	})
+}
+
+// TestRuntimeStateWatch_DefaultIsIndependentOfTheHeartbeat.
+//
+// The poll used to run at heartbeatCycle(), so WithNotificationHeartbeat(30s, ...)
+// silently made the state poll 30s too — the gate reporting "the runtime is in
+// CONFIG" went stale for half a minute because an unrelated knob moved. This is
+// the only assertion on the default, since the poller's own test now pins an
+// explicit interval.
+func TestRuntimeStateWatch_DefaultIsIndependentOfTheHeartbeat(t *testing.T) {
+	var sess Session
+	if got := sess.stateWatchCycle(); got != defaultStateWatchInterval {
+		t.Errorf("default state watch cycle = %v, want %v", got, defaultStateWatchInterval)
+	}
+	WithNotificationHeartbeat(30*time.Second, 3)(&sess)
+	if got := sess.stateWatchCycle(); got != defaultStateWatchInterval {
+		t.Errorf("state watch cycle = %v after a 30s heartbeat, want %v — the coupling is back",
+			got, defaultStateWatchInterval)
+	}
+	WithRuntimeStateWatch(750 * time.Millisecond)(&sess)
+	if got := sess.stateWatchCycle(); got != 750*time.Millisecond {
+		t.Errorf("state watch cycle = %v after WithRuntimeStateWatch, want 750ms", got)
+	}
+}
+
+// TestWithoutRuntimeStateWatch_StartsNoPollerAndKeepsTheOnce: the disabled check
+// sits outside stateOnce.Do, so turning the watch off does not consume the Once —
+// and with no reading the gates fall back to permitting, which is the behaviour
+// that predates the watch.
+func TestWithoutRuntimeStateWatch_StartsNoPollerAndKeepsTheOnce(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	srv.setADSState(ADSStateConfig)
+
+	sess, _ := newWiredTestSession(t, srv, WithoutRuntimeStateWatch())
+	sess.startRuntimeStateWatch()
+
+	time.Sleep(200 * time.Millisecond)
+	if state, known := sess.knownRuntimeState(); known {
+		t.Errorf("runtime state became known (%v) although the watch is disabled", state)
+	}
+
+	// The Once must still be unused: a session that had the watch disabled and
+	// later enabled it would otherwise never get a poller.
+	sess.stateWatchDisabled = false
+	// An explicit fast interval: the default is 5s, so a poller started here would
+	// not have ticked inside this test's deadline whether the Once was consumed or
+	// not — which would make the assertion below vacuous.
+	sess.stateWatchInterval = 100 * time.Millisecond
+	sess.startRuntimeStateWatch()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, known := sess.knownRuntimeState(); known {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("no poller started after re-enabling the watch: stateOnce was consumed by the disabled path")
 }

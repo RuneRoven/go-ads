@@ -189,7 +189,9 @@ func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32
 			"handle", handle, "symbol", symbolName, "error", err)
 		return err
 	}
-	sess.logger.Info("notification deleted", "handle", handle, "symbol", symbolName)
+	// Per handle; the aggregate "notifications deleted" line below carries the
+	// counts an operator actually needs.
+	sess.logger.Debug("notification deleted", "handle", handle, "symbol", symbolName)
 	return nil
 }
 
@@ -939,6 +941,44 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 // symbol version and the ADS state unchanged, so there is no inbound event to react
 // to — but one CYCLIC subscription of our own turns silence into proof, because
 // TwinCAT pushes those on a timer whether the value changes or not.
+// HeartbeatRecovery selects what the session does when its internal heartbeat
+// goes silent, i.e. when it concludes the caller's subscriptions have died.
+//
+// Recovery is not free: it deletes and re-adds every notification handle the
+// session holds, which on a 41-symbol session is 82 requests in a burst against
+// a device that may simply have stalled. Immediate is still the default because
+// it is the behaviour that has been in the field, and because in the one
+// investigation that looked for it the heartbeat never went silent at all.
+type HeartbeatRecovery int
+
+const (
+	// HeartbeatRecoveryImmediate re-subscribes as soon as the silence window is
+	// exceeded. The default.
+	HeartbeatRecoveryImmediate HeartbeatRecovery = iota + 1
+	// HeartbeatRecoveryConfirm requires two consecutive silent windows before
+	// re-subscribing, trading time-to-notice for not firing the burst at a device
+	// that was merely late.
+	HeartbeatRecoveryConfirm
+	// HeartbeatRecoveryObserve never re-subscribes. The silence is reported (log
+	// plus the WithOnSymbolVersionChanged callback) and left to the consumer, for
+	// a caller that would rather rebuild the session itself than have handles
+	// churned underneath it.
+	HeartbeatRecoveryObserve
+)
+
+func (h HeartbeatRecovery) String() string {
+	switch h {
+	case HeartbeatRecoveryImmediate:
+		return "immediate"
+	case HeartbeatRecoveryConfirm:
+		return "confirm"
+	case HeartbeatRecoveryObserve:
+		return "observe"
+	default:
+		return "unset"
+	}
+}
+
 const (
 	defaultHeartbeatInterval = 2 * time.Second
 	defaultHeartbeatMissed   = 5
@@ -983,6 +1023,45 @@ func heartbeatAllowedTicks(base, consecutiveFailures int, cycle time.Duration) i
 	shift := min(consecutiveFailures, maxFailureBackoffShift)
 	capTicks := max(int(maxHeartbeatRecoveryBackoff/cycle), base)
 	return min(base<<shift, capTicks)
+}
+
+// normalizeHeartbeatOptions resolves the options that depend on each other, once,
+// after every option has been applied and before any goroutine exists.
+//
+// WithNotificationSilenceTimeout is stated in wall-clock time but enforced in
+// ticks, so it needs the cycle — which a later option may still change. Resolving
+// it here rather than at first use is deliberate: heartbeatAllowedMisses() is read
+// on every tick by the watcher goroutine, so a lazy write into heartbeatMissed
+// would be a genuine data race, and the ordering problem it would be solving is
+// entirely contained in NewSession's single-threaded option loop.
+//
+// Last-wins between the two ways of saying it: whichever of
+// WithNotificationHeartbeat's missed argument and WithNotificationSilenceTimeout
+// ran later is the one that decides, because the caller wrote it later.
+func (sess *Session) normalizeHeartbeatOptions() {
+	if sess.heartbeatSilence <= 0 {
+		return
+	}
+	cycle := sess.heartbeatCycle()
+	// Round up: a silence timeout is "do not conclude anything before this much
+	// quiet", so truncating would conclude early.
+	missed := int((sess.heartbeatSilence + cycle - 1) / cycle)
+	if missed < 2 {
+		// Same floor as WithNotificationHeartbeat, for the same reason: a single
+		// late beat is not evidence of anything.
+		missed = 2
+	}
+	sess.heartbeatMissed = missed
+}
+
+// heartbeatRecoveryMode reports the configured recovery mode, defaulting to
+// Immediate for a session built without the option (including test fixtures that
+// construct a Session literal).
+func (sess *Session) heartbeatRecoveryMode() HeartbeatRecovery {
+	if sess.heartbeatRecovery == 0 {
+		return HeartbeatRecoveryImmediate
+	}
+	return sess.heartbeatRecovery
 }
 
 // heartbeatEnabled reports whether this session keeps a heartbeat.
@@ -1154,6 +1233,10 @@ func (sess *Session) heartbeatWatch() {
 	// consecutiveFailures backs the retry off and keeps the log to one line per
 	// episode. Goroutine-local: this is the only writer.
 	consecutiveFailures := 0
+	// silentWindows counts consecutive silent windows, for
+	// HeartbeatRecoveryConfirm. Reset whenever a beat arrives or a recovery runs,
+	// so "2" always means two in a row rather than two ever.
+	silentWindows := 0
 
 	for {
 		select {
@@ -1226,6 +1309,9 @@ func (sess *Session) heartbeatWatch() {
 		if beats != lastBeats {
 			lastBeats = beats
 			quietTicks = 0
+			// A beat is proof of life, so a previously-observed silent window no
+			// longer counts toward Confirm's two-in-a-row.
+			silentWindows = 0
 			continue
 		}
 		quietTicks++
@@ -1271,6 +1357,38 @@ func (sess *Session) heartbeatWatch() {
 		} else {
 			sess.logger.Debug(msg, append(args, "retry", consecutiveFailures)...)
 		}
+
+		switch mode := sess.heartbeatRecoveryMode(); mode {
+		case HeartbeatRecoveryConfirm:
+			// One silent window is not evidence enough for this caller: require a
+			// second consecutive one before churning every handle. silentWindows is
+			// reset by any beat arriving (quietTicks going back to zero above resets
+			// the tick count; this counter is reset on recovery and on a beat below),
+			// so two here means two in a row.
+			silentWindows++
+			if silentWindows < 2 {
+				sess.logger.Info("heartbeat silent, waiting for a second window before re-subscribing",
+					"mode", mode.String(), "window", 1)
+				continue
+			}
+			silentWindows = 0
+		case HeartbeatRecoveryObserve:
+			// Report and do nothing. The consumer owns the decision; churning 41
+			// handles under a caller that would rather rebuild the session is the
+			// thing this mode exists to avoid.
+			if consecutiveFailures == 0 {
+				sess.logger.Warn("heartbeat silent; not re-subscribing (WithHeartbeatRecovery(Observe))",
+					"detail", "this session's subscriptions are dead until the consumer rebuilds it")
+				if cb := sess.versionCallback; cb != nil {
+					cb(ReasonHeartbeatSilent)
+				}
+			}
+			consecutiveFailures++
+			continue
+		default:
+			silentWindows = 0
+		}
+
 		switch sess.recoverDeadSubscriptions() {
 		case recoveryDone:
 			consecutiveFailures = 0

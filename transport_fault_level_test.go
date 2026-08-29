@@ -245,7 +245,14 @@ func TestNoUngatedTransportDownLogs(t *testing.T) {
 				return true
 			}
 			method := sel.Sel.Name
-			if method != "Error" && method != "Log" {
+			// Info and Warn are inspected too. They were not, which left a hole
+			// exactly where a hole is least visible: a transport-down line logged at
+			// a hardcoded Info or Warn passed the guard silently, so the guard looked
+			// like coverage while permitting the thing it exists to forbid. The level
+			// of a transport fault is transportFaultLevel()'s decision on every path
+			// -- that is what keeps an expected RST during a cold-start probe out of
+			// the operator's error stream.
+			if method != "Error" && method != "Log" && method != "Info" && method != "Warn" {
 				return true
 			}
 			if !mentionsTransportDown(call.Args) {
@@ -253,9 +260,9 @@ func TestNoUngatedTransportDownLogs(t *testing.T) {
 			}
 			pos := fset.Position(call.Pos())
 			switch method {
-			case "Error":
-				t.Errorf("%s:%d logs a transport fault at a hardcoded Error level; use transportFaultLevel():\n\t%s",
-					pos.Filename, pos.Line, exprText(call.Fun))
+			case "Error", "Info", "Warn":
+				t.Errorf("%s:%d logs a transport fault at a hardcoded %s level; use transportFaultLevel():\n\t%s",
+					pos.Filename, pos.Line, method, exprText(call.Fun))
 			case "Log":
 				// logger.Log(ctx, level, msg, ...): the level must be the gate.
 				if len(call.Args) < 2 || !isTransportFaultLevelCall(call.Args[1]) {

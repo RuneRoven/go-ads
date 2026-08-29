@@ -200,7 +200,7 @@ func (s *symbol) parse(data []byte, offset int, datatypes map[string]SymbolUploa
 		// resolve. Only 1- and 2-byte widths are inferred — see
 		// inferBaseType doc for why 4/8 are refused.
 		if inferred := inferBaseType(s.Length, s.BaseType); inferred != "" {
-			getDefaultLogger().Warn("inferring base type from size (no datatype table loaded; LoadSymbols() recommended for user-defined types)",
+			s.warnInferenceOnce("inferring base type from size (no datatype table loaded; LoadSymbols() recommended for user-defined types)",
 				"symbol", s.DataType, "size", s.Length, "baseType", s.BaseType, "inferred", inferred)
 			resolved := *s
 			resolved.DataType = inferred
@@ -357,7 +357,7 @@ func (s *symbol) writeToNode(value string, datatypes map[string]SymbolUploadData
 		// doc for why 4/8 are refused (REAL/LREAL ambiguity).
 		if !slices.Contains(parseableTypes, dt) {
 			if inferred := inferBaseType(s.Length, s.BaseType); inferred != "" {
-				getDefaultLogger().Warn("inferring base type from size for write (no datatype table loaded; LoadSymbols() recommended)",
+				s.warnInferenceOnce("inferring base type from size for write (no datatype table loaded; LoadSymbols() recommended)",
 					"symbol", s.DataType,
 					"size", s.Length,
 					"baseType", s.BaseType,

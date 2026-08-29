@@ -15,7 +15,7 @@ import (
 // Validates: R-SYM-002.
 func TestMakeArrayChildren_CapsExcessiveElements(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 0, Elements: 10_000_000}} // 10M
-	got := makeArrayChildren(levels, "INT", 20_000_000)
+	got := makeArrayChildren(levels, "INT", 20_000_000, nil)
 	if got == nil {
 		t.Fatalf("expected non-nil empty map on cap-exceeded, got nil")
 	}
@@ -29,7 +29,7 @@ func TestMakeArrayChildren_CapsExcessiveElements(t *testing.T) {
 // Validates: R-SYM-002.
 func TestMakeArrayChildren_RejectsOverflowBound(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 0xFFFFFFF0, Elements: 0x20}} // overflows
-	got := makeArrayChildren(levels, "INT", 64)
+	got := makeArrayChildren(levels, "INT", 64, nil)
 	if got == nil {
 		t.Fatalf("expected non-nil empty map on overflow, got nil")
 	}
@@ -44,7 +44,7 @@ func TestMakeArrayChildren_RejectsOverflowBound(t *testing.T) {
 // Pins makeArrayChildren happy-path output keys ("[0]".."[3]") for a 4-element array.
 func TestMakeArrayChildren_HappyPath(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 0, Elements: 4}}
-	got := makeArrayChildren(levels, "INT", 8) // 8 bytes / 4 = 2 bytes each
+	got := makeArrayChildren(levels, "INT", 8, nil) // 8 bytes / 4 = 2 bytes each
 	if len(got) != 4 {
 		t.Errorf("expected 4 children, got %d", len(got))
 	}
@@ -61,7 +61,7 @@ func TestMakeArrayChildren_HappyPath(t *testing.T) {
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
 // Pins empty-buffer parse → empty map, no error.
 func TestParseUploadSymbolInfoDataTypes_Empty(t *testing.T) {
-	datatypes, err := parseUploadSymbolInfoDataTypes([]byte{})
+	datatypes, err := parseUploadSymbolInfoDataTypes([]byte{}, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestParseUploadSymbolInfoDataTypes_Empty(t *testing.T) {
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
 // Pins empty-buffer symbol-list parse → empty map, no error.
 func TestParseUploadSymbolInfoSymbols_Empty(t *testing.T) {
-	symbols, err := parseUploadSymbolInfoSymbols([]byte{}, nil)
+	symbols, err := parseUploadSymbolInfoSymbols([]byte{}, nil, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestAddOffsetEmptySegmentName(t *testing.T) {
 			"": {Name: "", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2}},
 		},
 	}
-	children := dt.addOffset(parent, nil, 0)
+	children := dt.addOffset(parent, nil, 0, nil)
 	// Empty segment name should be skipped (F-06 fix)
 	if len(children) != 0 {
 		t.Errorf("expected 0 children for empty segment name, got %d", len(children))
@@ -109,7 +109,7 @@ func TestAddOffsetFullNameWithDot(t *testing.T) {
 			"speed": {Name: "speed", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2, Offs: 0}},
 		},
 	}
-	children := dt.addOffset(parent, nil, 0)
+	children := dt.addOffset(parent, nil, 0, nil)
 	child, ok := children["speed"]
 	if !ok {
 		t.Fatal("expected child 'speed'")
@@ -129,7 +129,7 @@ func TestAddOffsetArrayFullName(t *testing.T) {
 			"[1]": {Name: "[1]", DataType: "INT", DatatypeEntry: datatypeEntry{Size: 2, Offs: 2}},
 		},
 	}
-	children := dt.addOffset(parent, nil, 0)
+	children := dt.addOffset(parent, nil, 0, nil)
 	child0, ok := children["[0]"]
 	if !ok {
 		t.Fatal("expected child '[0]'")
@@ -179,7 +179,7 @@ func TestParseEnumNestedInStruct(t *testing.T) {
 			DataType: "ST_Motor", Length: 8, Group: 0x4040,
 		}
 		dt := datatypes["ST_Motor"]
-		motorSym.Children = dt.addOffset(motorSym, datatypes, motorSym.Group)
+		motorSym.Children = dt.addOffset(motorSym, datatypes, motorSym.Group, nil)
 
 		// Wire data: state=2 (Running, DINT), speed=1500 (INT)
 		data := make([]byte, 8)
@@ -244,7 +244,7 @@ func TestParseEnumNestedInStruct(t *testing.T) {
 			DataType: "ST_Motor", Length: 8, Group: 0x4040,
 		}
 		dt := datatypes["ST_Motor"]
-		motorSym.Children = dt.addOffset(motorSym, datatypes, motorSym.Group)
+		motorSym.Children = dt.addOffset(motorSym, datatypes, motorSym.Group, nil)
 
 		data := make([]byte, 8)
 		binary.LittleEndian.PutUint32(data[0:4], 4) // ERROR=4
@@ -384,7 +384,7 @@ func TestArrayTypedefNotMistakenForEnum(t *testing.T) {
 		Offset:   0,
 	}
 	dt := datatypes["ST_WithArray"]
-	parent.Children = dt.addOffset(parent, datatypes, parent.Group)
+	parent.Children = dt.addOffset(parent, datatypes, parent.Group, nil)
 
 	// "values" child must have array element children expanded
 	valuesChild, ok := parent.Children["values"]
@@ -455,7 +455,7 @@ func TestAddChildrenNoDuplicates(t *testing.T) {
 // Pins 1-D 3-element array child generation (keys "[0]".."[2]").
 func TestMakeArrayChildren(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 0, Elements: 3}}
-	children := makeArrayChildren(levels, "INT", 6)
+	children := makeArrayChildren(levels, "INT", 6, nil)
 	if len(children) != 3 {
 		t.Fatalf("expected 3 children, got %d", len(children))
 	}
@@ -478,7 +478,7 @@ func TestMakeArrayChildren(t *testing.T) {
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
 // Pins makeArrayChildren on nil levels → empty map.
 func TestMakeArrayChildrenEmpty(t *testing.T) {
-	children := makeArrayChildren(nil, "INT", 6)
+	children := makeArrayChildren(nil, "INT", 6, nil)
 	if len(children) != 0 {
 		t.Errorf("expected 0 children for empty levels, got %d", len(children))
 	}
@@ -488,7 +488,7 @@ func TestMakeArrayChildrenEmpty(t *testing.T) {
 // Pins makeArrayChildren key indexing offset by LBound (LBound=5 → "[5]","[6]").
 func TestMakeArrayChildrenNonZeroLBound(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 5, Elements: 2}}
-	children := makeArrayChildren(levels, "BYTE", 2)
+	children := makeArrayChildren(levels, "BYTE", 2, nil)
 	if _, ok := children["[5]"]; !ok {
 		t.Error("expected child '[5]'")
 	}
@@ -505,7 +505,7 @@ func TestMakeArrayChildren_2D(t *testing.T) {
 		{LBound: 0, Elements: 2},
 		{LBound: 0, Elements: 3},
 	}
-	children := makeArrayChildren(levels, "INT", 12)
+	children := makeArrayChildren(levels, "INT", 12, nil)
 	if len(children) != 2 {
 		t.Fatalf("expected 2 top-level children, got %d", len(children))
 	}
@@ -545,7 +545,7 @@ func TestMakeArrayChildren_3D(t *testing.T) {
 		{LBound: 0, Elements: 2},
 		{LBound: 0, Elements: 2},
 	}
-	children := makeArrayChildren(levels, "BYTE", 8)
+	children := makeArrayChildren(levels, "BYTE", 8, nil)
 	if len(children) != 2 {
 		t.Fatalf("expected 2 children, got %d", len(children))
 	}
@@ -579,7 +579,7 @@ func TestMakeArrayChildren_3D(t *testing.T) {
 // Pins zero-length array → empty children map.
 func TestMakeArrayChildren_ZeroElements(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 0, Elements: 0}}
-	children := makeArrayChildren(levels, "INT", 0)
+	children := makeArrayChildren(levels, "INT", 0, nil)
 	if len(children) != 0 {
 		t.Errorf("expected 0 children for zero elements, got %d", len(children))
 	}
@@ -765,7 +765,7 @@ func TestParseUploadSymbolInfoSymbols_SingleSymbol(t *testing.T) {
 	buf = append(buf, comment...)
 	buf = append(buf, 0) // null terminator
 
-	symbols, err := parseUploadSymbolInfoSymbols(buf, nil)
+	symbols, err := parseUploadSymbolInfoSymbols(buf, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -793,7 +793,7 @@ func TestParseUploadSymbolInfoSymbols_SingleSymbol(t *testing.T) {
 // Validates: R-CMD-007.
 func TestParseUploadSymbolInfoSymbols_TruncatedEntry(t *testing.T) {
 	// Only 10 bytes — not enough for a symbolEntry header
-	_, err := parseUploadSymbolInfoSymbols([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, nil)
+	_, err := parseUploadSymbolInfoSymbols([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, nil, nil)
 	if err == nil {
 		t.Error("expected error for truncated data")
 	}
@@ -942,7 +942,7 @@ func TestAddOffsetDepthCap(t *testing.T) {
 	parent := &symbol{Name: "root", FullName: "root", Length: 4}
 	// Should NOT stack-overflow even though the cycle would otherwise recurse
 	// indefinitely.
-	children := cyclic.addOffset(parent, datatypes, 0x4020)
+	children := cyclic.addOffset(parent, datatypes, 0x4020, nil)
 	if len(children) == 0 {
 		t.Fatal("expected at least one child before depth cap fired")
 	}
@@ -975,7 +975,7 @@ func TestParseUploadSymbolInfoSymbols_EntryLengthTooShort(t *testing.T) {
 	buf.WriteByte(0)         // null terminator
 	buf.WriteByte(0)         // comment null terminator
 
-	_, err := parseUploadSymbolInfoSymbols(buf.Bytes(), nil)
+	_, err := parseUploadSymbolInfoSymbols(buf.Bytes(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error for EntryLength shorter than bytes consumed, got nil")
 	}

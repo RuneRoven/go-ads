@@ -70,6 +70,28 @@ type sessionLifecycle struct {
 	reconnectMu   sync.Mutex // protects reconnectDone
 	reconnectDone chan struct{}
 
+	// dialMu makes one teardown+dial pair atomic with respect to another, so two
+	// TCP connections to the same AMS router cannot briefly coexist. That overlap
+	// is the documented way to get evicted: the router serves one TCP per host and
+	// closes the older (Beckhoff/ADS#49).
+	//
+	// Scope is deliberately narrow -- the two handshake-phase redials, via
+	// redialDuringHandshake. The reconnect loop is NOT covered and must not be:
+	// its teardown (before the retry loop) and its dial (inside it) are separated
+	// by the whole loop body, and it reaches awaitRouteActive through ensureRoute,
+	// so holding this across an iteration would self-deadlock on the inner redial.
+	// Reconnect is already single-flighted by reconnectOwner, and Connect by
+	// lifecycle.connecting.
+	//
+	// INVARIANT: nothing registered on lifecycle.waitGroup, and no Client worker,
+	// may acquire dialMu. tearDownAndReset waits both WaitGroups while a redial
+	// holds this lock, so a member that blocked on it would deadlock: the teardown
+	// waits for the goroutine, the goroutine waits for the lock the teardown's own
+	// caller holds. In particular ondrop/triggerReconnect runs on the listen
+	// goroutine, which is in Client.waitGroup -- it must keep spawning Reconnect
+	// with a bare `go` and never dial synchronously.
+	dialMu sync.Mutex
+
 	// unservedCooldown is how long the reconnect loop goes completely quiet — no
 	// sockets, no route registration — after unservedAttemptsBeforeCooldown
 	// consecutive attempts where the TCP dial SUCCEEDED but the PLC answered
@@ -186,9 +208,60 @@ type sessionLifecycle struct {
 }
 
 const (
-	flapWindow      = 5 * time.Second
+	// flapWindow marks a SEVERE flap: a connection that did not even last this
+	// long counts double, because a PLC resetting us within five seconds is not
+	// going to be helped by trying again soon.
+	flapWindow = 5 * time.Second
+	// flapResetWindow is how long a connection must survive before the session is
+	// considered to have stabilised. Anything shorter counts as a flap.
+	//
+	// The cooldown a flap earns comes from the session's BackoffConfig, so its
+	// ceiling is BackoffConfig.MaxInterval (default 30s). That default deliberately
+	// favours the device: against a PLC resetting every ~35s it costs roughly a
+	// quarter of the data a 1s cooldown would deliver, and spares the device's
+	// socket table several hundred accepted-then-reset connections an hour. A
+	// consumer that would rather have the samples can lower it with WithBackoff —
+	// MaxInterval 5s keeps ~89% of the stream by measurement.
+	//
+	// The two used to leave a dead zone between them: a connection lasting 5-60s
+	// neither incremented flapCount nor reset it, so a device resetting us on a
+	// timer got a constant first-tier cooldown for ever. Measured on 10.13.37.52
+	// on 2026-08-28: 21 consecutive resets at a metronomic ~35s, flapCount frozen
+	// at 3, so every cycle waited reconnectBackoff(3) = 1s and burned ~5 sockets.
+	// 500 accepted-then-reset sockets an hour against a device whose socket table
+	// is small is plausibly feeding the condition it is reacting to.
 	flapResetWindow = 60 * time.Second
 )
+
+// nextFlapCount decides how a drop moves the flap counter.
+//
+// Pure and separate from the reconnect path because the two ways this goes wrong
+// are both invisible from outside — the session simply retries at the wrong rate —
+// and the previous version had exactly that bug: a gap between flapWindow and
+// flapResetWindow where a drop neither incremented the counter nor reset it, so a
+// device resetting on a timer got the first backoff tier for ever.
+//
+//   - shorter than flapWindow: severe, counts double.
+//   - shorter than flapResetWindow: a flap; the connection never stabilised.
+//   - longer: the session was healthy, so start over.
+//   - no previous Connected at all: a flap only if this attempt served nothing,
+//     since the sockets are being spent either way.
+func nextFlapCount(prev int, lastConnected, now time.Time, servedNothing bool) int {
+	if lastConnected.IsZero() {
+		if servedNothing {
+			return prev + 1
+		}
+		return prev
+	}
+	switch elapsed := now.Sub(lastConnected); {
+	case elapsed < flapWindow:
+		return prev + 2
+	case elapsed < flapResetWindow:
+		return prev + 1
+	default:
+		return 0
+	}
+}
 
 // enterConnected announces Connected and advances lifecycle.connectedGen when the
 // session really came from a connect or a reconnect — i.e. when its subscriptions
@@ -318,6 +391,24 @@ type Session struct {
 	heartbeatDisabled bool
 	heartbeatOnce     sync.Once
 	heartbeatWG       sync.WaitGroup
+	// heartbeatSilence is what WithNotificationSilenceTimeout asked for, kept as
+	// the caller stated it and converted to heartbeatMissed once, after the option
+	// loop in NewSession — see normalizeHeartbeatOptions. Not converted lazily at
+	// first use: heartbeatAllowedMisses() is read on EVERY tick by the watcher
+	// goroutine, so writing to heartbeatMissed from there is a data race, for a
+	// problem (an option that needs the cycle, which a later option may change)
+	// that is entirely contained in the constructor.
+	heartbeatSilence time.Duration
+	// heartbeatRecovery selects what happens when the heartbeat goes silent. Plain
+	// field, written during option application, read by the watcher.
+	heartbeatRecovery HeartbeatRecovery
+
+	// stateWatchInterval is how often the runtime-state poller asks the system
+	// service, and stateWatchDisabled turns it off. Independent of the heartbeat
+	// since 2026-08: the poll used to run at heartbeatCycle(), so
+	// WithNotificationHeartbeat(30s, ...) silently made the state poll 30s too.
+	stateWatchInterval time.Duration
+	stateWatchDisabled bool
 
 	// runtimeState is the last ADS state read from the system service port, and
 	// runtimeStateNs when. Zero (ADSStateInvalid) means "not known yet" — the gates
@@ -481,6 +572,7 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 	for _, opt := range opts {
 		opt(sess)
 	}
+	sess.normalizeHeartbeatOptions()
 	// Resolve whatever the caller left out of the target address by asking the
 	// PLC's router for its own identity. Decided from sess.target AFTER the
 	// options ran, not from the constructor argument: reading pre-option state
@@ -965,10 +1057,20 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 			// nothing else — measured against a PLC with its route table wiped,
 			// where the cause was a missing route and the message said so only in a
 			// log record the plugin never shows.
+			// Which verdict, and therefore which hint, depends on whether this
+			// connection ever carried a frame — the same split the drop log makes.
+			// A consumer that surfaces the error and not this library's logger gets
+			// the sentinel to branch on rather than having to match strings.
 			hint := resetAfterConnectHint(sess.sourceAddr(), sess.target)
+			verdict := ErrRouteNotServed
+			if c := sess.client.Load(); c != nil && c.wasEstablished() {
+				hint = establishedDropHint()
+				verdict = ErrEstablishedDropped
+			}
 			sess.tearDownAndReset()
 			sess.transitionState(SessionStateDisconnected)
-			return fmt.Errorf("transport dropped during connect to %s: %w (%s)", sess.ip, err, hint)
+			return fmt.Errorf("transport dropped during connect to %s: %w: %w (%s)",
+				sess.ip, verdict, err, hint)
 		case isUnservedError(err):
 			// Second opinion before condemning the link: ReadState is the most
 			// universally supported service there is, so if THAT is also met with
@@ -1145,17 +1247,12 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		case <-ctx.Done():
 			return false, fmt.Errorf("route probe retry aborted: %w", ctx.Err())
 		}
-		sess.tearDownAndReset()
-		if dialErr := sess.dialAndStart(); dialErr != nil {
+		if dialErr := sess.redialDuringHandshake(); dialErr != nil {
 			return false, fmt.Errorf("redial during route probe retry: %w", dialErr)
 		}
-		// dialAndStart re-armed ondrop on the new Client; disarm again
-		// for the remainder of ensureRouteOnConnect (the deferred
-		// re-arm at function exit restores the production handler).
-		if c := sess.client.Load(); c != nil {
-			c.SetOnDrop(nil)
-			c.beginHandshake()
-		}
+		// redialDuringHandshake leaves ondrop disarmed and the new Client in a
+		// handshake region, which is what the rest of ensureRouteOnConnect needs;
+		// the deferred re-arm at function exit restores the production handler.
 		if sess.isClosed() {
 			return false, fmt.Errorf("connection closed during route probe retry")
 		}
@@ -1203,7 +1300,65 @@ const (
 	routeActivationPollDelay      = 250 * time.Millisecond
 	minRouteActivationProbe       = 500 * time.Millisecond
 	maxRouteActivationProbe       = 2 * time.Second
+
+	// maxRouteActivationRedials caps how many TCP connections one activation
+	// window may burn. Measured in the field before the cap existed: 76 ephemeral
+	// ports in 11s (62029 -> 62041 -> 62117 -> 62184) and a device log counting
+	// attempt=16 .. attempt=22, because the loop redialled on EVERY 250ms poll for
+	// the whole 10s budget -- around 40 sockets.
+	//
+	// The cap is not just politeness. A Beckhoff AMS router serves one TCP per
+	// host and closes the older one (Beckhoff/ADS#49), so every redial evicted its
+	// own predecessor: the storm was ~40 self-inflicted evictions. On Windows CE
+	// each of those sockets then sits in TIME_WAIT for minutes on a device with a
+	// small socket table, which is the most likely source of the recurring "route
+	// registered but the PLC did not serve it" state.
+	maxRouteActivationRedials = 3
+	// redialBackoffBase/redialBackoffMax bound the wait between redials. The wait
+	// happens BEFORE the redial, which is what gives the PLC time to release the
+	// slot the previous connection held -- see awaitRouteActive.
+	redialBackoffBase = 250 * time.Millisecond
+	redialBackoffMax  = 2 * time.Second
 )
+
+// redialBackoff returns how long to wait before the nth redial of an activation
+// window (n counts redials already performed, so n=0 is the first one).
+//
+// Shift-with-cap, deliberately the same shape as heartbeatAllowedTicks: 250ms,
+// 500ms, 1s, then flat at redialBackoffMax. Pure and separate from the loop
+// because the arithmetic is the part worth pinning -- a loop that waits the wrong
+// amount is invisible from the outside, it just retries at the wrong rate.
+func redialBackoff(n int) time.Duration {
+	if n < 0 {
+		n = 0
+	}
+	if n > maxFailureBackoffShift {
+		n = maxFailureBackoffShift
+	}
+	d := redialBackoffBase << n
+	if d > redialBackoffMax || d <= 0 {
+		return redialBackoffMax
+	}
+	return d
+}
+
+// isTransportDead reports whether err means this TCP connection is gone, as
+// opposed to a request that failed on a connection that still works.
+//
+// Deliberately NOT isProbeRetryable, and deliberately not a widening of it:
+// isProbeRetryable answers "is a redial worth trying", and it excludes
+// context.DeadlineExceeded on purpose (session_test.go pins that, and the reason
+// is in its godoc). This answers a different question -- "is there still a socket
+// to probe on" -- which is what decides whether continuing to poll after the
+// redial budget is spent can achieve anything.
+func isTransportDead(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrTransportClosed) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, syscall.ECONNRESET)
+}
 
 // routeActivationBudget returns the total wait and the per-probe timeout
 // derived from it. Deriving the probe timeout keeps a shortened total
@@ -1222,6 +1377,26 @@ func (sess *Session) routeActivationBudget() (total, probe time.Duration) {
 		probe = maxRouteActivationProbe
 	}
 	return total, probe
+}
+
+// defaultStateWatchInterval is how often the runtime-state poller asks the system
+// service when the caller has not said otherwise.
+//
+// Fixed rather than derived from heartbeatCycle(), which is what it used to be.
+// The coupling was silent and surprising: WithNotificationHeartbeat(30*time.Second,
+// ...) also made the state poll 30s, so the gate that reports "the runtime is in
+// CONFIG" went stale for half a minute because someone tuned an unrelated knob. 5s
+// keeps the poll predictable and, at the 2s default heartbeat, actually reduces the
+// request rate.
+const defaultStateWatchInterval = 5 * time.Second
+
+// stateWatchCycle is the runtime-state poll interval: the configured one, or
+// defaultStateWatchInterval.
+func (sess *Session) stateWatchCycle() time.Duration {
+	if sess.stateWatchInterval > 0 {
+		return sess.stateWatchInterval
+	}
+	return defaultStateWatchInterval
 }
 
 // effectiveRouterPort is the UDP router port for this session, falling back to
@@ -1244,6 +1419,71 @@ func (sess *Session) currentLifecycleCtx() context.Context {
 	sess.lifecycle.ctxMu.RLock()
 	defer sess.lifecycle.ctxMu.RUnlock()
 	return sess.lifecycle.ctx
+}
+
+// waitDuringActivation sleeps for d during a route-activation window, honouring
+// three ways of being told to stop.
+//
+// The third one is the reason this is a function. A plain two-arm select on
+// time.After and the attempt context misses Close: on the Connect path ctxFor is
+// Connect's OWN caller context (Connect passes its ctx, and no teardown touches
+// it), which Close does not cancel. So Close would return -- its
+// Client.waitGroup.Wait finds the torn-down client already drained -- and this
+// loop would then wake up and dial a fresh TCP connection to the PLC AFTER Close
+// returned, because dialAndStart dials before it re-checks isClosed. A stray
+// socket and a stray ephemeral port, in the one code path whose whole purpose is
+// to stop burning ephemeral ports.
+func (sess *Session) waitDuringActivation(ctxFor func() context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-sess.lifecycle.closedCh:
+		return fmt.Errorf("connection closed while waiting for route activation")
+	case <-ctxFor().Done():
+		return fmt.Errorf("route activation wait aborted: %w", ctxFor().Err())
+	}
+}
+
+// redialDuringHandshake replaces the transport during a route probe or activation
+// wait, leaving the new Client in the handshake state its caller needs.
+//
+// Two things it does that a bare tearDownAndReset + dialAndStart does not:
+//
+//   - It sets tx.disconnected across the gap. awaitRouteActive's redial used to
+//     leave it false (resetForRetry sets it, this path never did), so the flag that
+//     gates user RPCs said "connected" while there was no socket and no workers at
+//     all. Requests in that window failed anyway — on the torn-down Client's closed
+//     `dropped` channel rather than on the flag — so this buys a correct reason
+//     rather than a correct outcome. It was survivable when the gap was a single
+//     dial; with a deliberate backoff before the dial it is up to seconds.
+//     Note the public IsDisconnected() is FSM-based and unaffected: during an
+//     activation window the session is Connecting or Reconnecting, never Connected.
+//   - It re-disarms ondrop. publishWiredClient arms it unconditionally on every
+//     new Client, so a caller that is deliberately holding the transport during a
+//     handshake gets a window in which a PLC RST spawns exactly the rival
+//     Reconnect that the disarm exists to prevent. Both callers need that, so it
+//     lives here rather than being repeated (and eventually forgotten) at each.
+//
+// Takes lifecycle.dialMu for the whole teardown+dial pair, which is what makes
+// the pair atomic against the other handshake-phase redial. Safe to hold here and
+// nowhere else: the two call sites (ensureRouteOnConnect, awaitRouteActive) never
+// nest -- Connect reaches them sequentially and the reconnect path reaches only
+// the second -- and neither holds any other session lock. See dialMu.
+func (sess *Session) redialDuringHandshake() error {
+	sess.lifecycle.dialMu.Lock()
+	defer sess.lifecycle.dialMu.Unlock()
+	sess.tx.disconnected.Store(true)
+	sess.tearDownAndReset()
+	if err := sess.dialAndStart(); err != nil {
+		return err
+	}
+	if c := sess.client.Load(); c != nil {
+		c.SetOnDrop(nil)
+		c.beginHandshake()
+	}
+	return nil
 }
 
 // awaitRouteActive re-probes the PLC after a route registration until one
@@ -1280,6 +1520,10 @@ func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, err
 	total, probeTimeout := sess.routeActivationBudget()
 	deadline := time.Now().Add(total)
 	var lastErr error
+	// redials counts sockets this window has burned, capped by
+	// maxRouteActivationRedials. Goroutine-local: one activation window has one
+	// owner, either Connect or the reconnect goroutine.
+	redials := 0
 	for attempt := 1; ; attempt++ {
 		if sess.isClosed() {
 			return 0, fmt.Errorf("connection closed while waiting for route activation")
@@ -1326,28 +1570,46 @@ func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, err
 		if !time.Now().Before(deadline) {
 			break
 		}
+		if isProbeRetryable(lastErr) {
+			// Budget spent and no socket left: stop. Every further probe would fail
+			// instantly with ErrTransportClosed, so continuing to poll is a tight
+			// spin for the rest of the budget that cannot discover anything. Without
+			// this early exit, capping the redials makes the loop worse rather than
+			// better.
+			if redials >= maxRouteActivationRedials && isTransportDead(lastErr) {
+				sess.logger.Warn("route activation gave up: redial budget spent and the transport is gone",
+					"attempt", attempt, "redials", redials, "error", lastErr)
+				break
+			}
+			wait := redialBackoff(redials)
+			sess.logger.Debug("route not served by PLC yet, waiting then redialing",
+				"attempt", attempt, "error", lastErr, "delay", wait, "redials", redials)
+			// The wait comes BEFORE the redial, and that ordering is the fix. Dialing
+			// immediately after our own close is the worst possible moment: on Windows
+			// CE the PLC still holds the slot the closed connection occupied, so the
+			// new connection is the one that gets refused or evicted. Waiting first
+			// gives the device that time, and costs nothing -- the budget is spent
+			// waiting either way.
+			if err := sess.waitDuringActivation(ctxFor, wait); err != nil {
+				return 0, err
+			}
+			if sess.isClosed() {
+				return 0, fmt.Errorf("connection closed while waiting for route activation")
+			}
+			if err := sess.redialDuringHandshake(); err != nil {
+				return 0, fmt.Errorf("redial while waiting for route activation: %w", err)
+			}
+			redials++
+			continue
+		}
 		sess.logger.Debug("route not served by PLC yet, re-probing",
 			"attempt", attempt, "error", lastErr, "delay", routeActivationPollDelay)
-		if isProbeRetryable(lastErr) {
-			sess.tearDownAndReset()
-			if dialErr := sess.dialAndStart(); dialErr != nil {
-				return 0, fmt.Errorf("redial while waiting for route activation: %w", dialErr)
-			}
-			// dialAndStart armed ondrop on the new Client; disarm again for the
-			// rest of the wait (the deferred restore handles function exit).
-			if c := sess.client.Load(); c != nil {
-				c.SetOnDrop(nil)
-				c.beginHandshake()
-			}
-		}
-		select {
-		case <-time.After(routeActivationPollDelay):
-		case <-ctxFor().Done():
-			return 0, fmt.Errorf("route activation wait aborted: %w", ctxFor().Err())
+		if err := sess.waitDuringActivation(ctxFor, routeActivationPollDelay); err != nil {
+			return 0, err
 		}
 	}
-	return 0, fmt.Errorf("route %q was registered but the PLC did not serve it within %v: %w",
-		sess.route.name, total, lastErr)
+	return 0, fmt.Errorf("route %q was registered but the PLC did not serve it within %v (%d redials): %w",
+		sess.route.name, total, redials, lastErr)
 }
 
 // probeRouteVersion sends a lightweight ADS command (GetSymbolVersion) to verify
@@ -1697,7 +1959,9 @@ func (sess *Session) releasePLCResources(wasDisconnected bool) {
 		if err := sess.client.Load().Write(sess.currentLifecycleCtx(), uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
 			sess.logger.Warn("failed to release symbol handle", "error", err, "handle", h)
 		} else {
-			sess.logger.Info("handle deleted", "handle", h)
+			// Per handle. The notification-delete path was demoted in 6fc9b14; this is
+			// the read-handle path, which was missed then.
+			sess.logger.Debug("handle deleted", "handle", h)
 		}
 	}
 }
@@ -1742,6 +2006,11 @@ func (sess *Session) shutdownTransport(wasDisconnected bool) {
 	})
 }
 
+// closeReconnectGrace bounds how long Close waits for an in-flight reconnect
+// attempt to notice it should stop. Generous relative to a dial: the point is a
+// ceiling, not a deadline.
+const closeReconnectGrace = 10 * time.Second
+
 // Close releases PLC-side notification subscriptions, releases the cached
 // PLC-side symbol handles when transport is still alive, cancels the
 // session context, closes the underlying TCP socket, and waits for the
@@ -1777,7 +2046,23 @@ func (sess *Session) Close() error {
 	ch := sess.lifecycle.reconnectDone
 	sess.lifecycle.reconnectMu.Unlock()
 	if ch != nil {
-		<-ch
+		// Bounded. This used to be a bare receive, which made Close's latency the
+		// reconnect loop's worst case: a full net.DialTimeout plus a teardown's wait
+		// for the previous Client's workers, with no ceiling the caller could see.
+		// closedCh is already closed by markClosed above, so the loop has been told
+		// to stop; the timeout only covers an attempt already in flight when it was.
+		//
+		// Proceeding on the timeout is safe: the waits that follow (the Client's
+		// workers, lifecycle.waitGroup) are the ones that actually establish "no
+		// goroutine of ours is running", and the WaitGroup-misuse race this receive
+		// guards against needs the loop to be mid-Add, which a stopped loop is not.
+		select {
+		case <-ch:
+		case <-time.After(closeReconnectGrace):
+			sess.logger.Warn("Close proceeded without waiting out the in-flight reconnect",
+				"grace", closeReconnectGrace,
+				"detail", "an attempt was mid-dial when Close ran; its own context is cancelled and it will exit")
+		}
 	}
 	// The heartbeat watcher is the one goroutine on these paths whose exit Close did
 	// not observe: heartbeatWG was Add'ed and Done'd but never waited, so Close
@@ -2124,17 +2409,18 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 	// before dialing so the existing stepped backoff also throttles cross-cycle
 	// reconnect storms — not just within-one-Reconnect retries. Reset when the
 	// last connection lived longer than flapResetWindow.
+	// A drop on a connection that never carried a frame is its own evidence: the
+	// PLC accepted the TCP and reset it without serving anything, so the next dial
+	// is unlikely to fare better and each one costs the device a socket. Counted as
+	// a flap regardless of how long the connection nominally lasted.
+	neverServed := false
+	if c := sess.client.Load(); c != nil {
+		neverServed = !c.wasEstablished()
+	}
+
 	sess.lifecycle.flapMu.Lock()
 	lastConn := sess.lifecycle.lastConnectedAt
-	if !lastConn.IsZero() {
-		elapsed := time.Since(lastConn)
-		switch {
-		case elapsed < flapWindow:
-			sess.lifecycle.flapCount++
-		case elapsed > flapResetWindow:
-			sess.lifecycle.flapCount = 0
-		}
-	}
+	sess.lifecycle.flapCount = nextFlapCount(sess.lifecycle.flapCount, lastConn, time.Now(), neverServed)
 	flapCount := sess.lifecycle.flapCount
 	sess.lifecycle.flapMu.Unlock()
 
@@ -2142,7 +2428,9 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		delay := sess.reconnectBackoff(flapCount)
 		sess.logger.Warn("connection flapping, applying cross-cycle cooldown before reconnect",
 			"flapCount", flapCount, "delay", delay,
-			"lastConnectedAgo", time.Since(lastConn))
+			"lastConnectedAgo", time.Since(lastConn),
+			"lastDropServedNothing", neverServed,
+			"detail", "each reconnect costs the PLC an accepted socket; backing off protects its socket table as much as ours")
 		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:
@@ -2202,10 +2490,25 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 	// others.
 	retryAfter := func(err error, stage string) error {
 		lastErr = err
+		// Capture the verdict before the teardown: whether the socket this attempt
+		// used ever carried a frame is what separates "the PLC is refusing to serve
+		// us" from "the link died mid-work", and only the first should go quiet.
+		servedNothing := false
+		if c := sess.client.Load(); c != nil {
+			servedNothing = !c.wasEstablished()
+		}
 		sess.logger.Warn("reconnect step failed, retrying",
-			"stage", stage, "error", err, "attempt", attempts)
+			"stage", stage, "error", err, "attempt", attempts,
+			"servedNothing", servedNothing)
 		sess.resetForRetry()
-		if isUnservedError(err) {
+		// isUnservedError alone misses the shape measured in the field: the PLC
+		// accepts the TCP and RSTs it within ~40ms having served nothing. That is
+		// "accepted our connection and then said nothing" said with a reset instead
+		// of silence, and it was costing ~5 accepted sockets per flap on a device
+		// whose socket table is small. isUnservedError is deliberately narrow (it
+		// excludes ErrTransportClosed so a mid-stream drop is not misread), so the
+		// verdict is added here rather than by widening it.
+		if isUnservedError(err) || servedNothing {
 			unserved++
 			if unserved >= unservedAttemptsBeforeCooldown {
 				unserved = 0
@@ -2246,7 +2549,8 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		sess.lifecycle.reconnectAttempts.Add(1)
 		if err := sess.dialAndStart(); err != nil {
 			lastErr = err
-			sess.logger.Warn("reconnect dial/start failed, retrying", "error", err, "ip", sess.ip, "port", sess.port, "attempt", attempts)
+			sess.logger.Warn("reconnect dial/start failed, retrying",
+				"error", err, "ip", sess.ip, "port", sess.port, "attempt", attempts)
 			if err := sess.reconnectSleep(ctx, attempts); err != nil {
 				return err
 			}
@@ -2566,10 +2870,23 @@ func (sess *Session) tearDownAndReset() {
 	sess.lifecycle.ctxMu.RUnlock()
 	cancel()
 	sess.tx.connMu.Lock()
+	// Read the local port before the Close, not after: LocalAddr on a closed
+	// connection is not reliable, and this port is what every drop investigation
+	// needed to line the event up against a packet capture.
+	localPort := 0
 	if sess.tx.connection != nil {
+		if addr, ok := sess.tx.connection.LocalAddr().(*net.TCPAddr); ok {
+			localPort = addr.Port
+		}
 		sess.tx.connection.Close()
 	}
 	sess.tx.connMu.Unlock()
+	if localPort != 0 {
+		// INFO, not Debug. With debug_level on, the consumer's log rotated every
+		// ~9s in the field and destroyed the evidence window repeatedly; one line
+		// per teardown at INFO survives that.
+		sess.logger.Info("closed the TCP connection for a session reset", "localPort", localPort)
+	}
 	// Wait for the previous batch of Client workers (listen, transmit,
 	// recvWorker) to exit. They share ctx with lifecycle.ctx; the cancel
 	// above plus the closed TCP socket trigger their exit. Adopted inbound
@@ -2641,7 +2958,14 @@ func (sess *Session) dialAndStart() error {
 		sess.tx.connMu.Unlock()
 		return fmt.Errorf("connection closed during dial")
 	}
-	sess.publishWiredClient()
+	c := sess.publishWiredClient()
+	// The local port at INFO, on every dial this path makes — the reconnect and
+	// route-activation dials, which Connect's own "TCP socket established" line
+	// does not cover. Correlating a drop against a packet capture needs the
+	// ephemeral port of the connection that died, and by then it is gone.
+	if port := c.localPort(); port != 0 {
+		sess.logger.Info("dialed the PLC", "localPort", port, "ip", sess.ip, "port", sess.port)
+	}
 	// Clear disconnected AFTER the workers are up, so a user RPC that observes
 	// disconnected=false is guaranteed to find transmitWorker actually running.
 	sess.tx.disconnected.Store(false)
@@ -2675,8 +2999,17 @@ func (sess *Session) sourceAddr() AMSAddress {
 // the next. Having one copy of that means the invariant lives with the code
 // rather than in two comments.
 //
-// The publish is last on purpose: concurrent readers must never see a
-// half-initialised Client.
+// The publish comes BEFORE startWorkers, and the order matters. Previously the
+// workers were started first and sess.client.Store was last, on the reasoning
+// that a concurrent reader must never see a half-initialised Client. But the
+// workers ARE concurrent readers of sess.client: a drop landing in that window
+// runs callOnDrop -> triggerReconnect -> Reconnect -> tearDownAndReset, which
+// loads sess.client and so tore down the PREVIOUS Client — markDropped-ing and
+// waiting the wrong one — while this Client's workers kept running with nobody
+// waiting their WaitGroup and its transmitWorker sharing tx.sendChannel with the
+// next dial's. Storing first closes that window: by the time any worker exists,
+// the pointer and the drop handler are both in place, and the Client is fully
+// built either way (every field is set in the literal below).
 func (sess *Session) publishWiredClient() *Client {
 	sess.lifecycle.ctxMu.RLock()
 	clientCtx := sess.lifecycle.ctx
@@ -2694,14 +3027,19 @@ func (sess *Session) publishWiredClient() *Client {
 		dropped:        make(chan struct{}),
 		ctx:            clientCtx,
 		cancel:         clientCancel,
+		// dialedAt in the literal, never as a later assignment: readFrames reads it
+		// from the listen goroutine for the uptime on a drop.
+		dialedAt: time.Now(),
 	}
 	// handleNotification gives the Client cache-aware dispatch for inbound
 	// DeviceNotification packets; triggerReconnect routes transport-down into the
 	// Session's reconnect FSM.
 	c.SetNotificationHandler(sess.handleNotification)
 	c.SetOnDrop(sess.triggerReconnect)
-	c.startWorkers()
+	// Publish before the workers exist, so a drop cannot reach a teardown that
+	// would load a stale sess.client. See the ordering note above.
 	sess.client.Store(c)
+	c.startWorkers()
 	return c
 }
 
@@ -3174,7 +3512,7 @@ func (sess *Session) loadSymbols(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to upload datatypes: %w", err)
 	}
-	datatypes, err := parseUploadSymbolInfoDataTypes(datatypesResponse)
+	datatypes, err := parseUploadSymbolInfoDataTypes(datatypesResponse, sess.logger)
 	if err != nil {
 		return fmt.Errorf("failed to parse datatypes: %w", err)
 	}
@@ -3182,7 +3520,7 @@ func (sess *Session) loadSymbols(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to upload symbols: %w", err)
 	}
-	symbols, err := parseUploadSymbolInfoSymbols(symbolsResponse, datatypes)
+	symbols, err := parseUploadSymbolInfoSymbols(symbolsResponse, datatypes, sess.logger)
 	if err != nil {
 		return fmt.Errorf("failed to parse symbols: %w", err)
 	}
@@ -3194,6 +3532,10 @@ func (sess *Session) loadSymbols(ctx context.Context) error {
 	// reassigned to a different symbol after reconnect.
 	zeroOldSymbolHandles(sess.cache.symbols)
 	sess.cache.datatypes = datatypes
+	// Stamp the session's logger onto every symbol as the cache takes ownership,
+	// so records produced later while parsing or serialising them reach the
+	// caller's handler instead of stderr. See symbol.logger.
+	stampLoggerOnAll(symbols, sess.logger)
 	sess.cache.symbols = symbols
 	sess.bumpEpoch()
 	sess.cache.lock.Unlock()
@@ -3400,9 +3742,18 @@ func (sess *Session) requireRunningRuntime(what string) error {
 // Gives up after a run of failures so a device without a system service port costs
 // nothing: the gates fall back to permitting, which is the pre-existing behaviour.
 func (sess *Session) startRuntimeStateWatch() {
+	// Checked OUTSIDE stateOnce.Do on purpose: consuming the Once here would mean a
+	// session that had the watch disabled could never start one, and it costs
+	// nothing to leave the Once unused. With the watch off, stateWG.Wait() in Close
+	// is a no-op at zero and the gates fall back to permitting with no reading,
+	// which is exactly the behaviour that predates the watch.
+	if sess.stateWatchDisabled {
+		sess.logger.Debug("runtime state watch disabled by option")
+		return
+	}
 	sess.stateOnce.Do(func() {
 		started := sess.trackGoroutineOn(&sess.stateWG, func() {
-			interval := sess.heartbeatCycle()
+			interval := sess.stateWatchCycle()
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			failures := 0

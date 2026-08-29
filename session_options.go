@@ -160,6 +160,11 @@ type BackoffConfig struct {
 }
 
 // DefaultBackoffConfig returns the default reconnect backoff configuration.
+//
+// MaxInterval also caps the cross-cycle flap cooldown (see flapResetWindow), which
+// is what governs a device that resets the connection on a timer. The 30s default
+// protects the PLC's socket table at the cost of stream continuity during such an
+// episode; lower it if the samples matter more than the sockets.
 func DefaultBackoffConfig() BackoffConfig {
 	return BackoffConfig{
 		InitialInterval: 1 * time.Second,
@@ -508,6 +513,14 @@ func WithOnSymbolVersionChanged(fn func(reason Reason)) SessionOption {
 // session concludes its subscriptions are dead and re-subscribes them. Defaults:
 // 2s and 5 (so roughly 10s to notice). missed < 2 is raised to 2, because a single
 // late beat is not evidence of anything.
+//
+// See WithNotificationSilenceTimeout to state the tolerated silence as a duration
+// instead of a tick count, and WithHeartbeatRecovery to choose what happens when
+// it runs out.
+//
+// This option no longer affects the runtime-state poll. It used to: the poll ran
+// at this interval, so setting a 30s heartbeat silently made the state poll 30s
+// too. Use WithRuntimeStateWatch for that.
 func WithNotificationHeartbeat(interval time.Duration, missed int) SessionOption {
 	return func(s *Session) {
 		if interval > 0 {
@@ -528,7 +541,100 @@ func WithNotificationHeartbeat(interval time.Duration, missed int) SessionOption
 			missed = 2
 		}
 		s.heartbeatMissed = missed
+		// Clearing the duration form is what makes the two options last-wins: the
+		// caller stated the tick count later, so it is the one that should decide,
+		// and normalizeHeartbeatOptions only converts a duration that is still set.
+		s.heartbeatSilence = 0
 		s.heartbeatDisabled = false
+	}
+}
+
+// WithNotificationSilenceTimeout says how long the caller's subscriptions may be
+// silent before the session concludes they are dead, in wall-clock time.
+//
+// The same decision as WithNotificationHeartbeat's missed argument, stated in the
+// unit an operator thinks in. Set 30s and you get 30s whatever the cycle is;
+// missed is derived (rounded up, floored at 2) when the session is constructed.
+// Whichever of the two options is applied later wins, since that is the one the
+// caller wrote last.
+//
+// The heartbeat itself is described in WithNotificationHeartbeat; this only
+// changes how much of its silence is tolerated.
+func WithNotificationSilenceTimeout(d time.Duration) SessionOption {
+	return func(s *Session) {
+		if d <= 0 {
+			return
+		}
+		s.heartbeatSilence = d
+		s.heartbeatDisabled = false
+	}
+}
+
+// WithHeartbeatRecovery selects what happens when the heartbeat goes silent.
+//
+// The default, HeartbeatRecoveryImmediate, re-subscribes at once. That is one
+// delete plus one add per handle in a burst — 82 requests on a 41-symbol session —
+// against a device that may simply have stalled, which is why the alternatives
+// exist:
+//
+//   - HeartbeatRecoveryConfirm waits for a second consecutive silent window first.
+//     Doubles the time to notice a genuinely dead subscription; halves the chance
+//     of churning every handle over one late beat.
+//   - HeartbeatRecoveryObserve never re-subscribes. The session reports the
+//     silence (a Warn, plus ReasonHeartbeatSilent to the WithOnSymbolVersionChanged
+//     callback) and leaves the decision to the consumer.
+//
+// An unrecognised value is ignored, leaving the default in place: a typo should
+// not silently turn recovery off.
+func WithHeartbeatRecovery(mode HeartbeatRecovery) SessionOption {
+	return func(s *Session) {
+		switch mode {
+		case HeartbeatRecoveryImmediate, HeartbeatRecoveryConfirm, HeartbeatRecoveryObserve:
+			s.heartbeatRecovery = mode
+		default:
+			if s.logger != nil {
+				s.logger.Warn("WithHeartbeatRecovery: unrecognised mode, keeping the default",
+					"mode", int(mode), "using", HeartbeatRecoveryImmediate.String())
+			}
+		}
+	}
+}
+
+// WithRuntimeStateWatch sets how often the session polls the system service for
+// the PLC's runtime state (RUN / CONFIG).
+//
+// That reading is what lets the symbol and subscription calls refuse with "the
+// runtime is not running" instead of failing obscurely, and what lets a session
+// that starts while the PLC is in CONFIG come up and wait. The default is 5s.
+//
+// Before 2026-08 this interval was heartbeatCycle(), so WithNotificationHeartbeat
+// silently changed the state-poll rate too — a 30s heartbeat meant a 30s state
+// poll. The two are independent now; set this if you want the poll faster or
+// slower than 5s.
+func WithRuntimeStateWatch(d time.Duration) SessionOption {
+	return func(s *Session) {
+		if d <= 0 {
+			return
+		}
+		s.stateWatchInterval = d
+		s.stateWatchDisabled = false
+	}
+}
+
+// WithoutRuntimeStateWatch turns the runtime-state poll off entirely.
+//
+// What it saves: one small request per interval to the system service port. What
+// it accepts: the gates on the symbol and subscription calls fall back to
+// permitting, so a session against a PLC in CONFIG fails the old obscure way
+// (an AMS error naming an index group) rather than saying the runtime is not
+// running, and a session that starts in CONFIG will not notice the return to RUN
+// on its own.
+//
+// Connect still does one synchronous state read, so a device already in CONFIG at
+// connect time is still reported once.
+func WithoutRuntimeStateWatch() SessionOption {
+	return func(s *Session) {
+		s.stateWatchDisabled = true
 	}
 }
 
