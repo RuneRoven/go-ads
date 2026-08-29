@@ -69,6 +69,21 @@ type scriptableServer struct {
 	// mistake as the untracked connections above, on the other path.
 	quit chan struct{}
 
+	// dropAlwaysMu guards dropAlways and is deliberately NOT s.mu. dispatch holds
+	// s.mu for the whole handler and acceptLoop takes it per accept, so anything
+	// evaluated under s.mu can stall new accepts — and the test this injector
+	// exists for counts accepts. A separate lock makes that interaction
+	// impossible rather than merely unlikely.
+	dropAlwaysMu sync.Mutex
+	// dropAlways implements dropConnAlways: close the connection instead of
+	// answering EVERY occurrence of a command, until stopDroppingConn clears it.
+	//
+	// dropConnAfter cannot stand in for this: it deletes its own key once it
+	// fires, so a probe can only be made to fail at transport level ONCE. A
+	// redial loop that dials on every failed probe needs the failure to repeat,
+	// which is exactly the storm condition awaitRouteActive's cap exists to bound.
+	dropAlways map[CommandID]bool
+
 	mu sync.Mutex // guards every field below
 
 	// conns are the accepted client connections, tracked so stop() can close
@@ -161,6 +176,7 @@ func startScriptableServer(t *testing.T) *scriptableServer {
 		readHandlers:      map[uint32]readHandler{},
 		delays:            map[delayKey]time.Duration{},
 		conns:             map[net.Conn]struct{}{},
+		dropAlways:        map[CommandID]bool{},
 		quit:              make(chan struct{}),
 	}
 	s.wg.Add(1)
@@ -267,6 +283,35 @@ func (s *scriptableServer) delayBefore(cmd CommandID, group uint32, d time.Durat
 	s.mu.Unlock()
 }
 
+// dropConnAlways closes the connection instead of answering any occurrence of
+// cmd, for as long as it stays armed. The listener stays up, so the client's
+// next dial is still accepted — which is what makes a redial loop observable
+// through accepts().
+//
+// Sticky on purpose. dropConnAfter disarms itself on its first firing
+// (see dropAlways), so it cannot reproduce a probe that keeps failing at
+// transport level.
+func (s *scriptableServer) dropConnAlways(cmd CommandID) {
+	s.dropAlwaysMu.Lock()
+	s.dropAlways[cmd] = true
+	s.dropAlwaysMu.Unlock()
+}
+
+// stopDroppingConn disarms dropConnAlways for cmd, so a test can let the
+// session recover and assert on what it does next.
+func (s *scriptableServer) stopDroppingConn(cmd CommandID) {
+	s.dropAlwaysMu.Lock()
+	delete(s.dropAlways, cmd)
+	s.dropAlwaysMu.Unlock()
+}
+
+// droppingAlways reports whether cmd is currently armed for a sticky drop.
+func (s *scriptableServer) droppingAlways(cmd CommandID) bool {
+	s.dropAlwaysMu.Lock()
+	defer s.dropAlwaysMu.Unlock()
+	return s.dropAlways[cmd]
+}
+
 // frames returns a snapshot of every fully-received inbound frame.
 func (s *scriptableServer) frames() [][]byte {
 	s.mu.Lock()
@@ -359,6 +404,12 @@ func (s *scriptableServer) handle(c net.Conn) {
 			}
 		} else {
 			s.mu.Unlock()
+		}
+
+		// Sticky drop first, and under its own lock: this is the "the PLC will not
+		// serve this route yet" shape, which repeats until the test says otherwise.
+		if s.droppingAlways(cmd) {
+			return // deferred c.Close() drops it
 		}
 
 		// Drop the connection instead of answering, once the configured number

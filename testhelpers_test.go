@@ -200,31 +200,88 @@ func (conn *Session) drivePacket(ctx context.Context, packet []byte) error {
 // --- testLogHandler — captures slog records for assertions ---
 
 // logRecord captures a single log entry for test assertions.
+//
+// Attrs is rendered with %v rather than kept as `any`: every assertion this
+// suite makes on an attribute is "is it there, and does it say what I expect",
+// and comparing strings keeps those assertions readable. Attributes used to be
+// discarded entirely, which made a whole class of log content — the local port
+// on a drop, the frame counts behind a drop verdict — untestable, so an empty
+// field was indistinguishable from a correct one.
 type logRecord struct {
 	Level   slog.Level
 	Message string
+	Attrs   map[string]string
+}
+
+// attr returns the value of the named attribute, or "" when the record does not
+// carry it. The two cases are distinguished by hasAttr.
+func (r *logRecord) attr(key string) string { return r.Attrs[key] }
+
+// hasAttr reports whether the record carries the named attribute at all, so a
+// test can tell "absent" from "present but empty" — the difference between a log
+// site that was never reached and one that logged a zero value.
+func (r *logRecord) hasAttr(key string) bool {
+	_, ok := r.Attrs[key]
+	return ok
 }
 
 // testLogHandler is a minimal slog.Handler that captures log records for testing.
+//
+// WithAttrs returns a derived handler that records into the same store, so
+// attributes attached by the library through logger.With() (which is how the
+// session tags records) survive into the assertions instead of being dropped.
 type testLogHandler struct {
 	records []logRecord
 	mu      sync.Mutex
+
+	// parent and with are set only on derived handlers. The zero value is a
+	// usable root handler, which is how every test constructs one.
+	parent *testLogHandler
+	with   []slog.Attr
+}
+
+// root returns the handler that owns the record store.
+func (h *testLogHandler) root() *testLogHandler {
+	for h.parent != nil {
+		h = h.parent
+	}
+	return h
 }
 
 func (h *testLogHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
 func (h *testLogHandler) Handle(_ context.Context, r slog.Record) error {
-	h.mu.Lock()
-	h.records = append(h.records, logRecord{Level: r.Level, Message: r.Message})
-	h.mu.Unlock()
+	attrs := make(map[string]string, r.NumAttrs()+len(h.with))
+	for _, a := range h.with {
+		attrs[a.Key] = a.Value.String()
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.String()
+		return true
+	})
+	root := h.root()
+	root.mu.Lock()
+	root.records = append(root.records, logRecord{Level: r.Level, Message: r.Message, Attrs: attrs})
+	root.mu.Unlock()
 	return nil
 }
-func (h *testLogHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
-func (h *testLogHandler) WithGroup(_ string) slog.Handler      { return h }
+
+func (h *testLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	if len(attrs) == 0 {
+		return h
+	}
+	merged := make([]slog.Attr, 0, len(h.with)+len(attrs))
+	merged = append(merged, h.with...)
+	merged = append(merged, attrs...)
+	return &testLogHandler{parent: h.root(), with: merged}
+}
+
+func (h *testLogHandler) WithGroup(_ string) slog.Handler { return h }
 
 func (h *testLogHandler) findByMessage(msg string) *logRecord {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for _, r := range h.records {
+	root := h.root()
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	for _, r := range root.records {
 		if strings.Contains(r.Message, msg) {
 			return &r
 		}
@@ -402,10 +459,11 @@ func (r *routeResponder) registeredNetIDs() [][6]byte {
 // findByMessage because "did this happen at all" and "did this happen once
 // rather than every tick" are different questions.
 func (h *testLogHandler) countByMessage(msg string) int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	root := h.root()
+	root.mu.Lock()
+	defer root.mu.Unlock()
 	n := 0
-	for _, r := range h.records {
+	for _, r := range root.records {
 		if strings.Contains(r.Message, msg) {
 			n++
 		}
