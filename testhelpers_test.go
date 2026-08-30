@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -237,8 +238,20 @@ type testLogHandler struct {
 	// parent, with and groups are set only on derived handlers. The zero value is
 	// a usable root handler, which is how every test constructs one.
 	parent *testLogHandler
-	with   []slog.Attr
+	with   []attrBatch
 	groups []string
+}
+
+// attrBatch is the attributes from one WithAttrs call together with the group
+// prefix that was open when it was made.
+//
+// The prefix has to travel with the batch rather than being read from the
+// handler at Handle time: slog's contract is that a group qualifies only the
+// attributes added after it, so logger.With("request_id", x).WithGroup("net")
+// must still record "request_id", not "net.request_id".
+type attrBatch struct {
+	prefix []string
+	attrs  []slog.Attr
 }
 
 // root returns the handler that owns the record store.
@@ -259,6 +272,10 @@ func (h *testLogHandler) Enabled(_ context.Context, _ slog.Level) bool { return 
 // written as "group.key" — the kind of green that means nothing. Nothing in the
 // library groups attributes today; this keeps the helper honest if that changes.
 func collectAttr(dst map[string]string, prefix []string, a slog.Attr) {
+	// Resolve before the kind check. A slog.LogValuer — secret in this package is
+	// one — may return a group, and an unresolved value would land in the map as a
+	// single opaque scalar instead of its children.
+	a.Value = a.Value.Resolve()
 	if a.Value.Kind() == slog.KindGroup {
 		inner := a.Value.Group()
 		if len(inner) == 0 {
@@ -282,8 +299,10 @@ func collectAttr(dst map[string]string, prefix []string, a slog.Attr) {
 
 func (h *testLogHandler) Handle(_ context.Context, r slog.Record) error {
 	attrs := make(map[string]string, r.NumAttrs()+len(h.with))
-	for _, a := range h.with {
-		collectAttr(attrs, h.groups, a)
+	for _, batch := range h.with {
+		for _, a := range batch.attrs {
+			collectAttr(attrs, batch.prefix, a)
+		}
 	}
 	r.Attrs(func(a slog.Attr) bool {
 		collectAttr(attrs, h.groups, a)
@@ -300,9 +319,11 @@ func (h *testLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(attrs) == 0 {
 		return h
 	}
-	merged := make([]slog.Attr, 0, len(h.with)+len(attrs))
+	// h.groups is never mutated in place — WithGroup builds a fresh slice — so the
+	// batch can share it. attrs is the caller's slice and is copied.
+	merged := make([]attrBatch, 0, len(h.with)+1)
 	merged = append(merged, h.with...)
-	merged = append(merged, attrs...)
+	merged = append(merged, attrBatch{prefix: h.groups, attrs: slices.Clone(attrs)})
 	return &testLogHandler{parent: h.root(), with: merged, groups: h.groups}
 }
 

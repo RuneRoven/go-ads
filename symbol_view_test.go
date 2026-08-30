@@ -574,3 +574,69 @@ func TestTestLogHandler_QualifiesGroups(t *testing.T) {
 		t.Errorf("a group with no attributes must be ignored, got %v", r.Attrs)
 	}
 }
+
+// TestTestLogHandler_GroupQualifiesOnlyLaterAttrs covers the reverse call order
+// of TestTestLogHandler_QualifiesGroups: a group opened after an attribute must
+// not reach back and qualify it. A handler that applied the group prefix that
+// happened to be open at Handle time would record "net.request_id" here, and a
+// test asserting on "request_id" would then fail for a reason that exists only
+// in the helper.
+func TestTestLogHandler_GroupQualifiesOnlyLaterAttrs(t *testing.T) {
+	logs := &testLogHandler{}
+	lg := slog.New(logs)
+
+	lg.With("request_id", "abc").WithGroup("net").With("port", 48898).Info("dialed")
+
+	rec := logs.findByMessage("dialed")
+	if rec == nil {
+		t.Fatal("no record captured")
+	}
+	if got, want := rec.attr("request_id"), "abc"; got != want {
+		t.Errorf("attr added before the group = %q, want request_id=%q (attrs: %v)", got, want, rec.Attrs)
+	}
+	if rec.hasAttr("net.request_id") {
+		t.Errorf("a group must not qualify an attribute added before it (attrs: %v)", rec.Attrs)
+	}
+	if got, want := rec.attr("net.port"), "48898"; got != want {
+		t.Errorf("attr added after the group = %q, want net.port=%q (attrs: %v)", got, want, rec.Attrs)
+	}
+}
+
+// groupLogValuer is a slog.LogValuer whose LogValue returns a group, the case
+// that separates resolving from not resolving.
+type groupLogValuer struct{ port int }
+
+func (g groupLogValuer) LogValue() slog.Value {
+	return slog.GroupValue(slog.Int("port", g.port), slog.String("proto", "tcp"))
+}
+
+// TestTestLogHandler_ResolvesLogValuer: the capture helper must resolve values
+// before inspecting their kind. secret in this package is a slog.LogValuer, so
+// an unresolved value would be stored as one opaque scalar — and a redaction
+// assertion could pass against text the real handler never wrote.
+func TestTestLogHandler_ResolvesLogValuer(t *testing.T) {
+	logs := &testLogHandler{}
+	lg := slog.New(logs)
+
+	lg.Info("valued", "conn", groupLogValuer{port: 48898})
+	lg.Info("secret", "password", secret("hunter2"))
+
+	rec := logs.findByMessage("valued")
+	if rec == nil {
+		t.Fatal("no record captured")
+	}
+	if got, want := rec.attr("conn.port"), "48898"; got != want {
+		t.Errorf("LogValuer group child = %q, want conn.port=%q (attrs: %v)", got, want, rec.Attrs)
+	}
+	if got, want := rec.attr("conn.proto"), "tcp"; got != want {
+		t.Errorf("LogValuer group child = %q, want conn.proto=%q (attrs: %v)", got, want, rec.Attrs)
+	}
+	if rec.hasAttr("conn") {
+		t.Errorf("an unresolved LogValuer was stored as a scalar (attrs: %v)", rec.Attrs)
+	}
+
+	pw := logs.findByMessage("secret")
+	if got, want := pw.attr("password"), "[REDACTED]"; got != want {
+		t.Errorf("secret attr = %q, want %q (attrs: %v)", got, want, pw.Attrs)
+	}
+}
