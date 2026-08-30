@@ -698,6 +698,12 @@ func (data *SymbolUploadDataType) addOffsetDepth(parent *symbol, datatypes map[s
 		}
 
 		child := symbol{
+			// Children built here reach the cache through their parent, so the
+			// stamping at ingest never sees them — and rebuildSymbolChildren runs
+			// this path again when the datatype table arrives after the symbol list.
+			// Without this their parse and serialise warnings fall back to the
+			// package default logger, which is the bypass this change set removes.
+			logger:            lg,
 			Name:              segment.Name,
 			LastUpdateTime:    time.Now(),
 			MinUpdateInterval: 50 * time.Millisecond,

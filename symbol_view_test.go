@@ -538,3 +538,39 @@ func TestWarnUnresolvedBaseType_QuietOnceTheTableArrives(t *testing.T) {
 		t.Errorf("warned %d times although the datatype table resolves this symbol", n)
 	}
 }
+
+// TestTestLogHandler_QualifiesGroups covers the capture helper itself: a handler
+// that silently flattened groups could make an assertion pass on a key the real
+// handler would have written as "group.key".
+func TestTestLogHandler_QualifiesGroups(t *testing.T) {
+	logs := &testLogHandler{}
+	lg := slog.New(logs)
+
+	lg.WithGroup("net").With("port", 48898).Info("dialed", "peer", "10.0.0.1")
+	lg.Info("inline", slog.Group("drop", slog.Int("frames", 12)))
+	lg.Info("emptyGroupKeyInlines", slog.Group("", slog.String("k", "v")))
+	lg.Info("emptyGroupIgnored", slog.Group("g"))
+
+	rec := logs.findByMessage("dialed")
+	if rec == nil {
+		t.Fatal("no record captured")
+	}
+	if got := rec.attr("net.port"); got != "48898" {
+		t.Errorf("WithGroup+With key = %q, want net.port=48898 (attrs: %v)", got, rec.Attrs)
+	}
+	if got := rec.attr("net.peer"); got != "10.0.0.1" {
+		t.Errorf("record attr under group = %q, want net.peer=10.0.0.1 (attrs: %v)", got, rec.Attrs)
+	}
+
+	inline := logs.findByMessage("inline")
+	if got := inline.attr("drop.frames"); got != "12" {
+		t.Errorf("slog.Group key = %q, want drop.frames=12 (attrs: %v)", got, inline.Attrs)
+	}
+
+	if got := logs.findByMessage("emptyGroupKeyInlines").attr("k"); got != "v" {
+		t.Errorf("an empty group key must inline its attributes, got %q", got)
+	}
+	if r := logs.findByMessage("emptyGroupIgnored"); len(r.Attrs) != 0 {
+		t.Errorf("a group with no attributes must be ignored, got %v", r.Attrs)
+	}
+}

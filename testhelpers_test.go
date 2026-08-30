@@ -234,10 +234,11 @@ type testLogHandler struct {
 	records []logRecord
 	mu      sync.Mutex
 
-	// parent and with are set only on derived handlers. The zero value is a
-	// usable root handler, which is how every test constructs one.
+	// parent, with and groups are set only on derived handlers. The zero value is
+	// a usable root handler, which is how every test constructs one.
 	parent *testLogHandler
 	with   []slog.Attr
+	groups []string
 }
 
 // root returns the handler that owns the record store.
@@ -249,13 +250,43 @@ func (h *testLogHandler) root() *testLogHandler {
 }
 
 func (h *testLogHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+
+// collectAttr records one attribute under its group-qualified key, flattening
+// slog.Group values recursively.
+//
+// Groups are qualified rather than dropped because a handler that silently
+// flattens them can make a test pass on a key the real handler would have
+// written as "group.key" — the kind of green that means nothing. Nothing in the
+// library groups attributes today; this keeps the helper honest if that changes.
+func collectAttr(dst map[string]string, prefix []string, a slog.Attr) {
+	if a.Value.Kind() == slog.KindGroup {
+		inner := a.Value.Group()
+		if len(inner) == 0 {
+			return // slog: a group with no attributes is ignored
+		}
+		next := prefix
+		if a.Key != "" { // an empty group key inlines its attributes
+			next = append(append([]string{}, prefix...), a.Key)
+		}
+		for _, sub := range inner {
+			collectAttr(dst, next, sub)
+		}
+		return
+	}
+	key := a.Key
+	if len(prefix) > 0 {
+		key = strings.Join(prefix, ".") + "." + key
+	}
+	dst[key] = a.Value.String()
+}
+
 func (h *testLogHandler) Handle(_ context.Context, r slog.Record) error {
 	attrs := make(map[string]string, r.NumAttrs()+len(h.with))
 	for _, a := range h.with {
-		attrs[a.Key] = a.Value.String()
+		collectAttr(attrs, h.groups, a)
 	}
 	r.Attrs(func(a slog.Attr) bool {
-		attrs[a.Key] = a.Value.String()
+		collectAttr(attrs, h.groups, a)
 		return true
 	})
 	root := h.root()
@@ -272,10 +303,19 @@ func (h *testLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	merged := make([]slog.Attr, 0, len(h.with)+len(attrs))
 	merged = append(merged, h.with...)
 	merged = append(merged, attrs...)
-	return &testLogHandler{parent: h.root(), with: merged}
+	return &testLogHandler{parent: h.root(), with: merged, groups: h.groups}
 }
 
-func (h *testLogHandler) WithGroup(_ string) slog.Handler { return h }
+func (h *testLogHandler) WithGroup(name string) slog.Handler {
+	if name == "" {
+		return h // slog: an empty group name must return the receiver
+	}
+	return &testLogHandler{
+		parent: h.root(),
+		with:   h.with,
+		groups: append(append([]string{}, h.groups...), name),
+	}
+}
 
 func (h *testLogHandler) findByMessage(msg string) *logRecord {
 	root := h.root()

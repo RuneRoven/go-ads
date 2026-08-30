@@ -1312,6 +1312,13 @@ func (sess *Session) heartbeatWatch() {
 			// A beat is proof of life, so a previously-observed silent window no
 			// longer counts toward Confirm's two-in-a-row.
 			silentWindows = 0
+			// And the failure counter goes with it. Under Observe nothing else ever
+			// resets it — no recovery runs — so without this the first episode is the
+			// only one that warns or fires the callback (both are gated on zero), and
+			// the tolerated window doubles for every later episode. A beat means the
+			// PLC is serving our heartbeat again, which is exactly the evidence that
+			// the previous failures no longer describe the situation.
+			consecutiveFailures = 0
 			continue
 		}
 		quietTicks++
@@ -1379,8 +1386,13 @@ func (sess *Session) heartbeatWatch() {
 			if consecutiveFailures == 0 {
 				sess.logger.Warn("heartbeat silent; not re-subscribing (WithHeartbeatRecovery(Observe))",
 					"detail", "this session's subscriptions are dead until the consumer rebuilds it")
+				// Spawned, never called inline: Close waits heartbeatWG, and this
+				// runs ON the heartbeat watcher, so a callback that rebuilds the
+				// session by calling Close would deadlock against the goroutine it
+				// is running in. Rebuilding is precisely what this mode is for.
+				// Matches every other versionCallback site.
 				if cb := sess.versionCallback; cb != nil {
-					cb(ReasonHeartbeatSilent)
+					go cb(ReasonHeartbeatSilent)
 				}
 			}
 			consecutiveFailures++
