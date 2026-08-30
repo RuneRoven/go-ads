@@ -6,7 +6,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) a
 [go-semantic-release](https://github.com/go-semantic-release/semantic-release) for
 automated versioning and changelog generation.
 
-## Unreleased: reconnect-storm hardening and log hygiene
+## v2.3.1: reconnect-storm hardening and log hygiene
 
 A **patch** release: no API is removed or changed in shape, and every new option is additive.
 Two runtime behaviours differ, so they are listed first.
