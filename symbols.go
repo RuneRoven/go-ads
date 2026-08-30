@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strconv"
 	"strings"
@@ -172,6 +173,106 @@ type symbol struct {
 
 	Parent   *symbol
 	Children map[string]*symbol
+
+	// logger is the session's logger, stamped onto every symbol as it enters the
+	// cache (see stampLogger). nil means "not from a session" — a test-built
+	// literal, or a parse before ingest — and falls back to the package default.
+	//
+	// Carried on the symbol rather than threaded through parse/writeToNode/
+	// parseTree because those have ~70 call sites between the library and its
+	// tests, and the alternative was every one of their log records bypassing
+	// WithLogger. That bypass is not cosmetic: a consumer cannot mute or reroute
+	// them, they lose every structured field the host attached, and
+	// slog.SetDefault is unavailable to a process hosting several sessions.
+	// Measured on TC2 with loadSymbols false: 44 of 61 lines in a 25s run came
+	// from two of these sites, one per symbol per poll.
+	logger *slog.Logger
+
+	// inferenceWarned latches the "inferring base type from size" warning, which
+	// reports a STATIC property of the symbol — its width and the absence of a
+	// datatype table — and so says nothing new on the second poll. It fired once
+	// per symbol per poll: measured on TC2 with loadSymbols false, 44 of the 61
+	// lines in a 25 s run. Latched per symbol, so the first one still tells the
+	// operator to call LoadSymbols.
+	inferenceWarned bool
+
+	// baseTypeWarned latches the "base type unresolvable" warning from
+	// SymbolView.BaseTypeName. Same reasoning as inferenceWarned: the condition is
+	// a static property of the symbol, so repeating it per call says nothing — and
+	// a consumer may call BaseTypeName once per sample.
+	baseTypeWarned bool
+}
+
+// warnInferenceOnce logs the base-type inference warning the first time it
+// applies to this symbol and stays quiet afterwards.
+//
+// Not atomic: symbols are parsed under cache.lock (see the F-39 note in
+// improvements.md), so this field has the same protection every other field on
+// symbol has. If that ever changes, this becomes a race — and a benign one, since
+// the worst outcome is a duplicate warning.
+func (s *symbol) warnInferenceOnce(msg string, args ...any) {
+	if s.inferenceWarned {
+		return
+	}
+	s.inferenceWarned = true
+	s.log().Warn(msg, args...)
+}
+
+// logOr returns lg, or the package default when a caller has none to give (a
+// test-built fixture, or a parse that runs before a session owns the result).
+// Lets the discovery-path free functions take a logger without every call site
+// having to invent one.
+func logOr(lg *slog.Logger) *slog.Logger {
+	if lg == nil {
+		return getDefaultLogger()
+	}
+	return lg
+}
+
+// connLogger returns a session's logger, or the package default for a nil or
+// detached session. Free functions that receive a *Session use this so their
+// records reach the caller's handler like everything else.
+func connLogger(conn *Session) *slog.Logger {
+	if conn == nil || conn.logger == nil {
+		return getDefaultLogger()
+	}
+	return conn.logger
+}
+
+// log returns the logger records about this view belong on.
+func (v SymbolView) log() *slog.Logger { return connLogger(v.conn) }
+
+// log returns the logger records about this symbol belong on: the session's if
+// the symbol came from one, the package default otherwise.
+func (s *symbol) log() *slog.Logger {
+	if s == nil || s.logger == nil {
+		return getDefaultLogger()
+	}
+	return s.logger
+}
+
+// stampLogger attaches lg to a symbol and everything below it, so records
+// produced while parsing or serialising a symbol reach the caller's logger.
+//
+// Called at the points where a session takes ownership of symbols, which is the
+// only place that knows both the tree and the logger. Depth-bounded for the same
+// reason collectSubtreeDepth is: a malformed PLC response can present a cycle,
+// and a stack overflow is a worse outcome than an unstamped subtree.
+func stampLogger(s *symbol, lg *slog.Logger, depth int) {
+	if s == nil || lg == nil || depth >= collectSubtreeMaxDepth {
+		return
+	}
+	s.logger = lg
+	for _, child := range s.Children {
+		stampLogger(child, lg, depth+1)
+	}
+}
+
+// stampLoggerOnAll stamps a whole symbol map, for the bulk cache swaps.
+func stampLoggerOnAll(symbols map[string]*symbol, lg *slog.Logger) {
+	for _, s := range symbols {
+		stampLogger(s, lg, 0)
+	}
 }
 
 // SymbolView is a read-only snapshot of a symbol's metadata and current
@@ -233,8 +334,22 @@ func (v SymbolView) IsValid() bool { return v.conn != nil && v.FullName != "" }
 //     TC2 enums); refuses 4 and 8 to avoid REAL/LREAL ambiguity, matching
 //     parse()'s fallback policy.
 //
-// Returns "" when none of the routes can resolve a primitive — callers
-// should treat that as "load symbols or inspect Children".
+// Returns "" when none of the routes can resolve a primitive, which in practice
+// means a 4- or 8-byte user-defined type with no datatype table loaded (a
+// DINT-backed enum being the common case). "" is a total signal — no symbol has
+// "" as a legitimate base type — so callers can branch on it directly; there is
+// deliberately no error or sentinel for a state that a supported configuration
+// produces on purpose.
+//
+// The first time it happens for a given symbol the session logs a Warn naming the
+// symbol, its width, and the remedy (LoadSymbols / LoadDataTypes). Subscribing
+// raises the same warning at setup, which is where it is actionable — before
+// samples start arriving with the value unconverted. It is latched per symbol, so
+// a consumer calling this per sample gets one line, not one per read.
+//
+// This method never fetches the datatype table itself: a caller running with
+// symbol loading off has declined that upload, and a getter with no context and no
+// error return has no business doing I/O.
 func (v SymbolView) BaseTypeName() string {
 	if name := adsTypeToString(v.BaseType); name != "" {
 		return name
@@ -251,7 +366,75 @@ func (v SymbolView) BaseTypeName() string {
 			}
 		}
 	}
-	return inferBaseType(v.Length, v.BaseType)
+	if inferred := inferBaseType(v.Length, v.BaseType); inferred != "" {
+		return inferred
+	}
+	// Unresolvable, and until now silently so: a 4- or 8-byte user-defined type
+	// (typically a DINT-backed enum) with no datatype table loaded returned "" with
+	// nothing logged and nothing in the return to distinguish it from a symbol that
+	// genuinely has no base type. Downstream that shipped as a quoted string and was
+	// never repaired.
+	//
+	// Deliberately does NOT fetch the datatype table: a caller running with symbol
+	// loading off has declined that upload, and this getter has no context to do I/O
+	// with anyway. Say what is missing and what fixes it; the caller decides.
+	v.warnUnresolvedBaseType()
+	return ""
+}
+
+// warnUnresolvedBaseType reports an unresolvable base type once per symbol.
+func (v SymbolView) warnUnresolvedBaseType() {
+	if v.conn == nil {
+		return
+	}
+	v.conn.warnUnresolvedBaseType(v.FullName)
+}
+
+// warnUnresolvedBaseType reports, once per symbol, that this symbol's base type
+// cannot be determined without the datatype table.
+//
+// Called from two places, deliberately: SymbolView.BaseTypeName (where a caller
+// asks and gets "" back) and the subscribe paths (where the operator finds out at
+// setup rather than on first sample, which is when it is actually actionable).
+// One latch serves both, so a subscribe-time warning does not repeat when the
+// value is later read.
+//
+// The latch lives on the cached *symbol rather than on any view or config,
+// because a SymbolView is a copy handed out per call and a flag on it would latch
+// nothing. Logged after the lock is released: the handler is user-supplied, and
+// holding a cache lock across arbitrary handler code is how the deadlocks in this
+// package were built.
+func (sess *Session) warnUnresolvedBaseType(symbolName string) {
+	sess.cache.lock.Lock()
+	sym, ok := sess.cache.symbols[symbolKey(symbolName)]
+	if !ok || sym.baseTypeWarned {
+		sess.cache.lock.Unlock()
+		return
+	}
+	// Re-derive resolvability under the lock: the datatype table may have been
+	// loaded since whatever prompted this call.
+	dataType, baseType, length := sym.DataType, sym.BaseType, sym.Length
+	_, inTable := sess.cache.datatypes[dataType]
+	sess.cache.lock.Unlock()
+
+	if adsTypeToString(baseType) != "" || inTable || inferBaseType(length, baseType) != "" {
+		return
+	}
+
+	sess.cache.lock.Lock()
+	if sym.baseTypeWarned {
+		sess.cache.lock.Unlock()
+		return
+	}
+	sym.baseTypeWarned = true
+	sess.cache.lock.Unlock()
+
+	sess.logger.Warn("cannot resolve the base type of a user-defined type; no datatype table is loaded",
+		"symbol", symbolName,
+		"dataType", dataType,
+		"size", length,
+		"detail", "4- and 8-byte widths are ambiguous (DINT/REAL, LINT/LREAL share them), so they cannot be inferred from size",
+		"hint", "call LoadSymbols (or LoadDataTypes) to load the datatype table; without it this symbol's value is delivered as an unconverted string")
 }
 
 // GetJSON serializes the symbol's current cached value to JSON. For
@@ -286,7 +469,7 @@ func (v SymbolView) GetJSON() string {
 
 	jsonData, err := json.Marshal(data)
 	if err != nil {
-		getDefaultLogger().Warn("GetJSON marshal error", "symbol", name, "error", err)
+		v.log().Warn("GetJSON marshal error", "symbol", name, "error", err)
 		return ""
 	}
 	return string(jsonData)
@@ -363,7 +546,7 @@ func collectSubtree(s *symbol, conn *Session, out *[]SymbolView) {
 
 func collectSubtreeDepth(s *symbol, conn *Session, out *[]SymbolView, depth int) {
 	if depth >= collectSubtreeMaxDepth {
-		getDefaultLogger().Warn("collectSubtree hit depth cap; possible Children cycle or malformed symbol tree",
+		connLogger(conn).Warn("collectSubtree hit depth cap; possible Children cycle or malformed symbol tree",
 			"symbol", s.FullName,
 			"max_depth", collectSubtreeMaxDepth)
 		return
@@ -399,7 +582,7 @@ func (s *symbol) view(conn *Session) SymbolView {
 	}
 }
 
-func parseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUploadDataType) (symbols map[string]*symbol, err error) {
+func parseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUploadDataType, lg *slog.Logger) (symbols map[string]*symbol, err error) {
 	symbols = map[string]*symbol{}
 	buff := bytes.NewBuffer(data)
 
@@ -432,7 +615,7 @@ func parseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUpload
 		item.Comment = string(comment)
 		item.SymbolEntry = result
 		endBuff := buff.Len()
-		symbol := addSymbol(item, datatypes)
+		symbol := addSymbol(item, datatypes, lg)
 
 		symbols[symbolKey(item.Name)] = symbol
 		addChildren(symbol, symbols)
@@ -458,7 +641,7 @@ func addChildren(s *symbol, symbols map[string]*symbol) {
 	}
 }
 
-func addSymbol(uploadSym symbolUploadSymbol, datatypes map[string]SymbolUploadDataType) *symbol {
+func addSymbol(uploadSym symbolUploadSymbol, datatypes map[string]SymbolUploadDataType, lg *slog.Logger) *symbol {
 	flags := SymbolFlag(uploadSym.SymbolEntry.Flags)
 	sym := &symbol{
 		Name:              uploadSym.Name,
@@ -477,7 +660,7 @@ func addSymbol(uploadSym symbolUploadSymbol, datatypes map[string]SymbolUploadDa
 
 	dt, ok := datatypes[uploadSym.DataType]
 	if ok {
-		sym.Children = dt.addOffset(sym, datatypes, sym.Group)
+		sym.Children = dt.addOffset(sym, datatypes, sym.Group, lg)
 	}
 
 	return sym
@@ -489,14 +672,14 @@ func addSymbol(uploadSym symbolUploadSymbol, datatypes map[string]SymbolUploadDa
 // but not enforced over the wire).
 const addOffsetMaxDepth = 256
 
-func (data *SymbolUploadDataType) addOffset(parent *symbol, datatypes map[string]SymbolUploadDataType, group uint32) (children map[string]*symbol) {
-	return data.addOffsetDepth(parent, datatypes, group, 0)
+func (data *SymbolUploadDataType) addOffset(parent *symbol, datatypes map[string]SymbolUploadDataType, group uint32, lg *slog.Logger) (children map[string]*symbol) {
+	return data.addOffsetDepth(parent, datatypes, group, 0, lg)
 }
 
-func (data *SymbolUploadDataType) addOffsetDepth(parent *symbol, datatypes map[string]SymbolUploadDataType, group uint32, depth int) (children map[string]*symbol) {
+func (data *SymbolUploadDataType) addOffsetDepth(parent *symbol, datatypes map[string]SymbolUploadDataType, group uint32, depth int, lg *slog.Logger) (children map[string]*symbol) {
 	children = map[string]*symbol{}
 	if depth >= addOffsetMaxDepth {
-		getDefaultLogger().Warn("addOffset hit depth cap; possible datatype self-cycle in PLC response",
+		logOr(lg).Warn("addOffset hit depth cap; possible datatype self-cycle in PLC response",
 			"parent", parent.FullName,
 			"datatype", data.DataType,
 			"max_depth", addOffsetMaxDepth)
@@ -515,6 +698,12 @@ func (data *SymbolUploadDataType) addOffsetDepth(parent *symbol, datatypes map[s
 		}
 
 		child := symbol{
+			// Children built here reach the cache through their parent, so the
+			// stamping at ingest never sees them — and rebuildSymbolChildren runs
+			// this path again when the datatype table arrives after the symbol list.
+			// Without this their parse and serialise warnings fall back to the
+			// package default logger, which is the bypass this change set removes.
+			logger:            lg,
 			Name:              segment.Name,
 			LastUpdateTime:    time.Now(),
 			MinUpdateInterval: 50 * time.Millisecond,
@@ -532,7 +721,7 @@ func (data *SymbolUploadDataType) addOffsetDepth(parent *symbol, datatypes map[s
 		// Enums have children (enum constants) but should be parsed as
 		// their base type (e.g. INT), not expanded as struct fields.
 		if dt, ok := datatypes[segment.DataType]; ok && !isEnumDataType(&dt) {
-			child.Children = dt.addOffsetDepth(&child, datatypes, child.Group, depth+1)
+			child.Children = dt.addOffsetDepth(&child, datatypes, child.Group, depth+1, lg)
 		}
 
 		children[key] = &child
@@ -551,11 +740,11 @@ func isEnumDataType(dt *SymbolUploadDataType) bool {
 		slices.Contains(parseableTypes, dt.DataType)
 }
 
-func parseUploadSymbolInfoDataTypes(data []byte) (datatypes map[string]SymbolUploadDataType, err error) {
+func parseUploadSymbolInfoDataTypes(data []byte, lg *slog.Logger) (datatypes map[string]SymbolUploadDataType, err error) {
 	buff := bytes.NewBuffer(data)
 	datatypes = make(map[string]SymbolUploadDataType)
 	for buff.Len() > 0 {
-		header, err := decodeSymbolUploadDataType(buff, "")
+		header, err := decodeSymbolUploadDataType(buff, "", lg)
 		if err != nil {
 			return nil, fmt.Errorf("parsing datatype entry: %w", err)
 		}
@@ -564,7 +753,7 @@ func parseUploadSymbolInfoDataTypes(data []byte) (datatypes map[string]SymbolUpl
 	return
 }
 
-func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header SymbolUploadDataType, err error) {
+func decodeSymbolUploadDataType(data *bytes.Buffer, parent string, lg *slog.Logger) (header SymbolUploadDataType, err error) {
 	result := datatypeEntry{}
 	header = SymbolUploadDataType{}
 
@@ -572,13 +761,13 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 
 	if totalSize < 48 {
 		err = fmt.Errorf("%s - wrong size < 48 bytes", parent)
-		getDefaultLogger().Error("error during binary read", "error", err, hexAttr("data", data.Bytes()))
+		logOr(lg).Error("error during binary read", "error", err, hexAttr("data", data.Bytes()))
 		return
 	}
 
 	err = binary.Read(data, binary.LittleEndian, &result)
 	if err != nil {
-		getDefaultLogger().Error("error during binary read", "error", err)
+		logOr(lg).Error("error during binary read", "error", err)
 		return
 	}
 	name := make([]byte, result.NameLength)
@@ -587,19 +776,19 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 
 	err = binary.Read(data, binary.LittleEndian, name)
 	if err != nil {
-		getDefaultLogger().Error("error during binary read", "error", err)
+		logOr(lg).Error("error during binary read", "error", err)
 		return
 	}
 	data.Next(1)
 	err = binary.Read(data, binary.LittleEndian, dt)
 	if err != nil {
-		getDefaultLogger().Error("error during binary read", "error", err)
+		logOr(lg).Error("error during binary read", "error", err)
 		return
 	}
 	data.Next(1)
 	err = binary.Read(data, binary.LittleEndian, comment)
 	if err != nil {
-		getDefaultLogger().Error("error during binary read", "error", err)
+		logOr(lg).Error("error during binary read", "error", err)
 		return
 	}
 	data.Next(1)
@@ -642,11 +831,11 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 			}
 			arrayLevels = append(arrayLevels, arrayInfo)
 		}
-		header.Children = makeArrayChildren(arrayLevels, header.DataType, header.DatatypeEntry.Size)
+		header.Children = makeArrayChildren(arrayLevels, header.DataType, header.DatatypeEntry.Size, lg)
 	} else {
 		// Children is standard variables
 		for j := 0; j < int(result.SubItems); j++ {
-			child, err := decodeSymbolUploadDataType(buff, header.Name)
+			child, err := decodeSymbolUploadDataType(buff, header.Name, lg)
 			if err != nil {
 				return header, fmt.Errorf("reading subitem %d of %s: %w", j, header.Name, err)
 			}
@@ -663,7 +852,7 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string) (header Symbo
 // 1M is a safety ceiling well above any legitimate use.
 const maxArrayElementsPerLevel = 1_000_000
 
-func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (children map[string]*SymbolUploadDataType) {
+func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32, lg *slog.Logger) (children map[string]*SymbolUploadDataType) {
 	children = map[string]*SymbolUploadDataType{}
 
 	if len(levels) < 1 {
@@ -679,14 +868,14 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (chil
 	// (2) Reject when LBound + Elements overflows uint32 — loop counter would
 	//     wrap and either skip the body or iterate ~4 billion times.
 	if level.Elements > maxArrayElementsPerLevel {
-		getDefaultLogger().Error("makeArrayChildren: array Elements exceeds sanity cap, refusing to allocate",
+		logOr(lg).Error("makeArrayChildren: array Elements exceeds sanity cap, refusing to allocate",
 			"declared_elements", level.Elements,
 			"cap", maxArrayElementsPerLevel,
 			"datatype", dt)
 		return
 	}
 	if uint64(level.LBound)+uint64(level.Elements) > uint64(^uint32(0)) {
-		getDefaultLogger().Error("makeArrayChildren: LBound + Elements overflows uint32, refusing",
+		logOr(lg).Error("makeArrayChildren: LBound + Elements overflows uint32, refusing",
 			"lbound", level.LBound,
 			"elements", level.Elements,
 			"datatype", dt)
@@ -697,7 +886,7 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32) (chil
 	// and deep-copying would be expensive for large arrays (e.g., ARRAY[0..999]).
 	// Recursion size shrinks by this level's element count so inner-dim
 	// elements compute correct per-element byte size, not the outer total.
-	subChildren := makeArrayChildren(levels[1:], dt, size/level.Elements)
+	subChildren := makeArrayChildren(levels[1:], dt, size/level.Elements, lg)
 
 	var offset uint32
 
@@ -724,7 +913,7 @@ func (s *symbol) getJSON() string {
 	data := s.parseTree()
 	jsonData, err := json.Marshal(data)
 	if err != nil {
-		getDefaultLogger().Warn("getJSON marshal error", "symbol", s.Name, "error", err)
+		s.log().Warn("getJSON marshal error", "symbol", s.Name, "error", err)
 		return ""
 	}
 	return string(jsonData)
@@ -758,7 +947,7 @@ func (s *symbol) parseTree() (rData interface{}) {
 		case s.DataType == "BOOL":
 			v, err := strconv.ParseBool(s.Value)
 			if err != nil {
-				getDefaultLogger().Warn("parseTree: invalid BOOL value, defaulting to false",
+				s.log().Warn("parseTree: invalid BOOL value, defaulting to false",
 					"symbol", s.Name, "value", s.Value, "error", err)
 			}
 			rData = v
@@ -767,21 +956,21 @@ func (s *symbol) parseTree() (rData interface{}) {
 		case isInSet(s.DataType, signedIntTypes):
 			v, err := strconv.ParseInt(s.Value, 10, 64)
 			if err != nil {
-				getDefaultLogger().Warn("parseTree: invalid signed integer value, defaulting to 0",
+				s.log().Warn("parseTree: invalid signed integer value, defaulting to 0",
 					"symbol", s.Name, "dataType", s.DataType, "value", s.Value, "error", err)
 			}
 			rData = v
 		case isInSet(s.DataType, unsignedIntTypes):
 			v, err := strconv.ParseUint(s.Value, 10, 64)
 			if err != nil {
-				getDefaultLogger().Warn("parseTree: invalid unsigned integer value, defaulting to 0",
+				s.log().Warn("parseTree: invalid unsigned integer value, defaulting to 0",
 					"symbol", s.Name, "dataType", s.DataType, "value", s.Value, "error", err)
 			}
 			rData = v
 		case isInSet(s.DataType, floatTypes):
 			v, err := strconv.ParseFloat(s.Value, 64)
 			if err != nil {
-				getDefaultLogger().Warn("parseTree: invalid float value, defaulting to 0",
+				s.log().Warn("parseTree: invalid float value, defaulting to 0",
 					"symbol", s.Name, "dataType", s.DataType, "value", s.Value, "error", err)
 			}
 			rData = v
@@ -792,7 +981,7 @@ func (s *symbol) parseTree() (rData interface{}) {
 			// parsed cleanly under ParseFloat.
 			v, err := strconv.ParseFloat(s.Value, 64)
 			if err != nil {
-				getDefaultLogger().Warn("parseTree: invalid numeric value, defaulting to 0",
+				s.log().Warn("parseTree: invalid numeric value, defaulting to 0",
 					"symbol", s.Name, "dataType", s.DataType, "value", s.Value, "error", err)
 			}
 			rData = v

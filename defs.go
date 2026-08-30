@@ -734,6 +734,12 @@ const (
 	ReasonInvalidSize          Reason = "invalid-size"
 	ReasonReloadCapExhausted   Reason = "reload-cap-exhausted"
 	ReasonReloadInProgress     Reason = "reload-in-progress"
+	// ReasonHeartbeatSilent is delivered when the internal heartbeat has gone
+	// silent and the session is NOT re-subscribing because the caller chose
+	// WithHeartbeatRecovery(HeartbeatRecoveryObserve). It is the only signal that
+	// mode produces, and it means this session's subscriptions are dead until the
+	// consumer rebuilds it.
+	ReasonHeartbeatSilent Reason = "heartbeat-silent"
 )
 
 // detectStaleCache classifies a PLC return code against the R-CACHE-009

@@ -330,7 +330,7 @@ sess, _ := ads.NewSession(ctx, ads.AMSEndpoint{IP: ip, Port: 48898, AMS: target}
 | `WithSymbolVersionStrategy(s)` | `SymbolVersionAutoReload` | Online-change handling strategy (`AutoReload` / `Close` / `Ignore`) |
 | `WithMaxSymbolVersionReloadAttempts(n)` | `3` | Cap reload attempts within the sliding window (AutoReload only) |
 | `WithSymbolVersionReloadWindow(d)` | `60s` | Sliding window length for the reload-attempt cap |
-| `WithOnSymbolVersionChanged(fn)` | None | Callback fired once per online-change detection (`reason` is one of the `Reason*` constants) |
+| `WithOnSymbolVersionChanged(fn)` | None | Callback fired once per online-change detection (`reason` is one of the `Reason*` constants). Also fires with `ReasonHeartbeatSilent` under `WithHeartbeatRecovery(HeartbeatRecoveryObserve)` |
 | `WithLocalAMS(addr)` | NetID auto-derived; Port random in 32768-49151 | Override source AMSAddress in outgoing ADS headers. The AMS port is a logical identifier inside the header, NOT the TCP source port (kernel-assigned) and NOT the TCP destination port (always 48898). Each Session randomizes by default so distinct Session instances present distinct AMS source identities to the PLC |
 | `WithLocalBindIP(ip)` | Unset — OS picks via routing table | Pin the outbound TCP source IP. Used for multi-Session deployments on hosts with IP aliases. Invalid IP → Warn + nil (OS routing). See §Limitations for the multi-Session constraint |
 | `WithSkipRouteRegistration()` | Off | Explicit opt-out from probe+AddRoute. Required when routes are managed externally (TC3 UI pre-registered, AmsRouterDaemon front-end). Equivalent to omitting `WithRoute` but explicit |
@@ -338,6 +338,10 @@ sess, _ := ads.NewSession(ctx, ads.AMSEndpoint{IP: ip, Port: 48898, AMS: target}
 | `WithRequestTimeout(d)` | 5s | Per-request timeout for ADS commands and initial TCP dial |
 | `WithNotificationHeartbeat(interval, missed)` | `2s`, `5` | Tune the internal cyclic subscription that detects subscriptions dying silently. `interval` is clamped to the ADS cycle-time limit (~400s); `missed` below 2 is raised to 2 |
 | `WithoutNotificationHeartbeat()` | Heartbeat on | Opt out. Saves one PLC notification handle and one 1-byte sample per interval, at the cost of not noticing a runtime restart that leaves the TCP connection up |
+| `WithNotificationSilenceTimeout(d)` | Derived from `missed` (10s) | State the tolerated silence as a duration instead of a tick count; `missed` is derived (rounded up, floored at 2). Last of this and `WithNotificationHeartbeat`'s `missed` wins |
+| `WithHeartbeatRecovery(mode)` | `HeartbeatRecoveryImmediate` | What happens when the heartbeat goes silent. `Immediate` re-subscribes at once; `Confirm` waits for a second consecutive silent window before churning every handle; `Observe` reports (log + `ReasonHeartbeatSilent` callback) and leaves the rebuild to the consumer |
+| `WithRuntimeStateWatch(d)` | `5s` | How often the runtime state (RUN/CONFIG) is polled on the system service port. **Was previously the heartbeat interval** — the two are independent as of this release |
+| `WithoutRuntimeStateWatch()` | Watch on | Turn the state poll off. The gates on symbol and subscription calls then fall back to permitting, so a PLC in CONFIG fails the older, more obscure way |
 | `WithAmsPeerListen(port)` | Off (fallback binds 48898 on demand) | Listen on `port` for a connection the PLC opens to US. Needed for devices that treat their route to this host as a peer route and answer only on their own connection |
 | `WithoutAmsPeerFallback()` | Fallback on | Never bind the AMS port. Use on hosts where a local TwinCAT router owns 48898 |
 
@@ -390,6 +394,44 @@ not executing.
 The gate only ever fires on a positive reading. A device that does not serve the
 system service port behaves exactly as before, and the poll gives up after five
 consecutive failures.
+
+## Diagnosing a dropped connection
+
+A TCP drop has two very different meanings, and they used to look identical — both surfaced as
+`ErrTransportClosed` with a hint naming the route. The session now classifies them by whether the
+connection ever carried an AMS frame, and reports the verdict in the log for every drop, and as a
+sentinel on the error `Connect` returns:
+
+| Verdict | Sentinel | What it means | Where to look |
+|---|---|---|---|
+| Never served | `ErrRouteNotServed` | The connection was dropped without carrying a single frame | Route for our NetID, target NetID, credentials, AMS port, or another client on this host IP holding the router's single per-host TCP slot |
+| Established drop | `ErrEstablishedDropped` | The connection had been delivering frames and was then dropped | Not the route — it was demonstrably being served. Eviction by another client on this IP, a runtime restart, or the network path |
+
+```go
+if err := sess.Connect(ctx); err != nil {
+    switch {
+    case errors.Is(err, ads.ErrEstablishedDropped):
+        // the route worked a frame ago; do not go hunting route tables
+    case errors.Is(err, ads.ErrRouteNotServed):
+        // addressing or route problem
+    }
+}
+```
+
+**Scope of the sentinels:** they are attached to the error `Connect` returns when the transport
+drops during a connect. A drop on an already-running session is handled by the reconnect
+machinery and does not surface an error to the caller — RPCs issued in that window still fail
+with `ErrTransportClosed`, and the verdict for that drop is in the log line below.
+
+Both log lines carry `localPort`, `framesPrimary`, `framesPeer` and `uptime` at INFO, so a drop
+can be correlated against a packet capture after the fact. Note `framesPeer`: on a device that
+answers only on the connection it opens to us (see §Peer-route devices), the primary socket
+carries no frames at all, so the verdict counts frames on either socket.
+
+A connection that keeps dropping is throttled across reconnect cycles, not just within one:
+anything that fails to stay up for 60s counts as a flap and escalates through the
+`WithBackoff` tiers, up to `MaxInterval` (30s by default). Lower `MaxInterval` if stream
+continuity during a flapping episode matters more than sparing the PLC's socket table.
 
 ## Peer-route devices
 

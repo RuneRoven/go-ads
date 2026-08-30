@@ -65,17 +65,137 @@ var ErrTransportClosed = errors.New("ads: client transport closed")
 // "client transport closed", which is the exact ambiguity this package exists to
 // remove. Measured against a PLC whose route table had been wiped.
 //
-// Four plausible causes, named in the order they are worth checking. Listing only
-// the route one has previously sent people after a mistyped NetID, so all four stay.
+// Five plausible causes, named in the order they are worth checking. Listing only
+// the route one has previously sent people after a mistyped NetID, so all five stay.
 // Both ends of the addressing go in the message, so the reader can check them
 // without reconstructing the config.
+//
+// The eviction cause is last but not rare: a Beckhoff AMS router serves one TCP
+// per host and closes the older one (Beckhoff/ADS#49), so a second client on this
+// IP -- or a redial storm of our own -- produces a reset indistinguishable at the
+// wire level from a missing route. A field investigation spent hours re-reading
+// route tables because the hint named only the route causes.
 func resetAfterConnectHint(source, target AMSAddress) string {
 	return fmt.Sprintf("a reset right after TCP connect means one of: "+
 		"no route is registered on the PLC for our NetID (%s), "+
 		"the target NetID (%s) does not exist on this PLC, "+
 		"the route credentials were rejected, "+
-		"or AMS port %d addresses no running runtime (expect 851 on TwinCAT 3, 801 on TwinCAT 2)",
+		"AMS port %d addresses no running runtime (expect 851 on TwinCAT 3, 801 on TwinCAT 2), "+
+		"or another client on this host IP took the router's single per-host TCP slot and evicted us",
 		source.NetIDString(), target.NetIDString(), target.Port)
+}
+
+// ErrRouteNotServed reports a connection that was dropped without ever carrying
+// an AMS frame: the addressing or the route is the thing to look at. Distinct
+// from ErrEstablishedDropped so a consumer can branch without matching strings.
+var ErrRouteNotServed = errors.New("connection dropped before the PLC served any frame")
+
+// ErrEstablishedDropped reports a connection that had been carrying AMS frames
+// and was then dropped by the PLC or something on the path. The route
+// demonstrably existed, so route tables are the wrong place to look; eviction by
+// another client on this host IP, a runtime restart, or the network path are the
+// candidates.
+var ErrEstablishedDropped = errors.New("established connection dropped by the PLC or the network")
+
+// framesSeen reports how many AMS frames this client has decoded across both
+// socket directions.
+func (c *Client) framesSeen() uint64 {
+	return c.framesPrimary.Load() + c.framesPeer.Load()
+}
+
+// wasEstablished reports whether this client ever carried an AMS frame, which is
+// what separates a drop worth diagnosing as a route problem from one worth
+// diagnosing as a lost connection.
+//
+// Note what it does NOT mean: a frame carrying an AMS ErrorCode (a router
+// rejection, a port with no runtime behind it) counts. "The router talked to us"
+// is the claim, not "the route worked".
+func (c *Client) wasEstablished() bool { return c.framesSeen() > 0 }
+
+// uptimeAttr renders how long this client's connection had been up, for a drop
+// log line. Returns a nil-valued attr for a zero dialedAt so the paths that never
+// set it (raw Dial before its DialTimeout, test-built literals) print nothing
+// instead of a duration measured from the zero time.
+func (c *Client) uptimeAttr() slog.Attr {
+	if c.dialedAt.IsZero() {
+		return slog.Attr{}
+	}
+	return slog.Duration("uptime", time.Since(c.dialedAt))
+}
+
+// localPort reports the local TCP port of the primary connection, or 0 when
+// there is none.
+//
+// Read it BEFORE the socket is closed: LocalAddr on a closed connection is not
+// reliable, and the port is the field every drop investigation needed to
+// correlate the event against a packet capture.
+func (c *Client) localPort() int {
+	c.tx.connMu.Lock()
+	conn := c.tx.connection
+	c.tx.connMu.Unlock()
+	if conn == nil {
+		return 0
+	}
+	addr, ok := conn.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		return 0
+	}
+	return addr.Port
+}
+
+// logDropVerdict reports a primary-transport drop, split by whether this
+// connection had ever carried a frame.
+//
+// Before the split, both cases produced the same line and the same route hint,
+// because the only evidence consulted was the errno — and EOF/ECONNRESET look
+// identical whether the socket is 20ms or 20h old. A field investigation lost
+// hours re-reading route tables on drops of sessions that had been delivering
+// samples for half an hour.
+//
+// Both branches keep "transport down" in the message and go through
+// transportFaultLevel(): the level is gated for the handshake case (an expected
+// RST during a cold-start probe is not an ERROR), and an AST guard in the tests
+// enforces both properties.
+func (c *Client) logDropVerdict(err error) {
+	attrs := []any{
+		"error", err,
+		"localPort", c.localPort(),
+		"framesPrimary", c.framesPrimary.Load(),
+		"framesPeer", c.framesPeer.Load(),
+	}
+	if up := c.uptimeAttr(); up.Key != "" {
+		attrs = append(attrs, up)
+	}
+	if c.wasEstablished() {
+		c.logger.Log(c.ctx, c.transportFaultLevel(),
+			"PLC dropped an established connection, transport down",
+			append(attrs,
+				"hint", establishedDropHint(),
+				"sourceNetID", c.sourceAddr().NetIDString(),
+				"targetNetID", c.target.NetIDString(),
+				"targetPort", c.target.Port)...)
+		return
+	}
+	if isLikelyMissingRoute(err) {
+		c.logger.Log(c.ctx, c.transportFaultLevel(), "PLC closed connection, transport down",
+			append(attrs,
+				"hint", resetAfterConnectHint(c.sourceAddr(), c.target),
+				"sourceNetID", c.sourceAddr().NetIDString(),
+				"targetNetID", c.target.NetIDString(),
+				"targetPort", c.target.Port)...)
+		return
+	}
+	c.logger.Log(c.ctx, c.transportFaultLevel(), "listen read error, transport down", attrs...)
+}
+
+// establishedDropHint explains a reset that arrives on a connection which had
+// been working. The route is demonstrably not the problem — it was being served
+// one frame ago — so the causes worth naming are the ones that end a healthy
+// connection.
+func establishedDropHint() string {
+	return "this connection had been carrying AMS frames, so the route was being served: " +
+		"look at another client on this host IP taking the router's single per-host TCP slot, " +
+		"a PLC runtime restart or CONFIG toggle, or the network path (a VPN or subnet router in between)"
 }
 
 // isLikelyMissingRoute returns true if err indicates a likely missing-AMS-route
@@ -147,6 +267,37 @@ type Client struct {
 	// one re-enable ERROR logging while the outer is still running — the same
 	// reason subscribeInFlight is a counter.
 	handshaking atomic.Int64
+
+	// framesPrimary/framesPeer count AMS frames this client has decoded, split by
+	// which socket they arrived on. Together they answer the question that decides
+	// how a drop is reported: did this connection ever work?
+	//
+	// Two counters rather than one, because either single counter is wrong:
+	//
+	//   - Counting only the primary socket misclassifies a whole device class. On
+	//     TC3.1.4026/RTOS the PLC accepts our requests on the connection we opened
+	//     but answers on one IT opens back to us (see AcceptPeerConn), so a
+	//     perfectly healthy routed session decodes ZERO frames on its primary for
+	//     its entire life. Voting "never served" on those drops would give them the
+	//     route-suspect diagnosis and the slow, never-served backoff.
+	//   - One shared counter lets a peer frame vote the primary "established",
+	//     which is the inverse error.
+	//
+	// The verdict (dropVerdict) is "any frame on any socket of this client", and
+	// both counts go in the log so the operator can see which socket was silent.
+	framesPrimary atomic.Uint64
+	framesPeer    atomic.Uint64
+
+	// dialedAt is when this client's connection was established, used for the
+	// uptime on a drop. Set in the composite literal before the client is
+	// published and never written again — do NOT move it to an assignment after
+	// startWorkers, because readFrames reads it from the listen goroutine.
+	//
+	// Zero is a legitimate value: raw Dial builds the literal before
+	// net.DialTimeout, and ~30 test sites build &Client{} without it. Every log
+	// site must go through uptimeAttr, which prints nothing for a zero value
+	// rather than a ~2000-year duration.
+	dialedAt time.Time
 
 	// dropped is closed when THIS client's connection is known to be gone.
 	// disconnected stops new requests; this releases the ones already blocked
@@ -258,6 +409,10 @@ func Dial(
 	}
 	c.tx.connection = tcpConn
 	configureKeepAlive(tcpConn)
+	// Before startWorkers, so nothing can be reading it concurrently. The literal
+	// above is built before the dial, so this is the first point at which there is
+	// a connection time to record.
+	c.dialedAt = time.Now()
 	c.startWorkers()
 	return c, nil
 }
@@ -549,23 +704,11 @@ func (c *Client) readFrames(conn net.Conn, primary bool) {
 				return
 			default:
 			}
-			hint := ""
-			if isLikelyMissingRoute(err) {
-				hint = resetAfterConnectHint(c.sourceAddr(), c.target)
-			}
 			if !primary {
 				c.logger.Debug("inbound PLC connection closed", "error", err)
 				return
 			}
-			if hint != "" {
-				c.logger.Log(c.ctx, c.transportFaultLevel(), "PLC closed connection, transport down",
-					"error", err, "hint", hint,
-					"sourceNetID", c.sourceAddr().NetIDString(),
-					"targetNetID", c.target.NetIDString(),
-					"targetPort", c.target.Port)
-			} else {
-				c.logger.Log(c.ctx, c.transportFaultLevel(), "listen read error, transport down", "error", err)
-			}
+			c.logDropVerdict(err)
 			c.callOnDrop()
 			return
 		}
@@ -604,6 +747,14 @@ func (c *Client) readFrames(conn net.Conn, primary bool) {
 			c.logger.Log(c.ctx, c.transportFaultLevel(), "listen body read error, transport down", "error", err)
 			c.callOnDrop()
 			return
+		}
+		// A full frame arrived. Counted here rather than in listen because this is
+		// the only decode loop and it serves both socket directions; see
+		// framesPrimary for why the split matters.
+		if primary {
+			c.framesPrimary.Add(1)
+		} else {
+			c.framesPeer.Add(1)
 		}
 		if tcpHeader.System > 0 {
 			select {

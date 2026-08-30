@@ -6,7 +6,124 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) a
 [go-semantic-release](https://github.com/go-semantic-release/semantic-release) for
 automated versioning and changelog generation.
 
-## Unreleased: target NetID discovery, and a pre-release correctness pass
+## Unreleased: reconnect-storm hardening and log hygiene
+
+A **patch** release: no API is removed or changed in shape, and every new option is additive.
+Two runtime behaviours differ, so they are listed first.
+
+### Upgrade notes
+
+1. **The runtime-state poll no longer runs at the heartbeat interval.** It has its
+   own fixed 5s default and its own options. Previously
+   `WithNotificationHeartbeat(30*time.Second, ...)` silently made the state poll 30s
+   too, so the gate that reports "the runtime is in CONFIG" went stale for half a
+   minute because an unrelated knob moved. If you were relying on the coupling to
+   make that poll fast, say so directly:
+
+   ```go
+   ads.WithRuntimeStateWatch(500 * time.Millisecond) // or WithoutRuntimeStateWatch()
+   ```
+2. **A transport drop is now reported as one of two different events.** A connection
+   that had been carrying AMS frames reports "PLC dropped an established
+   connection"; one that never carried a frame keeps the route-suspect diagnosis.
+   Both messages still contain `transport down`. `Connect` additionally wraps
+   `ErrEstablishedDropped` or `ErrRouteNotServed` in the error it returns, so code
+   matching on the old single message can branch on those instead — note the
+   sentinels are on `Connect`'s error only; a drop on a running session is handled
+   by the reconnect machinery and surfaces no error to the caller.
+
+### Log volume and logger routing (reported by benthos-umh)
+
+The plugin had to filter this library's output to keep a healthy session readable, and for two
+of the three causes it could not filter at all. Fixed at source, so the downstream filter
+becomes a no-op:
+
+- **Per-item bookkeeping is Debug, not Info.** Five sites that emit one record per symbol or per
+  handle — `symbol resolved on-demand`, `notification created`, `batch notification created`,
+  `handle deleted` (the read-handle path; 6fc9b14 fixed only the notification-delete path) and
+  `notification deleted`. Measured downstream: 40 of 57 Info lines in a whole healthy session.
+  Per-connection events (dial, teardown, reconnect, route registration, drop) stay at Info, and
+  the aggregate lines that carry counts stay at Info too.
+- **Symbol and datatype records now reach `WithLogger`.** They went to
+  `getDefaultLogger()` — stderr, Go's default text format, no `@service`/`path` from the host,
+  and unmutable by a consumer, since `slog.SetDefault` is not available to a process hosting
+  several ADS sessions. 18 sites: the base-type inference warnings in `symbol_codec.go`, and
+  `symbols.go`'s `parseTree` per-value warnings, depth caps, sanity caps, binary-read errors and
+  marshal warnings. Symbols now carry the session's logger (stamped as the cache takes
+  ownership), and the discovery-path free functions take one as a parameter.
+- **An unresolvable base type is no longer silent.** `SymbolView.BaseTypeName()` returned `""`
+  for a 4- or 8-byte user-defined type (a DINT-backed enum, typically) when no datatype table
+  was loaded — no log, and nothing in the return to separate it from a symbol that genuinely
+  has no base type, so downstream it shipped as an unconverted string and was never repaired.
+  It now warns once per symbol, naming the symbol, its width, why the width is ambiguous
+  (DINT/REAL and LINT/LREAL share 4 and 8) and the remedy (`LoadSymbols` / `LoadDataTypes`).
+  It still returns `""`, and it deliberately does **not** fetch the datatype table: a caller
+  running with symbol loading off has declined that upload, and a getter with no context has no
+  business doing I/O. The parse path already failed loudly (`unknown format cannot parse`); this
+  closes the metadata path.
+- **The base-type inference warning is once per symbol, not once per poll.** It reports a static
+  property — the symbol's width plus the absence of a datatype table — so repeating it every
+  read added nothing. Measured on TC2 with `loadSymbols: false`: 44 of 61 lines in a 25 s run
+  came from this one condition. The first occurrence still tells the operator to call
+  `LoadSymbols`.
+
+### Reconnect-storm hardening (field investigation 2026-08-27/28)
+
+Two days against `10.13.37.52` / `.107` / `192.168.3.118` over a tailscale subnet
+router. The drops themselves were **not** this library: `jisotalo/ads-client` (pure
+JS, no shared code) was reset at 5.099s under identical conditions, and a packet
+capture showed the PLC originating the FIN. What the investigation did expose was
+how badly this library reacted to one.
+
+- **`awaitRouteActive` no longer redials on every poll.** It redialled on each 250ms
+  iteration for the whole activation budget — about 40 TCP connections per 10s
+  window, measured in the field as 76 ephemeral ports in 11s. Because a Beckhoff AMS
+  router serves one TCP per host and closes the older
+  ([Beckhoff/ADS#49](https://github.com/Beckhoff/ADS/issues/49)), every redial
+  evicted its own predecessor: the storm was ~40 self-inflicted evictions, and on
+  Windows CE each socket then held a TIME_WAIT slot on a device with a small socket
+  table. That is the most likely source of the recurring "route registered but the
+  PLC did not serve it" state, and of one device's unrecoverable deadloop. Now at
+  most 3 redials with 250ms/500ms/1s backoff, and the wait happens **before** the
+  redial so the device gets time to release the slot. A window that runs out of
+  redials on a dead transport now reports an honest failure instead of spinning.
+- **The publish window in `publishWiredClient` is closed.** The new Client's workers
+  were started before `sess.client` pointed at it, so a drop in that window made the
+  teardown release the *previous* Client — waiting the wrong WaitGroup and leaving
+  two transmit workers competing for one send channel.
+- **One teardown+dial pair can no longer interleave with another** (`dialMu`), which
+  is the overlap that gets a session evicted.
+- **The local port is at INFO** on every dial, teardown and drop. Every drop
+  investigated needed it to line the event up against a packet capture, and at Debug
+  it was rotated away every ~9 seconds by the consumer's own log settings.
+- **A connection that resets on a timer now escalates its backoff.** Flap detection had a dead
+  zone: a drop after 5-60s neither incremented the flap counter nor reset it, so a device
+  resetting us every ~35s kept the cheapest 1s cooldown for ever. Measured on hardware
+  2026-08-28: 21 consecutive resets at a metronomic ~35s, ~5 accepted-then-reset sockets each
+  time. Now anything under the reset window counts as a flap (under 5s counts double), so the
+  cooldown climbs through the configured tiers. `BackoffConfig.MaxInterval` caps it — the 30s
+  default favours the device's socket table over stream continuity, and a consumer that prefers
+  the samples can lower it via `WithBackoff`.
+- **The reconnect loop recognises "accepted, then reset without serving".** Those drops now feed
+  the existing unserved counter, so three of them trip the 30s quiet period instead of redialing
+  at 1s. `isUnservedError` is unchanged — it stays narrow on purpose — the drop verdict is used
+  alongside it.
+- **`Close` no longer waits an unbounded time** for an in-flight reconnect.
+- **New knobs, all additive:** `WithNotificationSilenceTimeout` (state the tolerated
+  silence as a duration instead of a tick count), `WithHeartbeatRecovery`
+  (`Immediate` — the unchanged default — `Confirm`, which needs two consecutive
+  silent windows before churning every handle, or `Observe`, which reports and lets
+  the consumer rebuild), `WithRuntimeStateWatch` / `WithoutRuntimeStateWatch`.
+
+
+This branch started as target-NetID discovery and became a hardening pass. Two
+review rounds plus a spec-and-verify round found fifteen candidate defects; five
+were refuted or materially corrected by measurement rather than implemented, and
+two of the worst were found while checking something else. Every fix here has a
+test that was watched failing first, and every test was mutation-verified.
+
+
+## v2.3.0: target NetID discovery, and a pre-release correctness pass
 
 ### Upgrade notes — read before bumping
 
@@ -46,15 +163,7 @@ listed first rather than buried.
    actually works, which it did not before.
 5. **`WithForceRouteRegistration` now registers on every reconnect**, as its
    documentation always claimed. Sessions that do not set it are unaffected.
-
 No dependency or toolchain changes: this module still has zero dependencies.
-
-
-This branch started as target-NetID discovery and became a hardening pass. Two
-review rounds plus a spec-and-verify round found fifteen candidate defects; five
-were refuted or materially corrected by measurement rather than implemented, and
-two of the worst were found while checking something else. Every fix here has a
-test that was watched failing first, and every test was mutation-verified.
 
 ### Breaking / consumer-visible
 

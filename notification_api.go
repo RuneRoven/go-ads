@@ -546,10 +546,16 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	}
 	// A subscription now exists, so it is worth protecting.
 	sess.establishHeartbeat(ctx)
-	sess.logger.Info("notification created",
+	// Per-subscription, so it scales with the caller's symbol count. See the note
+	// on "symbol resolved on-demand".
+	sess.logger.Debug("notification created",
 		"handle", handle,
 		"symbol", symbolName,
 		"mode", actualMode.String())
+	// Subscribe time is when an unresolvable base type is actionable: the operator
+	// can still load the datatype table before samples start arriving as
+	// unconverted strings. Latched per symbol, so the read path stays quiet.
+	sess.warnUnresolvedBaseType(symbolName)
 	// Re-fetch *symbol from cache before commit. The pointer obtained
 	// pre-roundtrip may be orphaned if loadSymbols swapped the cache during
 	// the network call; using the stranded pointer would write notifications
@@ -814,9 +820,12 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		// Deliver anything the PLC already sent for this handle before the bind
 		// landed. Must be outside commitNotification — replay takes cache.lock.
 		sess.replayEarlySamples(ctx, []uint32{r.Handle})
-		sess.logger.Info("batch notification created",
+		// Per handle in the batch: subscribing 40 symbols produced 40 of these.
+		sess.logger.Debug("batch notification created",
 			"handle", r.Handle,
 			"symbol", info.config.SymbolName)
+		// See the note at the single-subscribe site.
+		sess.warnUnresolvedBaseType(info.config.SymbolName)
 	}
 
 	// settle is the batch tail: the sweep amendment, then the release of every PLC

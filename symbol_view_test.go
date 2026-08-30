@@ -2,6 +2,8 @@ package ads
 
 import (
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -383,4 +385,258 @@ func TestBaseTypeName_LayeredResolution(t *testing.T) {
 			t.Errorf("BaseTypeName with nil conn = %q, want INT", got)
 		}
 	})
+}
+
+// TestBaseTypeName_UnresolvableWarnsOnceWithARemedy.
+//
+// The case the plugin fell into: a 4-byte user-defined type (a DINT-backed enum)
+// with no datatype table. BaseTypeName has to return "" — 4 and 8 are ambiguous
+// widths, and this getter has no context to fetch a table with, nor permission to,
+// since a caller running with symbol loading off has declined that upload. What it
+// must NOT do is return "" silently, which is what shipped the value downstream as
+// an unconverted string with nothing in the log or the return to say why.
+//
+// Once per symbol, because a consumer may call this per sample.
+func TestBaseTypeName_UnresolvableWarnsOnceWithARemedy(t *testing.T) {
+	logs := &testLogHandler{}
+	sess := newViewTestSession()
+	sess.logger = slog.New(logs)
+
+	// The latch lives on the cached symbol, so the view must correspond to one.
+	const name = "MAIN.eMachineState"
+	sess.cache.symbols[symbolKey(name)] = &symbol{
+		FullName: name,
+		DataType: "E_MachineState",
+		BaseType: ADSTBigType,
+		Length:   4,
+	}
+	view := SymbolView{
+		FullName: name,
+		BaseType: ADSTBigType,
+		DataType: "E_MachineState",
+		Length:   4,
+		conn:     sess,
+	}
+
+	if got := view.BaseTypeName(); got != "" {
+		t.Fatalf("BaseTypeName = %q, want \"\": a 4-byte width cannot be inferred", got)
+	}
+
+	rec := logs.findByMessage("cannot resolve the base type")
+	if rec == nil {
+		t.Fatal("no warning for an unresolvable base type — this is the silent case the plugin worked around")
+	}
+	if rec.Level != slog.LevelWarn {
+		t.Errorf("level = %v, want Warn", rec.Level)
+	}
+	if got := rec.attr("symbol"); got != name {
+		t.Errorf("symbol attr = %q, want %q", got, name)
+	}
+	if got := rec.attr("size"); got != "4" {
+		t.Errorf("size attr = %q, want 4 — the width is the reason it cannot be inferred", got)
+	}
+	if hint := rec.attr("hint"); !strings.Contains(hint, "LoadSymbols") {
+		t.Errorf("hint does not name the remedy: %q", hint)
+	}
+
+	// Called again — and again — it must stay quiet.
+	for i := 0; i < 5; i++ {
+		_ = view.BaseTypeName()
+	}
+	if n := logs.countByMessage("cannot resolve the base type"); n != 1 {
+		t.Errorf("warning count = %d after 6 calls, want 1: a per-sample caller would flood the log", n)
+	}
+}
+
+// TestBaseTypeName_ResolvableDoesNotWarn: the warning must fire only when the
+// answer is genuinely unavailable, or it becomes noise of exactly the kind this
+// change set exists to remove.
+func TestBaseTypeName_ResolvableDoesNotWarn(t *testing.T) {
+	tests := []struct {
+		name     string
+		baseType ADSDataType
+		length   uint32
+		table    map[string]SymbolUploadDataType
+		want     string
+	}{
+		{name: "protocol base type", baseType: ADSTReal32, length: 4, want: "REAL"},
+		{
+			name: "datatype table", baseType: ADSTBigType, length: 4,
+			table: map[string]SymbolUploadDataType{"MyAlias": {DataType: "DINT"}}, want: "DINT",
+		},
+		{name: "inferred from a 1-byte width", baseType: ADSTBigType, length: 1, want: "SINT"},
+		{name: "inferred from a 2-byte width", baseType: ADSTBigType, length: 2, want: "INT"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &testLogHandler{}
+			sess := newViewTestSession()
+			sess.logger = slog.New(logs)
+			if tc.table != nil {
+				sess.cache.datatypes = tc.table
+			}
+			view := SymbolView{
+				FullName: "MAIN.x", BaseType: tc.baseType, DataType: "MyAlias",
+				Length: tc.length, conn: sess,
+			}
+			if got := view.BaseTypeName(); got != tc.want {
+				t.Errorf("BaseTypeName = %q, want %q", got, tc.want)
+			}
+			if n := logs.countByMessage("cannot resolve the base type"); n != 0 {
+				t.Errorf("warned %d times for a base type it could resolve", n)
+			}
+		})
+	}
+}
+
+// TestWarnUnresolvedBaseType_SubscribeThenReadWarnsOnce: the warning is raised at
+// subscribe time (where an operator can still load the datatype table before
+// samples start arriving as unconverted strings) and the read path must then stay
+// quiet — one latch serves both, or the fix trades one flood for another.
+func TestWarnUnresolvedBaseType_SubscribeThenReadWarnsOnce(t *testing.T) {
+	logs := &testLogHandler{}
+	sess := newViewTestSession()
+	sess.logger = slog.New(logs)
+
+	const name = "MAIN.eState"
+	sess.cache.symbols[symbolKey(name)] = &symbol{
+		FullName: name, DataType: "E_State", BaseType: ADSTBigType, Length: 4,
+	}
+
+	// Subscribe-time call.
+	sess.warnUnresolvedBaseType(name)
+	if n := logs.countByMessage("cannot resolve the base type"); n != 1 {
+		t.Fatalf("warnings after subscribe = %d, want 1", n)
+	}
+
+	// Read-path calls afterwards.
+	view := SymbolView{FullName: name, DataType: "E_State", BaseType: ADSTBigType, Length: 4, conn: sess}
+	for i := 0; i < 3; i++ {
+		_ = view.BaseTypeName()
+	}
+	if n := logs.countByMessage("cannot resolve the base type"); n != 1 {
+		t.Errorf("warnings after reads = %d, want 1: the subscribe-time latch must cover the read path", n)
+	}
+}
+
+// TestWarnUnresolvedBaseType_QuietOnceTheTableArrives: resolvability is
+// re-derived when the warning is considered, so a session that loads the datatype
+// table before subscribing never warns about symbols the table explains.
+func TestWarnUnresolvedBaseType_QuietOnceTheTableArrives(t *testing.T) {
+	logs := &testLogHandler{}
+	sess := newViewTestSession()
+	sess.logger = slog.New(logs)
+
+	const name = "MAIN.eState"
+	sess.cache.symbols[symbolKey(name)] = &symbol{
+		FullName: name, DataType: "E_State", BaseType: ADSTBigType, Length: 4,
+	}
+	sess.cache.datatypes = map[string]SymbolUploadDataType{"E_State": {DataType: "DINT"}}
+
+	sess.warnUnresolvedBaseType(name)
+	if n := logs.countByMessage("cannot resolve the base type"); n != 0 {
+		t.Errorf("warned %d times although the datatype table resolves this symbol", n)
+	}
+}
+
+// TestTestLogHandler_QualifiesGroups covers the capture helper itself: a handler
+// that silently flattened groups could make an assertion pass on a key the real
+// handler would have written as "group.key".
+func TestTestLogHandler_QualifiesGroups(t *testing.T) {
+	logs := &testLogHandler{}
+	lg := slog.New(logs)
+
+	lg.WithGroup("net").With("port", 48898).Info("dialed", "peer", "10.0.0.1")
+	lg.Info("inline", slog.Group("drop", slog.Int("frames", 12)))
+	lg.Info("emptyGroupKeyInlines", slog.Group("", slog.String("k", "v")))
+	lg.Info("emptyGroupIgnored", slog.Group("g"))
+
+	rec := logs.findByMessage("dialed")
+	if rec == nil {
+		t.Fatal("no record captured")
+	}
+	if got := rec.attr("net.port"); got != "48898" {
+		t.Errorf("WithGroup+With key = %q, want net.port=48898 (attrs: %v)", got, rec.Attrs)
+	}
+	if got := rec.attr("net.peer"); got != "10.0.0.1" {
+		t.Errorf("record attr under group = %q, want net.peer=10.0.0.1 (attrs: %v)", got, rec.Attrs)
+	}
+
+	inline := logs.findByMessage("inline")
+	if got := inline.attr("drop.frames"); got != "12" {
+		t.Errorf("slog.Group key = %q, want drop.frames=12 (attrs: %v)", got, inline.Attrs)
+	}
+
+	if got := logs.findByMessage("emptyGroupKeyInlines").attr("k"); got != "v" {
+		t.Errorf("an empty group key must inline its attributes, got %q", got)
+	}
+	if r := logs.findByMessage("emptyGroupIgnored"); len(r.Attrs) != 0 {
+		t.Errorf("a group with no attributes must be ignored, got %v", r.Attrs)
+	}
+}
+
+// TestTestLogHandler_GroupQualifiesOnlyLaterAttrs covers the reverse call order
+// of TestTestLogHandler_QualifiesGroups: a group opened after an attribute must
+// not reach back and qualify it. A handler that applied the group prefix that
+// happened to be open at Handle time would record "net.request_id" here, and a
+// test asserting on "request_id" would then fail for a reason that exists only
+// in the helper.
+func TestTestLogHandler_GroupQualifiesOnlyLaterAttrs(t *testing.T) {
+	logs := &testLogHandler{}
+	lg := slog.New(logs)
+
+	lg.With("request_id", "abc").WithGroup("net").With("port", 48898).Info("dialed")
+
+	rec := logs.findByMessage("dialed")
+	if rec == nil {
+		t.Fatal("no record captured")
+	}
+	if got, want := rec.attr("request_id"), "abc"; got != want {
+		t.Errorf("attr added before the group = %q, want request_id=%q (attrs: %v)", got, want, rec.Attrs)
+	}
+	if rec.hasAttr("net.request_id") {
+		t.Errorf("a group must not qualify an attribute added before it (attrs: %v)", rec.Attrs)
+	}
+	if got, want := rec.attr("net.port"), "48898"; got != want {
+		t.Errorf("attr added after the group = %q, want net.port=%q (attrs: %v)", got, want, rec.Attrs)
+	}
+}
+
+// groupLogValuer is a slog.LogValuer whose LogValue returns a group, the case
+// that separates resolving from not resolving.
+type groupLogValuer struct{ port int }
+
+func (g groupLogValuer) LogValue() slog.Value {
+	return slog.GroupValue(slog.Int("port", g.port), slog.String("proto", "tcp"))
+}
+
+// TestTestLogHandler_ResolvesLogValuer: the capture helper must resolve values
+// before inspecting their kind. secret in this package is a slog.LogValuer, so
+// an unresolved value would be stored as one opaque scalar — and a redaction
+// assertion could pass against text the real handler never wrote.
+func TestTestLogHandler_ResolvesLogValuer(t *testing.T) {
+	logs := &testLogHandler{}
+	lg := slog.New(logs)
+
+	lg.Info("valued", "conn", groupLogValuer{port: 48898})
+	lg.Info("secret", "password", secret("hunter2"))
+
+	rec := logs.findByMessage("valued")
+	if rec == nil {
+		t.Fatal("no record captured")
+	}
+	if got, want := rec.attr("conn.port"), "48898"; got != want {
+		t.Errorf("LogValuer group child = %q, want conn.port=%q (attrs: %v)", got, want, rec.Attrs)
+	}
+	if got, want := rec.attr("conn.proto"), "tcp"; got != want {
+		t.Errorf("LogValuer group child = %q, want conn.proto=%q (attrs: %v)", got, want, rec.Attrs)
+	}
+	if rec.hasAttr("conn") {
+		t.Errorf("an unresolved LogValuer was stored as a scalar (attrs: %v)", rec.Attrs)
+	}
+
+	pw := logs.findByMessage("secret")
+	if got, want := pw.attr("password"), "[REDACTED]"; got != want {
+		t.Errorf("secret attr = %q, want %q (attrs: %v)", got, want, pw.Attrs)
+	}
 }
