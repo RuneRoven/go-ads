@@ -6,6 +6,66 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) a
 [go-semantic-release](https://github.com/go-semantic-release/semantic-release) for
 automated versioning and changelog generation.
 
+## v2.3.2: correct base types for struct members, and an outage that logs as one
+
+A **patch** release. No API changes; two behaviours differ.
+
+### A struct member's base type is now the member's own
+
+`SymbolView.BaseTypeName()` answered for a program or GVL variable and guessed for anything
+inside a struct or array. `addOffsetDepth` built each child without `BaseType`, so the ADST_
+code the PLC puts on the member's datatype entry — already decoded off the wire — was never
+copied, and the authoritative first step of resolution never ran for a member. The two
+fallbacks below it then answered, differently per firmware. Measured on the lab PLCs with the
+datatype table loaded:
+
+| symbol | device | reported | declared |
+|---|---|---|---|
+| `.stMotor1.bError` | TC3 | `BYTE` | `BOOL` |
+| `.stMotor1.bError` | TC2 | `SINT` | `BOOL` |
+| `.stMotor1.fSpeed` | both | *(empty)* | `LREAL` |
+| `.sMachineName` | both | *(empty)* | `STRING(80)` |
+
+Size inference maps one byte to `SINT` unconditionally, so on a device whose table does not
+answer, a `BYTE` member holding 200 was described as a type that cannot hold it, and a consumer
+shipped `number` as the tag type for a value of `true`.
+
+`BaseTypeName()` also answers with the declared type name whenever `parse()` knows it, ahead of
+the ADST_ code, because `parse()` switches on that name first: TwinCAT 2 sends neither a code
+nor a table entry for `DT`, and TwinCAT 3 stamps `DT` with the code for its storage type,
+`UDINT`, while both parse it as a timestamp.
+
+Both changes also silence the unresolved-base-type warning in the case where it was worst: with
+the datatype table loaded, hinting that the caller should load the datatype table. Composite
+members still report `ADST_BIGTYPE` and resolve through the table exactly as before, so enums
+and nested structs are unaffected and no parse path changes.
+
+Verified on 192.168.3.70 (TC2 2.10), .118 (TC3.1.4024/CE) and .224 (TC3.1.4026/RTOS): every
+leaf of the deep test struct resolves its declared type, with the table loaded and again
+resolving each member on demand.
+
+### A session that is not serving data logs at Error
+
+Every step of the reconnect path was Warn, and only exhaustion was Error — which never happens
+when `WithMaxReconnectAttempts` is unset, as it is by default. A device down for an hour, or
+flapping every 30s for days, produced no error from this library at any point, while nothing
+was read and every notification sample in the gap was lost.
+
+Now at Error: the transition into reconnecting, each failed attempt, the flap cooldown, the
+"accepted the connection but answered nothing" backoff, a route activation that gives up, and
+`resubscribe: dropping configs after max retries` — those subscriptions are gone for good,
+which is data loss on a live session. Recovery stays Info.
+
+There is no rate limiting, deliberately: the attempt rate is already governed by the backoff,
+capped by `BackoffConfig.MaxInterval` (30s by default), so the log follows the ramp. Lines that
+describe a session that is up and serving stay at Warn — handle-release bookkeeping during a
+reconnect, one symbol going missing, the peer-route notices, and `Close` proceeding without
+waiting.
+
+If you alert on log level, expect a session that loses its PLC to raise errors now where it
+previously raised warnings. That is the point of the change, and it is what makes an outage
+visible to a supervisor that reads levels rather than messages.
+
 ## v2.3.1: reconnect-storm hardening and log hygiene
 
 A **patch** release: no API is removed or changed in shape, and every new option is additive.
