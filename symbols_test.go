@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"testing"
@@ -978,5 +979,133 @@ func TestParseUploadSymbolInfoSymbols_EntryLengthTooShort(t *testing.T) {
 	_, err := parseUploadSymbolInfoSymbols(buf.Bytes(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error for EntryLength shorter than bytes consumed, got nil")
+	}
+}
+
+// TestAddOffsetChildBaseType: a struct member or array element carries the ADST_
+// code from its datatype entry, as addSymbol already does for a top-level symbol.
+func TestAddOffsetChildBaseType(t *testing.T) {
+	datatypes := map[string]SymbolUploadDataType{
+		"ST_Inner": {
+			Name:          "ST_Inner",
+			DatatypeEntry: datatypeEntry{Size: 4, SubItems: 1, DataType: uint32(ADSTBigType)},
+			Children: map[string]*SymbolUploadDataType{
+				"nDeep": {Name: "nDeep", DataType: "DINT", DatatypeEntry: datatypeEntry{Size: 4, DataType: uint32(ADSTInt32)}},
+			},
+		},
+	}
+	dt := &SymbolUploadDataType{
+		Name:          "ST_Outer",
+		DatatypeEntry: datatypeEntry{Size: 93, SubItems: 4},
+		Children: map[string]*SymbolUploadDataType{
+			"bError":   {Name: "bError", DataType: "BOOL", DatatypeEntry: datatypeEntry{Size: 1, Offs: 0, DataType: uint32(ADSTBool)}},
+			"sMachine": {Name: "sMachine", DataType: "STRING", DatatypeEntry: datatypeEntry{Size: 81, Offs: 4, DataType: uint32(ADSTString)}},
+			"[0]":      {Name: "[0]", DataType: "DINT", DatatypeEntry: datatypeEntry{Size: 4, Offs: 85, DataType: uint32(ADSTInt32)}},
+			"stInner":  {Name: "stInner", DataType: "ST_Inner", DatatypeEntry: datatypeEntry{Size: 4, Offs: 89, DataType: uint32(ADSTBigType)}},
+		},
+	}
+
+	parent := &symbol{Name: "outer", FullName: "MAIN.outer", DataType: "ST_Outer", Length: 93}
+	children := dt.addOffset(parent, datatypes, 0x4040, nil)
+
+	want := map[string]ADSDataType{
+		"bError":   ADSTBool,
+		"sMachine": ADSTString,
+		"[0]":      ADSTInt32,
+		"stInner":  ADSTBigType,
+	}
+	for key, wantType := range want {
+		child, ok := children[key]
+		if !ok {
+			t.Fatalf("missing child %q", key)
+		}
+		if child.BaseType != wantType {
+			t.Errorf("child %q BaseType = %d, want %d (%s)", key, child.BaseType, wantType, child.DataType)
+		}
+	}
+
+	// A grandchild goes through the same path one level down; it must be
+	// stamped too, or every member of a nested struct keeps the old behaviour.
+	deep, ok := children["stInner"].Children["nDeep"]
+	if !ok {
+		t.Fatal("missing grandchild 'nDeep'")
+	}
+	if deep.BaseType != ADSTInt32 {
+		t.Errorf("grandchild nDeep BaseType = %d, want %d (DINT)", deep.BaseType, ADSTInt32)
+	}
+}
+
+// TestBaseTypeName_StructMemberWithTableLoaded reproduces 192.168.3.70 (TC2 2.10):
+// with the table loaded, members reported "" or BYTE and warned to load the table.
+func TestBaseTypeName_StructMemberWithTableLoaded(t *testing.T) {
+	logs := &testLogHandler{}
+	sess := newViewTestSession()
+	sess.logger = slog.New(logs)
+
+	datatypes := map[string]SymbolUploadDataType{
+		"ST_Status": {
+			Name:          "ST_Status",
+			DatatypeEntry: datatypeEntry{Size: 93, SubItems: 3},
+			Children: map[string]*SymbolUploadDataType{
+				"sMachineName": {Name: "sMachineName", DataType: "STRING", DatatypeEntry: datatypeEntry{Size: 81, Offs: 0, DataType: uint32(ADSTString)}},
+				"fSpeed":       {Name: "fSpeed", DataType: "LREAL", DatatypeEntry: datatypeEntry{Size: 8, Offs: 84, DataType: uint32(ADSTReal64)}},
+				"bError":       {Name: "bError", DataType: "BOOL", DatatypeEntry: datatypeEntry{Size: 1, Offs: 92, DataType: uint32(ADSTBool)}},
+			},
+		},
+		// The controllers key BOOL to its storage type, which is the lookup
+		// that made a BOOL member report BYTE.
+		"BOOL": {Name: "BOOL", DataType: "BYTE", DatatypeEntry: datatypeEntry{Size: 1}},
+	}
+	sess.cache.datatypes = datatypes
+
+	root := addSymbol(symbolUploadSymbol{
+		Name:        "MAIN.stStatus",
+		DataType:    "ST_Status",
+		SymbolEntry: symbolEntry{Size: 93, DataType: uint32(ADSTBigType)},
+	}, datatypes, nil)
+	sess.cache.symbols[symbolKey(root.FullName)] = root
+	addChildren(root, sess.cache.symbols)
+
+	tests := []struct {
+		member string
+		want   string
+	}{
+		{member: "MAIN.stStatus.sMachineName", want: "STRING"},
+		{member: "MAIN.stStatus.fSpeed", want: "LREAL"},
+		{member: "MAIN.stStatus.bError", want: "BOOL"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.member, func(t *testing.T) {
+			sym, ok := sess.cache.symbols[symbolKey(tc.member)]
+			if !ok {
+				t.Fatalf("member %q not in the cache", tc.member)
+			}
+			if got := sym.view(sess).BaseTypeName(); got != tc.want {
+				t.Errorf("BaseTypeName = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	if n := logs.countByMessage("cannot resolve the base type"); n != 0 {
+		t.Errorf("warned %d times with the datatype table loaded; the hint asks for the option that is already on", n)
+	}
+}
+
+// TestBaseTypeName_DeclaredParseableType: TC2 reports no ADST_ code and no table
+// entry for DT/DATE/TOD, yet the parser handles those names directly.
+func TestBaseTypeName_DeclaredParseableType(t *testing.T) {
+	logs := &testLogHandler{}
+	sess := newViewTestSession()
+	sess.logger = slog.New(logs)
+
+	const name = "MAIN.stStatus.dtLastUpdate"
+	sess.cache.symbols[symbolKey(name)] = &symbol{FullName: name, DataType: "DT", Length: 4}
+
+	view := SymbolView{FullName: name, DataType: "DT", Length: 4, conn: sess}
+	if got := view.BaseTypeName(); got != "DT" {
+		t.Errorf("BaseTypeName = %q, want %q", got, "DT")
+	}
+	if n := logs.countByMessage("cannot resolve the base type"); n != 0 {
+		t.Errorf("warned %d times about a type the parser resolves by name", n)
 	}
 }
