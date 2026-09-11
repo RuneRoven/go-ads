@@ -351,6 +351,11 @@ func (v SymbolView) IsValid() bool { return v.conn != nil && v.FullName != "" }
 // symbol loading off has declined that upload, and a getter with no context and no
 // error return has no business doing I/O.
 func (v SymbolView) BaseTypeName() string {
+	// parse() switches on the declared name first, so it wins: TC3 stamps DT
+	// with the ADST_ code for its storage type and still parses a timestamp.
+	if slices.Contains(parseableTypes, v.DataType) {
+		return v.DataType
+	}
 	if name := adsTypeToString(v.BaseType); name != "" {
 		return name
 	}
@@ -417,7 +422,8 @@ func (sess *Session) warnUnresolvedBaseType(symbolName string) {
 	_, inTable := sess.cache.datatypes[dataType]
 	sess.cache.lock.Unlock()
 
-	if adsTypeToString(baseType) != "" || inTable || inferBaseType(length, baseType) != "" {
+	if adsTypeToString(baseType) != "" || inTable || inferBaseType(length, baseType) != "" ||
+		slices.Contains(parseableTypes, dataType) {
 		return
 	}
 
@@ -711,6 +717,9 @@ func (data *SymbolUploadDataType) addOffsetDepth(parent *symbol, datatypes map[s
 			DataType:          segment.DataType,
 			Comment:           segment.Comment,
 			Length:            segment.DatatypeEntry.Size,
+			// Left at ADSTVoid, a member resolved by guess instead: BOOL became
+			// BYTE on TC3, SINT on TC2. Composites still report ADSTBigType.
+			BaseType: ADSDataType(segment.DatatypeEntry.DataType),
 			// Update with area and offset
 			Group:  group,
 			Offset: segment.DatatypeEntry.Offs,

@@ -3405,3 +3405,124 @@ func TestIntegrationDP3LoadOrderEquivalence(t *testing.T) {
 		t.Logf("OK — both orders produce %d-node identical tree", len(treeA))
 	}
 }
+
+// baseNameTypes are the declared type names the parser knows directly. A member
+// declared as one of these must report itself, not a storage type or a guess.
+var baseNameTypes = map[string]bool{
+	"BOOL": true, "BYTE": true, "SINT": true, "USINT": true, "INT": true,
+	"UINT": true, "WORD": true, "DINT": true, "UDINT": true, "DWORD": true,
+	"LINT": true, "ULINT": true, "LWORD": true, "REAL": true, "LREAL": true,
+	"STRING": true, "WSTRING": true, "TIME": true, "TOD": true,
+	"TIME_OF_DAY": true, "DATE": true, "DT": true, "DATE_AND_TIME": true,
+}
+
+// checkBaseType asserts one symbol's base type. A declared primitive must come
+// back as itself; anything else must resolve only when the caller says a table
+// can answer for it — a struct legitimately has no primitive base type.
+func checkBaseType(t *testing.T, s SymbolView, path string, requireResolved bool) {
+	t.Helper()
+	got := s.BaseTypeName()
+	if baseNameTypes[s.DataType] {
+		if got != s.DataType {
+			t.Errorf("%s: BaseTypeName = %q, want %q (its declared type)", path, got, s.DataType)
+		}
+		return
+	}
+	if got == "" && requireResolved {
+		t.Errorf("%s (dataType %q, %d bytes): base type unresolved", path, s.DataType, s.Length)
+	}
+}
+
+// TestIntegrationMemberBaseType: the struct and every one of its members resolve
+// a base type, both with the datatype table loaded and resolving on demand.
+func TestIntegrationMemberBaseType(t *testing.T) {
+	structName := getEnvOrDefault("ADS_READ_DEEP_STRUCT", "GVL_ProcessData.stMachineStatus")
+	ctx := context.Background()
+
+	// Full names of every node below the struct, collected from the loaded pass
+	// and re-resolved one by one in the on-demand pass.
+	var members []string
+
+	t.Run("symbols loaded", func(t *testing.T) {
+		conn := setupConnection(t)
+		if err := conn.LoadSymbols(ctx); err != nil {
+			t.Fatalf("LoadSymbols failed: %v", err)
+		}
+		symbols, _ := conn.ListSymbols()
+		root, ok := symbols[structName]
+		if !ok {
+			t.Skipf("struct %s not found", structName)
+		}
+
+		var leaves int
+		var walk func(s SymbolView, path string)
+		walk = func(s SymbolView, path string) {
+			children := s.Children()
+			if len(children) > 0 {
+				for name, child := range children {
+					childPath := path + "." + name
+					if strings.HasPrefix(name, "[") {
+						childPath = path + name
+					}
+					members = append(members, childPath)
+					walk(child, childPath)
+				}
+				return
+			}
+			// A leaf is never a struct, so the table must answer for it even
+			// when its declared type is an alias or an enum.
+			leaves++
+			checkBaseType(t, s, path, true)
+		}
+		checkBaseType(t, root, structName, false)
+		walk(root, structName)
+
+		// The whole struct reads as nested JSON; the table is what makes that work.
+		value, err := conn.ReadFromSymbol(ctx, structName)
+		if err != nil {
+			t.Errorf("ReadFromSymbol(%s) failed: %v", structName, err)
+		}
+		t.Logf("%s: %d leaves, %d nodes, struct read %d bytes of JSON", structName, leaves, len(members), len(value))
+		if leaves == 0 {
+			t.Skip("struct has no leaves to check")
+		}
+	})
+
+	if len(members) == 0 {
+		t.Skip("no members collected from the loaded pass")
+	}
+
+	t.Run("on demand", func(t *testing.T) {
+		conn := setupConnection(t)
+
+		// The struct itself first: on-demand resolution has no datatype table,
+		// so a composite has no children and its read is expected to fail.
+		root, err := conn.GetSymbol(ctx, structName)
+		if err != nil {
+			t.Errorf("GetSymbol(%s) failed: %v", structName, err)
+		} else {
+			checkBaseType(t, root, structName, false)
+		}
+		if _, err := conn.ReadFromSymbol(ctx, structName); err != nil {
+			t.Logf("whole-struct read without the table failed as documented: %v", err)
+		}
+
+		var checked, missing int
+		for _, name := range members {
+			view, err := conn.GetSymbol(ctx, name)
+			if err != nil {
+				missing++
+				t.Logf("GetSymbol(%s) failed on demand: %v", name, err)
+				continue
+			}
+			// No datatype table here, so an alias or enum member is allowed to
+			// stay unresolved; a declared primitive is not.
+			checked++
+			checkBaseType(t, view, name, false)
+		}
+		t.Logf("%s: %d of %d members resolved on demand, %d unresolvable by name", structName, checked, len(members), missing)
+		if checked == 0 {
+			t.Skip("no members resolvable on demand")
+		}
+	})
+}

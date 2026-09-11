@@ -473,3 +473,45 @@ func TestNextFlapCount_MetronomeEscalates(t *testing.T) {
 		t.Errorf("after 12 flaps the cooldown is still %v; the loop is still burning sockets every cycle", last)
 	}
 }
+
+// TestReconnect_LogsAtError: while a session is down nothing is read, and in
+// notification mode every sample in the gap is lost. umh-core's benthos health
+// check holds a data-flow component out of active on any error line and has no
+// allowlist, so the level is what makes an outage visible downstream.
+func TestReconnect_LogsAtError(t *testing.T) {
+	srv := startScriptableServer(t)
+	logs := &testLogHandler{}
+	sess := newDialableTestSession(t, srv.host, srv.port, 1)
+	sess.logger = slog.New(logs)
+	t.Cleanup(func() { sess.markClosed() })
+
+	// Nothing to dial: the loop fails at the first step and exhausts its one
+	// attempt, which is the shape of a PLC that has gone away.
+	srv.stop()
+
+	if err := sess.Reconnect(context.Background()); err == nil {
+		t.Fatal("Reconnect against a stopped server returned nil")
+	}
+
+	errs := logs.recordsByLevel(slog.LevelError)
+	if len(errs) == 0 {
+		t.Fatal("a failed reconnect logged no error: umh-core sees a healthy component while no data is read")
+	}
+	want := []string{
+		"session disconnected",             // the transition into not serving
+		"reconnect dial/start failed",      // the attempt
+		"max reconnect attempts exhausted", // giving up
+	}
+	for _, msg := range want {
+		var found bool
+		for _, rec := range errs {
+			if strings.Contains(rec.Message, msg) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no Error record contains %q; levels on the reconnect path decayed", msg)
+		}
+	}
+}
