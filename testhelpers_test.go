@@ -516,6 +516,27 @@ func (r *routeResponder) registeredNetIDs() [][6]byte {
 	return out
 }
 
+// all returns a copy of every record captured so far. Named for the question,
+// not the field it reads, because the field is already called records.
+func (h *testLogHandler) all() []logRecord {
+	root := h.root()
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	return slices.Clone(root.records)
+}
+
+// recordsByLevel returns the captured records logged at exactly level, for
+// assertions about whether something was an error or merely a warning.
+func (h *testLogHandler) recordsByLevel(level slog.Level) []logRecord {
+	var out []logRecord
+	for _, r := range h.all() {
+		if r.Level == level {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // countByMessage reports how many records contain msg. Separate from
 // findByMessage because "did this happen at all" and "did this happen once
 // rather than every tick" are different questions.

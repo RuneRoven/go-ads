@@ -1577,7 +1577,7 @@ func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, err
 			// this early exit, capping the redials makes the loop worse rather than
 			// better.
 			if redials >= maxRouteActivationRedials && isTransportDead(lastErr) {
-				sess.logger.Warn("route activation gave up: redial budget spent and the transport is gone",
+				sess.logger.Error("route activation gave up: redial budget spent and the transport is gone",
 					"attempt", attempt, "redials", redials, "error", lastErr)
 				break
 			}
@@ -2175,7 +2175,7 @@ func isUnservedError(err error) bool {
 // while waiting.
 func (sess *Session) coolDownAfterUnserved(ctx context.Context, attempts int, cause error) error {
 	d := sess.unservedCooldownDuration()
-	sess.logger.Warn("PLC accepted the connection but answered nothing; backing off completely before trying again",
+	sess.logger.Error("PLC accepted the connection but answered nothing; backing off completely before trying again",
 		"unservedAttempts", attempts, "cooldown", d, "error", cause,
 		"hint", "a stale or duplicate route entry for this source NetID, or another client on this IP, can hold a TwinCAT router in this state")
 	// Nothing open while we wait: the point is to stop competing for the
@@ -2426,7 +2426,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 
 	if flapCount > 0 {
 		delay := sess.reconnectBackoff(flapCount)
-		sess.logger.Warn("connection flapping, applying cross-cycle cooldown before reconnect",
+		sess.logger.Error("connection flapping, applying cross-cycle cooldown before reconnect",
 			"flapCount", flapCount, "delay", delay,
 			"lastConnectedAgo", time.Since(lastConn),
 			"lastDropServedNothing", neverServed,
@@ -2443,7 +2443,10 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		}
 	}
 
-	sess.logger.Info("attempting reconnect")
+	// Error, not Info: from here until "reconnect successful" nothing is read and
+	// every notification sample in the gap is lost.
+	sess.logger.Error("session disconnected, reconnecting; no data is read until it succeeds",
+		"flapCount", flapCount)
 	sess.tx.disconnected.Store(true)
 	// State is already Reconnecting (transitionToOnce above).
 
@@ -2497,7 +2500,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		if c := sess.client.Load(); c != nil {
 			servedNothing = !c.wasEstablished()
 		}
-		sess.logger.Warn("reconnect step failed, retrying",
+		sess.logger.Error("reconnect step failed, retrying",
 			"stage", stage, "error", err, "attempt", attempts,
 			"servedNothing", servedNothing)
 		sess.resetForRetry()
@@ -2549,7 +2552,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		sess.lifecycle.reconnectAttempts.Add(1)
 		if err := sess.dialAndStart(); err != nil {
 			lastErr = err
-			sess.logger.Warn("reconnect dial/start failed, retrying",
+			sess.logger.Error("reconnect dial/start failed, retrying",
 				"error", err, "ip", sess.ip, "port", sess.port, "attempt", attempts)
 			if err := sess.reconnectSleep(ctx, attempts); err != nil {
 				return err
@@ -3420,7 +3423,7 @@ func (sess *Session) resubscribeNotificationsLocked() error {
 			"retry_count", len(retryEntries))
 	}
 	if len(droppedConfigs) > 0 {
-		sess.logger.Warn("resubscribe: dropping configs after max retries",
+		sess.logger.Error("resubscribe: dropping configs after max retries",
 			"dropped", droppedConfigs,
 			"max_attempts", resubscribeMaxAttempts)
 	}
