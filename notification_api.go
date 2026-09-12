@@ -545,7 +545,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 		return 0, err
 	}
 	// A subscription now exists, so it is worth protecting.
-	sess.establishHeartbeat(ctx)
+	_ = sess.establishHeartbeat(ctx)
 	// Per-subscription, so it scales with the caller's symbol count. See the note
 	// on "symbol resolved on-demand".
 	sess.logger.Debug("notification created",
@@ -944,7 +944,7 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 	// Everything else was already bound (or recorded as failed/skipped) by
 	// onItem as its result arrived; nothing left to commit here.
 	if len(committed) > 0 {
-		sess.establishHeartbeat(ctx)
+		_ = sess.establishHeartbeat(ctx)
 	}
 	return results, nil
 }

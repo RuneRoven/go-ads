@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"os"
 	"time"
 )
 
@@ -1093,16 +1095,18 @@ func (sess *Session) heartbeatAllowedMisses() int {
 
 // establishHeartbeat registers the internal cyclic notification, if enabled and not
 // already present. Failing is not fatal: the session works, it just loses the
-// ability to notice its subscriptions dying quietly.
-func (sess *Session) establishHeartbeat(ctx context.Context) {
+// ability to notice its subscriptions dying quietly. The error is returned so a
+// caller can tell a PLC that refused from one that did not answer; most callers
+// have nothing to do with it.
+func (sess *Session) establishHeartbeat(ctx context.Context) error {
 	// Same window as recoverDeadSubscriptions: registering a beat on a session that
 	// has already released its PLC resources strands it.
 	if sess.isClosed() || !sess.heartbeatEnabled() || sess.notifications.heartbeatHandle.Load() != 0 {
-		return
+		return nil
 	}
 	c := sess.client.Load()
 	if c == nil {
-		return
+		return nil
 	}
 	// Cyclic, one byte, on the symbol-version group: runtime-served (so it dies
 	// with the runtime's notification table, which is the event being detected),
@@ -1124,7 +1128,7 @@ func (sess *Session) establishHeartbeat(ctx context.Context) {
 		// — no retry, and a later silent death went unnoticed with one Warn as the
 		// only trace. The watcher re-attempts the beat itself (see heartbeatWatch).
 		sess.startHeartbeatWatch()
-		return
+		return err
 	}
 	sess.notifications.heartbeatEstablishFailures.Store(0)
 	// A handle that is already one of the caller's would make every sample for
@@ -1145,7 +1149,7 @@ func (sess *Session) establishHeartbeat(ctx context.Context) {
 		// unnoticed. The collision itself is transient — the next attempt asks the
 		// PLC for a fresh handle.
 		sess.startHeartbeatWatch()
-		return
+		return nil
 	}
 	// CompareAndSwap, not Store: two concurrent first subscribes both see no
 	// heartbeat, both register one, and the second Store would orphan the first —
@@ -1156,11 +1160,12 @@ func (sess *Session) establishHeartbeat(ctx context.Context) {
 		if derr := c.DeleteDeviceNotification(ctx, handle); derr != nil {
 			sess.logger.Debug("releasing the redundant heartbeat handle failed", "handle", handle, "error", derr)
 		}
-		return
+		return nil
 	}
 	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
 	sess.logger.Debug("notification heartbeat established", "handle", handle, "cycle", sess.heartbeatCycle())
 	sess.startHeartbeatWatch()
+	return nil
 }
 
 // consumeHeartbeat records a beat. Returns true when the sample was the heartbeat
@@ -1241,6 +1246,9 @@ func (sess *Session) heartbeatWatch() {
 	// consecutiveFailures backs the retry off and keeps the log to one line per
 	// episode. Goroutine-local: this is the only writer.
 	consecutiveFailures := 0
+	// Separate from consecutiveFailures, which also counts a PLC that answers and
+	// refuses. Only silence is evidence about the transport.
+	unanswered := 0
 	// silentWindows counts consecutive silent windows, for
 	// HeartbeatRecoveryConfirm. Reset whenever a beat arrives or a recovery runs,
 	// so "2" always means two in a row rather than two ever.
@@ -1330,6 +1338,21 @@ func (sess *Session) heartbeatWatch() {
 			continue
 		}
 		quietTicks++
+		// Every site that counts a failure decides the same way: attempts that keep
+		// failing are evidence about the link, not the subscriptions. Spawned for the
+		// same reason as the versionCallback sites -- this runs on the heartbeat
+		// watcher and Close waits heartbeatWG, so tearing the session down inline
+		// would deadlock against the goroutine it runs on.
+		escalate := func() bool {
+			if unanswered < heartbeatFailuresBeforeReconnect {
+				return false
+			}
+			sess.logger.Error("the PLC has stopped answering; treating the transport as dead and reconnecting",
+				"unanswered", unanswered,
+				"detail", "re-subscribing cannot fix a link that is gone, and retrying on it keeps TCP from noticing")
+			go sess.triggerReconnect()
+			return true
+		}
 		// Each consecutive failed recovery doubles the tolerated silence, capped, so
 		// a PLC that stays in CONFIG for an hour costs a handful of attempts instead
 		// of one per interval.
@@ -1350,8 +1373,20 @@ func (sess *Session) heartbeatWatch() {
 			// rate was not.
 			consecutiveFailures++
 			ctx, cancel := context.WithTimeout(sess.currentLifecycleCtx(), cycle)
-			sess.establishHeartbeat(ctx)
+			err := sess.establishHeartbeat(ctx)
 			cancel()
+			// Checked here too, not only after a recovery: recoverDeadSubscriptions
+			// releases the heartbeat handle, so once one attempt has failed the loop
+			// lives in this branch and never reaches the recovery path again. A PLC
+			// that answers -- even to refuse -- is reachable, so only silence counts.
+			if isUnanswered(err) {
+				unanswered++
+				if escalate() {
+					return
+				}
+			} else {
+				unanswered = 0
+			}
 			continue
 		}
 		quietTicks = 0
@@ -1419,25 +1454,20 @@ func (sess *Session) heartbeatWatch() {
 			// Counting it doubled the wait every window while a runtime sat in CONFIG,
 			// so by the time it returned to RUN the next attempt was minutes out —
 			// measured on 192.168.3.118, which never recovered inside a 2 minute grace.
-		default:
+		case recoveryUnreachable:
+			// Nothing answered, so the link is the suspect and re-subscribing on it
+			// cannot help. Still counted for the backoff below.
 			consecutiveFailures++
-			// Attempts that keep failing are evidence about the link, not about the
-			// subscriptions: a runtime that is merely not serving yet answers and
-			// returns recoveryDeferred above. Hand it to the reconnect path, which
-			// is what a read or write error would have done.
-			//
-			// Spawned for the same reason as the versionCallback sites: this runs on
-			// the heartbeat watcher and Close waits heartbeatWG, so calling into a
-			// path that tears the session down would deadlock against the goroutine
-			// it is running in. triggerReconnect is CAS-guarded, so a transport
-			// error racing this one is harmless.
-			if consecutiveFailures >= heartbeatFailuresBeforeReconnect {
-				sess.logger.Error("subscriptions could not be recovered; treating the transport as dead and reconnecting",
-					"attempts", consecutiveFailures,
-					"detail", "re-subscribing cannot fix a link that is gone, and retrying on it keeps TCP from noticing")
-				go sess.triggerReconnect()
+			unanswered++
+			if escalate() {
 				return
 			}
+		default:
+			// The PLC answered and refused: reachable, so the subscriptions are worth
+			// retrying and this says nothing about the transport. A runtime not
+			// serving yet returns recoveryDeferred above and is not counted at all.
+			consecutiveFailures++
+			unanswered = 0
 		}
 	}
 }
@@ -1454,7 +1484,31 @@ const (
 	recoveryFailed recoveryOutcome = iota
 	recoveryDone
 	recoveryDeferred
+	// recoveryUnreachable: the attempt got no answer at all, as opposed to an
+	// answer refusing it. A PLC that replies with an ADS error is reachable and
+	// the subscriptions are worth retrying; silence is evidence about the link.
+	recoveryUnreachable
 )
+
+// isUnanswered reports whether an error means nothing came back, rather than
+// something came back saying no.
+func isUnanswered(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrTransportClosed) ||
+		errors.Is(err, ErrDisconnected) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	// An answered request carries an ADS return code; those are reachable by
+	// definition and must not count toward declaring the transport dead.
+	var rc ReturnCode
+	return !errors.As(err, &rc)
+}
 
 func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
 	// heartbeatWatch checks this too, but that check is a TOCTOU: Close can land
@@ -1535,6 +1589,9 @@ func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
 		}
 		sess.logger.Error("re-subscribe after a heartbeat timeout failed; keeping the subscriptions on file and retrying in the next window",
 			"error", err, "configs", len(intent))
+		if isUnanswered(err) {
+			return recoveryUnreachable
+		}
 		return recoveryFailed
 	}
 	// A "successful" resubscribe that bound nothing is the CONFIG case: the PLC
@@ -1549,7 +1606,7 @@ func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
 		return recoveryFailed
 	}
 	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
-	sess.establishHeartbeat(ctx)
+	_ = sess.establishHeartbeat(ctx)
 	sess.logger.Info("subscriptions re-established after the heartbeat stopped")
 	return recoveryDone
 }
