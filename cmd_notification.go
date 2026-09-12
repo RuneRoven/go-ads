@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net"
-	"os"
 	"time"
 )
 
@@ -985,12 +983,13 @@ const (
 	defaultHeartbeatInterval = 2 * time.Second
 	defaultHeartbeatMissed   = 5
 
-	// heartbeatFailuresBeforeReconnect is how many recovery attempts may fail
-	// before the transport itself is treated as the fault. Re-subscribing cannot
-	// fix a link that is gone, and repeated attempts against one keep the socket
-	// busy enough that TCP's keepalive timer never runs — measured, the session
-	// then survives the whole outage and only reconnects when the peer's RST
-	// arrives. Two is roughly 20-30s, against 107s observed without this.
+	// heartbeatFailuresBeforeReconnect is how many silent windows may pass, with
+	// no frame arriving on either socket, before the transport itself is treated
+	// as the fault. Re-subscribing cannot fix a link that is gone, and repeated
+	// attempts against one keep the socket busy enough that TCP's keepalive timer
+	// never runs -- measured, the session then survives the whole outage and only
+	// reconnects when the peer's RST arrives. Two is roughly 20-30s, against 107s
+	// observed without this.
 	heartbeatFailuresBeforeReconnect = 2
 	// maxADSCycleTime is the longest cycle an ADS notification can carry: the
 	// wire field is 32-bit 100ns ticks.
@@ -1246,9 +1245,13 @@ func (sess *Session) heartbeatWatch() {
 	// consecutiveFailures backs the retry off and keeps the log to one line per
 	// episode. Goroutine-local: this is the only writer.
 	consecutiveFailures := 0
-	// Separate from consecutiveFailures, which also counts a PLC that answers and
-	// refuses. Only silence is evidence about the transport.
-	unanswered := 0
+	// Frames seen when the last silent window opened, and how many windows have
+	// passed without that number moving. A PLC that answers -- even to refuse --
+	// moves it, which is the whole discriminator: anything arriving means the link
+	// works and the subscriptions are worth retrying. Nothing arriving is the only
+	// evidence about the transport, and it cannot be misread the way an error can.
+	framesAtWindow := uint64(0)
+	framelessWindows := 0
 	// silentWindows counts consecutive silent windows, for
 	// HeartbeatRecoveryConfirm. Reset whenever a beat arrives or a recovery runs,
 	// so "2" always means two in a row rather than two ever.
@@ -1343,12 +1346,27 @@ func (sess *Session) heartbeatWatch() {
 		// same reason as the versionCallback sites -- this runs on the heartbeat
 		// watcher and Close waits heartbeatWG, so tearing the session down inline
 		// would deadlock against the goroutine it runs on.
+		// One decision, used by every path that reaches a silent window: has any
+		// frame arrived since the last one? Spawned for the same reason as the
+		// versionCallback sites -- this runs on the heartbeat watcher and Close waits
+		// heartbeatWG, so tearing the session down inline would deadlock against the
+		// goroutine it runs on.
 		escalate := func() bool {
-			if unanswered < heartbeatFailuresBeforeReconnect {
+			frames := uint64(0)
+			if c := sess.client.Load(); c != nil {
+				frames = c.framesSeen()
+			}
+			if frames != framesAtWindow {
+				framesAtWindow = frames
+				framelessWindows = 0
 				return false
 			}
-			sess.logger.Error("the PLC has stopped answering; treating the transport as dead and reconnecting",
-				"unanswered", unanswered,
+			framelessWindows++
+			if framelessWindows < heartbeatFailuresBeforeReconnect {
+				return false
+			}
+			sess.logger.Error("no frame has arrived on either socket; treating the transport as dead and reconnecting",
+				"windows", framelessWindows, "framesSeen", frames,
 				"detail", "re-subscribing cannot fix a link that is gone, and retrying on it keeps TCP from noticing")
 			go sess.triggerReconnect()
 			return true
@@ -1373,19 +1391,13 @@ func (sess *Session) heartbeatWatch() {
 			// rate was not.
 			consecutiveFailures++
 			ctx, cancel := context.WithTimeout(sess.currentLifecycleCtx(), cycle)
-			err := sess.establishHeartbeat(ctx)
+			_ = sess.establishHeartbeat(ctx)
 			cancel()
 			// Checked here too, not only after a recovery: recoverDeadSubscriptions
 			// releases the heartbeat handle, so once one attempt has failed the loop
-			// lives in this branch and never reaches the recovery path again. A PLC
-			// that answers -- even to refuse -- is reachable, so only silence counts.
-			if isUnanswered(err) {
-				unanswered++
-				if escalate() {
-					return
-				}
-			} else {
-				unanswered = 0
+			// lives in this branch and never reaches the recovery path again.
+			if escalate() {
+				return
 			}
 			continue
 		}
@@ -1454,20 +1466,11 @@ func (sess *Session) heartbeatWatch() {
 			// Counting it doubled the wait every window while a runtime sat in CONFIG,
 			// so by the time it returned to RUN the next attempt was minutes out —
 			// measured on 192.168.3.118, which never recovered inside a 2 minute grace.
-		case recoveryUnreachable:
-			// Nothing answered, so the link is the suspect and re-subscribing on it
-			// cannot help. Still counted for the backoff below.
+		default:
 			consecutiveFailures++
-			unanswered++
 			if escalate() {
 				return
 			}
-		default:
-			// The PLC answered and refused: reachable, so the subscriptions are worth
-			// retrying and this says nothing about the transport. A runtime not
-			// serving yet returns recoveryDeferred above and is not counted at all.
-			consecutiveFailures++
-			unanswered = 0
 		}
 	}
 }
@@ -1484,31 +1487,7 @@ const (
 	recoveryFailed recoveryOutcome = iota
 	recoveryDone
 	recoveryDeferred
-	// recoveryUnreachable: the attempt got no answer at all, as opposed to an
-	// answer refusing it. A PLC that replies with an ADS error is reachable and
-	// the subscriptions are worth retrying; silence is evidence about the link.
-	recoveryUnreachable
 )
-
-// isUnanswered reports whether an error means nothing came back, rather than
-// something came back saying no.
-func isUnanswered(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrTransportClosed) ||
-		errors.Is(err, ErrDisconnected) || errors.Is(err, os.ErrDeadlineExceeded) {
-		return true
-	}
-	var ne net.Error
-	if errors.As(err, &ne) && ne.Timeout() {
-		return true
-	}
-	// An answered request carries an ADS return code; those are reachable by
-	// definition and must not count toward declaring the transport dead.
-	var rc ReturnCode
-	return !errors.As(err, &rc)
-}
 
 func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
 	// heartbeatWatch checks this too, but that check is a TOCTOU: Close can land
@@ -1589,9 +1568,6 @@ func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
 		}
 		sess.logger.Error("re-subscribe after a heartbeat timeout failed; keeping the subscriptions on file and retrying in the next window",
 			"error", err, "configs", len(intent))
-		if isUnanswered(err) {
-			return recoveryUnreachable
-		}
 		return recoveryFailed
 	}
 	// A "successful" resubscribe that bound nothing is the CONFIG case: the PLC
