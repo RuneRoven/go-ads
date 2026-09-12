@@ -1697,3 +1697,92 @@ func TestWithoutRuntimeStateWatch_StartsNoPollerAndKeepsTheOnce(t *testing.T) {
 	}
 	t.Error("no poller started after re-enabling the watch: stateOnce was consumed by the disabled path")
 }
+
+// TestHeartbeat_RecoversSubscriptionsWhileTheBeatIsHealthy pins the deadlock
+// measured on 192.168.3.107 (2026-09-12): a degraded link starved the beat,
+// recovery released every handle, the 41-symbol re-subscribe failed, and then the
+// beat -- one small request, no batch -- was re-established on its own. Silence
+// stopped, so nothing ever retried the subscriptions again, and the session sat
+// there receiving one beat every 2s and delivering no data while looking healthy.
+//
+// The beat is deliberately kept alive throughout, so heartbeat silence cannot be
+// the trigger. Only the want/have gap can be.
+func TestHeartbeat_RecoversSubscriptionsWhileTheBeatIsHealthy(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var adds atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xC00)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		adds.Add(1)
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	sess, c := newWiredTestSession(t, srv, WithNotificationHeartbeat(100*time.Millisecond, 2))
+	c.SetNotificationHandler(sess.handleNotification)
+	// The scriptable server answers individual Adds, not the sum command.
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) || !c.capabilities.SumDeleteNotifStateCAS(0, 2) {
+		t.Fatal("could not force the sum commands into the unsupported state")
+	}
+	preSeedTypedSymbol(sess, "MAIN.gap", 0xF800)
+
+	ch := make(chan *Update, 8)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.gap", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Fatalf("AddSymbolNotification: %v", err)
+	}
+	want, have := sess.notifications.subscriptionGap()
+	if want == 0 || want != have {
+		t.Fatalf("baseline not established: want=%d have=%d", want, have)
+	}
+	addsAfterSubscribe := adds.Load()
+
+	// Hold the beat alive for the rest of the test. The scriptable server does not
+	// push cyclic notifications, so without this the heartbeat goes silent and the
+	// silence path recovers -- which is the very trigger this test must exclude.
+	// heartbeatBeats is what the watcher reads to reset its quiet counter.
+	stopBeats := make(chan struct{})
+	defer close(stopBeats)
+	go func() {
+		t := time.NewTicker(20 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopBeats:
+				return
+			case <-t.C:
+				sess.notifications.heartbeatBeats.Add(1)
+			}
+		}
+	}()
+
+	// The subscriptions vanish without the caller asking and without the beat
+	// stopping: exactly the state the release-then-restore-only-the-beat path
+	// leaves behind. registered stays where it was, which is the whole point.
+	sess.notifications.lock.Lock()
+	for h := range sess.notifications.activeNotifications {
+		delete(sess.notifications.activeNotifications, h)
+	}
+	sess.notifications.lock.Unlock()
+
+	if w, h := sess.notifications.subscriptionGap(); w <= h {
+		t.Fatalf("the gap was not created: want=%d have=%d", w, h)
+	}
+
+	// No silence is ever declared -- the beat keeps arriving -- so recovery has to
+	// come from the gap check alone.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if w, h := sess.notifications.subscriptionGap(); h >= w && w > 0 {
+			t.Logf("recovered: want=%d have=%d after %d further Adds", w, h, adds.Load()-addsAfterSubscribe)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	w, h := sess.notifications.subscriptionGap()
+	t.Fatalf("subscriptions were never restored: want=%d have=%d, further Adds=%d — "+
+		"a session with a healthy beat and no subscriptions never recovers",
+		w, h, adds.Load()-addsAfterSubscribe)
+}

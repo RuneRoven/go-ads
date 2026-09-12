@@ -2106,6 +2106,18 @@ func (sess *Session) reconnectBackoff(attempt int) time.Duration {
 	}
 }
 
+// logAttempt reports a failed reconnect attempt: Error for the first, Debug for
+// the rest. The session being down is already reported once by the caller that
+// started the reconnect, and repeating it per attempt buries the log and keeps
+// umh-core's error window rolling forward for the whole outage.
+func (sess *Session) logAttempt(attempt int, msg string, args ...any) {
+	if attempt <= 1 {
+		sess.logger.Error(msg, args...)
+		return
+	}
+	sess.logger.Debug(msg, args...)
+}
+
 // reconnectSleep sleeps for the appropriate backoff duration based on the attempt
 // number. Returns early if Close() is called.
 func (sess *Session) reconnectSleep(ctx context.Context, attempt int) error {
@@ -2500,7 +2512,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		if c := sess.client.Load(); c != nil {
 			servedNothing = !c.wasEstablished()
 		}
-		sess.logger.Error("reconnect step failed, retrying",
+		sess.logAttempt(attempts, "reconnect step failed, retrying",
 			"stage", stage, "error", err, "attempt", attempts,
 			"servedNothing", servedNothing)
 		sess.resetForRetry()
@@ -2552,7 +2564,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		sess.lifecycle.reconnectAttempts.Add(1)
 		if err := sess.dialAndStart(); err != nil {
 			lastErr = err
-			sess.logger.Error("reconnect dial/start failed, retrying",
+			sess.logAttempt(attempts, "reconnect dial/start failed, retrying",
 				"error", err, "ip", sess.ip, "port", sess.port, "attempt", attempts)
 			if err := sess.reconnectSleep(ctx, attempts); err != nil {
 				return err

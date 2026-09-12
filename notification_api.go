@@ -123,6 +123,24 @@ type notificationManager struct {
 	// heartbeatEstablishFailures counts consecutive failures to register the beat,
 	// so a PLC that refuses it permanently costs one Warn rather than one per retry.
 	heartbeatEstablishFailures atomic.Int64
+	// registered is how many handles the PLC last gave us for the caller's intent:
+	// what a healthy session should have. Compared against len(activeNotifications)
+	// to notice subscriptions that went away without the caller asking.
+	//
+	// Not len(pending): pending is a superset by design and legitimately outlives a
+	// handle (see hasLiveNotification), so a symbol the PLC permanently refuses
+	// would make want != have forever and churn recovery for the life of the
+	// session. This counts what was actually achieved instead.
+	//
+	// Lowered only when the caller deletes a subscription. A release done by
+	// recovery must NOT lower it -- that gap is precisely what has to be detected.
+	registered atomic.Int64
+	// orphanSamples counts samples arriving for handles we do not own. A PLC that
+	// kept a previous session's subscriptions pushes one per cycle per handle --
+	// measured at 527 in a single log file -- so only the first is worth a Warn.
+	// Reset when a sample for an owned handle arrives, which means the episode is
+	// over. See the delete in tryOrphanDelete, which is the actual remedy.
+	orphanSamples atomic.Int64
 	// heartbeatLastNs is kept for the log line only ("silentFor"), never for the
 	// decision. A stepped clock makes it a confusing number, not a wrong outcome.
 	heartbeatLastNs atomic.Int64
@@ -228,6 +246,15 @@ func (m *notificationManager) hasConfig(symbolName string) bool {
 // already has an active notification" for a symbol with no notification at all —
 // and since DeleteDeviceNotification works by handle, a pending-only entry had no
 // exported way out: the symbol was un-subscribable for the life of the session.
+// subscriptionGap reports what a healthy session should hold against what it
+// actually holds. want > have means subscriptions went away without the caller
+// asking, which a live heartbeat does not reveal.
+func (m *notificationManager) subscriptionGap() (want, have int) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	return int(m.registered.Load()), len(m.activeNotifications)
+}
+
 func (m *notificationManager) hasLiveNotification(symbolName string) bool {
 	key := symbolKey(symbolName)
 	for _, entry := range m.activeNotifications {
@@ -606,6 +633,8 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	}
 	defer sess.notifications.lock.Unlock()
 	sess.notifications.activeNotifications[handle] = activeNotification{Sym: fresh, Ch: updateReceiver}
+	// The PLC gave us this handle, so it is part of what a healthy session holds.
+	sess.notifications.registered.Store(int64(len(sess.notifications.activeNotifications)))
 	committed = append(committed, handle)
 
 	// Save config for reconnect re-subscribe

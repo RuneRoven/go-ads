@@ -168,6 +168,8 @@ func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32
 		sess.removeNotificationConfig(symbolName)
 	}
 	delete(sess.notifications.activeNotifications, handle)
+	// The caller asked for this one to go, so a healthy session holds one fewer.
+	sess.notifications.registered.Store(int64(len(sess.notifications.activeNotifications)))
 	// Gated on the handle having actually been ours, not merely on the map being
 	// empty. A raw-handle caller — or one of AddSymbolNotification's own refusal
 	// paths releasing a handle it never committed — would otherwise clear the
@@ -253,6 +255,11 @@ func (sess *Session) sumDeleteDeviceNotification(ctx context.Context, handles []
 			sess.removeNotificationConfig(symbolName)
 		}
 		delete(sess.notifications.activeNotifications, h)
+		// Only a caller teardown lowers the baseline. A release done by recovery
+		// leaves it where it was, so the gap it opens is visible as want > have.
+		if userTeardown {
+			sess.notifications.registered.Store(int64(len(sess.notifications.activeNotifications)))
+		}
 		deleted++
 		// Debug per handle: routine teardown of an N-symbol subscription is not
 		// worth N Info lines. The summary below is the Info-worthy event.
@@ -352,11 +359,21 @@ func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestam
 			// on the PLC so the orphan handle table slot is freed; without
 			// this cleanup the TwinCAT AMS router accumulates entries
 			// across restarts until it crashes (Beckhoff issue #268).
-			sess.logger.Warn("received notification for unknown handle", "handle", handle)
+			// First of an episode at Warn, the rest at Debug: the PLC pushes one of
+			// these per cycle per orphaned handle, which buries every other line in
+			// the log and tells the operator nothing new each time.
+			if n := sess.notifications.orphanSamples.Add(1); n == 1 {
+				sess.logger.Warn("received notification for unknown handle", "handle", handle,
+					"detail", "a previous session's subscriptions are still registered on the PLC; deleting them")
+			} else {
+				sess.logger.Debug("received notification for unknown handle", "handle", handle, "sinceFirst", n)
+			}
 			sess.tryOrphanDelete(handle)
 		}
 		return
 	}
+	// An owned sample means the orphan episode is over; the next one warns again.
+	sess.notifications.orphanSamples.Store(0)
 	notification := entry.Ch
 	fullName := entry.Sym.FullName
 	sess.notifications.lock.Unlock()
@@ -1252,6 +1269,9 @@ func (sess *Session) heartbeatWatch() {
 	// evidence about the transport, and it cannot be misread the way an error can.
 	framesAtWindow := uint64(0)
 	framelessWindows := 0
+	// Ticks since the subscription gap was last acted on. Separate from quietTicks,
+	// which a beat resets.
+	gapTicks := 0
 	// silentWindows counts consecutive silent windows, for
 	// HeartbeatRecoveryConfirm. Reset whenever a beat arrives or a recovery runs,
 	// so "2" always means two in a row rather than two ever.
@@ -1317,10 +1337,42 @@ func (sess *Session) heartbeatWatch() {
 		if wanted == 0 && active == 0 {
 			continue // the caller has asked for nothing; nothing to protect
 		}
-		// No special case for "wanted but none active": a failed recovery leaves the
-		// heartbeat clock stale, so the silence check below fires again on the next
-		// tick and retries. Verified by removing this path and watching the test
-		// still pass, which is the definition of code not worth keeping.
+		// Subscriptions can go away while the beat keeps arriving, and then nothing
+		// below ever runs: the silence check is the only trigger for recovery, and a
+		// live beat means there is no silence. Measured on 192.168.3.107 2026-09-12 --
+		// 41/41 registered, link degraded, every handle released, the 41-symbol
+		// re-subscribe failed, and then the beat came back on its own because it is
+		// one small request where a re-subscribe is a batch. The session then sat
+		// receiving one beat every 2s and delivering nothing, looking healthy.
+		//
+		// registered, not len(pending): pending is a superset by design and outlives
+		// a handle, so a symbol the PLC permanently refuses would make this fire for
+		// the life of the session.
+		//
+		// gapTicks rather than quietTicks, which a beat resets -- the whole point is
+		// that beats are arriving. Same backoff as the silence path, so a PLC that
+		// refuses the re-subscribe costs the same handful of attempts.
+		gapTicks++
+		if registered := int(sess.notifications.registered.Load()); registered > active {
+			allowed := heartbeatAllowedTicks(sess.heartbeatAllowedMisses(), consecutiveFailures, cycle)
+			if gapTicks >= allowed {
+				gapTicks = 0
+				sess.logger.Error("subscriptions are missing; recovering",
+					"want", registered, "have", active,
+					"detail", "the beat is arriving, so silence would never have revealed this")
+				switch sess.recoverDeadSubscriptions() {
+				case recoveryDone:
+					consecutiveFailures = 0
+				case recoveryDeferred:
+					// Runtime not serving yet: wait, exactly as the silence path does.
+				default:
+					consecutiveFailures++
+				}
+				continue
+			}
+		} else {
+			gapTicks = 0
+		}
 		// Silence measured in ticks of this ticker, not in wall-clock time: the
 		// ticker is monotonic, so a clock step cannot make a healthy session look
 		// dead (or a dead one look healthy). See notificationManager.heartbeatBeats.
@@ -1583,6 +1635,9 @@ func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
 	}
 	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
 	_ = sess.establishHeartbeat(ctx)
+	sess.notifications.lock.Lock()
+	sess.notifications.registered.Store(int64(len(sess.notifications.activeNotifications)))
+	sess.notifications.lock.Unlock()
 	sess.logger.Info("subscriptions re-established after the heartbeat stopped")
 	return recoveryDone
 }
