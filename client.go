@@ -860,6 +860,18 @@ func (c *Client) transmitWorker() {
 			return
 		case data := <-c.tx.sendChannel:
 			c.logger.Log(context.Background(), LevelTrace, fmt.Sprintf("Sending %d bytes", len(data)))
+			// Bound the write. Without a deadline a send into a backed-up buffer
+			// blocks here for as long as the kernel retries (tcp_retries2, ~15
+			// minutes), and callOnDrop below is only reached on an error, so a
+			// wedged link never reports itself. The deadline turns that into the
+			// error case this loop already handles. Same budget as a request: a
+			// write that cannot drain in the time a caller waits for its reply is
+			// not going to.
+			if err := conn.SetWriteDeadline(time.Now().Add(c.requestTimeout)); err != nil {
+				c.logger.Log(c.ctx, c.transportFaultLevel(), "error setting the write deadline, transport down", "error", err)
+				c.callOnDrop()
+				return
+			}
 			if _, err := writer.Write(data); err != nil {
 				c.logger.Log(c.ctx, c.transportFaultLevel(), "error sending data on conn, transport down", "error", err)
 				c.callOnDrop()
@@ -867,6 +879,13 @@ func (c *Client) transmitWorker() {
 			}
 			if err := writer.Flush(); err != nil {
 				c.logger.Log(c.ctx, c.transportFaultLevel(), "error flushing data on conn, transport down", "error", err)
+				c.callOnDrop()
+				return
+			}
+			// Cleared so an idle socket is never judged by a stale deadline: the
+			// next write sets its own.
+			if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+				c.logger.Log(c.ctx, c.transportFaultLevel(), "error clearing the write deadline, transport down", "error", err)
 				c.callOnDrop()
 				return
 			}

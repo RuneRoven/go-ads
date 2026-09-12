@@ -982,6 +982,14 @@ func (h HeartbeatRecovery) String() string {
 const (
 	defaultHeartbeatInterval = 2 * time.Second
 	defaultHeartbeatMissed   = 5
+
+	// heartbeatFailuresBeforeReconnect is how many recovery attempts may fail
+	// before the transport itself is treated as the fault. Re-subscribing cannot
+	// fix a link that is gone, and repeated attempts against one keep the socket
+	// busy enough that TCP's keepalive timer never runs — measured, the session
+	// then survives the whole outage and only reconnects when the peer's RST
+	// arrives. Two is roughly 20-30s, against 107s observed without this.
+	heartbeatFailuresBeforeReconnect = 2
 	// maxADSCycleTime is the longest cycle an ADS notification can carry: the
 	// wire field is 32-bit 100ns ticks.
 	maxADSCycleTime = 400 * time.Second
@@ -1413,6 +1421,23 @@ func (sess *Session) heartbeatWatch() {
 			// measured on 192.168.3.118, which never recovered inside a 2 minute grace.
 		default:
 			consecutiveFailures++
+			// Attempts that keep failing are evidence about the link, not about the
+			// subscriptions: a runtime that is merely not serving yet answers and
+			// returns recoveryDeferred above. Hand it to the reconnect path, which
+			// is what a read or write error would have done.
+			//
+			// Spawned for the same reason as the versionCallback sites: this runs on
+			// the heartbeat watcher and Close waits heartbeatWG, so calling into a
+			// path that tears the session down would deadlock against the goroutine
+			// it is running in. triggerReconnect is CAS-guarded, so a transport
+			// error racing this one is harmless.
+			if consecutiveFailures >= heartbeatFailuresBeforeReconnect {
+				sess.logger.Error("subscriptions could not be recovered; treating the transport as dead and reconnecting",
+					"attempts", consecutiveFailures,
+					"detail", "re-subscribing cannot fix a link that is gone, and retrying on it keeps TCP from noticing")
+				go sess.triggerReconnect()
+				return
+			}
 		}
 	}
 }
