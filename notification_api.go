@@ -1022,6 +1022,10 @@ func (sess *Session) commitNotification(cfg NotificationConfig, handle uint32, c
 	}
 
 	sess.notifications.activeNotifications[handle] = activeNotification{Sym: fresh, Ch: ch}
+	// Same as the single-subscribe site: this is what a healthy session holds.
+	// Missing it here made the gap check inert for every batch subscriber, which
+	// is how the plugin subscribes -- caught on hardware, want=0 have=1.
+	sess.notifications.registered.Store(int64(len(sess.notifications.activeNotifications)))
 	// addConfig wraps in a fresh pendingNotification with resubscribeAttempts=0,
 	// so a successful subscribe naturally resets any prior retry counter.
 	sess.notifications.addConfig(cfg)
