@@ -1348,8 +1348,10 @@ func (sess *Session) heartbeatWatch() {
 		}
 		quietTicks = 0
 
-		// One Warn per episode. Repeats go to Debug: the operator needs to know the
-		// subscriptions died, not to be told again every interval until they recover.
+		// One Error per episode, because nothing is being delivered and a
+		// notification session loses the samples in the window. Repeats go to Debug:
+		// the operator needs to know the subscriptions died, not to be told again
+		// every interval until they recover.
 		msg := "no notification heartbeat within the allowed window; treating this session's subscriptions as dead and re-subscribing"
 		args := []any{
 			"cycle", cycle, "missedTicks", allowed,
@@ -1360,7 +1362,7 @@ func (sess *Session) heartbeatWatch() {
 				"changing the symbol version or reporting an error",
 		}
 		if consecutiveFailures == 0 {
-			sess.logger.Warn(msg, args...)
+			sess.logger.Error(msg, args...)
 		} else {
 			sess.logger.Debug(msg, append(args, "retry", consecutiveFailures)...)
 		}
@@ -1384,7 +1386,7 @@ func (sess *Session) heartbeatWatch() {
 			// handles under a caller that would rather rebuild the session is the
 			// thing this mode exists to avoid.
 			if consecutiveFailures == 0 {
-				sess.logger.Warn("heartbeat silent; not re-subscribing (WithHeartbeatRecovery(Observe))",
+				sess.logger.Error("heartbeat silent; not re-subscribing (WithHeartbeatRecovery(Observe))",
 					"detail", "this session's subscriptions are dead until the consumer rebuilds it")
 				// Spawned, never called inline: Close waits heartbeatWG, and this
 				// runs ON the heartbeat watcher, so a callback that rebuilds the
@@ -1506,7 +1508,7 @@ func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
 			sess.logger.Info("re-subscribe deferred: the PLC runtime stopped serving", "error", err)
 			return recoveryDeferred
 		}
-		sess.logger.Warn("re-subscribe after a heartbeat timeout failed; keeping the subscriptions on file and retrying in the next window",
+		sess.logger.Error("re-subscribe after a heartbeat timeout failed; keeping the subscriptions on file and retrying in the next window",
 			"error", err, "configs", len(intent))
 		return recoveryFailed
 	}
@@ -1517,7 +1519,7 @@ func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
 	sess.notifications.lock.Unlock()
 	if bound == 0 && len(intent) > 0 {
 		restoreIntent()
-		sess.logger.Warn("re-subscribe bound nothing (PLC not serving yet); keeping the subscriptions on file and retrying in the next window",
+		sess.logger.Error("re-subscribe bound nothing (PLC not serving yet); keeping the subscriptions on file and retrying in the next window",
 			"configs", len(intent))
 		return recoveryFailed
 	}
