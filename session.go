@@ -64,8 +64,8 @@ type sessionLifecycle struct {
 	// same router cannot coexist and get us evicted (Beckhoff #49). Scope is the two
 	// handshake redials only: the reconnect loop separates its teardown and dial by
 	// the whole loop body and would self-deadlock on the inner redial. Reconnect is
-	// single-flighted by reconnectOwner, Connect by lifecycle.connecting.
-	// INVARIANT: nothing on lifecycle.waitGroup and no Client worker may take it --
+	// single-flighted by reconnectOwner, Connect by lifecycle.connecting. INVARIANT:
+	// nothing on lifecycle.waitGroup and no Client worker may take it --
 	// tearDownAndReset waits both WaitGroups while a redial holds it.
 	dialMu sync.Mutex
 
@@ -94,12 +94,10 @@ type sessionLifecycle struct {
 
 	closedCh   chan struct{}
 	closedOnce sync.Once
-	// shutdownOnce guards the terminal teardown (see Session.shutdownTransport).
-	// It exists because that work has two entry points — Close() and
-	// giveUpReconnecting() — and gating it on winning the FSM transition to Closed
-	// meant whichever lost did nothing at all: a give-up left the socket, the 48898
-	// listener and every worker in place, and the user's later Close() returned nil
-	// without touching them.
+	// shutdownOnce guards the terminal teardown, which has two entry points. Gating
+	// it on winning the FSM transition instead meant whichever lost did nothing: a
+	// give-up left the socket, listener and workers up, and the later Close returned
+	// nil without touching them.
 	shutdownOnce sync.Once
 	// spawnMu makes "is the session closed" and "register a goroutine" one decision.
 	// A bare isClosed() before waitGroup.Add is a TOCTOU that panics the process with
@@ -107,12 +105,9 @@ type sessionLifecycle struct {
 	// AddSymbolNotification -> ... -> tryOrphanDelete.
 	spawnMu sync.Mutex // guards close(closedCh) so Close() and Reconnect-exhaustion can both fire safely
 
-	// state is the explicit FSM state plus the unified epoch counter
-	// (docs/archive/specs/09-fsm-design.md). FSM is the source of truth for closed and
-	// reconnecting. epoch replaces the previous cache.generation and
-	// reconnectGeneration counters and bumps on every Connected entry plus
-	// on user-driven cache swaps that don't (yet) transition through
-	// Reloading.
+	// The FSM state plus the unified epoch counter, which is the source of truth for
+	// closed and reconnecting. epoch bumps on every Connected entry and on cache
+	// swaps that do not transition through Reloading.
 	state sessionFSM
 
 	// connectedGen counts genuine (re)entries into Connected, so the heartbeat
@@ -173,12 +168,9 @@ func nextFlapCount(prev int, lastConnected, now time.Time, servedNothing bool) i
 	}
 }
 
-// enterConnected announces Connected and advances lifecycle.connectedGen when the
-// session really came from a connect or a reconnect — i.e. when its subscriptions
-// have just been rebuilt. Every production transition into Connected goes through
-// here; see the connectedGen comment for why the from-filter is the whole point.
-//
-// Logging matches transitionState so the FSM trace is unchanged.
+// enterConnected announces Connected and advances connectedGen only when the
+// session really came from a connect or reconnect, i.e. its subscriptions were
+// just rebuilt. Every production transition goes through here.
 func (sess *Session) enterConnected() {
 	from, ok := sess.lifecycle.state.transitionTo(SessionStateConnected)
 	if !ok {
@@ -259,23 +251,17 @@ type Session struct {
 	// this listener lives for the whole session and only closes in Close — so
 	// sharing the group deadlocks the first teardown.
 	peerWG sync.WaitGroup
-	// peerMu guards peerLn. sync.Once orders only the goroutines that call Do, and
-	// Close never does: it reads peerLn from whatever goroutine called Close while
-	// a Connect may still be inside startPeerListener. Unsynchronised, Close can
-	// read nil, skip closing the listener, and then block forever in peerWG.Wait()
-	// on an accept loop nothing will ever wake — the loop's isClosed() escape only
-	// runs after a connection arrives, which on a dead PLC never happens.
+	// peerMu guards peerLn: sync.Once orders only the goroutines calling Do, and
+	// Close never does. Unsynchronised, Close reads nil, skips the listener and
+	// blocks for ever in peerWG.Wait on an accept loop nothing wakes.
 	peerMu      sync.Mutex
 	peerStopped bool
 	// peerFallbackDisabled turns off the automatic attempt described in
 	// tryPeerFallback. See WithoutAmsPeerFallback.
 	peerFallbackDisabled bool
-	// peerConnsAdopted counts the inbound connections this session has handed to a
-	// Client. Non-zero means the device really does answer on a connection it opens
-	// to us, which is what forgetPeerRouteHostIfUnused needs to know: a Connect that
-	// succeeded with this at zero got its answers on our own connection and must not
-	// leave the device remembered. Atomic because the accept loop writes it while
-	// Connect reads it.
+	// Inbound connections handed to a Client. Non-zero means the device really does
+	// answer on one it opens to us, which is what forgetPeerRouteHostIfUnused needs.
+	// Atomic: the accept loop writes it while Connect reads it.
 	peerConnsAdopted atomic.Int64
 
 	// Heartbeat: an internal cyclic notification whose silence proves the caller's
@@ -785,20 +771,15 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 				return fmt.Errorf("TCP reconnect after route registration failed: %w", err)
 			}
 			sess.logger.Info("TCP reconnected after route registration")
-			// Don't report a working session until the PLC actually serves the
-			// new route. Returning here with the router still catching up hands
-			// the caller a Connect that succeeded and a session where every
-			// command times out.
-			// Connect's own ctx: no teardown replaces it, so passing it for every
-			// attempt is safe. See awaitRouteActive on why this is a function.
+			// Do not report success until the PLC actually serves the new route, or
+			// the caller gets a Connect that worked and a session that times out.
+			// Connect's own ctx is safe to pass per attempt: no teardown replaces it.
 			probedVersion, err := sess.awaitRouteActive(func() context.Context { return ctx })
 			if err != nil {
-				// A device that answers on a connection IT opens to us cannot pass
-				// this probe, however healthy the route is: our socket stays silent
-				// because the reply goes to the other one. Measured on TC3.1.4026
-				// (192.168.3.224), which does exactly that. Try the fallback before
-				// condemning the route — this is what the peer listener is for, and
-				// until now the route branch returned before it could ever run.
+				// A device answering on a connection IT opens cannot pass this probe
+				// however healthy the route is -- our socket stays silent because the
+				// reply goes to the other one. Try the fallback before condemning the
+				// route; the route branch used to return before it could run.
 				if errors.Is(err, ErrRuntimeNotRunning) {
 					// The route works; the runtime does not. Come up and wait — the
 					// state poll and the gates on the symbol calls carry it from here.
@@ -839,11 +820,9 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		case err == nil:
 		case errors.Is(err, ErrTransportClosed):
 			// The link died mid-connect; reporting success hands back a dead session.
-			// The addressing hint goes in the RETURNED error, not just the log: a
-			// consumer that surfaces err and not our logger would otherwise see only
-			// "client transport closed". Which hint depends on whether the connection
-			// ever carried a frame, and a sentinel carries it so callers need not
-			// match strings.
+			// The addressing hint goes in the RETURNED error, not just the log, and
+			// which hint depends on whether the connection ever carried a frame. A
+			// sentinel carries it so callers need not match strings.
 			hint := resetAfterConnectHint(sess.sourceAddr(), sess.target)
 			verdict := ErrRouteNotServed
 			if c := sess.client.Load(); c != nil && c.wasEstablished() {
@@ -1198,12 +1177,9 @@ func (sess *Session) effectiveRouterPort() int {
 	return routePort
 }
 
-// currentLifecycleCtx returns the live lifecycle context.
-//
-// tearDownAndReset cancels the old context and installs a fresh one under
-// ctxMu, so anything spanning a teardown must re-read it rather than capture
-// it — a captured one is cancelled out from underneath the caller. Reading it
-// bare also races the replacement.
+// currentLifecycleCtx returns the live lifecycle context. tearDownAndReset cancels
+// the old one and installs a fresh one under ctxMu, so anything spanning a
+// teardown must re-read rather than capture it, and a bare read races the swap.
 func (sess *Session) currentLifecycleCtx() context.Context {
 	sess.lifecycle.ctxMu.RLock()
 	defer sess.lifecycle.ctxMu.RUnlock()
@@ -1327,12 +1303,10 @@ func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, err
 			wait := redialBackoff(redials)
 			sess.logger.Debug("route not served by PLC yet, waiting then redialing",
 				"attempt", attempt, "error", lastErr, "delay", wait, "redials", redials)
-			// The wait comes BEFORE the redial, and that ordering is the fix. Dialing
-			// immediately after our own close is the worst possible moment: on Windows
-			// CE the PLC still holds the slot the closed connection occupied, so the
-			// new connection is the one that gets refused or evicted. Waiting first
-			// gives the device that time, and costs nothing -- the budget is spent
-			// waiting either way.
+			// The wait comes BEFORE the redial: dialing straight after our own close is
+			// the worst moment, since the PLC still holds the slot the closed
+			// connection occupied and the new one gets refused. Costs nothing -- the
+			// budget is spent waiting either way.
 			if err := sess.waitDuringActivation(ctxFor, wait); err != nil {
 				return 0, err
 			}
@@ -1925,14 +1899,10 @@ func (sess *Session) triggerReconnect() {
 		go sess.onDisconnect()
 	}
 
-	// Connect owns the transport end to end; a rival Reconnect must not tear it
-	// down under it (see lifecycle.connecting). The drop is already recorded in
-	// tx.disconnected, so Connect's own error handling — or its exit adopt —
-	// schedules the redial.
-	//
-	// Placement is load-bearing: above the CAS the drop is lost, above the callback
-	// WithOnDisconnect never fires during Connect, and creating reconnectDone here
-	// would hang Close's wait on it.
+	// Connect owns the transport end to end and schedules its own redial from
+	// tx.disconnected. Placement is load-bearing: above the CAS the drop is lost,
+	// above the callback WithOnDisconnect never fires, and creating reconnectDone
+	// here would hang Close's wait on it.
 	if sess.lifecycle.connecting.Load() {
 		return
 	}
