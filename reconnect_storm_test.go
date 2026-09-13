@@ -515,3 +515,35 @@ func TestReconnect_LogsAtError(t *testing.T) {
 		}
 	}
 }
+
+// Every failed attempt logs at Error, not just the first. Reporting only the
+// first left a long outage looking healthy: once the consumer's rolling error
+// window passed that one line the component read as fine, and the only thing
+// still printing was "reconnect backoff" at Info, which announces a retry but
+// never says what failed. An operator watching a down bridge has to see the
+// cause on each attempt.
+func TestReconnect_LogsEveryFailedAttemptAtError(t *testing.T) {
+	srv := startScriptableServer(t)
+	logs := &testLogHandler{}
+	const attempts = 3
+	sess := newDialableTestSession(t, srv.host, srv.port, attempts)
+	sess.logger = slog.New(logs)
+	t.Cleanup(func() { sess.markClosed() })
+
+	srv.stop()
+	if err := sess.Reconnect(context.Background()); err == nil {
+		t.Fatal("Reconnect against a stopped server returned nil")
+	}
+
+	var failures int
+	for _, rec := range logs.recordsByLevel(slog.LevelError) {
+		if strings.Contains(rec.Message, "reconnect dial/start failed") ||
+			strings.Contains(rec.Message, "reconnect step failed") {
+			failures++
+		}
+	}
+	if failures < attempts {
+		t.Errorf("only %d of %d failed attempts logged at Error — the later ones decayed to Debug, "+
+			"so an outage outlasting the consumer's error window reads as healthy", failures, attempts)
+	}
+}

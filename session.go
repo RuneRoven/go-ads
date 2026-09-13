@@ -2106,16 +2106,18 @@ func (sess *Session) reconnectBackoff(attempt int) time.Duration {
 	}
 }
 
-// logAttempt reports a failed reconnect attempt: Error for the first, Debug for
-// the rest. The session being down is already reported once by the caller that
-// started the reconnect, and repeating it per attempt buries the log and keeps
-// umh-core's error window rolling forward for the whole outage.
-func (sess *Session) logAttempt(attempt int, msg string, args ...any) {
-	if attempt <= 1 {
-		sess.logger.Error(msg, args...)
-		return
-	}
-	sess.logger.Debug(msg, args...)
+// logAttempt reports a failed reconnect attempt at Error, every time.
+//
+// It used to report only the first at Error and the rest at Debug, to keep the
+// log short and stop umh-core's error window rolling forward for the whole
+// outage. That was the wrong trade: after the window passed the one Error the
+// session looked healthy while nothing was flowing, and the only thing still
+// being printed was "reconnect backoff" at Info, which says a retry is coming
+// but not what failed. An operator watching a bridge that is down has to be able
+// to see what is failing, on every attempt. A rolling error window is correct
+// while the link is genuinely down.
+func (sess *Session) logAttempt(msg string, args ...any) {
+	sess.logger.Error(msg, args...)
 }
 
 // reconnectSleep sleeps for the appropriate backoff duration based on the attempt
@@ -2512,7 +2514,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		if c := sess.client.Load(); c != nil {
 			servedNothing = !c.wasEstablished()
 		}
-		sess.logAttempt(attempts, "reconnect step failed, retrying",
+		sess.logAttempt("reconnect step failed, retrying",
 			"stage", stage, "error", err, "attempt", attempts,
 			"servedNothing", servedNothing)
 		sess.resetForRetry()
@@ -2564,7 +2566,7 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		sess.lifecycle.reconnectAttempts.Add(1)
 		if err := sess.dialAndStart(); err != nil {
 			lastErr = err
-			sess.logAttempt(attempts, "reconnect dial/start failed, retrying",
+			sess.logAttempt("reconnect dial/start failed, retrying",
 				"error", err, "ip", sess.ip, "port", sess.port, "attempt", attempts)
 			if err := sess.reconnectSleep(ctx, attempts); err != nil {
 				return err
