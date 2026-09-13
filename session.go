@@ -19,16 +19,10 @@ import (
 	"time"
 )
 
-// randomAMSPort returns a random AMS source port in the IANA dynamic/private
-// range (32768-49151). Sessions get a unique port at construction so multiple
-// processes from the same host (same source NetID) appear as distinct clients
-// to the PLC and so a process restart doesn't reuse a prior process's port.
-// The PLC's notification handle table is keyed by {source NetID, source AMS
-// port, handle}, so a new port = new identity = old subscriptions auto-age
-// via route-idle-timeout rather than competing with the new connection.
-//
-// WithLocalAMS(AMSAddress{Port: N}) overrides for deployments that need a
-// stable port (e.g. firewalled environments with port allow-lists).
+// randomAMSPort returns a random AMS source port in the dynamic range. The PLC
+// keys its notification table by {source NetID, port, handle}, so a fresh port per
+// session means a prior process's subscriptions age out instead of competing with
+// the new connection. WithLocalAMS overrides it where a stable port is needed.
 func randomAMSPort() uint16 {
 	const minPort, span = 32768, 49151 - 32768 + 1
 	return uint16(minPort + rand.IntN(span)) //nolint:gosec // non-cryptographic port selection
@@ -392,17 +386,10 @@ type AMSEndpoint struct {
 	// AMS is the target AMS address. A zero NetID and/or Port is resolved from
 	// the device — see NewSession.
 	AMS AMSAddress
-	// RouterPort is the UDP port of the AMS router, used to register a route and
-	// to identify the device. Defaults to 48899, TwinCAT's own.
-	//
-	// Set it when the PLC is reached through NAT with port forwarding. NAT maps
-	// one external port per internal port, so the forwarded UDP port is normally
-	// a different number than the forwarded TCP port and cannot be derived from
-	// Port — e.g. external TCP 5534 -> 48898 and external UDP 6499 -> 48899 give
-	// AMSEndpoint{IP: natHost, Port: 5534, RouterPort: 6499}.
-	//
-	// Only the two UDP calls use it. Notifications need no inbound forward: they
-	// arrive on the TCP connection this side opened.
+	// RouterPort is the AMS router's UDP port (default 48899), used to register a
+	// route and identify the device. Set it behind NAT, where the forwarded UDP
+	// port differs from the TCP one and cannot be derived from Port. Only the two
+	// UDP calls use it; notifications arrive on the TCP connection we opened.
 	RouterPort int
 }
 
@@ -2147,17 +2134,12 @@ const defaultUnservedCooldown = 30 * time.Second
 // backstop after that.
 const preReconnectReleaseAttempts = 3
 
-// Reconnect attempts to re-establish the TCP connection, reload symbols,
-// and re-subscribe to previously registered notifications.
-// Uses configurable backoff (see WithBackoff) with fast initial retries and
-// progressive slowdown. Backoff resets on each successful reconnect.
+// Reconnect re-establishes the transport, reloads symbols and re-subscribes,
+// backing off per WithBackoff.
 //
-// Cancelling ctx gives up and CLOSES the session, exactly as exhausting
-// WithMaxReconnectAttempts does. It is not a pause: Reconnecting has no exit to
-// Disconnected (see the FSM table), and a session left there is invisible to a
-// consumer that polls IsClosed() to decide when to rebuild — no data would flow
-// and nothing would ever retry. So cancellation means "this session is done",
-// and PLC-side resources are released on the way out.
+// Cancelling ctx CLOSES the session, as exhausting WithMaxReconnectAttempts does.
+// Not a pause: Reconnecting has no exit to Disconnected, so a session left there
+// would never retry and a consumer polling IsClosed() could not see it.
 func (sess *Session) Reconnect(ctx context.Context) error {
 	// closeReconnectDone closes the reconnectDone channel if still open and
 	// nils it. Mutex + nil-check is safe against concurrent callers — only
@@ -2220,17 +2202,11 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 	}
 	sess.lifecycle.reconnectMu.Unlock()
 
-	// Flap detection: a successful Connected → drop within flapWindow indicates
-	// the previous reconnect cycle didn't really stabilize (typical when the
-	// PLC RSTs every connection because its route table or connection-tracking
-	// is saturated). Increment flapCount and sleep reconnectBackoff(flapCount)
-	// before dialing so the existing stepped backoff also throttles cross-cycle
-	// reconnect storms — not just within-one-Reconnect retries. Reset when the
-	// last connection lived longer than flapResetWindow.
-	// A drop on a connection that never carried a frame is its own evidence: the
-	// PLC accepted the TCP and reset it without serving anything, so the next dial
-	// is unlikely to fare better and each one costs the device a socket. Counted as
-	// a flap regardless of how long the connection nominally lasted.
+	// Flap detection: a Connected -> drop inside flapWindow means the last cycle
+	// never stabilised, so back off before dialing and throttle cross-cycle storms,
+	// not just retries within one Reconnect. A drop on a connection that never
+	// carried a frame counts as a flap regardless of how long it nominally lasted --
+	// the PLC reset it without serving anything.
 	neverServed := false
 	if c := sess.client.Load(); c != nil {
 		neverServed = !c.wasEstablished()
@@ -2268,17 +2244,10 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 	sess.tx.disconnected.Store(true)
 	// State is already Reconnecting (transitionToOnce above).
 
-	// Clear active notifications (old handles are never reused after a reconnect)
-	// but snapshot the handle list first, because the PLC may still hold those
-	// registrations.
-	//
-	// Load bearing on a silent loss -- cable, switch, NAT idle-out -- where the PLC
-	// never saw a FIN and the old handles are still alive: they stream alongside the
-	// new ones, and uncleaned they fill the AMS router's table (Beckhoff #268). On a
-	// clean disconnect they are already 0x714/0x715 and this is a formality.
-	//
-	// No dispatch quiescing: the transport is about to go. The heartbeat rides along
-	// in this snapshot, which is what lets establishHeartbeat register a fresh one.
+	// Snapshot the handles before clearing: the PLC may still hold them. Load
+	// bearing on a silent loss where it never saw a FIN -- those handles stream
+	// alongside the new ones and uncleaned fill the router's table (Beckhoff #268).
+	// The heartbeat rides along, which lets establishHeartbeat register a fresh one.
 	savedHandles := sess.takeNotificationHandles(false)
 
 	sess.tearDownAndReset()
@@ -2765,18 +2734,10 @@ func (sess *Session) dialAndStart() error {
 	return nil
 }
 
-// sourceAddr returns the source AMS address under the mutex that guards it.
-//
-// tx.connMu is the field's lock: Connect takes it around the auto-derive
-// (session.go, "Auto-derive source AMS NetID") and around the local-mode
-// handshake's assignment, and localHandshake does the same on the reconnect
-// goroutine. Every reader outside those critical sections must come through here —
-// the exported AddRoute is callable from any goroutine, and Client.encodeTo
-// (ams.go) and Client.sourceAddr take the same lock for the same reason.
-//
-// Returns the whole AMSAddress, not just the NetID: publishWiredClient needs the
-// port too, and one accessor for the field beats two that could disagree about
-// which lock protects it.
+// sourceAddr returns the source AMS address under tx.connMu, the field's lock.
+// Every reader outside Connect's own critical sections must come through here;
+// AddRoute is callable from any goroutine. Returns the whole address, not just the
+// NetID, so one accessor covers the field.
 func (sess *Session) sourceAddr() AMSAddress {
 	sess.tx.connMu.Lock()
 	defer sess.tx.connMu.Unlock()
@@ -3498,17 +3459,10 @@ func (sess *Session) requireRunningRuntime(what string) error {
 	return nil
 }
 
-// startRuntimeStateWatch polls the system service for the runtime state, once per
-// session, at the heartbeat interval.
-//
-// Polling is the only option here: there is nothing to subscribe to that survives
-// the transition being watched — in CONFIG the runtime port that would carry a
-// notification does not exist. It is one small request per interval to a port that
-// is up whenever the device is, and it is what lets the session say "the runtime is
-// in CONFIG" instead of retrying blindly.
-//
-// Gives up after a run of failures so a device without a system service port costs
-// nothing: the gates fall back to permitting, which is the pre-existing behaviour.
+// startRuntimeStateWatch polls the system service for the runtime state at the
+// heartbeat interval. Polling is the only option: in CONFIG the runtime port that
+// would carry a notification does not exist. Gives up after a run of failures, so
+// a device without a system service port costs nothing and the gates permit.
 func (sess *Session) startRuntimeStateWatch() {
 	// Checked OUTSIDE stateOnce.Do on purpose: consuming the Once here would mean a
 	// session that had the watch disabled could never start one, and it costs
