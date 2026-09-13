@@ -13,29 +13,16 @@ import (
 	"time"
 )
 
-// symbolCache owns the connection-level symbol metadata: the symbol map,
-// the data-type table, the PLC's reported symbol version (for change
-// detection), and discovery-mode flags that track which load function was
-// used (LoadSymbols, LoadSymbolsSlow, LoadSymbolList, LoadDataTypes).
+// symbolCache owns the connection-level symbol metadata: the symbol map, the
+// datatype table, the reported symbol version, and which load function was used.
+// The lock also covers parse(), which rewrites symbols in place.
 //
-// Lock also covers symbol mutation during parse() — symbol objects live
-// in the cache.symbols map and parse() rewrites their Value/Valid
-// fields. Lock ordering: NEVER hold both cache.lock and notifications.lock at
-// the same time. Paths that need both must release one before acquiring
-// the other.
+// Lock ordering: NEVER hold cache.lock and notifications.lock at once.
 //
-// Generation tracking lives on sessionFSM.epoch. Cache.symbols swaps
-// (loadSymbols, LoadSymbolList, LoadDataTypes, on-demand reset in
-// reloadSymbols) call Session.bumpEpoch() under this lock. Simple insert
-// (on-demand getSymbol) does NOT bump — existing pointers stay valid
-// across an insert.
-//
-// Callers that need to publish a *symbol pointer they obtained pre-roundtrip
-// into another data structure (e.g. notifications.activeNotifications) MUST capture
-// the epoch before resolve and recheck before commit; if the value changed,
-// the pointer is stranded and must be discarded. Closes the residual race
-// window between cache.lock release and notifications.lock acquire that the
-// simple re-fetch pattern leaves open.
+// Generation tracking lives on sessionFSM.epoch: a cache.symbols swap bumps it, a
+// simple on-demand insert does not. A caller publishing a *symbol obtained
+// pre-roundtrip into another structure MUST capture the epoch before resolve and
+// recheck before commit, or the pointer may be stranded.
 type symbolCache struct {
 	lock               sync.Mutex
 	symbols            map[string]*symbol
@@ -128,30 +115,13 @@ type SymbolUploadInfo struct {
 	ExtraLength    uint32
 }
 
-// symbol is the internal cache record for a PLC symbol. External callers
-// should use SymbolView (returned by GetSymbol/ListSymbols) - direct access
-// to *symbol is reserved for in-package code paths that need to mutate
-// state under the appropriate lock.
+// symbol is the internal cache record; external callers use SymbolView.
 //
-// Field guards:
-//
-//   - Immutable after construction (safe to read without a lock):
-//     FullName, Name, DataType, Comment, Group, Offset, Length, BaseType,
-//     Flags, ContextMask, MinUpdateInterval, Parent, Children.
-//
-//   - Guarded by Session.cache.lock (mutated by parse/Read/Write/loadSymbols):
-//     Value, Valid, ValueParsed, LastUpdateTime.
-//
-//   - Handle: written during getSymbol resolve and zeroed during
-//     zeroOldSymbolHandles on reload/refresh; all writes under cache.lock.
-//     Reads must also hold cache.lock — see symbolSumAddress and the
-//     readMultipleSymbolsRetry / writeMultipleSymbolsRetry call sites.
-//     An observed-zero Handle naturally fails the next PLC operation with
-//     ReturnCodeDeviceNotifyHandleInvalid, prompting re-resolve via GetSymbol.
-//
-// The Children map and Parent pointer form a tree, set up during discovery
-// and never mutated after - callers may walk freely without a lock as long
-// as no concurrent reload (LoadSymbols/LoadSymbolsSlow) is in progress.
+// Field guards: the metadata (FullName, DataType, Group, Offset, Length,
+// BaseType, Flags, Parent, Children) is immutable after construction and needs no
+// lock. Value, Valid, ValueParsed and LastUpdateTime are guarded by cache.lock, as
+// is Handle -- zeroed on reload, and an observed zero simply fails the next PLC
+// call and prompts a re-resolve. Parent/Children form a tree fixed at discovery.
 type symbol struct {
 	FullName          string
 	LastUpdateTime    time.Time
@@ -174,18 +144,10 @@ type symbol struct {
 	Parent   *symbol
 	Children map[string]*symbol
 
-	// logger is the session's logger, stamped onto every symbol as it enters the
-	// cache (see stampLogger). nil means "not from a session" — a test-built
-	// literal, or a parse before ingest — and falls back to the package default.
-	//
-	// Carried on the symbol rather than threaded through parse/writeToNode/
-	// parseTree because those have ~70 call sites between the library and its
-	// tests, and the alternative was every one of their log records bypassing
-	// WithLogger. That bypass is not cosmetic: a consumer cannot mute or reroute
-	// them, they lose every structured field the host attached, and
-	// slog.SetDefault is unavailable to a process hosting several sessions.
-	// Measured on TC2 with loadSymbols false: 44 of 61 lines in a 25s run came
-	// from two of these sites, one per symbol per poll.
+	// The session's logger, stamped on as the symbol enters the cache; nil falls
+	// back to the package default. Carried here rather than threaded through
+	// parse/writeToNode, whose ~70 call sites would otherwise bypass WithLogger --
+	// unmutable, unroutable, and stripped of the host's structured fields.
 	logger *slog.Logger
 
 	// inferenceWarned latches the "inferring base type from size" warning, which
@@ -275,25 +237,15 @@ func stampLoggerOnAll(symbols map[string]*symbol, lg *slog.Logger) {
 	}
 }
 
-// SymbolView is a read-only snapshot of a symbol's metadata and current
-// cached value, captured atomically under cache.lock at view creation.
-// All fields - including Value and Parsed - reflect the cache state at the
-// instant GetSymbol/ListSymbols returned. The view does NOT track later
-// updates; for fresh data, call GetSymbol again or subscribe via
-// AddSymbolNotification.
+// SymbolView is a read-only snapshot of a symbol's metadata and cached value,
+// captured under cache.lock at creation. It does not track later updates -- call
+// GetSymbol again or subscribe for fresh data.
 //
-// Trade-offs of the snapshot model:
-//   - Read-only ergonomics: every field access is a cheap struct read, no
-//     locks, no allocation, no deadlock risk.
-//   - Internally consistent: Parsed and Value were captured together, so
-//     callers cannot observe a "Parsed=true, Value=empty" tear.
-//   - Stale after concurrent loadSymbols / online-change: if the cache is
-//     swapped after the view is built, the view shows the prior state.
-//
-// IsValid() returns false for the zero-value SymbolView. Children() and
-// ChildrenWalk() collect snapshots under cache.lock and release before
-// invoking the caller's iterator - safe to call any Session method
-// from within a walk.
+// The snapshot model buys lock-free field access and internal consistency (Parsed
+// and Value captured together), at the cost of going stale after a concurrent
+// reload. IsValid() is false for the zero value. Children() and ChildrenWalk()
+// release the lock before calling the iterator, so any Session method is safe
+// inside a walk.
 type SymbolView struct {
 	Name        string
 	FullName    string
@@ -318,38 +270,16 @@ type SymbolView struct {
 // true (until the connection is closed).
 func (v SymbolView) IsValid() bool { return v.conn != nil && v.FullName != "" }
 
-// BaseTypeName returns the IEC 61131-3 primitive name underlying this symbol
-// (e.g. "DINT" for an INT-aliased enum, "REAL" for a REAL-aliased type).
-// Useful for downstream consumers that need the storage layout without
-// having to track user-defined type names.
+// BaseTypeName returns the IEC 61131-3 primitive underlying this symbol, for
+// consumers that need the storage layout without tracking user-defined names.
+// Resolved from the protocol ADST_ code, else the datatype table, else inferred
+// from size -- inference is limited to 1- and 2-byte widths, since 4 and 8 are
+// REAL/LREAL ambiguous.
 //
-// Resolution order:
-//  1. Protocol BaseType (ADST_ code) → adsTypeToString — authoritative when
-//     the PLC ships a primitive code (TC3 enums, simple primitives).
-//  2. Datatype table lookup by DataType name — required for user-defined
-//     types reported as ADST_BIGTYPE (TC2 enums, type aliases). Populated
-//     by LoadSymbols / LoadDataTypes.
-//  3. Size-based inference — last-resort fallback for on-demand mode when
-//     no table is loaded. Restricted to 1- and 2-byte widths (safe for
-//     TC2 enums); refuses 4 and 8 to avoid REAL/LREAL ambiguity, matching
-//     parse()'s fallback policy.
-//
-// Returns "" when none of the routes can resolve a primitive, which in practice
-// means a 4- or 8-byte user-defined type with no datatype table loaded (a
-// DINT-backed enum being the common case). "" is a total signal — no symbol has
-// "" as a legitimate base type — so callers can branch on it directly; there is
-// deliberately no error or sentinel for a state that a supported configuration
-// produces on purpose.
-//
-// The first time it happens for a given symbol the session logs a Warn naming the
-// symbol, its width, and the remedy (LoadSymbols / LoadDataTypes). Subscribing
-// raises the same warning at setup, which is where it is actionable — before
-// samples start arriving with the value unconverted. It is latched per symbol, so
-// a consumer calling this per sample gets one line, not one per read.
-//
-// This method never fetches the datatype table itself: a caller running with
-// symbol loading off has declined that upload, and a getter with no context and no
-// error return has no business doing I/O.
+// Returns "" when none resolve, in practice a 4- or 8-byte user type with no
+// datatype table loaded. No symbol has "" legitimately, so callers branch on it
+// directly. Warns once per symbol naming the remedy. Never fetches the table
+// itself: a getter with no ctx and no error has no business doing I/O.
 func (v SymbolView) BaseTypeName() string {
 	// parse() switches on the declared name first, so it wins: TC3 stamps DT
 	// with the ADST_ code for its storage type and still parses a timestamp.
@@ -395,20 +325,11 @@ func (v SymbolView) warnUnresolvedBaseType() {
 	v.conn.warnUnresolvedBaseType(v.FullName)
 }
 
-// warnUnresolvedBaseType reports, once per symbol, that this symbol's base type
-// cannot be determined without the datatype table.
-//
-// Called from two places, deliberately: SymbolView.BaseTypeName (where a caller
-// asks and gets "" back) and the subscribe paths (where the operator finds out at
-// setup rather than on first sample, which is when it is actually actionable).
-// One latch serves both, so a subscribe-time warning does not repeat when the
-// value is later read.
-//
-// The latch lives on the cached *symbol rather than on any view or config,
-// because a SymbolView is a copy handed out per call and a flag on it would latch
-// nothing. Logged after the lock is released: the handler is user-supplied, and
-// holding a cache lock across arbitrary handler code is how the deadlocks in this
-// package were built.
+// warnUnresolvedBaseType reports once per symbol that the base type needs the
+// datatype table. Called from BaseTypeName and from the subscribe paths, where it
+// is actionable before samples arrive; one latch serves both. The latch lives on
+// the cached *symbol, since a SymbolView is a per-call copy and would latch
+// nothing. Logged after the lock is released -- the handler is user-supplied.
 func (sess *Session) warnUnresolvedBaseType(symbolName string) {
 	sess.cache.lock.Lock()
 	sym, ok := sess.cache.symbols[symbolKey(symbolName)]
@@ -443,17 +364,10 @@ func (sess *Session) warnUnresolvedBaseType(symbolName string) {
 		"hint", "call LoadSymbols (or LoadDataTypes) to load the datatype table; without it this symbol's value is delivered as an unconverted string")
 }
 
-// GetJSON serializes the symbol's current cached value to JSON. For
-// composite types (structs, arrays) the result is the nested JSON
-// representation walked from the children subtree; for primitives it is a
-// single JSON literal (number, boolean, or string).
-//
-// Returns "" if the view is detached (no underlying Session) or the
-// symbol no longer exists in the cache (e.g. removed by a concurrent
-// online change).
-//
-// Acquires cache.lock briefly to read the live symbol; safe to call from
-// any goroutine.
+// GetJSON serializes the cached value: nested JSON walked from the children
+// subtree for composites, a single literal for primitives. Returns "" for a
+// detached view or a symbol no longer in the cache. Takes cache.lock briefly;
+// safe from any goroutine.
 func (v SymbolView) GetJSON() string {
 	if v.conn == nil {
 		return ""
