@@ -365,17 +365,11 @@ const resubscribeMaxAttempts = 3
 // connection anyway if this does not land.
 const notificationReleaseTimeout = 2 * time.Second
 
-// releaseCleanupCtx picks the context for a best-effort release of PLC handles
-// the library declined to bind. A usable caller context is used as-is; a done one
-// is replaced, because the handles exist on the PLC either way and a context that
-// is already cancelled fails the delete before it is sent.
-// The replacement deliberately does NOT inherit cancellation: the batch may have
-// aborted precisely because the session is closing, and callers on that path
-// (resubscribeNotifications) pass the lifecycle context itself — deriving from it
-// would hand back a context that is already done. WithoutCancel keeps the values
-// and drops the Done channel, and the timeout is what keeps a closing session
-// from blocking here. A nil lifecycle context (Session struct literals) falls
-// back to Background rather than panicking inside WithTimeout.
+// releaseCleanupCtx picks the context for releasing handles the library declined
+// to bind: a usable caller ctx as-is, a done one replaced, since the handles exist
+// on the PLC either way. The replacement does NOT inherit cancellation -- the
+// batch may have aborted because the session is closing -- so WithoutCancel keeps
+// the values and a timeout bounds it. A nil lifecycle ctx falls back to Background.
 func (sess *Session) releaseCleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx.Err() == nil {
 		return ctx, func() {}
@@ -907,18 +901,11 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 	return results, nil
 }
 
-// commitNotification binds a PLC-assigned handle to its symbol, making the
-// handle recognisable to dispatchSample. Returns nil on success, or the reason
-// the library refused to commit — the caller surfaces that as Skipped together
-// with the handle so the PLC-side registration can be released.
-//
-// Called once per handle, as soon as that handle is known, so a batch that the
-// PLC serves one Add at a time has each symbol bound while the rest are still
-// registering rather than all of them at the end.
-//
-// Caller must hold neither cache.lock nor notifications.lock: this takes
-// cache.lock first and releases it before taking notifications.lock, per the
-// never-both-held rule.
+// commitNotification binds a PLC handle to its symbol so dispatchSample
+// recognises it, returning the reason for any refusal so the caller can surface
+// it as Skipped and release the registration. Called once per handle as soon as
+// it is known, so a batch served one Add at a time binds progressively. Caller
+// must hold neither lock: this takes cache.lock and releases it before the other.
 func (sess *Session) commitNotification(cfg NotificationConfig, handle uint32, ch chan *Update, batchCacheEpoch uint64) error {
 	// Re-fetch the *symbol under cache.lock. The pointer resolved before the
 	// PLC round-trip may have been stranded by a concurrent loadSymbols /

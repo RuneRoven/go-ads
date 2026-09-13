@@ -303,17 +303,11 @@ func WithoutAmsPeerFallback() SessionOption {
 	}
 }
 
-// WithForceRouteRegistration disables route probing and always registers the route
-// with credentials on every Connect and Reconnect. Use this in environments where
-// routes are not persistent or must be refreshed on each connection.
-//
-// The cost, accepted deliberately: a session that sets this sends one route
-// registration per reconnect, so a flapping link means one UDP registration per
-// attempt. The AMS router is the component this library has already seen go mute
-// under duplicate route entries for one NetID (see route.go on the two TC3 devices
-// that recovered only after their tables were rebound), so freshness is traded for
-// route-table safety here. Sessions that do not set the option register at most
-// once per session, plus one healing registration per unserved-recovery episode.
+// WithForceRouteRegistration skips probing and registers on every Connect and
+// Reconnect, for environments where routes are not persistent. The cost is one UDP
+// registration per attempt on a flapping link, against a router this library has
+// seen go mute under duplicate entries -- freshness traded for route-table safety.
+// Without it a session registers once, plus one healing registration per cooldown.
 func WithForceRouteRegistration() SessionOption {
 	return func(s *Session) {
 		s.route.forceRouteRegistration = true
@@ -469,17 +463,11 @@ func WithNotificationHeartbeat(interval time.Duration, missed int) SessionOption
 	}
 }
 
-// WithNotificationSilenceTimeout says how long the caller's subscriptions may be
-// silent before the session concludes they are dead, in wall-clock time.
-//
-// The same decision as WithNotificationHeartbeat's missed argument, stated in the
-// unit an operator thinks in. Set 30s and you get 30s whatever the cycle is;
-// missed is derived (rounded up, floored at 2) when the session is constructed.
-// Whichever of the two options is applied later wins, since that is the one the
-// caller wrote last.
-//
-// The heartbeat itself is described in WithNotificationHeartbeat; this only
-// changes how much of its silence is tolerated.
+// WithNotificationSilenceTimeout says how long subscriptions may be silent before
+// the session calls them dead, in wall-clock time -- the same decision as
+// WithNotificationHeartbeat's missed argument, in the unit an operator thinks in.
+// missed is derived from it at construction (rounded up, floored at 2), and
+// whichever of the two options is applied later wins.
 func WithNotificationSilenceTimeout(d time.Duration) SessionOption {
 	return func(s *Session) {
 		if d <= 0 {
@@ -511,16 +499,10 @@ func WithHeartbeatRecovery(mode HeartbeatRecovery) SessionOption {
 }
 
 // WithRuntimeStateWatch sets how often the session polls the system service for
-// the PLC's runtime state (RUN / CONFIG).
-//
-// That reading is what lets the symbol and subscription calls refuse with "the
-// runtime is not running" instead of failing obscurely, and what lets a session
-// that starts while the PLC is in CONFIG come up and wait. The default is 5s.
-//
-// Before 2026-08 this interval was heartbeatCycle(), so WithNotificationHeartbeat
-// silently changed the state-poll rate too — a 30s heartbeat meant a 30s state
-// poll. The two are independent now; set this if you want the poll faster or
-// slower than 5s.
+// the runtime state. That reading is what lets symbol and subscription calls
+// refuse with "the runtime is not running" instead of failing obscurely, and lets
+// a session starting in CONFIG come up and wait. Default 5s, independent of the
+// heartbeat interval.
 func WithRuntimeStateWatch(d time.Duration) SessionOption {
 	return func(s *Session) {
 		if d <= 0 {

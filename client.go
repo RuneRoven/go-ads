@@ -256,16 +256,11 @@ type Client struct {
 	// rather than a ~2000-year duration.
 	dialedAt time.Time
 
-	// dropped is closed when THIS client's connection is known to be gone.
-	// disconnected stops new requests; this releases the ones already blocked
-	// on a response that will never come, which a flag cannot do.
-	//
-	// Per-Client, not per-transport, and immutable for the client's lifetime:
-	// a Session reuses one transport across reconnects but allocates a fresh
-	// Client each time, so "this connection died" is a client-scoped fact. Held
-	// on the transport it was signalled by a stale client's listen goroutine
-	// after the replacement had already re-armed it, which killed every request
-	// on the new connection.
+	// dropped closes when THIS client's connection is gone: disconnected stops new
+	// requests, this releases the ones already blocked on a reply that will never
+	// come. Per-Client, not per-transport -- a Session reuses one transport across
+	// reconnects, and on the transport a stale client's listen goroutine signalled
+	// it after the replacement had re-armed it, killing every new request.
 	dropped  chan struct{}
 	dropOnce sync.Once
 
@@ -491,17 +486,11 @@ func (c *Client) endHandshake() {
 	}
 }
 
-// transportFaultLevel returns the level to log a transport fault at: Debug
-// while a handshake is in flight, Error otherwise.
-//
-// Use it for every TRANSPORT fault — the link went away, a request went
-// unanswered, a write failed — because all of those are expected states of the
-// probe → register → redial cold start. Do NOT use it for protocol or
-// programming faults (header/body parse, packet exceeds the sanity limit,
-// binary.Write failure): a handshake never legitimately produces those, and
-// demoting them would hide corruption. One un-gated transport site is enough to
-// re-trip a downstream log-based health check, so new fault paths need this
-// distinction made deliberately.
+// transportFaultLevel returns the level for a transport fault: Debug during a
+// handshake, Error otherwise. Use it for every TRANSPORT fault, all of which are
+// expected states of the probe -> register -> redial cold start. Do NOT use it for
+// protocol or programming faults -- a handshake never produces those, and demoting
+// them would hide corruption.
 func (c *Client) transportFaultLevel() slog.Level {
 	if c.handshaking.Load() > 0 {
 		return slog.LevelDebug
@@ -554,17 +543,11 @@ func (c *Client) listen() {
 	c.readFrames(conn, true)
 }
 
-// AcceptPeerConn adopts a TCP connection the PLC opened TO US and reads AMS
-// frames from it into the same response mux as our own connection.
-//
-// Some devices treat a registered route as a peer router: they accept and process
-// our requests on the connection we opened, then send every response over a
-// connection they open back to us on 48898. Measured on TC3.1.4026 (TC/RTOS);
-// TC2 2.10 and TC3.1.4024/CE answer on our connection instead. Beckhoff's own
-// Linux AdsLib never listens, so it cannot talk to a device in that state at all.
-//
-// Frames carry their own invokeID, so responses match up regardless of which
-// socket they arrive on, and notifications dispatch normally.
+// AcceptPeerConn adopts a connection the PLC opened TO US, reading its frames into
+// the same response mux. Some devices treat a registered route as a peer router:
+// they process our requests on our connection but answer over one they open back
+// to us. Frames carry their own invokeID, so responses match regardless of which
+// socket they arrive on.
 func (c *Client) AcceptPeerConn(conn net.Conn) {
 	// Refuse once the adopted connections have been dropped for a teardown. The
 	// PLC re-dials after every drop, which is exactly when teardown runs, and

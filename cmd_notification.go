@@ -338,16 +338,11 @@ func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestam
 			// never sees that tag at all.
 			sess.bufferEarlySample(ctx, handle, timestamp, content)
 		default:
-			// Genuine orphan sample — handle is registered on the PLC but
-			// not in our client-side map. Most likely cause: a prior process
-			// (us or another go-ads client with same source NetID+port) left
-			// the subscription behind on crash/restart. Schedule a Delete
-			// on the PLC so the orphan handle table slot is freed; without
-			// this cleanup the TwinCAT AMS router accumulates entries
-			// across restarts until it crashes (Beckhoff issue #268).
-			// One Warn per orphanReportInterval carrying the count, the rest at
-			// Debug: the PLC pushes one of these per cycle per orphaned handle and
-			// they interleave with healthy samples after a reconnect.
+			// Genuine orphan: registered on the PLC, not in our map -- usually a
+			// prior process with the same source NetID+port. Delete it, or the
+			// router accumulates entries until it crashes (Beckhoff #268). One Warn
+			// per interval with a count, the rest Debug: the PLC pushes one per
+			// cycle per handle, interleaved with healthy samples after a reconnect.
 			n := sess.notifications.orphanSamples.Add(1)
 			if reportNow(&sess.notifications.orphanWarnNs, orphanReportInterval) {
 				sess.logger.Warn("received notification for unknown handle", "handle", handle,
@@ -1206,17 +1201,11 @@ func (sess *Session) heartbeatWatch() {
 			// bounded by reconnectSleep, not by this counter.
 			consecutiveFailures = 0
 		}
-		// Connected, not merely "not disconnected": dialAndStart clears
-		// tx.disconnected before the route, reload and resubscribe steps run, so a
-		// reconnect's tail looks live here. Ticking through it accumulates quiet
-		// ticks against subscriptions the reconnect is in the middle of restoring,
-		// and can trigger a full delete-and-re-add of handles it has just
-		// registered — correct, thanks to resubscribeMu, but pure churn.
-		//
-		// Deliberately no reset here: every path back to Connected bumps the
-		// generation above, and resetting on any non-Connected tick would reset
-		// once per tick for as long as some future long-lived state (Reloading)
-		// were held — which is the masking bug, arrived at from the other side.
+		// Connected, not merely "not disconnected": dialAndStart clears the flag
+		// before the route, reload and resubscribe steps, so a reconnect's tail
+		// looks live and ticking through it churns handles it is still restoring.
+		// No reset here -- every path back to Connected bumps the generation above,
+		// and resetting per non-Connected tick is the masking bug from the other side.
 		if sess.lifecycle.state.load() != SessionStateConnected {
 			continue // a drop has its own recovery path; do not compete with it
 		}
@@ -1444,17 +1433,10 @@ const (
 )
 
 func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
-	// heartbeatWatch checks this too, but that check is a TOCTOU: Close can land
-	// immediately after it. Close marks the session closed and releases the PLC
-	// resources BEFORE cancelling the context, so a recovery entering that window
-	// still has a live transport and its registrations land after the release that
-	// was meant to be the last word — handles nobody will ever delete, streaming
-	// into a channel the caller considers finished.
-	// Atomic with markClosed, not a bare check: Close marks the session closed and
-	// releases its PLC resources before cancelling the context, and a concurrent
-	// Reconnect re-derives lifecycle.ctx from the (uncancelled) parent — so a
-	// recovery that passed a bare check could register handles over a freshly
-	// dialled transport AFTER the release meant to be terminal.
+	// Atomic with markClosed, not a bare check, which heartbeatWatch's own is: Close
+	// releases the PLC resources BEFORE cancelling the context, so a recovery
+	// entering that window still has a live transport and registers handles after
+	// the release meant to be terminal -- nobody will ever delete them.
 	if !sess.admitBackgroundWork() {
 		sess.logger.Debug("skipping subscription recovery: the session is closed")
 		return recoveryFailed
