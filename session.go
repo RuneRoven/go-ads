@@ -3503,11 +3503,12 @@ func (sess *Session) resubscribeNotificationsLocked() error {
 	// the event the same way whether it was a first connect or a recovery, and
 	// the counts stay filterable instead of being baked into the string.
 	if restored < len(validConfigs) {
-		sess.logger.Error("Registering notifications restored fewer symbols than requested; the missing ones deliver nothing until a later attempt restores them",
-			"registered", restored, "requested", len(validConfigs))
+		sess.logger.Error(fmt.Sprintf(
+			"Registering notifications restored only %d/%d symbols; the missing ones deliver nothing until a later attempt restores them",
+			restored, len(validConfigs)))
 	} else {
-		sess.logger.Info("Registering notifications succeeded",
-			"registered", restored, "requested", len(validConfigs))
+		sess.logger.Info(fmt.Sprintf("Registering notifications succeeded for %d/%d symbols",
+			restored, len(validConfigs)))
 	}
 	return nil
 }
