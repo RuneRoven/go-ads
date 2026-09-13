@@ -221,6 +221,49 @@ func TestSymbolParseUnknownType(t *testing.T) {
 	}
 }
 
+// An array carries its element's ADST_ code and the whole array's Length. With
+// no datatype table it has no Children, so parse falls through to BaseType
+// resolution -- which used to read 40 bytes as one DINT and report "DINT Size
+// Wrong", naming a type the caller never asked for.
+func TestSymbolParseArrayWithoutDatatypeTable(t *testing.T) {
+	sym := &symbol{
+		Name:     "anCounters",
+		DataType: "ARRAY [0..9] OF DINT",
+		BaseType: ADSTInt32, // element type, not the aggregate
+		Length:   40,        // 10 * 4
+	}
+	_, err := sym.parse(make([]byte, 40), 0, nil)
+	if err == nil {
+		t.Fatal("expected an error for an array with no datatype table")
+	}
+	if strings.Contains(err.Error(), "DINT Size Wrong") {
+		t.Errorf("error still blames the element type: %v", err)
+	}
+	for _, want := range []string{"ARRAY [0..9] OF DINT", "LoadSymbols()"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q, got: %v", want, err)
+		}
+	}
+}
+
+// The width guard must not catch a plain scalar resolved through BaseType: a
+// type-aliased DINT has Length 4 and parses as before.
+func TestSymbolParseAliasScalarStillResolves(t *testing.T) {
+	sym := &symbol{
+		Name:     "aliased",
+		DataType: "E_SomeAlias",
+		BaseType: ADSTInt32,
+		Length:   4,
+	}
+	got, err := sym.parse([]byte{0x07, 0x00, 0x00, 0x00}, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "7" {
+		t.Errorf("got %q, want %q", got, "7")
+	}
+}
+
 // ============================================================
 // writeToNode round-trip tests
 // ============================================================

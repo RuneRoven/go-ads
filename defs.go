@@ -666,6 +666,26 @@ func adsTypeToString(code ADSDataType) string {
 	}
 }
 
+// adsTypeWidth returns the fixed width in bytes of a scalar ADST_ code, or 0
+// when the width is not fixed (STRING/WSTRING) or the code is not scalar.
+// Used to tell an aggregate apart from a scalar: an array reports its element's
+// ADST_ code alongside the whole array's length, so a symbol whose length
+// disagrees with its base type's width is not the scalar the code claims.
+func adsTypeWidth(code ADSDataType) uint32 {
+	switch code {
+	case ADSTBool, ADSTInt8, ADSTUint8:
+		return 1
+	case ADSTInt16, ADSTUint16:
+		return 2
+	case ADSTInt32, ADSTUint32, ADSTReal32:
+		return 4
+	case ADSTInt64, ADSTUint64, ADSTReal64:
+		return 8
+	default:
+		return 0
+	}
+}
+
 // isSumCommandUnsupportedError returns true if the error indicates the PLC does
 // not support sum/batch commands (as opposed to a transient network error).
 func isSumCommandUnsupportedError(err error) bool {
