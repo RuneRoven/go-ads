@@ -90,6 +90,11 @@ func resetAfterConnectHint(source, target AMSAddress) string {
 // from ErrEstablishedDropped so a consumer can branch without matching strings.
 var ErrRouteNotServed = errors.New("connection dropped before the PLC served any frame")
 
+// ErrRouterUnresponsive reports a PLC whose AMS router answered nothing, on TCP
+// or UDP 48899, for long enough that the route could not be checked. Nothing to
+// fix: retry. Measured at ~8s after a client restart on a TC3 4024.
+var ErrRouterUnresponsive = errors.New("the PLC's AMS router answered nothing; it is briefly unreachable, not misconfigured")
+
 // ErrEstablishedDropped reports a connection that had been carrying AMS frames
 // and was then dropped by the PLC or something on the path. The route
 // demonstrably existed, so route tables are the wrong place to look; eviction by

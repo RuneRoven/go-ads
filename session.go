@@ -1138,6 +1138,55 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 // (~500ms is empirically enough on TC3 4024.x; tunable if needed).
 const routeProbeRetryDelay = 500 * time.Millisecond
 
+const (
+	// How long a probe failure is treated as a briefly deaf router rather than a
+	// missing route, and how often identify is retried inside it. Measured ~8s
+	// of silence after a client restart on a TC3 4024; 20s leaves margin.
+	routerAwakePoll = 1 * time.Second
+	// How long to keep re-probing a live router before concluding the route is
+	// genuinely missing. Measured: a probe that failed at 1.6s succeeded 36s later
+	// with nothing registered in between.
+	routeProbeGrace = 30 * time.Second
+)
+
+// var, not const: tests shorten it rather than waiting out the real grace.
+var routerDeafGrace = 20 * time.Second
+
+// awaitRouterAwake waits until the PLC's AMS router answers identify, or reports
+// ErrRouterUnresponsive after routerDeafGrace. Identify needs no route and no TCP
+// slot, so silence there means the router is serving nobody -- the one case where
+// a failed route probe says nothing about whether the route exists.
+func (sess *Session) awaitRouterAwake(ctx context.Context) error {
+	deadline := time.Now().Add(routerDeafGrace)
+	for attempt := 1; ; attempt++ {
+		probeCtx, cancel := context.WithTimeout(ctx, routerAwakePoll)
+		_, err := IdentifyRemoteWithLogger(probeCtx, sess.logger, sess.ip)
+		cancel()
+		if err == nil {
+			if attempt > 1 {
+				sess.logger.Info("the PLC's AMS router is answering again",
+					"waited", time.Since(deadline.Add(-routerDeafGrace)).Round(time.Second))
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("waiting for the PLC's AMS router: %w", ctx.Err())
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: no identify answer in %v", ErrRouterUnresponsive, routerDeafGrace)
+		}
+		if attempt == 1 {
+			sess.logger.Info("the PLC's AMS router is not answering; waiting for it rather than assuming the route is missing",
+				"grace", routerDeafGrace, "error", err)
+		}
+		select {
+		case <-time.After(routerAwakePoll):
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for the PLC's AMS router: %w", ctx.Err())
+		}
+	}
+}
+
 // isProbeRetryable reports whether a route-probe error is a transport-level
 // flap worth a TCP redial + probe retry before falling back to AddRoute.
 //
@@ -1238,31 +1287,48 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 	// previous TCP not yet released). Redial + retry probe once before
 	// concluding the route is missing.
 	if isProbeRetryable(probeErr) {
-		sess.logger.Info("route probe failed at transport layer, retrying once before AddRoute",
-			"error", probeErr, "delay", routeProbeRetryDelay)
-		// ctx-aware sleep: honor caller cancellation. Plain time.Sleep
-		// would block the full delay even if the caller has given up.
-		select {
-		case <-time.After(routeProbeRetryDelay):
-		case <-ctx.Done():
-			return false, fmt.Errorf("route probe retry aborted: %w", ctx.Err())
+		// A deaf router cannot answer a probe OR a registration, so registering is
+		// pointless; report it as retryable instead. Measured at ~8s on a TC3 4024.
+		if err := sess.awaitRouterAwake(ctx); err != nil {
+			return false, err
 		}
-		if dialErr := sess.redialDuringHandshake(); dialErr != nil {
-			return false, fmt.Errorf("redial during route probe retry: %w", dialErr)
+		// The router is alive, so the route it holds is intact and only the TCP
+		// path is failing. Keep re-probing for the grace rather than registering a
+		// route that already exists: measured on a TC3 4024, one retry at 1.6s was
+		// short and the same probe succeeded 36s later, having registered nothing.
+		deadline := time.Now().Add(routeProbeGrace)
+		for attempt := 1; ; attempt++ {
+			sess.logger.Info("route probe failed at transport layer; retrying rather than registering a route the PLC may already hold",
+				"error", probeErr, "delay", routeProbeRetryDelay, "attempt", attempt)
+			// ctx-aware sleep: honor caller cancellation. Plain time.Sleep
+			// would block the full delay even if the caller has given up.
+			select {
+			case <-time.After(routeProbeRetryDelay):
+			case <-ctx.Done():
+				return false, fmt.Errorf("route probe retry aborted: %w", ctx.Err())
+			}
+			if dialErr := sess.redialDuringHandshake(); dialErr != nil {
+				return false, fmt.Errorf("redial during route probe retry: %w", dialErr)
+			}
+			// redialDuringHandshake leaves ondrop disarmed and the new Client in a
+			// handshake region, which is what the rest of ensureRouteOnConnect needs;
+			// the deferred re-arm at function exit restores the production handler.
+			if sess.isClosed() {
+				return false, fmt.Errorf("connection closed during route probe retry")
+			}
+			_, retryErr := sess.probeRouteVersion(ctx)
+			if retryErr == nil {
+				sess.logger.Info("route already exists on PLC (confirmed after retry)", "attempts", attempt)
+				sess.route.routeProbeFailures.Store(0)
+				return false, nil
+			}
+			probeErr = fmt.Errorf("probe failed after %d retries: %w", attempt, retryErr)
+			// Anything but a transport flap is a real answer: stop and let the
+			// registration below deal with it.
+			if !isProbeRetryable(retryErr) || time.Now().After(deadline) {
+				break
+			}
 		}
-		// redialDuringHandshake leaves ondrop disarmed and the new Client in a
-		// handshake region, which is what the rest of ensureRouteOnConnect needs;
-		// the deferred re-arm at function exit restores the production handler.
-		if sess.isClosed() {
-			return false, fmt.Errorf("connection closed during route probe retry")
-		}
-		_, retryErr := sess.probeRouteVersion(ctx)
-		if retryErr == nil {
-			sess.logger.Info("route already exists on PLC (confirmed after retry)")
-			sess.route.routeProbeFailures.Store(0)
-			return false, nil
-		}
-		probeErr = fmt.Errorf("probe failed after retry: %w", retryErr)
 	}
 
 	// Definite probe failure → register, unless this session did so recently.
