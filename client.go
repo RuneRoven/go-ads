@@ -245,15 +245,10 @@ type Client struct {
 	framesPrimary atomic.Uint64
 	framesPeer    atomic.Uint64
 
-	// dialedAt is when this client's connection was established, used for the
-	// uptime on a drop. Set in the composite literal before the client is
-	// published and never written again — do NOT move it to an assignment after
-	// startWorkers, because readFrames reads it from the listen goroutine.
-	//
-	// Zero is a legitimate value: raw Dial builds the literal before
-	// net.DialTimeout, and ~30 test sites build &Client{} without it. Every log
-	// site must go through uptimeAttr, which prints nothing for a zero value
-	// rather than a ~2000-year duration.
+	// When this connection was established, for the uptime on a drop. Set in the
+	// literal before publishing and never written again -- readFrames reads it from
+	// the listen goroutine. Zero is legitimate, so every log site goes through
+	// uptimeAttr, which prints nothing rather than a ~2000-year duration.
 	dialedAt time.Time
 
 	// dropped closes when THIS client's connection is gone: disconnected stops new
@@ -281,15 +276,11 @@ type Client struct {
 	peerClosed bool
 }
 
-// setSource replaces the source AMS address this Client stamps on every request.
-//
-// Local mode learns its real address from the router only AFTER the Client has been
-// published (the handshake is a request, so it needs a live Client to send it). The
-// Client held a by-value copy taken at construction, and nothing ever updated it —
-// so every request for the rest of the session carried the auto-derived placeholder
-// (127.0.0.1.1.1 and a random port) instead of the address the router assigned.
-// This is also what makes encode's connMu snapshot of c.source meaningful; before
-// this existed, that lock guarded a field nobody wrote.
+// setSource replaces the source AMS address stamped on every request. Local mode
+// learns its real address from the router only after the Client is published,
+// since the handshake needs a live Client -- without this every later request
+// carried the auto-derived placeholder. It is also what makes encode's connMu
+// snapshot of c.source mean anything.
 func (c *Client) setSource(addr AMSAddress) {
 	c.tx.connMu.Lock()
 	c.source = addr
@@ -446,15 +437,11 @@ func (c *Client) SetOnDrop(fn func()) {
 	c.ondropMu.Unlock()
 }
 
-// beginHandshake marks a route probe / registration region as in flight. During the handshake a dropped connection and an unanswered request
-// are expected states, not faults: the normal cold-start flow is probe → PLC
-// rejects an unknown NetID → register route → redial → probe again. Logging
-// those at ERROR misreports a connect that is still progressing, and
-// downstream log-based health checks (umh-core's IsLogsFine fails a data-flow
-// component on any level=error line in its recent window) hold the component
-// in a starting state even though the PLC is connected and streaming.
-//
-// Errors are still returned to the caller unchanged — only the log level moves.
+// beginHandshake marks a route probe or registration as in flight, during which a
+// dropped connection and an unanswered request are expected: the cold start is
+// probe -> rejected -> register -> redial -> probe. Logging those at ERROR
+// misreports a connect that is progressing, and holds downstream log-based health
+// checks in a starting state. Errors still reach the caller unchanged.
 func (c *Client) beginHandshake() {
 	c.handshaking.Add(1)
 }

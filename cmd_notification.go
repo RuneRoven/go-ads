@@ -475,15 +475,11 @@ const (
 	earlySampleMaxBytes = 8 << 20
 )
 
-// subscribeRaceActive reports whether an unknown handle should be presumed to
-// be one of ours mid-registration rather than a leaked one.
-//
-// The in-flight counter is authoritative but not unconditional: a subscribe that
-// wedges would otherwise disable the orphan reaper for the life of the session,
-// and the reaper exists to stop the PLC's handle table filling up. So the window
-// also expires. subscribeRaceMaxOpen is generous enough for any real batch —
-// hundreds of symbols registered one at a time on a slow PLC — while still
-// bounded.
+// subscribeRaceActive reports whether an unknown handle is presumed one of ours
+// mid-registration rather than leaked. The in-flight counter is authoritative but
+// not unconditional -- a wedged subscribe would otherwise disable the orphan reaper
+// for the session's life -- so the window also expires, generously enough for
+// hundreds of symbols registered one at a time.
 func (sess *Session) subscribeRaceActive() bool {
 	mgr := sess.notifications
 	now := time.Now().UnixNano()
@@ -514,15 +510,11 @@ func (m *notificationManager) newestOpenSubscribe() (int64, bool) {
 	return newest, newest != 0
 }
 
-// beginSubscribe marks a subscribe operation as in flight and returns the token
-// that closes it. Every call must be paired with endSubscribe, which is why
-// callers defer it immediately.
-//
-// The token exists so each open subscribe is tracked individually. Sharing one
-// counter and one timestamp made the pair non-atomic across goroutines — an
-// ending subscribe could clear the clock a starting one had just written, and the
-// resulting "in flight but no clock" state suppressed the orphan reaper
-// permanently.
+// beginSubscribe marks a subscribe in flight and returns the token that closes it;
+// every call pairs with endSubscribe, which is why callers defer it at once. The
+// token tracks each subscribe individually: one shared counter and timestamp were
+// not atomic across goroutines, and the resulting "in flight but no clock" state
+// suppressed the orphan reaper permanently.
 func (sess *Session) beginSubscribe() subscribeToken {
 	mgr := sess.notifications
 	now := time.Now().UnixNano()
@@ -829,15 +821,9 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 		ctx, cancel := context.WithTimeout(parentCtx, orphanDeleteRPCTimeout)
 		defer cancel()
 		if err := c.DeleteDeviceNotification(ctx, handle); err != nil {
-			// 0x714 NotifyHandleInvalid = expected (PLC already reaped via
-			// route-idle-timeout, reboot, or prior cleanup pass).
-			// 0x715 DeviceClientUnknown = PLC dropped our client identity
-			// entirely (typical after TCP reset / reconnect); the handle
-			// went with it. Both Debug so they don't flood under high-rate
-			// orphan streams.
-			// Every other code (transport, auth, timeout, marshaling,
-			// protocol mismatch) is a real failure operators need to see;
-			// surface at Warn.
+			// 0x714 (already reaped) and 0x715 (client identity dropped, so the handle
+			// went with it) are expected and stay at Debug, or they flood under a
+			// high-rate orphan stream. Everything else is a real failure at Warn.
 			if isBestEffortDeleteSuccessErr(err) {
 				sess.logger.Debug("orphan delete RPC: handle already gone PLC-side (expected)",
 					"handle", handle, "error", err)
@@ -947,10 +933,9 @@ const (
 // and separate because both ways the arithmetic goes wrong are invisible -- the
 // session just retries at the wrong rate.
 //
-// The cap is a duration in ticks, so it is floored at base: at a long cycle it is
-// fewer ticks than the base and would run the backoff backwards, and once the
-// cycle exceeds the budget the division truncates to zero and the window grew
-// unbounded.
+// The cap is a duration in ticks, floored at base: at a long cycle it is fewer
+// ticks than base and would run the backoff backwards, and once the cycle exceeds
+// the budget the division truncates to zero and the window grows unbounded.
 func heartbeatAllowedTicks(base, consecutiveFailures int, cycle time.Duration) int {
 	if consecutiveFailures <= 0 || base <= 0 || cycle <= 0 {
 		return base

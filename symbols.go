@@ -19,10 +19,9 @@ import (
 //
 // Lock ordering: NEVER hold cache.lock and notifications.lock at once.
 //
-// Generation tracking lives on sessionFSM.epoch: a cache.symbols swap bumps it, a
-// simple on-demand insert does not. A caller publishing a *symbol obtained
-// pre-roundtrip into another structure MUST capture the epoch before resolve and
-// recheck before commit, or the pointer may be stranded.
+// Generation tracking lives on sessionFSM.epoch: a symbols swap bumps it, an
+// on-demand insert does not. Publishing a *symbol obtained pre-roundtrip elsewhere
+// MUST capture the epoch before resolve and recheck before commit.
 type symbolCache struct {
 	lock               sync.Mutex
 	symbols            map[string]*symbol
@@ -276,9 +275,8 @@ func (v SymbolView) IsValid() bool { return v.conn != nil && v.FullName != "" }
 // from size -- inference is limited to 1- and 2-byte widths, since 4 and 8 are
 // REAL/LREAL ambiguous.
 //
-// Returns "" when none resolve, in practice a 4- or 8-byte user type with no
-// datatype table loaded. No symbol has "" legitimately, so callers branch on it
-// directly. Warns once per symbol naming the remedy. Never fetches the table
+// Returns "" when none resolve -- no symbol has "" legitimately, so callers branch
+// on it -- and warns once per symbol naming the remedy. Never fetches the table
 // itself: a getter with no ctx and no error has no business doing I/O.
 func (v SymbolView) BaseTypeName() string {
 	// parse() switches on the declared name first, so it wins: TC3 stamps DT
