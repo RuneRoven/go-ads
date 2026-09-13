@@ -30,20 +30,11 @@ func WithHostIP(ip string) SessionOption {
 	}
 }
 
-// WithLocalBindIP forces the outbound TCP source IP. Default behavior (when
-// unset) lets the OS pick source IP via the routing table — usual case.
-// Used for multi-Session deployments on a host with IP aliases: each Session
-// pins to a distinct local IP so the PLC sees them as separate hosts and
-// allocates a TCP slot per source IP (TwinCAT enforces 1 TCP slot per
-// source IP, regardless of source AMS NetID — see Beckhoff/ADS #49 / #72).
-// The aliased IP must exist on a local interface before Connect; the OS
-// returns "address not available" from Dial if it doesn't.
-//
-// Invalid IP strings are rejected at option-application time with a Warn
-// log; the Session's localBindIP stays nil (OS-default routing). This
-// matches the WithBackoff precedent — option-time validation surfaces
-// configuration errors immediately rather than failing every Connect /
-// Reconnect attempt with the same parse error.
+// WithLocalBindIP forces the outbound TCP source IP; unset lets the OS pick. Used
+// on hosts with IP aliases so each Session looks like a separate host and gets its
+// own TCP slot -- TwinCAT allows one per source IP regardless of NetID (Beckhoff
+// #49/#72). The alias must exist before Connect. An invalid IP is rejected at
+// option time with a Warn, leaving OS-default routing.
 func WithLocalBindIP(ip string) SessionOption {
 	return func(s *Session) {
 		if ip == "" {
@@ -62,34 +53,16 @@ func WithLocalBindIP(ip string) SessionOption {
 	}
 }
 
-// WithLocalAMS sets the local (source) AMSAddress carried in outgoing ADS
-// headers. NetID defaults to auto-derivation from the local TCP source IP
-// when this option is omitted; Port defaults to a random value in the IANA
-// dynamic range 32768-49151 (see randomAMSPort). The AMS port is a logical
-// identifier inside the AMS header — it is NOT the TCP source port (which
-// the OS assigns ephemerally) and NOT the TCP destination port (always
-// 48898). Override with WithLocalAMS(AMSAddress{Port: N}) only when a
-// deployment needs a stable, predictable AMS port (e.g. PLC-side route
-// table pinning).
-// HAZARD when combined with route registration. TwinCAT keys its route table
-// differently per generation — TC2 by route NAME, TC3 by ADDRESS — and on TC3 a
-// table holding two entries for one address takes the router out of service for
-// EVERY client until it is cleared by hand and the device restarted. Measured on
-// TC3.1.4024 and TC3.1.4026: healthy one moment, dead five seconds after a second
-// NetID was registered at an address that already had an entry. Re-registering the
-// same NetID at the same address on TC2 is harmless (measured: one entry before,
-// one after).
+// WithLocalAMS sets the local (source) AMSAddress in outgoing ADS headers. NetID
+// defaults to the local TCP source IP, Port to a random dynamic-range value. The
+// AMS port is a logical id in the header, not the TCP source or destination port.
 //
-// The library keeps itself on the safe side of that: the NetID is derived from the
-// address the PLC is told to use (WithHostIP, or the local TCP source IP), and a
-// Session registers a route at most once. Overriding the NetID here breaks the
-// correspondence, so if another entry on that PLC already claims the address the
-// PLC will use for us, the two collide on exactly the key TC3 cares about.
-//
-// Safe uses: a NetID that matches the address (what auto-derivation produces), or
-// WithSkipRouteRegistration when the route table is managed elsewhere. Avoid: two
-// sessions from one host under different NetIDs while both register routes, and
-// changing the NetID between runs — the PLC keeps the old entry.
+// HAZARD with route registration: TC3 keys its route table by ADDRESS, and two
+// entries for one address take the router out of service for every client until it
+// is cleared by hand and the device restarted. Auto-derivation keeps NetID and
+// address in correspondence; overriding the NetID breaks it. Safe: a NetID
+// matching the address, or WithSkipRouteRegistration. Avoid: two sessions from one
+// host under different NetIDs, or changing the NetID between runs.
 func WithLocalAMS(local AMSAddress) SessionOption {
 	return func(s *Session) {
 		if local.NetID != [6]byte{} {
@@ -278,19 +251,11 @@ const (
 	TargetCheckOff
 )
 
-// WithTargetCheck sets what happens when the target NetID disagrees with what
-// the device reports for itself (see TargetCheck). Default is TargetCheckWarn.
-//
-// The check runs in Connect, costs one UDP round-trip, and only applies to a
-// caller-supplied target — an incomplete one is resolved from the device by
-// NewSession instead, which is authoritative by construction. TargetCheckOff
-// therefore disables verification of a complete target; it does not disable
-// that resolution.
-//
-// A device that does not answer the identify service is never treated as a
-// mismatch, in any mode: verification is skipped with an Info line and Connect
-// proceeds, because a firewalled UDP port says nothing about whether the
-// address is right.
+// WithTargetCheck sets what happens when the target NetID disagrees with what the
+// device reports. Default TargetCheckWarn. Runs in Connect for one UDP round-trip,
+// and only for a caller-supplied target -- an incomplete one is resolved from the
+// device, which is authoritative. A device that does not answer identify is never
+// a mismatch in any mode: a firewalled UDP port says nothing about the address.
 func WithTargetCheck(c TargetCheck) SessionOption {
 	return func(s *Session) {
 		if c != 0 {
@@ -299,20 +264,11 @@ func WithTargetCheck(c TargetCheck) SessionOption {
 	}
 }
 
-// WithRouteActivationTimeout caps how long Connect waits, after registering a
-// route, for the PLC's AMS router to actually start serving it. The router
-// acknowledges the UDP registration before the entry is necessarily live, and
-// until it is, requests are dropped with no reply — so Connect re-probes
-// rather than handing back a session where every command times out.
-//
-// The default (10s) covers every PLC observed so far, including TC/RTOS, which
-// is the slowest. Raise it for a PLC or router under heavy load; lower it when
-// the caller would rather fail fast than wait (CI, discovery tooling). The
-// per-probe timeout and retry cadence are derived from this value.
-//
-// Values <= 0 are ignored. Note a deadline on the context passed to Connect
-// also bounds this wait, so the option is only needed to wait LONGER than the
-// default.
+// WithRouteActivationTimeout caps how long Connect waits for a freshly registered
+// route to actually be served: the router acks the registration before the entry
+// is live, and until then requests are dropped with no reply. Default 10s covers
+// every PLC observed. Values <= 0 are ignored, and a deadline on Connect's context
+// also bounds the wait, so this is only needed to wait longer.
 func WithRouteActivationTimeout(d time.Duration) SessionOption {
 	return func(s *Session) {
 		if d > 0 {
@@ -322,41 +278,25 @@ func WithRouteActivationTimeout(d time.Duration) SessionOption {
 }
 
 // WithAmsPeerListen makes the session listen for a connection the PLC opens back
-// to us, and use it for responses.
+// to us and use it for responses. Needed for devices that treat a registered route
+// as a peer router: they process our requests on our connection but answer over
+// one they open to us. Without it such a device looks like it times out on
+// everything, because the responses reach a socket nobody is listening on.
 //
-// Needed for devices that treat a registered route as a peer router: they accept
-// and process our requests on the connection we opened, then send every response
-// over a connection they open to us on port 48898. Measured on TC3.1.4026
-// (TC/RTOS); TC2 2.10 and TC3.1.4024/CE answer on our own connection and never
-// dial back. Without this, such a device looks exactly like a PLC that times out
-// on everything — the responses are being delivered to a socket nobody is
-// listening on.
-//
-// port is normally amsPeerListenPort (48898), which is where a TwinCAT peer
-// expects to find a router; it is a parameter so tests, containers and hosts that
-// already run a TwinCAT router can choose another. Binding failures are reported
-// by Connect rather than being silent, because a session that needs this and does
-// not have it will not work at all.
-//
-// Off by default: it binds a listening socket, which is not something a client
-// library should do unless asked.
+// port is normally 48898, parameterised for tests and hosts already running a
+// TwinCAT router. Off by default, since binding is not a client library's business
+// unless asked; binding failures surface from Connect rather than silently.
 func WithAmsPeerListen(port int) SessionOption {
 	return func(s *Session) {
 		s.peerListenPort = port
 	}
 }
 
-// WithoutAmsPeerFallback disables the automatic peer-listener fallback.
-//
-// By default, a Connect that proves the PLC answers nothing at all will try to
-// bind the AMS port and see whether the device is answering there instead — see
-// WithAmsPeerListen for what that means and why devices do it. The fallback only
-// ever binds a socket for a session that would otherwise be dead, and it says so
-// at WARN when it rescues one.
-//
-// Use this where binding is unacceptable or must be explicit: a host already
-// running a TwinCAT router owns that port, and some environments do not permit a
-// client process to listen at all.
+// WithoutAmsPeerFallback disables the automatic peer-listener fallback, which
+// otherwise binds the AMS port when a Connect proves the PLC answers nothing at
+// all (see WithAmsPeerListen). The fallback only binds for a session that would
+// be dead anyway. Use this where a TwinCAT router already owns the port, or where
+// a client process may not listen.
 func WithoutAmsPeerFallback() SessionOption {
 	return func(s *Session) {
 		s.peerFallbackDisabled = true
@@ -491,36 +431,16 @@ func WithOnSymbolVersionChanged(fn func(reason Reason)) SessionOption {
 	}
 }
 
-// WithNotificationHeartbeat tunes the internal heartbeat that detects
-// subscriptions dying silently.
-//
-// A subscription can stop delivering with nothing observable happening. Measured
-// on TC3.1.4024 across a CONFIG -> RUN cycle with no program change: the TCP
-// connection survives (no drop, no reconnect), the symbol version is unchanged
-// because nothing was recompiled, ADS state reads back identical, no error and no
-// terminal sample ever arrives — and the caller's subscriptions never deliver
-// again. A fully passive listener that sent the PLC nothing confirmed it: 210
-// samples, then silence for the rest of the run.
-//
-// Silence alone cannot be the signal, because an on-change subscription on a
-// constant symbol is legitimately silent forever. So the session keeps ONE cyclic
-// notification of its own, on the symbol-version index group: TwinCAT pushes it on
-// a timer regardless of change, and it was measured stopping in the same second as
-// the caller's samples on that transition. Its absence is therefore conclusive,
-// and it costs no client-side polling — the PLC does the sending.
+// WithNotificationHeartbeat tunes the internal cyclic notification that detects
+// subscriptions dying silently. A subscription can stop delivering with nothing
+// observable happening, and an on-change subscription may be silent legitimately,
+// so only a cyclic beat's absence is conclusive.
 //
 // interval is the cycle time; missed is how many beats may be lost before the
-// session concludes its subscriptions are dead and re-subscribes them. Defaults:
-// 2s and 5 (so roughly 10s to notice). missed < 2 is raised to 2, because a single
-// late beat is not evidence of anything.
-//
-// See WithNotificationSilenceTimeout to state the tolerated silence as a duration
-// instead of a tick count, and WithHeartbeatRecovery to choose what happens when
-// it runs out.
-//
-// This option no longer affects the runtime-state poll. It used to: the poll ran
-// at this interval, so setting a 30s heartbeat silently made the state poll 30s
-// too. Use WithRuntimeStateWatch for that.
+// session re-subscribes. Defaults 2s and 5 (~10s to notice); missed < 2 is raised
+// to 2. See WithNotificationSilenceTimeout for a duration instead of a count,
+// WithHeartbeatRecovery for what happens next, and WithRuntimeStateWatch for the
+// runtime-state poll, which this no longer affects.
 func WithNotificationHeartbeat(interval time.Duration, missed int) SessionOption {
 	return func(s *Session) {
 		if interval > 0 {
@@ -570,22 +490,12 @@ func WithNotificationSilenceTimeout(d time.Duration) SessionOption {
 	}
 }
 
-// WithHeartbeatRecovery selects what happens when the heartbeat goes silent.
-//
-// The default, HeartbeatRecoveryImmediate, re-subscribes at once. That is one
-// delete plus one add per handle in a burst — 82 requests on a 41-symbol session —
-// against a device that may simply have stalled, which is why the alternatives
-// exist:
-//
-//   - HeartbeatRecoveryConfirm waits for a second consecutive silent window first.
-//     Doubles the time to notice a genuinely dead subscription; halves the chance
-//     of churning every handle over one late beat.
-//   - HeartbeatRecoveryObserve never re-subscribes. The session reports the
-//     silence (a Warn, plus ReasonHeartbeatSilent to the WithOnSymbolVersionChanged
-//     callback) and leaves the decision to the consumer.
-//
-// An unrecognised value is ignored, leaving the default in place: a typo should
-// not silently turn recovery off.
+// WithHeartbeatRecovery selects what happens when the heartbeat goes silent. The
+// default, Immediate, re-subscribes at once -- a delete plus an add per handle, 82
+// requests on a 41-symbol session, against a device that may have merely stalled.
+// Confirm waits for a second silent window, doubling the time to notice but
+// halving needless churn. Observe never re-subscribes and reports it instead. An
+// unrecognised value keeps the default: a typo must not turn recovery off.
 func WithHeartbeatRecovery(mode HeartbeatRecovery) SessionOption {
 	return func(s *Session) {
 		switch mode {
