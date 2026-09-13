@@ -3379,8 +3379,24 @@ func (sess *Session) resubscribeNotificationsLocked() error {
 		// Clear channel reference so a future AddSymbolNotification can use a new channel.
 		sess.notifications.lock.Lock()
 		sess.notifications.notificationChannel = nil
+		// A healthy session now holds nothing, so the baseline has to say so.
+		// Left where it was, the gap check would re-subscribe for ever against
+		// symbols the PLC has told us it no longer has.
+		sess.notifications.lowerRegisteredTo(0)
 		sess.notifications.lock.Unlock()
 		return nil
+	}
+	// Same reasoning for a partial disappearance: what filterValidPending dropped
+	// is gone from the PLC, not missing because a re-subscribe failed, so it must
+	// come off the baseline. Everything still on file -- including entries this
+	// attempt will fail to restore and re-queue -- stays counted, which is what
+	// leaves the shortfall visible as want > have.
+	if dropped := len(savedPending) - len(validPending); dropped > 0 {
+		sess.notifications.lock.Lock()
+		sess.notifications.lowerRegisteredTo(len(validPending))
+		sess.notifications.lock.Unlock()
+		sess.logger.Info("re-subscribe: symbols are no longer on the PLC, lowering what a healthy session holds",
+			"dropped", dropped, "remaining", len(validPending))
 	}
 	// Snapshot active handles before the re-subscribe attempt. If
 	// AddSymbolNotifications partially succeeds and then errors, we use the
@@ -3437,6 +3453,12 @@ func (sess *Session) resubscribeNotificationsLocked() error {
 			"retry_count", len(retryEntries))
 	}
 	if len(droppedConfigs) > 0 {
+		// Abandoned for good, so they stop counting toward healthy -- otherwise
+		// the gap they leave is permanent and recovery retries them for the life
+		// of the session, which is the churn resubscribeMaxAttempts exists to stop.
+		sess.notifications.lock.Lock()
+		sess.notifications.lowerRegisteredTo(len(validPending) - len(droppedConfigs))
+		sess.notifications.lock.Unlock()
 		sess.logger.Error("resubscribe: dropping configs after max retries",
 			"dropped", droppedConfigs,
 			"max_attempts", resubscribeMaxAttempts)
@@ -3465,6 +3487,23 @@ func (sess *Session) resubscribeNotificationsLocked() error {
 				"deleted", deleted)
 		}
 		return err
+	}
+
+	// Report what came back. "reconnect successful" says the socket is up, not
+	// that data is flowing, and everything else about a session that returned
+	// with fewer subscriptions than it asked for reads as healthy: the transport
+	// is live and the FSM says Connected. This is the only place the shortfall is
+	// visible, and the symbols that did not come back deliver nothing until some
+	// later retry restores them.
+	sess.notifications.lock.Lock()
+	restored := len(sess.notifications.activeNotifications)
+	sess.notifications.lock.Unlock()
+	if restored < len(validConfigs) {
+		sess.logger.Error("re-subscribed fewer symbols than were on file; the missing ones deliver nothing until a later attempt restores them",
+			"restored", restored, "requested", len(validConfigs))
+	} else {
+		sess.logger.Info("re-subscribed after reconnect",
+			"restored", restored, "requested", len(validConfigs))
 	}
 	return nil
 }

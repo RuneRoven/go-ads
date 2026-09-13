@@ -1662,7 +1662,7 @@ func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
 	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
 	_ = sess.establishHeartbeat(ctx)
 	sess.notifications.lock.Lock()
-	sess.notifications.registered.Store(int64(len(sess.notifications.activeNotifications)))
+	sess.notifications.raiseRegistered()
 	sess.notifications.lock.Unlock()
 	sess.logger.Info("subscriptions re-established after the heartbeat stopped")
 	return recoveryDone

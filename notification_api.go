@@ -132,8 +132,12 @@ type notificationManager struct {
 	// would make want != have forever and churn recovery for the life of the
 	// session. This counts what was actually achieved instead.
 	//
-	// Lowered only when the caller deletes a subscription. A release done by
-	// recovery must NOT lower it -- that gap is precisely what has to be detected.
+	// Raised by any commit, lowered only deliberately: the caller deletes a
+	// subscription, or the PLC no longer has the symbol. A release done by
+	// recovery must NOT lower it -- that gap is precisely what has to be detected
+	// -- and neither may a partial re-subscribe, or the symbols it failed to
+	// restore become the new definition of healthy and nothing ever retries them.
+	// See raiseRegistered / lowerRegisteredTo.
 	registered atomic.Int64
 	// orphanSamples counts samples arriving for handles we do not own. A PLC that
 	// kept a previous session's subscriptions pushes one per cycle per handle --
@@ -253,6 +257,33 @@ func (m *notificationManager) subscriptionGap() (want, have int) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	return int(m.registered.Load()), len(m.activeNotifications)
+}
+
+// raiseRegistered lifts the healthy-session baseline to what is held now, and
+// never lowers it. A commit is proof the session can hold that many; it is not
+// proof that fewer is the new normal. Storing the count outright instead meant a
+// partial re-subscribe redefined healthy as the smaller set it had just managed,
+// so the symbols it failed to restore left no gap and nothing retried them --
+// the session ran short for good, looking healthy the whole time.
+//
+// Lowering is deliberate and has exactly two causes: the caller tears a
+// subscription down, or the PLC no longer has the symbol. See lowerRegisteredTo.
+// Caller must hold lock.
+func (m *notificationManager) raiseRegistered() {
+	if n := int64(len(m.activeNotifications)); n > m.registered.Load() {
+		m.registered.Store(n)
+	}
+}
+
+// lowerRegisteredTo drops the baseline to n when it currently sits higher, for
+// the cases where a healthy session genuinely holds less than it used to: a
+// symbol the PLC no longer has, or a config abandoned after too many retries.
+// Without it the gap check would chase handles that can never come back.
+// Caller must hold lock.
+func (m *notificationManager) lowerRegisteredTo(n int) {
+	if int64(n) < m.registered.Load() {
+		m.registered.Store(int64(n))
+	}
 }
 
 func (m *notificationManager) hasLiveNotification(symbolName string) bool {
@@ -634,7 +665,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	defer sess.notifications.lock.Unlock()
 	sess.notifications.activeNotifications[handle] = activeNotification{Sym: fresh, Ch: updateReceiver}
 	// The PLC gave us this handle, so it is part of what a healthy session holds.
-	sess.notifications.registered.Store(int64(len(sess.notifications.activeNotifications)))
+	sess.notifications.raiseRegistered()
 	committed = append(committed, handle)
 
 	// Save config for reconnect re-subscribe
@@ -1025,7 +1056,7 @@ func (sess *Session) commitNotification(cfg NotificationConfig, handle uint32, c
 	// Same as the single-subscribe site: this is what a healthy session holds.
 	// Missing it here made the gap check inert for every batch subscriber, which
 	// is how the plugin subscribes -- caught on hardware, want=0 have=1.
-	sess.notifications.registered.Store(int64(len(sess.notifications.activeNotifications)))
+	sess.notifications.raiseRegistered()
 	// addConfig wraps in a fresh pendingNotification with resubscribeAttempts=0,
 	// so a successful subscribe naturally resets any prior retry counter.
 	sess.notifications.addConfig(cfg)

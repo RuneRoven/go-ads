@@ -1865,3 +1865,76 @@ func TestHeartbeat_RecoversWhenTheBeatIsSlowerThanTheTick(t *testing.T) {
 	t.Fatalf("never recovered with a beat slower than the tick: want=%d have=%d — "+
 		"beatless ticks are resetting the gap counter", w, h)
 }
+
+// newGapManager builds a notificationManager holding n handles with the baseline
+// raised to match, which is the state a first connect leaves behind.
+func newGapManager(n int) *notificationManager {
+	m := &notificationManager{activeNotifications: map[uint32]activeNotification{}}
+	for i := 1; i <= n; i++ {
+		m.activeNotifications[uint32(0x100+i)] = activeNotification{}
+	}
+	m.raiseRegistered()
+	return m
+}
+
+// A re-subscribe that restores fewer handles than the session had must leave the
+// shortfall visible. The baseline used to be stored outright on every commit, so
+// the last partial commit redefined healthy as the smaller set: want == have, no
+// gap, and nothing ever retried the symbols that did not come back.
+func TestRegisteredBaseline_PartialResubscribeLeavesAGap(t *testing.T) {
+	m := newGapManager(40)
+	if want, have := m.subscriptionGap(); want != 40 || have != 40 {
+		t.Fatalf("first connect baseline: want=%d have=%d, expected 40/40", want, have)
+	}
+
+	// A reconnect that gets only 12 of them back.
+	m.lock.Lock()
+	m.activeNotifications = map[uint32]activeNotification{}
+	for i := 1; i <= 12; i++ {
+		m.activeNotifications[uint32(0x200+i)] = activeNotification{}
+		m.raiseRegistered() // as each commit lands
+	}
+	m.lock.Unlock()
+
+	want, have := m.subscriptionGap()
+	if want != 40 || have != 12 {
+		t.Fatalf("want=%d have=%d, expected 40/12 — a partial re-subscribe redefined what healthy means, "+
+			"so the 28 symbols that never came back leave no gap and nothing retries them", want, have)
+	}
+}
+
+// The baseline must still rise when the caller genuinely subscribes more.
+func TestRegisteredBaseline_RisesOnNewSubscriptions(t *testing.T) {
+	m := newGapManager(2)
+	m.lock.Lock()
+	m.activeNotifications[0x999] = activeNotification{}
+	m.raiseRegistered()
+	m.lock.Unlock()
+	if want, have := m.subscriptionGap(); want != 3 || have != 3 {
+		t.Errorf("want=%d have=%d, expected 3/3: a new subscribe must raise the baseline", want, have)
+	}
+}
+
+// Symbols the PLC no longer has must come off the baseline, or the gap check
+// chases handles that can never come back for the life of the session.
+func TestRegisteredBaseline_LowersWhenSymbolsAreGone(t *testing.T) {
+	m := newGapManager(40)
+	m.lock.Lock()
+	m.lowerRegisteredTo(35) // filterValidPending dropped 5
+	m.activeNotifications = map[uint32]activeNotification{}
+	for i := 1; i <= 35; i++ {
+		m.activeNotifications[uint32(0x300+i)] = activeNotification{}
+		m.raiseRegistered()
+	}
+	m.lock.Unlock()
+	if want, have := m.subscriptionGap(); want != 35 || have != 35 {
+		t.Errorf("want=%d have=%d, expected 35/35: symbols gone from the PLC must not leave a permanent gap", want, have)
+	}
+	// And lowering never raises.
+	m.lock.Lock()
+	m.lowerRegisteredTo(99)
+	m.lock.Unlock()
+	if want, _ := m.subscriptionGap(); want != 35 {
+		t.Errorf("lowerRegisteredTo raised the baseline to %d", want)
+	}
+}
