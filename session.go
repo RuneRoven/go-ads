@@ -82,18 +82,10 @@ type sessionLifecycle struct {
 	// goroutine and must keep spawning Reconnect with a bare `go`.
 	dialMu sync.Mutex
 
-	// unservedCooldown is how long the reconnect loop goes completely quiet — no
-	// sockets, no route registration — after unservedAttemptsBeforeCooldown
-	// consecutive attempts where the TCP dial SUCCEEDED but the PLC answered
-	// nothing.
-	//
-	// That combination is not "the PLC is down"; it is a router that has our IP
-	// in a state it will not serve. The TwinCAT router expects exactly one TCP
-	// connection per remote IP and drops the older one whenever a new connection
-	// arrives (Beckhoff/ADS#85), so redialing every backoff sustains the problem:
-	// each new dial costs the router the connection it just rebuilt. Observed on a
-	// TC/RTOS device in this lab for months, and it tends to serve again once
-	// something stops connecting for a while. Zero means the default.
+	// unservedCooldown silences the reconnect loop entirely after N attempts where
+	// the dial succeeded but the PLC answered nothing. That is a router holding our
+	// IP in a state it will not serve, and since it keeps one TCP per host
+	// (Beckhoff #85) redialing sustains it. Zero means the default.
 	unservedCooldown time.Duration
 
 	// reconnectAttempts counts dials made by the current reconnect loop. Exposed
@@ -926,18 +918,12 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		switch {
 		case err == nil:
 		case errors.Is(err, ErrTransportClosed):
-			// The link died while we were connecting. Reporting success here hands
-			// the caller a Session whose transport is already gone.
-			// The addressing guidance goes in the RETURNED error, not only in the
-			// log line the listen goroutine wrote. A consumer that surfaces err and
-			// not this library's logger otherwise sees "client transport closed" and
-			// nothing else — measured against a PLC with its route table wiped,
-			// where the cause was a missing route and the message said so only in a
-			// log record the plugin never shows.
-			// Which verdict, and therefore which hint, depends on whether this
-			// connection ever carried a frame — the same split the drop log makes.
-			// A consumer that surfaces the error and not this library's logger gets
-			// the sentinel to branch on rather than having to match strings.
+			// The link died mid-connect; reporting success hands back a dead session.
+			// The addressing hint goes in the RETURNED error, not just the log: a
+			// consumer that surfaces err and not our logger would otherwise see only
+			// "client transport closed". Which hint depends on whether the connection
+			// ever carried a frame, and a sentinel carries it so callers need not
+			// match strings.
 			hint := resetAfterConnectHint(sess.sourceAddr(), sess.target)
 			verdict := ErrRouteNotServed
 			if c := sess.client.Load(); c != nil && c.wasEstablished() {
@@ -1201,36 +1187,22 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 	return true, nil
 }
 
-// Route activation: AddRoute is a UDP call to the PLC's AMS router, and the
-// router acknowledges the entry before it is necessarily serving it. Until it
-// does, ADS requests for our NetID are dropped with no reply at all — not an
-// error code, silence. Observed on TC/RTOS 3.1.4026 (192.168.3.224) as a
-// Connect that returned success followed by a session where ReadState,
-// ReadDeviceInfo and LoadSymbols all timed out; the route worked on the next
-// process start. Re-probe until the router answers so Connect either hands
-// back a session that works or fails honestly.
-// The default ceiling is generous on purpose: the wait ends on the first
-// successful probe, so the only case that pays it is a route that never comes
-// live, where taking 10s to report an honest failure beats reporting success.
-// Override with WithRouteActivationTimeout.
+// Route activation: the router acks an AddRoute before it necessarily serves it,
+// and until it does our requests are dropped in silence rather than refused. So
+// re-probe until it answers and Connect either works or fails honestly. The
+// ceiling is generous because the wait ends on the first successful probe; only a
+// route that never comes live pays it. See WithRouteActivationTimeout.
 const (
 	defaultRouteActivationTimeout = 10 * time.Second
 	routeActivationPollDelay      = 250 * time.Millisecond
 	minRouteActivationProbe       = 500 * time.Millisecond
 	maxRouteActivationProbe       = 2 * time.Second
 
-	// maxRouteActivationRedials caps how many TCP connections one activation
-	// window may burn. Measured in the field before the cap existed: 76 ephemeral
-	// ports in 11s (62029 -> 62041 -> 62117 -> 62184) and a device log counting
-	// attempt=16 .. attempt=22, because the loop redialled on EVERY 250ms poll for
-	// the whole 10s budget -- around 40 sockets.
-	//
-	// The cap is not just politeness. A Beckhoff AMS router serves one TCP per
-	// host and closes the older one (Beckhoff/ADS#49), so every redial evicted its
-	// own predecessor: the storm was ~40 self-inflicted evictions. On Windows CE
-	// each of those sockets then sits in TIME_WAIT for minutes on a device with a
-	// small socket table, which is the most likely source of the recurring "route
-	// registered but the PLC did not serve it" state.
+	// maxRouteActivationRedials caps the TCP connections one activation window may
+	// burn -- uncapped it redialled on every poll, ~40 sockets in 11s. Not
+	// politeness: the router keeps one TCP per host (Beckhoff #49), so each redial
+	// evicted its own predecessor, and on CE those sockets sit in TIME_WAIT for
+	// minutes.
 	maxRouteActivationRedials = 3
 	// redialBackoffBase/redialBackoffMax bound the wait between redials. The wait
 	// happens BEFORE the redial, which is what gives the PLC time to release the
@@ -1339,17 +1311,10 @@ func (sess *Session) currentLifecycleCtx() context.Context {
 	return sess.lifecycle.ctx
 }
 
-// waitDuringActivation sleeps for d during a route-activation window, honouring
-// three ways of being told to stop.
-//
-// The third one is the reason this is a function. A plain two-arm select on
-// time.After and the attempt context misses Close: on the Connect path ctxFor is
-// Connect's OWN caller context (Connect passes its ctx, and no teardown touches
-// it), which Close does not cancel. So Close would return -- its
-// Client.waitGroup.Wait finds the torn-down client already drained -- and this
-// loop would then wake up and dial a fresh TCP connection to the PLC AFTER Close
-// returned, because dialAndStart dials before it re-checks isClosed. A stray
-// socket and a stray ephemeral port, in the one code path whose whole purpose is
+// waitDuringActivation sleeps during a route-activation window, honouring three
+// stop signals. The third is why it exists: on the Connect path the attempt ctx is
+// the caller's own, which Close does not cancel, so a two-arm select would wake
+// after Close returned and dial a fresh socket -- in the one path whose purpose is
 // to stop burning ephemeral ports.
 func (sess *Session) waitDuringActivation(ctxFor func() context.Context, d time.Duration) error {
 	timer := time.NewTimer(d)
@@ -2523,18 +2488,11 @@ func (sess *Session) ensureRoute() error {
 		return fmt.Errorf("connection closed")
 	}
 
-	// Force mode or too many probe failures → register, unless this session
-	// registered recently. See routeManager.registered and mayRegister: re-registering the
-	// same route cannot fix anything, and on some firmware it leaves a duplicate
-	// runtime entry that breaks the device outright.
-	//
-	// Force is the one caller-declared exception, and it bypasses the latch here
-	// exactly as it already does on Connect (ensureRouteOnConnect). Gating it was
-	// what made WithForceRouteRegistration mean "register once, then stop" —
-	// contradicting its godoc, README.md and R-ROUTE-005, and failing the very case
-	// it is documented for: a device that forgets its route table on reboot was
-	// reconnected to without a re-registration. The route-table cost is stated in
-	// the option's godoc and is opt-in; sessions that do not set it are unaffected.
+	// Register on force or repeated probe failures, unless this session registered
+	// recently: re-registering the same route fixes nothing and on some firmware
+	// leaves a duplicate entry. Force bypasses the latch, as it does on Connect --
+	// gating it made WithForceRouteRegistration mean "register once, then stop",
+	// failing the reboot case it exists for.
 	probeFailures := sess.route.routeProbeFailures.Load()
 	if sess.route.forceRouteRegistration || probeFailures >= 3 {
 		if !sess.route.forceRouteRegistration && !sess.route.mayRegister() {
@@ -3510,19 +3468,10 @@ func (sess *Session) knownRuntimeState() (ADSState, bool) {
 	return state, true
 }
 
-// requireRunningRuntime refuses an operation that cannot work outside RUN.
-//
-// Gated on evidence: with no reading (a device that does not serve the system
-// service port, or a session that has not polled yet) it permits the operation
-// rather than inventing a reason to fail.
-// runtimeDefinitelyNotServing lists the states in which a runtime port provably
-// does not serve, so the call cannot succeed and attempting it only produces a
-// confusing AMS "port not found".
-//
-// A whitelist of bad states, not "anything that is not RUN": the only measured
-// evidence is TC3.1.4024 reporting CONFIG (15), and refusing on every state this
-// code has not been taught about would turn an unfamiliar-but-working device into
-// one where nothing can be subscribed at all — with no PLC error to explain it.
+// requireRunningRuntime refuses an operation that cannot work outside RUN. With
+// no reading at all it permits rather than inventing a reason to fail. A
+// whitelist of provably-not-serving states, not "anything but RUN": refusing on
+// unfamiliar states would break a working device with no PLC error to explain it.
 func runtimeDefinitelyNotServing(state ADSState) bool {
 	switch state {
 	case ADSStateConfig, ADSStateReconfig:
