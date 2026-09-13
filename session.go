@@ -76,13 +76,10 @@ type sessionLifecycle struct {
 	// the whole loop body and would self-deadlock on the inner redial. Reconnect is
 	// single-flighted by reconnectOwner, Connect by lifecycle.connecting.
 	//
-	// INVARIANT: nothing registered on lifecycle.waitGroup, and no Client worker,
-	// may acquire dialMu. tearDownAndReset waits both WaitGroups while a redial
-	// holds this lock, so a member that blocked on it would deadlock: the teardown
-	// waits for the goroutine, the goroutine waits for the lock the teardown's own
-	// caller holds. In particular ondrop/triggerReconnect runs on the listen
-	// goroutine, which is in Client.waitGroup -- it must keep spawning Reconnect
-	// with a bare `go` and never dial synchronously.
+	// INVARIANT: nothing on lifecycle.waitGroup and no Client worker may take
+	// dialMu. tearDownAndReset waits both WaitGroups while a redial holds it, so a
+	// member blocking on it deadlocks. triggerReconnect runs on the listen
+	// goroutine and must keep spawning Reconnect with a bare `go`.
 	dialMu sync.Mutex
 
 	// unservedCooldown is how long the reconnect loop goes completely quiet — no
@@ -188,19 +185,11 @@ const (
 	flapResetWindow = 60 * time.Second
 )
 
-// nextFlapCount decides how a drop moves the flap counter.
-//
-// Pure and separate from the reconnect path because the two ways this goes wrong
-// are both invisible from outside — the session simply retries at the wrong rate —
-// and the previous version had exactly that bug: a gap between flapWindow and
-// flapResetWindow where a drop neither incremented the counter nor reset it, so a
-// device resetting on a timer got the first backoff tier for ever.
-//
-//   - shorter than flapWindow: severe, counts double.
-//   - shorter than flapResetWindow: a flap; the connection never stabilised.
-//   - longer: the session was healthy, so start over.
-//   - no previous Connected at all: a flap only if this attempt served nothing,
-//     since the sockets are being spent either way.
+// nextFlapCount decides how a drop moves the flap counter. Pure and separate
+// because both ways it goes wrong are invisible -- the session just retries at the
+// wrong rate. Shorter than flapWindow counts double; shorter than flapResetWindow
+// is a flap; longer resets; no previous Connected is a flap only if this attempt
+// served nothing.
 func nextFlapCount(prev int, lastConnected, now time.Time, servedNothing bool) int {
 	if lastConnected.IsZero() {
 		if servedNothing {
@@ -794,19 +783,10 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	// Session and Client share the *transport pointer (no re-dial); the Client
 	// owns the listen / transmit / recvWorker goroutines.
 	newClient := sess.publishWiredClient()
-	// Same rule as dialAndStart: clear AFTER the workers are up, so anything that
-	// observes disconnected=false finds transmitWorker actually running.
-	//
-	// Connect never cleared this flag, which was invisible only because a rival
-	// Reconnect used to do it: the flag starts false, so the first Connect never
-	// noticed, and a retry after a Connect that recorded a drop only worked because
-	// the drop had spawned a Reconnect whose dialAndStart cleared it. With that
-	// spawn suppressed (lifecycle.connecting) the stale true survived into the
-	// retry, and every request on the retry's perfectly good socket failed
-	// ErrTransportClosed — a session that cannot be reconnected in place and cannot
-	// be retried either. A drop landing in the gap above is not erased for long:
-	// the liveness probe is the very next thing to run and fails on the dead
-	// socket, which records it again.
+	// Clear AFTER the workers are up, so disconnected=false implies transmitWorker
+	// is running. Connect never cleared it and got away with it only because a rival
+	// Reconnect did; with that spawn suppressed the stale true survived into the
+	// retry and failed every request on a perfectly good socket.
 	sess.tx.disconnected.Store(false)
 	// If this device has already been shown to answer on a connection it opens to
 	// us, bind the listener before probing anything. Otherwise every session pays
@@ -1118,20 +1098,10 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 		return false, fmt.Errorf("connection closed")
 	}
 
-	// Disarm ondrop for the entire ensureRouteOnConnect call. PLC RST
-	// during the probe (typical when the route is missing or stale) would
-	// otherwise fire sess.triggerReconnect via the listen goroutine's
-	// callOnDrop, spawning a Reconnect goroutine that races our own
-	// AddRoute/redial path on sess.client / tx.connection / lifecycle.ctx
-	// (observed as concurrent "registering route" + "FSM invalid
-	// transition" log noise during cold-start when the PLC route doesn't
-	// yet match the current source IP). Re-armed at the end of the
-	// function via defer; intermediate dialAndStart calls in the retry
-	// path also re-arm on each new Client they create, but we override
-	// those back to nil for the duration of this routine.
-	// beginHandshake rides along with the ondrop disarm: a probe that times out
-	// or gets RST is the expected first step of the cold-start flow, so it must
-	// not surface as ERROR. See Client.beginHandshake.
+	// Disarm ondrop for the whole call: an RST during the probe is normal when the
+	// route is missing, and would otherwise spawn a Reconnect racing our own
+	// AddRoute/redial. Re-armed by defer. beginHandshake rides along so the
+	// expected probe faults do not surface as ERROR.
 	if oldClient := sess.client.Load(); oldClient != nil {
 		oldClient.SetOnDrop(nil)
 		oldClient.beginHandshake()
@@ -1542,20 +1512,10 @@ func (sess *Session) probeRouteVersion(ctx context.Context) (uint8, error) {
 	return sess.client.Load().GetSymbolVersion(ctx)
 }
 
-// handleStaleDetection runs the configured online-change strategy when a
-// PLC return code from the R-CACHE-009 detection set surfaces. It returns
-// (true, reason) when the code triggered stale-cache handling and
-// (false, "") for unrelated codes (no-op).
-//
-// The user-supplied callback fires in its own goroutine to honor R-SES-007:
-// callers MUST NOT block in the callback.
-//
-// Strategy dispatch:
-//   - SymbolVersionIgnore: surface the error unchanged. Subsequent
-//     notification samples are flagged Stale by R-NOT-017.
-//   - SymbolVersionClose: terminate the session asynchronously
-//     (R-CACHE-011).
-//   - SymbolVersionAutoReload: trigger full reload + resub (R-CACHE-010).
+// handleStaleDetection runs the configured online-change strategy for a PLC code
+// in the R-CACHE-009 set, reporting whether it handled the code. The user callback
+// fires in its own goroutine (R-SES-007). Ignore surfaces the error unchanged,
+// Close terminates asynchronously, AutoReload reloads and resubscribes.
 func (sess *Session) handleStaleDetection(rc ReturnCode) (stale bool, reason Reason) {
 	stale, reason = detectStaleCache(rc)
 	if !stale {
@@ -2458,19 +2418,11 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 			continue
 		}
 
-		// Release the pre-reconnect handles now, not after the reload: this is the
-		// first point where the transport is up AND routed, which is all a Delete
-		// needs. Waiting until after reloadSymbols meant a session whose dial and
-		// route came up but whose reload kept failing never issued these deletes at
-		// all, and every retry cycle left another set of handles in the PLC's table.
-		//
-		// Only forget the snapshot once every handle is accounted for. Earlier than
-		// this the transport may look dialled without being usable — with route
-		// registration skipped there is no probe to prove otherwise — and clearing
-		// the snapshot on a release that did not land loses the only record of
-		// registrations the PLC still holds. Measured against a flapping TC2:
-		// "requested=3 deleted=0" on every cycle, three more entries stranded each
-		// time.
+		// Release here, not after the reload: this is the first point where the
+		// transport is up AND routed, which is all a Delete needs. A session whose
+		// reload kept failing otherwise never issued these at all. Forget the
+		// snapshot only once every handle is accounted for -- clearing it on a
+		// release that did not land loses the record of what the PLC still holds.
 		if len(savedHandles) > 0 {
 			releaseTries++
 			deleted := sess.bestEffortDeleteNotifications(sess.currentLifecycleCtx(), savedHandles)
@@ -3005,20 +2957,11 @@ func (sess *Session) peerListenPortOrDefault() int {
 // port a PLC serves ADS on. Only relevant with WithAmsPeerListen.
 const amsPeerListenPort = 48898
 
-// startPeerListener begins accepting connections the PLC opens to us, once per
-// session. Each accepted connection is handed to whichever Client is current, so
-// it keeps working across reconnects — the PLC dials again after every drop.
-//
-// Errors are returned rather than logged-and-ignored: a session that needs this
-// cannot work without it, and the usual cause (a local TwinCAT router already
-// owns the port) is worth saying out loud.
-// A mutex, not sync.Once. Once runs its body once whether it succeeded or not, and
-// the error was a closure local — so after a failed bind every later call returned
-// nil with nothing listening. A Connect retry (legal: the rollback leaves
-// Disconnected, and Disconnected -> Connecting is an allowed edge) then proceeded
-// believing the listener was up, and tryPeerFallback went on to log "listening for
-// one it may open to us" and probe three times against a port it had never bound,
-// swallowing the one hint that says a local TwinCAT router owns 48898.
+// startPeerListener accepts connections the PLC opens to us, handing each to
+// whichever Client is current so it survives reconnects. A mutex, not sync.Once:
+// Once runs its body once whether it succeeded or not, so after a failed bind
+// every later call returned nil with nothing listening -- hiding the usual cause,
+// a local TwinCAT router already owning the port.
 func (sess *Session) startPeerListener() error {
 	sess.peerMu.Lock()
 	defer sess.peerMu.Unlock()
