@@ -3498,12 +3498,16 @@ func (sess *Session) resubscribeNotificationsLocked() error {
 	sess.notifications.lock.Lock()
 	restored := len(sess.notifications.activeNotifications)
 	sess.notifications.lock.Unlock()
+	// Same message text the initial subscribe logs, with the counts as fields
+	// rather than formatted into it: a bridge that dropped and came back reports
+	// the event the same way whether it was a first connect or a recovery, and
+	// the counts stay filterable instead of being baked into the string.
 	if restored < len(validConfigs) {
-		sess.logger.Error("re-subscribed fewer symbols than were on file; the missing ones deliver nothing until a later attempt restores them",
-			"restored", restored, "requested", len(validConfigs))
+		sess.logger.Error("Registering notifications restored fewer symbols than requested; the missing ones deliver nothing until a later attempt restores them",
+			"registered", restored, "requested", len(validConfigs))
 	} else {
-		sess.logger.Info("re-subscribed after reconnect",
-			"restored", restored, "requested", len(validConfigs))
+		sess.logger.Info("Registering notifications succeeded",
+			"registered", restored, "requested", len(validConfigs))
 	}
 	return nil
 }
