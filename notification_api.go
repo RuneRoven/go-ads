@@ -89,64 +89,29 @@ type notificationManager struct {
 	earlyBytes int
 
 	// heartbeatHandle is an internal CYCLIC notification on the symbol-version
-	// index group, and heartbeatLastNs is when it last delivered.
-	//
-	// It exists because a subscription can die with nothing observable happening:
-	// measured on TC3.1.4024 across CONFIG -> RUN with no program change, the TCP
-	// connection survives, the symbol version is unchanged, ADS state reads back
-	// identical, no error or terminal sample arrives — and the caller's
-	// subscriptions never deliver again (confirmed with a fully passive listener
-	// that sent the PLC nothing). An on-change subscription may also be silent
-	// legitimately, so silence alone proves nothing.
-	//
-	// A cyclic subscription fixes that: TwinCAT pushes on a timer regardless of
-	// change, so ITS silence is conclusive. Measured on the same transition, the
-	// beat and the caller's samples stop in the same second, which is what makes
-	// this a valid detector. 0xF008 is served by the runtime (so it dies with the
-	// runtime's notification table, unlike anything on the system port), exists
-	// regardless of the caller's program, is one byte, and its payload is the
-	// symbol version — so each beat doubles as online-change detection.
+	// index group. A subscription can die silently (TC3 across CONFIG->RUN: TCP up,
+	// symbol version unchanged, no error, no more samples), and an on-change
+	// subscription may be silent legitimately -- so only a cyclic beat's silence is
+	// conclusive. 0xF008 dies with the runtime's notification table and its payload
+	// is the symbol version, so each beat doubles as online-change detection.
 	heartbeatHandle atomic.Uint32
-	// heartbeatBeats counts delivered beats. The watchdog compares this against what
-	// it saw on the previous tick, so the decision never touches a clock.
-	//
-	// It used to compare time.Now().UnixNano() against a stored timestamp, and
-	// time.Unix carries no monotonic reading — so a wall-clock STEP was read as
-	// elapsed time. That is not exotic on the hardware this runs on: an IPC without
-	// a battery-backed RTC boots at some stale time and steps years forward on its
-	// first NTP sync, and a suspended VM or container resumes with a jump. A forward
-	// step past the window declared every live subscription dead and re-registered
-	// all of them for nothing; a backward step blinded the watchdog for the length of
-	// the step while subscriptions may genuinely have been gone. The ticker driving
-	// the watch is monotonic, so counting its ticks is both correct and less code.
+	// heartbeatBeats counts delivered beats; the watchdog compares it against the
+	// previous tick so the decision never touches a clock. A wall-clock step -- an
+	// IPC with no RTC on its first NTP sync, a resumed VM -- otherwise reads as
+	// elapsed time and kills every live subscription.
 	heartbeatBeats atomic.Uint64
 	// heartbeatEstablishFailures counts consecutive failures to register the beat,
 	// so a PLC that refuses it permanently costs one Warn rather than one per retry.
 	heartbeatEstablishFailures atomic.Int64
-	// registered is how many handles the PLC last gave us for the caller's intent:
-	// what a healthy session should have. Compared against len(activeNotifications)
-	// to notice subscriptions that went away without the caller asking.
-	//
-	// Not len(pending): pending is a superset by design and legitimately outlives a
-	// handle (see hasLiveNotification), so a symbol the PLC permanently refuses
-	// would make want != have forever and churn recovery for the life of the
-	// session. This counts what was actually achieved instead.
-	//
-	// Raised by any commit, lowered only deliberately: the caller deletes a
-	// subscription, or the PLC no longer has the symbol. A release done by
-	// recovery must NOT lower it -- that gap is precisely what has to be detected
-	// -- and neither may a partial re-subscribe, or the symbols it failed to
-	// restore become the new definition of healthy and nothing ever retries them.
-	// See raiseRegistered / lowerRegisteredTo.
+	// registered is what a healthy session holds, compared against
+	// len(activeNotifications) to spot subscriptions that died unasked. Not
+	// len(pending), which is a superset and outlives a handle. Raised by any commit;
+	// lowered only by a caller teardown or a symbol the PLC no longer has.
 	registered atomic.Int64
-	// orphanSamples counts samples arriving for handles we do not own, and
-	// orphanDeletes counts the deletes that follow, both since the last report.
-	// A PLC holding a previous session's subscriptions pushes one sample per
-	// cycle per handle -- measured at 527 in one log file -- and one delete per
-	// handle in a burst. Reported on a timer (orphanWarnNs / orphanDeleteNs) with
-	// the count, because after a reconnect these interleave with healthy samples:
-	// an "episode" reset by the next owned sample ends immediately and every
-	// orphan warns again. See tryOrphanDelete, which is the actual remedy.
+	// Samples for handles we do not own, and the deletes that follow, counted since
+	// the last report. Reported on a timer rather than per episode: after a
+	// reconnect orphans interleave with healthy samples, so a counter reset by the
+	// next owned sample ends the episode at once and every orphan reports again.
 	orphanSamples  atomic.Int64
 	orphanWarnNs   atomic.Int64
 	orphanDeletes  atomic.Int64
@@ -155,21 +120,11 @@ type notificationManager struct {
 	// decision. A stepped clock makes it a confusing number, not a wrong outcome.
 	heartbeatLastNs atomic.Int64
 
-	// resubscribeMu serialises whole re-subscribe sequences. Three paths run one —
-	// the reconnect loop, the auto-reload after an online change, and heartbeat
-	// recovery — and each begins by snapshotting pending and clearing it, so two at
-	// once means one of them reads an empty intent: it either subscribes nothing and
-	// reports success, or both register the same symbols and the PLC ends up holding
-	// two registrations per symbol.
-	//
-	// Measured on hardware, power-cycling 192.168.3.70 with 40 symbols subscribed:
-	// the heartbeat fired while the FSM still said Connected, the TCP drop was
-	// detected two seconds later, both recoveries ran, and the session reported
-	// "bound notifications = 24, want 40" while still in Reconnecting. Everything
-	// recovered in the end, but the bookkeeping disagreed with the PLC in between.
-	//
-	// Not `lock`: the sequence includes PLC round-trips, and `lock` is the dispatch
-	// hot path's mutex. Never held while taking `lock` for more than a snapshot.
+	// resubscribeMu serialises whole re-subscribe sequences. Three paths run one --
+	// reconnect, auto-reload after an online change, heartbeat recovery -- and each
+	// snapshots pending and clears it, so two at once leaves one reading an empty
+	// intent or both registering the same symbols twice on the PLC. Not `lock`,
+	// which is the dispatch hot path's; never held while taking it beyond a snapshot.
 	resubscribeMu sync.Mutex
 
 	// orphanDelete tracks unknown-handle Delete attempts so we don't spam
@@ -265,19 +220,8 @@ func (m *notificationManager) subscriptionGap() (want, have int) {
 	return int(m.registered.Load()), len(m.activeNotifications)
 }
 
-// raiseRegistered lifts the healthy-session baseline to what is held now, and
-// never lowers it. A commit is proof the session can hold that many; it is not
-// proof that fewer is the new normal. Storing the count outright instead meant a
-// partial re-subscribe redefined healthy as the smaller set it had just managed,
-// so the symbols it failed to restore left no gap and nothing retried them --
-// the session ran short for good, looking healthy the whole time.
-//
-// Lowering is deliberate and has exactly two causes: the caller tears a
-// subscription down, or the PLC no longer has the symbol. See lowerRegisteredTo.
-// Caller must hold lock.
 // reportNow reports true at most once per interval, so a burst produces one line
-// instead of one per event. Safe for concurrent callers: only the one that wins
-// the CAS reports.
+// instead of one per event. Only the caller winning the CAS reports.
 func reportNow(last *atomic.Int64, interval time.Duration) bool {
 	now := time.Now().UnixNano()
 	prev := last.Load()
@@ -290,6 +234,11 @@ func reportNow(last *atomic.Int64, interval time.Duration) bool {
 // orphanReportInterval bounds how often the orphan sample/delete lines appear.
 const orphanReportInterval = 30 * time.Second
 
+// raiseRegistered lifts the baseline to what is held now and never lowers it: a
+// commit proves the session can hold that many, not that fewer is the new normal.
+// Storing the count outright let a partial re-subscribe redefine healthy as the
+// smaller set, leaving no gap for the symbols it failed to restore.
+// Caller must hold lock.
 func (m *notificationManager) raiseRegistered() {
 	if n := int64(len(m.activeNotifications)); n > m.registered.Load() {
 		m.registered.Store(n)

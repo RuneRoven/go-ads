@@ -701,34 +701,10 @@ func (sess *Session) replayEarlySamples(ctx context.Context, handles []uint32) {
 	}
 }
 
-// Orphan-Delete: when handleNotification receives a sample for a handle that
-// is not in activeNotifications (and we are past the first-sample-race
-// window), the handle is most likely a leftover subscription from a prior
-// process that shared our source NetID+port. The PLC's notification handle
-// table is finite per source identity; without explicit cleanup repeated
-// process restarts accumulate orphan entries until the TwinCAT AMS router
-// runs out of slots and starts rejecting new Adds or crashes outright
-// (Beckhoff issue #268).
-//
-// Mitigation: issue an asynchronous DeleteDeviceNotification for the orphan
-// handle. Constraints:
-//   - Throttle per-handle so a high-rate orphan stream (PLC re-firing every
-//     PLC cycle on a still-live subscription) doesn't spam Delete RPCs.
-//   - Bound concurrency so a burst of N orphans on session resume doesn't
-//     spawn N goroutines simultaneously.
-//   - Re-check that the handle is STILL absent from activeNotifications
-//     immediately before sending the RPC: between scheduling and firing, a
-//     concurrent AddSymbolNotification can have committed this very handle.
-//     Not because IDs get recycled — measured on TC2 and TC3, allocation is
-//     monotonic (+1 per Add, no reuse after a Delete, no restart from a low
-//     number for a fresh source NetID) — but because the sample that looked
-//     orphaned may simply have arrived before its own commit landed. Deleting
-//     our own just-acquired subscription would produce a permanent
-//     orphan-loop. The re-check eliminates that race.
-//   - Track the goroutine via lifecycle.waitGroup so Close waits for any
-//     in-flight Delete to complete instead of leaving zombie goroutines.
-//   - panic recover defensively — an unexpected panic here must not kill
-//     the listen goroutine that called handleNotification.
+// Orphan-Delete frees handles left by a prior process sharing our source
+// NetID+port; uncleaned they fill the PLC's handle table (Beckhoff #268).
+// Throttled per handle, concurrency-bounded, and re-checked against
+// activeNotifications before firing so we never delete our own subscription.
 const (
 	orphanDeleteThrottle       = 60 * time.Second
 	orphanDeleteMaxConcurrency = 10
@@ -736,27 +712,10 @@ const (
 	orphanDeleteRPCTimeout     = 5 * time.Second
 )
 
-// isBestEffortDeleteSuccess reports whether a DeleteDeviceNotification
-// return code counts as cleanup success for best-effort paths.
-// NoErrors                = actually deleted.
-// NotifyHandleInvalid (0x714) = handle already gone on PLC side
-//
-//	(route-idle-timeout, PLC reboot, prior cleanup).
-//
-// DeviceClientUnknown  (0x715) = PLC dropped our client identity (typical
-//
-//	after TCP reset / reconnect); whatever
-//	handles we had are implicitly gone too.
-//
-// In all three cases the handle is no longer consuming PLC resources,
-// which is the only goal of best-effort cleanup paths.
-//
-// Note: Beckhoff's official AdsLib does NOT treat 0x715 as cleanup-success.
-// This library does, because go-ads's reconnect path frequently hits
-// 0x715 when PLC drops the client identity tied to the just-severed TCP,
-// and treating it as failure produces misleading WARN spam during normal
-// recovery. Net effect on cleanup correctness is identical: in both cases
-// the PLC handle is gone.
+// isBestEffortDeleteSuccess reports whether the handle is gone, which is all
+// best-effort cleanup wants: deleted, 0x714 (already gone), or 0x715 (client
+// identity dropped, so our handles went with it). Beckhoff's AdsLib refuses
+// 0x715; here it is routine on reconnect and counting it as failure is spam.
 func isBestEffortDeleteSuccess(code ReturnCode) bool {
 	return code == ReturnCodeNoErrors ||
 		code == ReturnCodeDeviceNotifyHandleInvalid ||
@@ -777,21 +736,10 @@ func isBestEffortDeleteSuccessErr(err error) bool {
 		errors.Is(err, ReturnCodeDeviceClientUnknown)
 }
 
-// tryOrphanDelete schedules an async best-effort Delete of an unknown
-// notification handle. Skip paths log Debug. RPC outcome:
-//   - success         → Info (operators see productive cleanup)
-//   - 0x714 NotifyHandleInvalid → Debug (PLC already reaped, expected)
-//   - 0x715 DeviceClientUnknown → Debug (PLC dropped client identity,
-//     handle implicitly gone)
-//   - any other error → Warn (real failure: transport, auth, timeout,
-//     marshaling, protocol mismatch)
-//
-// orphanDeleteAbortReason re-checks, immediately before the RPC, whether this
-// handle might be ours after all. Both windows it covers open between scheduling
-// the delete and firing it, and deleting our own live subscription is the
-// failure this whole area exists to prevent — so the checks are a named function
-// that can be tested directly rather than inline in a goroutine that a test can
-// only race against.
+// orphanDeleteAbortReason re-checks, immediately before the RPC, whether the
+// handle is ours after all: both windows open between scheduling and firing, and
+// deleting a live subscription is the failure this area exists to prevent. Named
+// so it can be tested directly rather than raced against inside a goroutine.
 func (sess *Session) orphanDeleteAbortReason(handle uint32) (string, bool) {
 	mgr := sess.notifications
 	// A concurrent subscribe may have committed this very handle since the delete
@@ -1345,45 +1293,24 @@ func (sess *Session) heartbeatWatch() {
 		wanted := len(sess.notifications.pending)
 		// Under the same lock as active, not re-read later: every writer updates
 		// the map and this counter together while holding it, so reading them a
-		// lock apart can pair a fresh registered with a stale active. A reconnect
-		// committing a batch between the two reads then looks like a full gap and
-		// costs a delete-and-re-add of everything it just registered.
+		// lock apart can pair a fresh registered with a stale active, and a reconnect
+		// committing a batch in between then looks like a full gap.
 		registered := int(sess.notifications.registered.Load())
 		sess.notifications.lock.Unlock()
 		if wanted == 0 && active == 0 {
 			continue // the caller has asked for nothing; nothing to protect
 		}
-		// Subscriptions can go away while the beat keeps arriving, and then nothing
-		// below ever runs: the silence check is the only trigger for recovery, and a
-		// live beat means there is no silence. Measured on 192.168.3.107 2026-09-12 --
-		// 41/41 registered, link degraded, every handle released, the 41-symbol
-		// re-subscribe failed, and then the beat came back on its own because it is
-		// one small request where a re-subscribe is a batch. The session then sat
-		// receiving one beat every 2s and delivering nothing, looking healthy.
-		//
-		// registered, not len(pending): pending is a superset by design and outlives
-		// a handle, so a symbol the PLC permanently refuses would make this fire for
-		// the life of the session.
-		//
-		// gapTicks rather than quietTicks, which a beat resets -- the whole point is
-		// that beats are arriving. Same backoff as the silence path, so a PLC that
-		// refuses the re-subscribe costs the same handful of attempts.
-		// Read once and share with the silence check below: the gap branch must not
-		// fire on a session whose beat is gone. Measured with the link severed --
-		// the gap branch ran on frozen beats, continued past the silence path, and
-		// pushed the transport-dead call out from ~30s to 78s while re-subscribing
-		// into a link that was not there.
+		// Subscriptions can die while the beat keeps arriving, and silence is the
+		// only other trigger for recovery. Read the beat once and share it with the
+		// silence check: the gap branch must not fire on a dead beat.
 		beats := sess.notifications.heartbeatBeats.Load()
 		beatArrived := beats != lastBeats
 
 		gapTicks++
 		if registered > active {
-			// Counting the gap and acting on it are separate decisions. The gap
-			// persists whether or not this particular tick saw a beat, and the
-			// ticker runs at the beat's own period, so gating the count on
-			// beatArrived let ordinary jitter reset it and the check could never
-			// reach allowed. Act only on a tick that saw a beat: without one the
-			// link may be gone, and the silence path below is the right decider.
+			// Count the gap regardless, act only on a tick that saw a beat: the
+			// ticker runs at the beat's period, so gating the count on beatArrived
+			// lets jitter reset it before it ever reaches allowed.
 			if beatArrived {
 				allowed := heartbeatAllowedTicks(sess.heartbeatAllowedMisses(), consecutiveFailures, cycle)
 				if gapTicks >= allowed {
