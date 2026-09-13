@@ -57,12 +57,10 @@ func WithLocalBindIP(ip string) SessionOption {
 // defaults to the local TCP source IP, Port to a random dynamic-range value. The
 // AMS port is a logical id in the header, not the TCP source or destination port.
 //
-// HAZARD with route registration: TC3 keys its route table by ADDRESS, and two
-// entries for one address take the router out of service for every client until it
-// is cleared by hand and the device restarted. Auto-derivation keeps NetID and
-// address in correspondence; overriding the NetID breaks it. Safe: a NetID
-// matching the address, or WithSkipRouteRegistration. Avoid: two sessions from one
-// host under different NetIDs, or changing the NetID between runs.
+// HAZARD with route registration: TC3 keys its table by ADDRESS, and two entries
+// for one address take the router out of service for every client until it is
+// cleared by hand. Safe: a NetID matching the address, or
+// WithSkipRouteRegistration. Avoid two sessions from one host under different ones.
 func WithLocalAMS(local AMSAddress) SessionOption {
 	return func(s *Session) {
 		if local.NetID != [6]byte{} {
@@ -84,16 +82,12 @@ func WithLocalMode() SessionOption {
 	}
 }
 
-// WithRoute configures automatic AMS route registration during Connect().
-// The route is registered via UDP (port 48899) after the TCP connection is established
-// and the source AMS NetID is derived, but before any ADS commands are sent.
-// By default, Connect and Reconnect probe the PLC first (via GetSymbolVersion) to check
-// if the route already exists, and only register with credentials if the probe fails.
-// Use WithForceRouteRegistration to always register without probing.
+// WithRoute registers an AMS route during Connect, over UDP 48899 once the source
+// NetID is derived and before any ADS command. Connect and Reconnect probe first
+// and register only if that fails; WithForceRouteRegistration always registers.
 //
-// Security: Beckhoff's route registration protocol transmits credentials in cleartext
-// over UDP. This is a protocol-level limitation — there is no encrypted alternative.
-// Ensure route registration only occurs on trusted networks.
+// Security: Beckhoff's protocol sends credentials in cleartext and offers no
+// encrypted alternative. Trusted networks only.
 func WithRoute(routeName, username, password string) SessionOption {
 	return func(s *Session) {
 		s.route.name = routeName
@@ -102,16 +96,10 @@ func WithRoute(routeName, username, password string) SessionOption {
 	}
 }
 
-// WithSkipRouteRegistration explicitly disables AMS route registration during
-// Connect() and Reconnect(). Use when routes are managed externally:
-//   - Pre-registered on the PLC via TC3 UI / TC2 properties or AdsTool
-//   - Owned by a local AMS router daemon (AmsRouterDaemon) that the Session
-//     connects to instead of the PLC directly
-//
-// Equivalent to omitting WithRoute, but explicit: callers may still invoke
-// WithRoute for documentation/auditing yet override here without changing
-// the rest of the option chain. Bypasses both probe and AddRoute so no UDP
-// traffic to port 48899 is generated.
+// WithSkipRouteRegistration disables route registration, for routes managed
+// externally -- pre-registered on the PLC, or owned by a local AmsRouterDaemon.
+// Equivalent to omitting WithRoute but explicit, so a caller can keep WithRoute for
+// documentation and override here. Bypasses probe and AddRoute, so no UDP at all.
 func WithSkipRouteRegistration() SessionOption {
 	return func(s *Session) {
 		s.route.skipRegistration = true
@@ -430,11 +418,9 @@ func WithOnSymbolVersionChanged(fn func(reason Reason)) SessionOption {
 // observable happening, and an on-change subscription may be silent legitimately,
 // so only a cyclic beat's absence is conclusive.
 //
-// interval is the cycle time; missed is how many beats may be lost before the
-// session re-subscribes. Defaults 2s and 5 (~10s to notice); missed < 2 is raised
-// to 2. See WithNotificationSilenceTimeout for a duration instead of a count,
-// WithHeartbeatRecovery for what happens next, and WithRuntimeStateWatch for the
-// runtime-state poll, which this no longer affects.
+// interval is the cycle time, missed how many beats may be lost before
+// re-subscribing. Defaults 2s and 5; missed < 2 is raised to 2. See
+// WithNotificationSilenceTimeout, WithHeartbeatRecovery and WithRuntimeStateWatch.
 func WithNotificationHeartbeat(interval time.Duration, missed int) SessionOption {
 	return func(s *Session) {
 		if interval > 0 {

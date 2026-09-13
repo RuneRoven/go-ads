@@ -271,14 +271,10 @@ var parseableTypes = []string{
 // inferBaseType guesses a base type from a symbol's byte size, the last resort
 // when neither the ADST_ code nor the datatype table resolves it.
 //
-// Only 1- and 2-byte widths, where no IEEE-754 form exists and sign affects
-// rendering alone. At 4 and 8 bytes the layout is genuinely ambiguous (DINT/REAL,
-// LINT/LREAL) and reading a REAL as a DINT silently corrupts every parse -- 1.5
-// becomes 1069547520 -- so those return "" and the caller points at LoadSymbols,
-// which is Beckhoff's own answer for user-defined types.
-//
-// baseType is threaded through to keep the resolution chain explicit; only size is
-// inspected today.
+// Only 1- and 2-byte widths, where no IEEE-754 form exists. At 4 and 8 the layout
+// is ambiguous (DINT/REAL, LINT/LREAL) and reading a REAL as a DINT silently
+// corrupts every parse, so those return "" and the caller points at LoadSymbols.
+// baseType is threaded through for the chain; only size is inspected today.
 func inferBaseType(size uint32, baseType ADSDataType) string {
 	_ = baseType // reserved for future width+type tightening; see godoc above.
 	switch size {

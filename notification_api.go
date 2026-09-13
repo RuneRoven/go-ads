@@ -390,15 +390,10 @@ func (sess *Session) releaseUncommittedHandle(ctx context.Context, handle uint32
 }
 
 // takeNotificationHandles empties activeNotifications and returns every handle the
-// PLC still holds, the internal heartbeat included. Collecting both together is the
-// point: the heartbeat is deliberately not in activeNotifications, and the four
-// callers that open-coded this mostly forgot it, leaving heartbeatHandle armed so
-// establishHeartbeat became a no-op and the session ran on with no beat at all.
-//
-// quiesceDispatch bumps lastSubscribeNs so in-flight samples for the doomed handles
-// read as race-window noise rather than Warn; a reconnect tearing the transport
-// down does not need it. The heartbeat clock restarts rather than zeroing, since
-// zero reads as "no beat expected yet" and would park the watcher.
+// PLC still holds, heartbeat included -- the point, since the heartbeat is not in
+// that map and callers open-coding this forgot it, leaving the session with no beat.
+// quiesceDispatch makes in-flight samples for the doomed handles read as race-window
+// noise; the heartbeat clock restarts rather than zeroing, which would park the watcher.
 func (sess *Session) takeNotificationHandles(quiesceDispatch bool) []uint32 {
 	sess.notifications.lock.Lock()
 	handles := make([]uint32, 0, len(sess.notifications.activeNotifications)+1)
@@ -727,16 +722,10 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		}
 		if r.Error != ReturnCodeNoErrors {
 			results[info.configIndex] = r
-			// Level by whether anyone has to act. A code in the stale-detection set
-			// is the expected answer after a runtime restart: detection fires, the
-			// handle is invalidated, and the next call re-resolves it. Measured on a
-			// TC3 box, logging those at Error turned one ordinary restart into 22
-			// ERROR lines in a second for a condition that healed immediately —
-			// the log-flood shape this branch has already fixed twice elsewhere.
-			// Anything else is something the library cannot resolve on its own.
-			//
-			// The code reaches the caller in results either way, so demoting costs
-			// no signal.
+			// Level by whether anyone has to act: a stale-detection code is the
+			// expected answer after a runtime restart and heals itself, and logging
+			// those at Error turned one restart into 22 ERROR lines in a second. The
+			// code reaches the caller in results either way, so demoting costs nothing.
 			level := slog.LevelError
 			if stale, _ := detectStaleCache(r.Error); stale {
 				level = slog.LevelWarn
@@ -773,16 +762,11 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		sess.warnUnresolvedBaseType(info.config.SymbolName)
 	}
 
-	// settle is the batch tail: the sweep amendment, then the release of every PLC
-	// handle nothing on this side ended up owning. Deferred rather than called at
-	// each return, because the bug it fixes was a return path that skipped it —
-	// the transport-abort path, which is exactly where handles get created and not
-	// bound. A defer covers every present and future exit, panics included. It is
-	// registered AFTER the endSubscribe defer so LIFO runs settle first: the
-	// amendment must decide what is stranded before the replay looks at what
-	// committed. On a dead transport the delete short-circuits in
-	// sumDeleteNotificationFallback, so this costs one failed round trip, not one
-	// per handle.
+	// settle is the batch tail: amend the sweep, then release every handle nothing
+	// here ended up owning. Deferred because the bug it fixes was a return path that
+	// skipped it -- the transport abort, which is exactly where handles are created
+	// and not bound. Registered AFTER the endSubscribe defer so LIFO runs it first:
+	// the amendment must decide what is stranded before the replay looks.
 	settle := func() {
 		// A sweep wipes activeNotifications and deletes those handles PLC-side, so
 		// anything this batch committed beforehand now exists on neither side and
