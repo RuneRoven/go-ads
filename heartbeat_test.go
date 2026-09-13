@@ -1786,3 +1786,82 @@ func TestHeartbeat_RecoversSubscriptionsWhileTheBeatIsHealthy(t *testing.T) {
 		"a session with a healthy beat and no subscriptions never recovers",
 		w, h, adds.Load()-addsAfterSubscribe)
 }
+
+// The beat arriving more slowly than the watcher ticks must still reach recovery.
+// Counting the gap was briefly gated on "this tick saw a beat", so every beatless
+// tick reset the counter and a session with a real gap could never reach the
+// allowed threshold -- with the default 5 allowed misses, gapTicks could never
+// climb past 1.
+//
+// The window has to be wide (10 misses) and the beat sparse but inside it (one
+// beat per ~4 ticks). Anything slower is declared silent and the silence path
+// recovers instead, which is what made a first attempt at this test vacuous: it
+// passed with the broken coupling restored.
+func TestHeartbeat_RecoversWhenTheBeatIsSlowerThanTheTick(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+
+	var adds atomic.Int32
+	var nextHandle atomic.Uint32
+	nextHandle.Store(0xD00)
+	srv.onAddDeviceNotification(func(_ addNotifRequest) addNotifResponse {
+		adds.Add(1)
+		return addNotifResponse{Handle: nextHandle.Add(1)}
+	})
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode { return ReturnCodeNoErrors })
+
+	sess, c := newWiredTestSession(t, srv, WithNotificationHeartbeat(100*time.Millisecond, 10))
+	c.SetNotificationHandler(sess.handleNotification)
+	if !c.capabilities.SumAddNotifStateCAS(0, 2) || !c.capabilities.SumDeleteNotifStateCAS(0, 2) {
+		t.Fatal("could not force the sum commands into the unsupported state")
+	}
+	preSeedTypedSymbol(sess, "MAIN.slowbeat", 0xF900)
+
+	ch := make(chan *Update, 8)
+	if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.slowbeat", 0, 0,
+		TransModeServerOnChange, ch); err != nil {
+		t.Fatalf("AddSymbolNotification: %v", err)
+	}
+	if want, have := sess.notifications.subscriptionGap(); want == 0 || want != have {
+		t.Fatalf("baseline not established: want=%d have=%d", want, have)
+	}
+
+	// One beat per ~4 watcher ticks: inside the 10-miss window, so silence is
+	// never declared, yet three ticks in four see no new beat.
+	stopBeats := make(chan struct{})
+	defer close(stopBeats)
+	go func() {
+		tk := time.NewTicker(400 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stopBeats:
+				return
+			case <-tk.C:
+				sess.notifications.heartbeatBeats.Add(1)
+			}
+		}
+	}()
+
+	sess.notifications.lock.Lock()
+	for h := range sess.notifications.activeNotifications {
+		delete(sess.notifications.activeNotifications, h)
+	}
+	sess.notifications.lock.Unlock()
+
+	if w, h := sess.notifications.subscriptionGap(); w <= h {
+		t.Fatalf("the gap was not created: want=%d have=%d", w, h)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if w, h := sess.notifications.subscriptionGap(); h >= w && w > 0 {
+			t.Logf("recovered: want=%d have=%d", w, h)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	w, h := sess.notifications.subscriptionGap()
+	t.Fatalf("never recovered with a beat slower than the tick: want=%d have=%d — "+
+		"beatless ticks are resetting the gap counter", w, h)
+}

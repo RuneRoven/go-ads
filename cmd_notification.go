@@ -1333,6 +1333,12 @@ func (sess *Session) heartbeatWatch() {
 		sess.notifications.lock.Lock()
 		active := len(sess.notifications.activeNotifications)
 		wanted := len(sess.notifications.pending)
+		// Under the same lock as active, not re-read later: every writer updates
+		// the map and this counter together while holding it, so reading them a
+		// lock apart can pair a fresh registered with a stale active. A reconnect
+		// committing a batch between the two reads then looks like a full gap and
+		// costs a delete-and-re-add of everything it just registered.
+		registered := int(sess.notifications.registered.Load())
 		sess.notifications.lock.Unlock()
 		if wanted == 0 && active == 0 {
 			continue // the caller has asked for nothing; nothing to protect
@@ -1361,27 +1367,35 @@ func (sess *Session) heartbeatWatch() {
 		beatArrived := beats != lastBeats
 
 		gapTicks++
-		if registered := int(sess.notifications.registered.Load()); beatArrived && registered > active {
-			allowed := heartbeatAllowedTicks(sess.heartbeatAllowedMisses(), consecutiveFailures, cycle)
-			if gapTicks >= allowed {
-				gapTicks = 0
-				sess.logger.Error("subscriptions are missing; recovering",
-					"want", registered, "have", active,
-					"detail", "the beat is arriving, so silence would never have revealed this")
-				switch sess.recoverDeadSubscriptions() {
-				case recoveryDone:
-					consecutiveFailures = 0
-				case recoveryDeferred:
-					// Runtime not serving yet: wait, exactly as the silence path does.
-				default:
-					consecutiveFailures++
+		if registered > active {
+			// Counting the gap and acting on it are separate decisions. The gap
+			// persists whether or not this particular tick saw a beat, and the
+			// ticker runs at the beat's own period, so gating the count on
+			// beatArrived let ordinary jitter reset it and the check could never
+			// reach allowed. Act only on a tick that saw a beat: without one the
+			// link may be gone, and the silence path below is the right decider.
+			if beatArrived {
+				allowed := heartbeatAllowedTicks(sess.heartbeatAllowedMisses(), consecutiveFailures, cycle)
+				if gapTicks >= allowed {
+					gapTicks = 0
+					sess.logger.Error("subscriptions are missing; recovering",
+						"want", registered, "have", active,
+						"detail", "the beat is arriving, so silence would never have revealed this")
+					switch sess.recoverDeadSubscriptions() {
+					case recoveryDone:
+						consecutiveFailures = 0
+					case recoveryDeferred:
+						// Runtime not serving yet: wait, exactly as the silence path does.
+					default:
+						consecutiveFailures++
+					}
+					// This tick saw a beat, so record it exactly as the silence check
+					// would have. Skipping it leaves lastBeats stale, and beatArrived
+					// then stays true for ever -- including after the beat dies.
+					lastBeats = beats
+					quietTicks = 0
+					continue
 				}
-				// This tick saw a beat, so record it exactly as the silence check
-				// would have. Skipping it leaves lastBeats stale, and beatArrived
-				// then stays true for ever -- including after the beat dies.
-				lastBeats = beats
-				quietTicks = 0
-				continue
 			}
 		} else {
 			gapTicks = 0
