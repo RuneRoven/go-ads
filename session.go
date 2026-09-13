@@ -28,14 +28,10 @@ func randomAMSPort() uint16 {
 	return uint16(minPort + rand.IntN(span)) //nolint:gosec // non-cryptographic port selection
 }
 
-// dialTCP opens the outbound TCP connection to sess.ip:sess.port honoring
-// sess.localBindIP if set. Used by Connect() and Reconnect() so both paths
-// share the same source-IP binding semantics. Default behavior (empty
-// localBindIP) lets the OS pick source IP via routing table — usual case.
-// Setting localBindIP supports multi-Session deployments on hosts with
-// IP aliases, where each Session pins to a distinct local IP so the PLC
-// sees them as separate hosts (one TCP slot per source IP — see Beckhoff
-// ADS #49 / #72).
+// dialTCP opens the outbound connection, honouring localBindIP. Shared by Connect
+// and Reconnect so both bind the same way. Empty lets the OS pick; setting it pins
+// each Session to a distinct local IP so the PLC sees separate hosts, one TCP slot
+// each (Beckhoff #49/#72).
 func (sess *Session) dialTCP() (net.Conn, error) {
 	dialer := net.Dialer{Timeout: sess.requestTimeout}
 	if sess.localBindIP != nil {
@@ -136,14 +132,10 @@ type sessionLifecycle struct {
 	strictReconnectMaxAttempts int
 	strictReconnectFailures    int
 
-	// Flap detection: a successful Connect/Reconnect that drops again within
-	// flapWindow counts as a flap. flapCount increments per flap and feeds
-	// reconnectBackoff() so the existing BackoffConfig tiers also govern
-	// cross-cycle behaviour, not just within-one-Reconnect retries. Without
-	// this, a PLC that RSTs every connection produces "successful attempts=1"
-	// every few ms because each new Reconnect() starts with fresh local
-	// attempts=0 — burning ephemeral ports and hammering the PLC. flapCount
-	// resets after the connection stays up for flapResetWindow.
+	// Flap detection: a connection that drops again inside flapWindow counts as a
+	// flap, and flapCount feeds reconnectBackoff so the tiers govern cross-cycle
+	// behaviour too. Without it a PLC that RSTs everything reports "attempts=1"
+	// every few ms, since each Reconnect starts from zero.
 	flapMu          sync.Mutex
 	lastConnectedAt time.Time
 	flapCount       int
@@ -563,15 +555,11 @@ func (sess *Session) applyTargetCheck(id RemoteIdentity) error {
 	return nil
 }
 
-// Connect dials the PLC and transitions the session to Connected.
-//
-// May bind a listening socket on the AMS port unasked: some devices answer only
-// on a connection they open to us. WithAmsPeerListen moves it,
-// WithoutAmsPeerFallback refuses it. A failed Connect rolls back to Disconnected
-// and releases that listener, so the session stays usable for a retry.
-//
-// Not safe for concurrent use on one Session: the FSM gate serialises callers but
-// sess.tx / sess.client publishing would still race.
+// Connect dials the PLC and transitions the session to Connected. May bind a
+// listening socket on the AMS port unasked, since some devices answer only on a
+// connection they open to us (WithAmsPeerListen, WithoutAmsPeerFallback). A failed
+// Connect rolls back to Disconnected and stays usable for a retry. Not safe for
+// concurrent use on one Session.
 func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	local := sess.isLocal
 	// transitionToOnce returns ok=false if another goroutine already won
@@ -1017,14 +1005,10 @@ func isProbeRetryable(err error) bool {
 	return false
 }
 
-// ensureRouteOnConnect probes the PLC and registers a route if needed during Connect().
-// Returns (registered bool, err error) where registered=true means a route was added
-// and the caller should TCP-reconnect.
-//
-// On transport-level probe failure (RST/EOF/timeout), redials the TCP
-// connection and retries the probe once before falling back to AddRoute.
-// This avoids spurious route registration when the PLC RST'd due to a
-// transient slot conflict rather than a missing route.
+// ensureRouteOnConnect probes the PLC and registers a route if needed. Reports
+// whether one was added, in which case the caller should reconnect. On a
+// transport-level probe failure it redials and retries rather than registering,
+// since a transient slot conflict looks identical to a missing route.
 func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool, err error) {
 	if sess.isClosed() {
 		return false, fmt.Errorf("connection closed")
@@ -1264,15 +1248,11 @@ func (sess *Session) waitDuringActivation(ctxFor func() context.Context, d time.
 	}
 }
 
-// redialDuringHandshake replaces the transport during a route probe or activation
-// wait, leaving the new Client in the handshake state its caller needs. Beyond a
-// bare tearDownAndReset+dialAndStart it sets tx.disconnected across the gap, so
-// the flag gating user RPCs does not claim "connected" with no socket, and it
+// redialDuringHandshake replaces the transport mid-handshake. Beyond
+// tearDownAndReset+dialAndStart it sets tx.disconnected across the gap and
 // re-disarms ondrop, which publishWiredClient arms on every new Client -- without
-// that a PLC RST mid-handshake spawns the rival Reconnect the disarm prevents.
-//
-// Holds dialMu for the whole teardown+dial pair, making it atomic against the
-// other handshake redial. The two call sites never nest. See dialMu.
+// that an RST mid-handshake spawns the rival Reconnect the disarm prevents. Holds
+// dialMu for the pair; the two call sites never nest.
 func (sess *Session) redialDuringHandshake() error {
 	sess.lifecycle.dialMu.Lock()
 	defer sess.lifecycle.dialMu.Unlock()
@@ -1288,14 +1268,10 @@ func (sess *Session) redialDuringHandshake() error {
 	return nil
 }
 
-// awaitRouteActive re-probes after a route registration until one round-trips,
-// redialing when the PLC drops mid-probe (it does that for a NetID it does not
-// serve yet). Returns the symbol version the winning probe read.
-//
-// ctxFor is a function because this routine's redial replaces lifecycle.ctx:
-// passing that ctx by value would have the loop cancel its own context on the
-// first redial. Call right after AddRoute; ondrop stays disarmed throughout so an
-// RST cannot spawn a rival Reconnect while we own the transport.
+// awaitRouteActive re-probes after a registration until one round-trips, redialing
+// when the PLC drops mid-probe. ctxFor is a function because the redial replaces
+// lifecycle.ctx, and passing it by value would cancel the loop's own context.
+// ondrop stays disarmed so an RST cannot spawn a rival Reconnect.
 func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, error) {
 	if c := sess.client.Load(); c != nil {
 		c.SetOnDrop(nil)
@@ -2854,15 +2830,10 @@ func (sess *Session) stopPeerListener() {
 	sess.releasePeerListener()
 }
 
-// releasePeerListener closes the listener and waits for the accept loop to exit,
-// WITHOUT latching peerStopped.
-//
-// This is what a failed Connect needs. The session stays usable for a retry (the
-// FSM rolls back to Disconnected, and Disconnected -> Connecting is a legal edge),
-// so latching here would permanently refuse the bind and make every retry fail
-// with "session is shutting down" — while NOT releasing at all left port 48898
-// held and its accept loop running per failed attempt, which callers that respond
-// to a Connect error by discarding the session then leaked for the process's life.
+// releasePeerListener closes the listener and waits for the accept loop, WITHOUT
+// latching peerStopped. That is what a failed Connect needs: latching would refuse
+// every retry's bind, while not releasing leaked port 48898 and its accept loop per
+// failed attempt.
 func (sess *Session) releasePeerListener() {
 	sess.peerMu.Lock()
 	ln := sess.peerLn
@@ -3295,15 +3266,11 @@ func (sess *Session) recordRuntimeState(state ADSState) {
 	// machinery, and a coupling from the state poll into notification internals.
 }
 
-// runtimeStateTTL is how long a state reading is trusted. Beyond it the session
-// treats the state as unknown, which means the gates permit again.
-//
-// Without an expiry a reading was permanent: the watch gives up after a run of
-// failures, and nothing then cleared the last value — so a session that saw CONFIG
-// and then lost the system service refused every symbol and subscribe call for its
-// whole life, with no poller left to notice the runtime coming back. Failing OPEN is
-// the right direction here: the worst case is the old behaviour (attempt it and let
-// the PLC answer), where failing closed is a session that never works again.
+// runtimeStateTTL is how long a state reading is trusted; beyond it the gates
+// permit again. Without an expiry a session that saw CONFIG and then lost the
+// system service refused everything for life, with no poller left to notice the
+// runtime return. Failing open costs an attempt the PLC answers; failing closed
+// costs the session.
 const runtimeStateTTL = 30 * time.Second
 
 // knownRuntimeState returns the last observed state and whether one was observed
