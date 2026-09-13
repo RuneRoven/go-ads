@@ -359,21 +359,22 @@ func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestam
 			// on the PLC so the orphan handle table slot is freed; without
 			// this cleanup the TwinCAT AMS router accumulates entries
 			// across restarts until it crashes (Beckhoff issue #268).
-			// First of an episode at Warn, the rest at Debug: the PLC pushes one of
-			// these per cycle per orphaned handle, which buries every other line in
-			// the log and tells the operator nothing new each time.
-			if n := sess.notifications.orphanSamples.Add(1); n == 1 {
+			// One Warn per orphanReportInterval carrying the count, the rest at
+			// Debug: the PLC pushes one of these per cycle per orphaned handle and
+			// they interleave with healthy samples after a reconnect.
+			n := sess.notifications.orphanSamples.Add(1)
+			if reportNow(&sess.notifications.orphanWarnNs, orphanReportInterval) {
 				sess.logger.Warn("received notification for unknown handle", "handle", handle,
+					"sinceLastReport", n,
 					"detail", "a previous session's subscriptions are still registered on the PLC; deleting them")
+				sess.notifications.orphanSamples.Store(0)
 			} else {
-				sess.logger.Debug("received notification for unknown handle", "handle", handle, "sinceFirst", n)
+				sess.logger.Debug("received notification for unknown handle", "handle", handle, "sinceLastReport", n)
 			}
 			sess.tryOrphanDelete(handle)
 		}
 		return
 	}
-	// An owned sample means the orphan episode is over; the next one warns again.
-	sess.notifications.orphanSamples.Store(0)
 	notification := entry.Ch
 	fullName := entry.Sym.FullName
 	sess.notifications.lock.Unlock()
@@ -934,9 +935,18 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 		// the v2.2.0 subscribe-race regression it was saying that about
 		// subscriptions this very session had created milliseconds earlier,
 		// which sent the diagnosis in the wrong direction for months.
-		sess.logger.Info("deleted a PLC notification handle this session does not own",
-			"handle", handle,
-			"hint", "usually a subscription left behind by an earlier process sharing this source NetID and port")
+		// Rate-limited with a count: a reconnect leaves one orphan per handle, so
+		// this arrives 40-odd at a time and one line per handle says nothing extra.
+		d := sess.notifications.orphanDeletes.Add(1)
+		if reportNow(&sess.notifications.orphanDeleteNs, orphanReportInterval) {
+			sess.logger.Info("deleted a PLC notification handle this session does not own",
+				"handle", handle, "deletedSinceLastReport", d,
+				"hint", "usually a subscription left behind by an earlier process sharing this source NetID and port")
+			sess.notifications.orphanDeletes.Store(0)
+		} else {
+			sess.logger.Debug("deleted a PLC notification handle this session does not own",
+				"handle", handle, "deletedSinceLastReport", d)
+		}
 	})
 	if !started {
 		// Release what was reserved for a goroutine that will not run: the semaphore

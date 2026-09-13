@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"log/slog"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -945,5 +946,47 @@ func TestOrphanDelete_RPCFailureNonFatal(t *testing.T) {
 	// Verify Session not closed/panicked: a benign op should succeed.
 	if sess.isClosed() {
 		t.Error("session unexpectedly closed after orphan-Delete RPC failure")
+	}
+}
+
+// Orphan samples interleaved with healthy ones must still produce one Warn.
+// The previous throttle reset its counter on every owned sample, so after a
+// reconnect -- the one time orphans actually arrive in bulk -- the episode ended
+// on the next healthy sample and every orphan warned again.
+func TestDeviceNotification_UnknownHandleWarnsOnceWhileInterleaved(t *testing.T) {
+	handler := &testLogHandler{}
+	conn := newTestConnection()
+	conn.logger = slog.New(handler)
+	defer conn.lifecycle.shutdown()
+
+	owned := uint32(0xA1)
+	preSeedTypedSymbol(conn, "MAIN.owned", owned)
+	ch := make(chan *Update, 64)
+	conn.notifications.lock.Lock()
+	conn.notifications.activeNotifications[owned] = activeNotification{
+		Sym: conn.cache.symbols[symbolKey("MAIN.owned")], Ch: ch,
+	}
+	conn.notifications.lock.Unlock()
+
+	data := make([]byte, 2)
+	binary.LittleEndian.PutUint16(data, 42)
+	for i := 0; i < 20; i++ {
+		// One orphan, then one owned, repeatedly: the shape after a reconnect.
+		if err := conn.drivePacket(conn.lifecycle.ctx, buildNotificationPacket(uint32(0x900+i), 0, data)); err != nil {
+			t.Fatalf("orphan packet %d: %v", i, err)
+		}
+		if err := conn.drivePacket(conn.lifecycle.ctx, buildNotificationPacket(owned, 0, data)); err != nil {
+			t.Fatalf("owned packet %d: %v", i, err)
+		}
+	}
+
+	warns := 0
+	for _, rec := range handler.recordsByLevel(slog.LevelWarn) {
+		if strings.Contains(rec.Message, "received notification for unknown handle") {
+			warns++
+		}
+	}
+	if warns != 1 {
+		t.Errorf("got %d warns for 20 interleaved orphans, want 1 — the throttle resets on owned samples again", warns)
 	}
 }

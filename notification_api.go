@@ -139,12 +139,18 @@ type notificationManager struct {
 	// restore become the new definition of healthy and nothing ever retries them.
 	// See raiseRegistered / lowerRegisteredTo.
 	registered atomic.Int64
-	// orphanSamples counts samples arriving for handles we do not own. A PLC that
-	// kept a previous session's subscriptions pushes one per cycle per handle --
-	// measured at 527 in a single log file -- so only the first is worth a Warn.
-	// Reset when a sample for an owned handle arrives, which means the episode is
-	// over. See the delete in tryOrphanDelete, which is the actual remedy.
-	orphanSamples atomic.Int64
+	// orphanSamples counts samples arriving for handles we do not own, and
+	// orphanDeletes counts the deletes that follow, both since the last report.
+	// A PLC holding a previous session's subscriptions pushes one sample per
+	// cycle per handle -- measured at 527 in one log file -- and one delete per
+	// handle in a burst. Reported on a timer (orphanWarnNs / orphanDeleteNs) with
+	// the count, because after a reconnect these interleave with healthy samples:
+	// an "episode" reset by the next owned sample ends immediately and every
+	// orphan warns again. See tryOrphanDelete, which is the actual remedy.
+	orphanSamples  atomic.Int64
+	orphanWarnNs   atomic.Int64
+	orphanDeletes  atomic.Int64
+	orphanDeleteNs atomic.Int64
 	// heartbeatLastNs is kept for the log line only ("silentFor"), never for the
 	// decision. A stepped clock makes it a confusing number, not a wrong outcome.
 	heartbeatLastNs atomic.Int64
@@ -269,6 +275,21 @@ func (m *notificationManager) subscriptionGap() (want, have int) {
 // Lowering is deliberate and has exactly two causes: the caller tears a
 // subscription down, or the PLC no longer has the symbol. See lowerRegisteredTo.
 // Caller must hold lock.
+// reportNow reports true at most once per interval, so a burst produces one line
+// instead of one per event. Safe for concurrent callers: only the one that wins
+// the CAS reports.
+func reportNow(last *atomic.Int64, interval time.Duration) bool {
+	now := time.Now().UnixNano()
+	prev := last.Load()
+	if now-prev < int64(interval) {
+		return false
+	}
+	return last.CompareAndSwap(prev, now)
+}
+
+// orphanReportInterval bounds how often the orphan sample/delete lines appear.
+const orphanReportInterval = 30 * time.Second
+
 func (m *notificationManager) raiseRegistered() {
 	if n := int64(len(m.activeNotifications)); n > m.registered.Load() {
 		m.registered.Store(n)
