@@ -69,11 +69,8 @@ type sessionLifecycle struct {
 	// handshake redials only: the reconnect loop separates its teardown and dial by
 	// the whole loop body and would self-deadlock on the inner redial. Reconnect is
 	// single-flighted by reconnectOwner, Connect by lifecycle.connecting.
-	//
-	// INVARIANT: nothing on lifecycle.waitGroup and no Client worker may take
-	// dialMu. tearDownAndReset waits both WaitGroups while a redial holds it, so a
-	// member blocking on it deadlocks. triggerReconnect runs on the listen
-	// goroutine and must keep spawning Reconnect with a bare `go`.
+	// INVARIANT: nothing on lifecycle.waitGroup and no Client worker may take it --
+	// tearDownAndReset waits both WaitGroups while a redial holds it.
 	dialMu sync.Mutex
 
 	// unservedCooldown silences the reconnect loop entirely after N attempts where
@@ -1825,16 +1822,9 @@ func (sess *Session) Close() error {
 	ch := sess.lifecycle.reconnectDone
 	sess.lifecycle.reconnectMu.Unlock()
 	if ch != nil {
-		// Bounded. This used to be a bare receive, which made Close's latency the
-		// reconnect loop's worst case: a full net.DialTimeout plus a teardown's wait
-		// for the previous Client's workers, with no ceiling the caller could see.
-		// closedCh is already closed by markClosed above, so the loop has been told
-		// to stop; the timeout only covers an attempt already in flight when it was.
-		//
-		// Proceeding on the timeout is safe: the waits that follow (the Client's
-		// workers, lifecycle.waitGroup) are the ones that actually establish "no
-		// goroutine of ours is running", and the WaitGroup-misuse race this receive
-		// guards against needs the loop to be mid-Add, which a stopped loop is not.
+		// Bounded: a bare receive made Close's latency the reconnect loop's worst
+		// case. Proceeding on the timeout is safe -- the waits below are what
+		// actually establish that no goroutine of ours is running.
 		select {
 		case <-ch:
 		case <-time.After(closeReconnectGrace):
@@ -1885,16 +1875,10 @@ func (sess *Session) reconnectBackoff(attempt int) time.Duration {
 	}
 }
 
-// logAttempt reports a failed reconnect attempt at Error, every time.
-//
-// It used to report only the first at Error and the rest at Debug, to keep the
-// log short and stop umh-core's error window rolling forward for the whole
-// outage. That was the wrong trade: after the window passed the one Error the
-// session looked healthy while nothing was flowing, and the only thing still
-// being printed was "reconnect backoff" at Info, which says a retry is coming
-// but not what failed. An operator watching a bridge that is down has to be able
-// to see what is failing, on every attempt. A rolling error window is correct
-// while the link is genuinely down.
+// logAttempt reports a failed reconnect attempt at Error, every time. Reporting
+// only the first left a long outage looking healthy once a consumer's rolling
+// error window passed it, with nothing but "reconnect backoff" at Info still
+// printing -- which never says what failed.
 func (sess *Session) logAttempt(msg string, args ...any) {
 	sess.logger.Error(msg, args...)
 }
@@ -2007,16 +1991,10 @@ func (sess *Session) giveUpReconnecting(cause error) error {
 	sess.lifecycle.state.transitionToOnce(SessionStateClosed)
 	// Idempotent via closedOnce, whichever of Close() and this ran first.
 	sess.markClosed()
-	// Full teardown, not just the PLC-side release: this path is reachable without
-	// the user ever calling Close (WithMaxReconnectAttempts, a cancelled Reconnect),
-	// and leaving the socket and the 48898 listener open then leaked them for the
-	// life of the process. wasDisconnected=true: the transport is gone by
-	// definition once we give up on it.
-	//
-	// The blocking half of Close's teardown stays in Close. This runs inside the
-	// Reconnect goroutine, so waiting for reconnectDone here would deadlock — but
-	// the workers need no waiting to exit, only the cancel and the socket close
-	// that shutdownTransport performs.
+	// Full teardown: this path is reachable without the user ever calling Close, and
+	// the socket and listener would leak for the life of the process. The blocking
+	// half stays in Close -- this runs inside the Reconnect goroutine, so waiting on
+	// reconnectDone here would deadlock.
 	sess.shutdownTransport(true)
 	return cause
 }
@@ -2048,11 +2026,9 @@ func (sess *Session) triggerReconnect() {
 	// tx.disconnected, so Connect's own error handling — or its exit adopt —
 	// schedules the redial.
 	//
-	// Placement is load-bearing: above the CAS the drop is lost rather than
-	// deferred, and above the callback WithOnDisconnect never fires for a drop
-	// during Connect. So: after the callback, before reconnectDone -- creating that
-	// channel here would hang Close's unconditional wait on it, since the Reconnect
-	// that closes it is exactly what is being suppressed.
+	// Placement is load-bearing: above the CAS the drop is lost, above the callback
+	// WithOnDisconnect never fires during Connect, and creating reconnectDone here
+	// would hang Close's wait on it.
 	if sess.lifecycle.connecting.Load() {
 		return
 	}
@@ -2531,16 +2507,10 @@ func (sess *Session) reloadSymbols() error {
 		}
 
 	case hasOnDemand:
-		// On-demand mode: re-resolve only the symbols that were previously loaded.
-		// By default, missing symbols are skipped gracefully (PLC may have done
-		// an online change). With WithStrictReconnect, missing symbols cause failure.
-		//
-		// Snapshot the requested set BEFORE wiping cache.symbols; do NOT also
-		// wipe onDemandSymbols here. Failed resolutions leave their name in
-		// onDemandSymbols so the NEXT reconnect retry still sees the full
-		// requested set. Without this, partial-success on retry N silently
-		// drops the failed names from retry N+1's set, masking symbols that
-		// would have come back after a transient PLC condition cleared.
+		// Re-resolve only previously loaded symbols; missing ones are skipped unless
+		// WithStrictReconnect. Snapshot the requested set before wiping
+		// cache.symbols and leave onDemandSymbols alone, or a partial success on one
+		// retry drops the failed names from the next one's set.
 		sess.cache.lock.Lock()
 		oldSymbols := make(map[string]bool, len(sess.cache.onDemandSymbols))
 		for k, v := range sess.cache.onDemandSymbols {
@@ -2912,16 +2882,11 @@ func (sess *Session) peerAcceptLoop(ln net.Listener) {
 // again, and waits for the accept loop to exit. For terminal teardown only.
 func (sess *Session) stopPeerListener() {
 	sess.peerMu.Lock()
-	// Latch, so a Connect that was about to bind cannot do so after this returns.
-	// Without it: a Connect descheduled just before the bind, a concurrent Close
-	// reading peerLn as nil and waiting on an empty peerWG, and then the bind
-	// landing — leaving 48898 held and an accept loop running in a session the
-	// caller believes is fully closed. The accept loop's own isClosed() escape only
-	// runs after a connection arrives, which on a dead PLC never happens.
-	//
-	// Set BEFORE releasePeerListener takes the lock: startPeerListener holds peerMu
-	// across its net.Listen, so once the latch is visible any bind either already
-	// completed (and releasePeerListener sees the listener) or is refused.
+	// Latch so a Connect descheduled just before its bind cannot bind after Close
+	// returns, leaving 48898 held in a session the caller believes is closed. Set
+	// BEFORE releasePeerListener takes the lock: startPeerListener holds peerMu
+	// across net.Listen, so a visible latch means the bind either landed or is
+	// refused.
 	sess.peerStopped = true
 	sess.peerMu.Unlock()
 	sess.releasePeerListener()
