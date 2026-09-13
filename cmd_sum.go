@@ -97,19 +97,10 @@ type SumReadResult struct {
 // SumRead performs a batch read of multiple index group/offset/length combinations
 // in a single ADS round-trip.
 //
-// Beckhoff recommends using the newest command versions, so this tries:
-//  1. SumReadEx2 (0xF084) — preferred, TC3 only
-//  2. SumReadEx  (0xF083) — works on TC2 + TC3
-//  3. Individual reads     — final fallback
-//
-// Both 0xF084 and 0xF083 use the same response format: [N × (error(4), length(4))][data].
-// The detected command level is cached for subsequent calls and reset on reconnect.
-//
-// SumRead is intentionally NOT migrated to executeSumCommand. The two-command-ID
-// fallback (Ex2 → Ex → individual) doesn't fit the helper's single-spec contract
-// cleanly — migrating would require either two helper invocations or a spec
-// extension that couples the helper to one caller's quirk. Custom orchestration
-// is clearer here.
+// Tries SumReadEx2 (0xF084, TC3), then SumReadEx (0xF083, TC2+TC3), then
+// individual reads. Both sum variants share one response format, and the detected
+// level is cached until reconnect. Deliberately not on executeSumCommand: the
+// two-command-ID fallback does not fit its single-spec contract.
 func (c *Client) SumRead(ctx context.Context, requests []SumReadRequest) ([]SumReadResult, error) {
 	if len(requests) == 0 {
 		return nil, nil
@@ -431,22 +422,14 @@ func (c *Client) SumAddDeviceNotification(ctx context.Context, requests []SumNot
 }
 
 // sumAddDeviceNotificationFunc is SumAddDeviceNotification with a per-item
-// callback, invoked with each item's result as soon as that result is known.
+// callback fired as each result is known. It exists for the PLC that rejects the
+// sum command: the call degrades to one Add per request and the PLC streams each
+// handle as it creates it, so a caller waiting for the whole batch cannot
+// recognise the early ones -- several hundred ms on a 40-symbol TC2 batch.
 //
-// This exists for the PLC that rejects the sum command: the call then degrades
-// to one AddDeviceNotification per request, and the PLC starts streaming each
-// handle the moment it creates it. A caller that waits for the whole batch
-// cannot recognise the early handles for the rest of the batch — on TC2 a
-// 40-symbol batch leaves the first handle unaccounted for several hundred
-// milliseconds. With onItem the caller binds each handle as its own Add
-// returns, which narrows that window to one round-trip.
-//
-// onItem is called synchronously on the calling goroutine, exactly once per
-// request, in request order: progressively on the fallback path, and after
-// decode on the batched path (where the PLC created every handle before
-// answering, so there is nothing to report early). Callers therefore get one
-// commit path regardless of which path ran. The returned slice carries the
-// same results.
+// onItem runs synchronously, once per request, in order: progressively on the
+// fallback path and after decode on the batched one, so callers get a single
+// commit path either way.
 func (c *Client) sumAddDeviceNotificationFunc(
 	ctx context.Context,
 	requests []SumNotificationRequest,
@@ -585,18 +568,10 @@ func (c *Client) sumAddNotificationFallback(ctx context.Context, requests []SumN
 	return results, nil
 }
 
-// bestEffortDeleteNotifications attempts to delete the given handles via
-// SumDeleteDeviceNotification (Session wrapper, so notifications cleanup also
-// fires). Errors are logged but never returned — this is for cleanup
-// paths where the caller cannot meaningfully react to a failure (e.g.
-// PLC unreachable during a reconnect retry). Returns the count of
-// successfully deleted handles. Treats ReturnCodeDeviceNotifyHandleInvalid
-// (0x714) and ReturnCodeDeviceClientUnknown (0x715) as success-equivalent
-// (handle already gone PLC-side / client identity dropped post-reconnect)
-// via isBestEffortDeleteSuccess.
-//
-// Lives on *Session because it routes through Session.SumDeleteDeviceNotification
-// to keep activeNotifications consistent with the PLC.
+// bestEffortDeleteNotifications deletes handles for cleanup paths that cannot act
+// on a failure, logging errors rather than returning them, and reports how many
+// went. 0x714 and 0x715 count as gone. On *Session because it routes through the
+// wrapper that keeps activeNotifications consistent with the PLC.
 func (sess *Session) bestEffortDeleteNotifications(ctx context.Context, handles []uint32) int {
 	if len(handles) == 0 {
 		return 0
@@ -630,17 +605,10 @@ func (sess *Session) bestEffortDeleteNotifications(ctx context.Context, handles 
 	return deleted
 }
 
-// sumDeleteNotificationFallback deletes notifications individually when sum commands are not supported.
-// Two distinct error paths:
-//
-//   - PLC returned an ADS-level ReturnCode (handle-invalid, client-unknown,
-//     device-error, etc.) → stored in codes[i], loop continues. Caller's
-//     isBestEffortDeleteSuccess() reduces success codes.
-//   - Non-ReturnCode error (transport closed, ctx canceled, marshaling
-//     failure) → loop SHORT-CIRCUITS and returns the partial codes plus
-//     the wrapped error. Subsequent handles would hit the same transport
-//     condition; pushing on would only multiply the failure log spam and
-//     mask the root cause behind synthesized ReturnCodeDeviceError values.
+// sumDeleteNotificationFallback deletes individually when sum commands are
+// unsupported. An ADS-level code is stored and the loop continues; anything else
+// (transport closed, ctx cancelled) short-circuits with partial codes, since every
+// later handle would fail identically and bury the root cause.
 func (c *Client) sumDeleteNotificationFallback(ctx context.Context, handles []uint32) ([]ReturnCode, error) {
 	codes := make([]ReturnCode, len(handles))
 	for i, h := range handles {
