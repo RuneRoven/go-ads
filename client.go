@@ -1,24 +1,12 @@
 // Package ads is a pure-Go client for the Beckhoff TwinCAT ADS protocol.
 //
-// The package exposes two layers:
+// Two layers, chosen at construction. Client (this file) is a thin RPC layer: one
+// TCP connection, raw AMS framing, no cache or reconnect -- once it drops, build a
+// new one. Session (session.go) wraps it with the symbol cache, persistent
+// notifications, auto-reconnect and an FSM.
 //
-//   - Client (this file): a thin Beckhoff-equivalent RPC layer. One TCP
-//     connection, raw AMS framing, request multiplexing, no cache, no
-//     reconnect, no notification persistence. Construct via Dial; once the
-//     transport drops, every subsequent method returns ErrTransportClosed
-//     and the caller reconstructs a new Client. Suitable for one-shot
-//     consumers (CLI tools, web ADS browsers).
-//
-//   - Session (session.go): a managed wrapper that adds the symbol cache,
-//     name-based read/write, persistent notifications with auto-resubscribe
-//     after a reconnect, auto-reconnect with backoff, lifecycle callbacks,
-//     and an explicit FSM (docs/archive/specs/09-fsm-design.md). Construct via
-//     NewSession + Connect.
-//
-// Session does NOT embed *Client; pick a layer at construction time. Raw
-// methods (Read, Write, Sum*, AddDeviceNotification, ReadProcess*, etc.)
-// live on *Client only. Cache-aware methods (ReadFromSymbol,
-// AddSymbolNotification, LoadSymbols, …) live on *Session only.
+// Session does NOT embed *Client: raw methods live on *Client, cache-aware ones on
+// *Session. See docs/archive/specs/09-fsm-design.md.
 package ads
 
 import (
@@ -38,19 +26,11 @@ import (
 	"time"
 )
 
-// droppedResponseGrace is how long a request already waiting for a reply keeps
-// waiting after the transport is observed dead.
-//
-// A drop is detected on the listen goroutine, which closes the dropped channel
-// immediately — but a reply it parsed a moment earlier is still travelling
-// recvQueue to a recvWorker. Without this grace the drop signal wins that race
-// and an answer we already received is thrown away: measured at 40/40 replies
-// lost against a stub that answers and then closes, which is exactly what a PLC
-// does on a route-idle timeout, a runtime restart, or an RST after answering.
-//
-// Only a request with a reply in flight pays it, and only once — a multi-request
-// operation aborts on the first failure — so the fast-fail this exists to
-// support keeps almost all of its benefit.
+// droppedResponseGrace is how long a request already waiting keeps waiting after
+// the transport is seen dead. The drop closes its channel immediately while a
+// reply parsed a moment earlier is still in flight to a recvWorker, and without
+// the grace the drop wins that race -- measured at 40/40 replies discarded against
+// a stub that answers then closes. Only a request with a reply in flight pays it.
 const droppedResponseGrace = 100 * time.Millisecond
 
 // ErrTransportClosed is returned by every Client method after the underlying
@@ -58,23 +38,14 @@ const droppedResponseGrace = 100 * time.Millisecond
 // Callers reconstruct a new *Client to re-establish.
 var ErrTransportClosed = errors.New("ads: client transport closed")
 
-// resetAfterConnectHint explains a TCP reset that lands right after a successful
-// connect. Shared by the transport-fault log line and by the error Connect returns,
-// so the two cannot drift — and because the log line alone is not enough: a consumer
-// that surfaces the error and not this library's logger otherwise sees only
-// "client transport closed", which is the exact ambiguity this package exists to
-// remove. Measured against a PLC whose route table had been wiped.
+// resetAfterConnectHint explains a reset landing right after a successful connect.
+// Shared by the log line and the returned error so they cannot drift, and because
+// a consumer that surfaces only the error would otherwise see "client transport
+// closed" and nothing else.
 //
-// Five plausible causes, named in the order they are worth checking. Listing only
-// the route one has previously sent people after a mistyped NetID, so all five stay.
-// Both ends of the addressing go in the message, so the reader can check them
-// without reconstructing the config.
-//
-// The eviction cause is last but not rare: a Beckhoff AMS router serves one TCP
-// per host and closes the older one (Beckhoff/ADS#49), so a second client on this
-// IP -- or a redial storm of our own -- produces a reset indistinguishable at the
-// wire level from a missing route. A field investigation spent hours re-reading
-// route tables because the hint named only the route causes.
+// All five causes stay, in the order worth checking: naming only the route one has
+// sent people after a mistyped NetID, and eviction by another client on this IP
+// (Beckhoff #49) looks identical on the wire to a missing route.
 func resetAfterConnectHint(source, target AMSAddress) string {
 	return fmt.Sprintf("a reset right after TCP connect means one of: "+
 		"no route is registered on the PLC for our NetID (%s), "+
@@ -148,19 +119,11 @@ func (c *Client) localPort() int {
 	return addr.Port
 }
 
-// logDropVerdict reports a primary-transport drop, split by whether this
-// connection had ever carried a frame.
-//
-// Before the split, both cases produced the same line and the same route hint,
-// because the only evidence consulted was the errno — and EOF/ECONNRESET look
-// identical whether the socket is 20ms or 20h old. A field investigation lost
-// hours re-reading route tables on drops of sessions that had been delivering
-// samples for half an hour.
-//
-// Both branches keep "transport down" in the message and go through
-// transportFaultLevel(): the level is gated for the handshake case (an expected
-// RST during a cold-start probe is not an ERROR), and an AST guard in the tests
-// enforces both properties.
+// logDropVerdict reports a primary-transport drop, split by whether the connection
+// ever carried a frame: EOF/ECONNRESET look identical whether the socket is 20ms
+// or 20h old, and one shared route hint cost a field investigation hours. Both
+// branches keep "transport down" and go through transportFaultLevel, so an
+// expected RST during a cold-start probe is not an ERROR; tests pin both.
 func (c *Client) logDropVerdict(err error) {
 	attrs := []any{
 		"error", err,
@@ -273,23 +236,12 @@ type Client struct {
 	// reason subscribeInFlight is a counter.
 	handshaking atomic.Int64
 
-	// framesPrimary/framesPeer count AMS frames this client has decoded, split by
-	// which socket they arrived on. Together they answer the question that decides
-	// how a drop is reported: did this connection ever work?
-	//
-	// Two counters rather than one, because either single counter is wrong:
-	//
-	//   - Counting only the primary socket misclassifies a whole device class. On
-	//     TC3.1.4026/RTOS the PLC accepts our requests on the connection we opened
-	//     but answers on one IT opens back to us (see AcceptPeerConn), so a
-	//     perfectly healthy routed session decodes ZERO frames on its primary for
-	//     its entire life. Voting "never served" on those drops would give them the
-	//     route-suspect diagnosis and the slow, never-served backoff.
-	//   - One shared counter lets a peer frame vote the primary "established",
-	//     which is the inverse error.
-	//
-	// The verdict (dropVerdict) is "any frame on any socket of this client", and
-	// both counts go in the log so the operator can see which socket was silent.
+	// AMS frames decoded, split by which socket they arrived on. Together they
+	// answer what decides how a drop is reported: did this connection ever work?
+	// Two counters because either alone is wrong -- a peer-answering device decodes
+	// zero frames on its primary for its whole healthy life, while one shared
+	// counter lets a peer frame vote the primary "established". The verdict is any
+	// frame on any socket; both counts are logged so the silent one is visible.
 	framesPrimary atomic.Uint64
 	framesPeer    atomic.Uint64
 
@@ -558,20 +510,13 @@ func (c *Client) transportFaultLevel() slog.Level {
 }
 
 func (c *Client) callOnDrop() {
-	// Release every request on THIS client — the ones already blocked as well as
-	// any issued later — so they fail fast with ErrTransportClosed instead of
-	// waiting out a timeout on a dead socket. Measured cost of not doing this: a
-	// 40-symbol notification batch that lost the link at symbol 3 took 3m10s to
-	// return, holding the subscribe window (and so disabling the orphan reaper)
-	// for all of it.
+	// Release every request on THIS client so they fail fast instead of waiting out
+	// a timeout on a dead socket: a 40-symbol batch that lost the link at symbol 3
+	// took 3m10s to return, holding the subscribe window open throughout.
 	//
-	// Deliberately does NOT touch tx.disconnected. That flag lives on the
-	// transport, which a Session reuses across reconnects, and Session already
-	// owns it (triggerReconnect, Reconnect, resetForRetry, Close). Setting it
-	// here let a stale client's listen goroutine flip it back to true after the
-	// replacement had cleared it, which made every probe on the new connection
-	// fail instantly with ErrTransportClosed — route registration could then
-	// never complete.
+	// Deliberately does NOT touch tx.disconnected, which lives on the transport a
+	// Session reuses and which Session owns. Setting it here let a stale client's
+	// listen goroutine flip it back after the replacement had cleared it.
 	c.markDropped()
 	c.ondropMu.RLock()
 	fn := c.ondrop
@@ -988,19 +933,11 @@ func (c *Client) send(data []byte) ([]byte, error) {
 	}
 }
 
-// sendRequest is the single-shot RPC primitive used by every Client RPC
-// method. Encodes the AMS frame, registers a per-invoke response channel,
-// pushes the frame to the transmit worker, and waits for the response or
-// context cancel / timeout.
-//
-// The caller's ctx is merged with c.requestTimeout via context.WithTimeout;
-// whichever fires first cancels the wait. Pass context.Background() to
-// preserve the v2.1 "timeout-only" semantic.
-//
-// Returns ErrTransportClosed immediately if the transport is known dead
-// (Close called or drop detected). Otherwise no retry — drops mid-flight
-// surface as context.Canceled / DeadlineExceeded; Session wraps this with
-// wait-for-reconnect retry semantics in its own helpers.
+// sendRequest is the single-shot RPC primitive behind every Client method: encode
+// the frame, register a response channel, hand it to the transmit worker, wait.
+// The caller's ctx is merged with requestTimeout, whichever fires first. Returns
+// ErrTransportClosed at once on a known-dead transport; otherwise no retry, and
+// mid-flight drops surface as ctx errors for Session to handle.
 func (c *Client) sendRequest(ctx context.Context, command CommandID, data []byte) ([]byte, error) {
 	return c.sendRequestTo(ctx, c.target, command, data)
 }
