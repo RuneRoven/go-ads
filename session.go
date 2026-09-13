@@ -70,18 +70,11 @@ type sessionLifecycle struct {
 	reconnectMu   sync.Mutex // protects reconnectDone
 	reconnectDone chan struct{}
 
-	// dialMu makes one teardown+dial pair atomic with respect to another, so two
-	// TCP connections to the same AMS router cannot briefly coexist. That overlap
-	// is the documented way to get evicted: the router serves one TCP per host and
-	// closes the older (Beckhoff/ADS#49).
-	//
-	// Scope is deliberately narrow -- the two handshake-phase redials, via
-	// redialDuringHandshake. The reconnect loop is NOT covered and must not be:
-	// its teardown (before the retry loop) and its dial (inside it) are separated
-	// by the whole loop body, and it reaches awaitRouteActive through ensureRoute,
-	// so holding this across an iteration would self-deadlock on the inner redial.
-	// Reconnect is already single-flighted by reconnectOwner, and Connect by
-	// lifecycle.connecting.
+	// dialMu makes one teardown+dial pair atomic against another, so two TCPs to the
+	// same router cannot coexist and get us evicted (Beckhoff #49). Scope is the two
+	// handshake redials only: the reconnect loop separates its teardown and dial by
+	// the whole loop body and would self-deadlock on the inner redial. Reconnect is
+	// single-flighted by reconnectOwner, Connect by lifecycle.connecting.
 	//
 	// INVARIANT: nothing registered on lifecycle.waitGroup, and no Client worker,
 	// may acquire dialMu. tearDownAndReset waits both WaitGroups while a redial
@@ -122,24 +115,11 @@ type sessionLifecycle struct {
 	// Reconnecting self-loop lets a new owner take over an abandoned state.
 	reconnectOwner atomic.Bool
 
-	// connecting is true for the whole of Connect, and suppresses the automatic
-	// Reconnect that a drop would otherwise spawn.
-	//
-	// Connect owns sess.tx / sess.client / lifecycle.ctx end to end — it dials,
-	// publishes, probes, and on any failure tears down and rolls back — but ondrop
-	// is armed across most of that (the local handshake, the liveness probe, the
-	// runtime-state read; the route stage disarms, and its helpers re-arm from a
-	// defer in the middle of Connect). A rival Reconnect running tearDownAndReset
-	// under Connect cancelled the context Connect's fresh Client was holding and
-	// closed the socket it had just dialled, and vice versa, leaving a session the
-	// caller had been told failed sitting Connected on a second connection with
-	// IsClosed() false — socket, workers, runtime watcher and an unbounded
-	// reconnect loop all leaked, and not recoverable in place because a retry is
-	// refused as "Connect already in progress".
-	//
-	// A flag rather than tighter SetOnDrop bookkeeping: five sites arm or re-arm,
-	// two of them from a defer mid-Connect, and TestAwaitRouteActive_RestoresClientState
-	// correctly pins that re-arm. One gate in triggerReconnect is immune to all of it.
+	// connecting suppresses the automatic Reconnect a drop would spawn for the whole
+	// of Connect. A rival Reconnect tearing down under Connect leaked the socket,
+	// workers and reconnect loop, leaving a session the caller was told had failed
+	// sitting Connected. A flag, not tighter ondrop bookkeeping: five sites arm or
+	// re-arm it, two from a defer mid-Connect; one gate is immune to all of them.
 	connecting atomic.Bool
 
 	closedCh   chan struct{}
@@ -168,23 +148,11 @@ type sessionLifecycle struct {
 	// Reloading.
 	state sessionFSM
 
-	// connectedGen counts genuine (re)entries into Connected, and nothing else.
-	// It exists for the heartbeat watcher: a reconnect resubscribes everything and
-	// registers a fresh beat, so the silence count the watcher accumulated before
-	// the drop describes subscriptions that no longer exist. Carrying it across the
-	// gap declares the rebuilt session dead on its first Connected tick.
-	//
-	// Deliberately NOT epoch: bumpEpoch also fires on cache.symbols swaps, so a
-	// flapping symbol version would reset the detector every tick and mask a real
-	// stall forever.
-	//
-	// The counter must therefore advance ONLY when the subscriptions were actually
-	// rebuilt. enterConnected enforces that by bumping only for
-	// Connecting/Reconnecting -> Connected. Note Reloading -> Connected is a legal
-	// FSM edge that no production path takes today (SessionStateReloading is never
-	// entered outside tests); if the reload path is ever wired through it, it must
-	// keep going through enterConnected's filter and stay unbumped, or every
-	// AutoReload cycle re-introduces exactly the masking that ruled epoch out.
+	// connectedGen counts genuine (re)entries into Connected, so the heartbeat
+	// watcher drops a silence count describing subscriptions a reconnect has since
+	// rebuilt. Not epoch, which also fires on symbol swaps and would mask a real
+	// stall. Must advance only when subscriptions were actually rebuilt:
+	// enterConnected bumps for Connecting/Reconnecting -> Connected only.
 	connectedGen atomic.Uint64
 
 	autoReconnect              bool
@@ -212,24 +180,11 @@ const (
 	// long counts double, because a PLC resetting us within five seconds is not
 	// going to be helped by trying again soon.
 	flapWindow = 5 * time.Second
-	// flapResetWindow is how long a connection must survive before the session is
-	// considered to have stabilised. Anything shorter counts as a flap.
-	//
-	// The cooldown a flap earns comes from the session's BackoffConfig, so its
-	// ceiling is BackoffConfig.MaxInterval (default 30s). That default deliberately
-	// favours the device: against a PLC resetting every ~35s it costs roughly a
-	// quarter of the data a 1s cooldown would deliver, and spares the device's
-	// socket table several hundred accepted-then-reset connections an hour. A
-	// consumer that would rather have the samples can lower it with WithBackoff —
-	// MaxInterval 5s keeps ~89% of the stream by measurement.
-	//
-	// The two used to leave a dead zone between them: a connection lasting 5-60s
-	// neither incremented flapCount nor reset it, so a device resetting us on a
-	// timer got a constant first-tier cooldown for ever. Measured on 10.13.37.52
-	// on 2026-08-28: 21 consecutive resets at a metronomic ~35s, flapCount frozen
-	// at 3, so every cycle waited reconnectBackoff(3) = 1s and burned ~5 sockets.
-	// 500 accepted-then-reset sockets an hour against a device whose socket table
-	// is small is plausibly feeding the condition it is reacting to.
+	// flapResetWindow is how long a connection must survive to count as stabilised.
+	// It must meet the flap threshold with no gap between them: a dead zone left a
+	// device resetting on a timer at a constant first-tier cooldown for ever,
+	// burning ~500 accepted-then-reset sockets an hour. The cooldown itself comes
+	// from BackoffConfig, defaulting to favour the device over throughput.
 	flapResetWindow = 60 * time.Second
 )
 
@@ -307,23 +262,11 @@ func (s secret) LogValue() slog.Value {
 	return slog.StringValue("[REDACTED]")
 }
 
-// Session is the managed wrapper around a single ADS *Client. It owns the
-// symbol cache, persistent notifications (with auto-resubscribe across
-// reconnect), the lifecycle FSM, the auto-reconnect retry loop, and the
-// route-registration state. Construct via NewSession; call Connect to dial
-// the PLC and start the workers.
-//
-// Session does NOT embed *Client. Raw RPC methods (Read, Write, Sum*,
-// process-image, etc.) are NOT exposed on Session; reach them by
-// constructing a separate *Client via Dial. Session's public surface is
-// limited to the cache-aware / persistence-aware / lifecycle-aware
-// methods: ReadFromSymbol, WriteToSymbol, ReadMultipleSymbols,
-// WriteMultipleSymbols, GetSymbol, ListSymbols, BrowseSymbols,
-// AddSymbolNotification(s), LoadSymbols, LoadSymbolsSlow, LoadSymbolList,
-// LoadDataTypes, RefreshSymbols, CheckSymbolVersion, AddRoute, Connect,
-// Close, Reconnect, IsDisconnected.
-//
-// See docs/archive/specs/09-fsm-design.md for the full layered architecture.
+// Session is the managed wrapper around one ADS *Client: symbol cache,
+// persistent notifications, the lifecycle FSM, auto-reconnect and route state.
+// It does NOT embed *Client -- raw RPCs live on a *Client from Dial, and
+// Session's surface is the cache- and lifecycle-aware methods only.
+// See docs/archive/specs/09-fsm-design.md.
 type Session struct {
 	ip   string
 	port int
@@ -482,31 +425,16 @@ type AMSEndpoint struct {
 	RouterPort int
 }
 
-// NewSession creates a new ADS session targeting remote. The session does
-// no I/O until Connect; ctx is captured for the long-lived session
-// lifecycle and cancelling it shuts the session down.
+// NewSession creates a session targeting remote. No I/O until Connect, except
+// when remote.AMS is incomplete: a zero NetID or port is resolved over UDP
+// (IdentifyRemote), and the port then follows the TC major version (801/851), so
+// a project with several runtimes must set it explicitly. A fully specified
+// target is checked against the device by Connect -- see WithTargetCheck.
 //
-// Target address: remote.AMS may be left incomplete. A zero NetID and/or a
-// zero AMS port are resolved by asking the device for its own identity over
-// UDP (see IdentifyRemote) — one round-trip, read-only, no route or
-// credentials needed. The resolved port follows the TwinCAT-major-version
-// convention (801 on TC2, 851 on TC3), so a project with several runtimes must
-// still set the port explicitly. This is the only case where NewSession does
-// I/O, and it happens because omitting the address is itself a request to look
-// it up.
-//
-// A target that IS fully specified is left alone here and checked against the
-// device by Connect, so a wrong or stale NetID surfaces as a named error rather
-// than as a session that connects and then answers nothing. See WithTargetCheck.
-//
-// Local AMS NetID defaults to auto-derivation from the local TCP source IP.
-// Local AMS port defaults to a random value in the IANA dynamic range
-// (32768-49151) so each Session instance — including each process restart —
-// appears as a distinct AMS client to the PLC, preventing notification-handle
-// table collisions between concurrent or successive sessions sharing a host.
-// Override either with WithLocalAMS(AMSAddress{NetID:..., Port:...}).
-//
-// Use sess.Close() to shut down the session.
+// Local NetID defaults to the local TCP source IP; local AMS port to a random
+// dynamic-range value, so each session looks like a distinct AMS client and
+// notification handles cannot collide. Override with WithLocalAMS. Close to shut
+// the session down.
 func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) (sess *Session, err error) {
 	if remote.IP == "" {
 		return nil, fmt.Errorf("ads: NewSession: remote.IP must be set")
@@ -573,21 +501,10 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 		opt(sess)
 	}
 	sess.normalizeHeartbeatOptions()
-	// Resolve whatever the caller left out of the target address by asking the
-	// PLC's router for its own identity. Decided from sess.target AFTER the
-	// options ran, not from the constructor argument: reading pre-option state
-	// to make a post-option decision is how the two silently diverge.
-	//
-	// Only when something is actually missing: omitting the address IS the
-	// request to look it up, so the I/O is what the caller asked for. A fully
-	// specified target reaches Connect without any I/O here — verifying one is
-	// Connect's job, not the constructor's.
-	//
-	// Never in local mode. There the target is loopback by definition and
-	// Connect overwrites NetID and IP regardless (see WithLocalMode), so a probe
-	// against the caller-supplied address is at best a wasted round-trip that
-	// logs a discovered address Connect is about to discard — and at worst it
-	// fails construction for a mode that needs no network to resolve anything.
+	// Fill in what the caller omitted by asking the router for its identity, read
+	// from sess.target AFTER the options ran. Only when something is missing --
+	// omitting the address is itself the request to look it up. Never in local
+	// mode, where Connect overwrites NetID and IP anyway.
 	needsDiscovery := !sess.isLocal &&
 		(sess.target.NetID == [6]byte{} || sess.target.Port == 0)
 	if needsDiscovery {
@@ -703,25 +620,15 @@ func (sess *Session) applyTargetCheck(id RemoteIdentity) error {
 	return nil
 }
 
-// Connect dials the PLC and transitions the session to Connected. Local-mode
-// (in-process TwinCAT runtime at 127.0.0.1) is selected via WithLocalMode at
-// NewSession time.
+// Connect dials the PLC and transitions the session to Connected.
 //
-// Connect may bind a LISTENING socket on the AMS port (48898 by default) without
-// being asked: some devices answer only on a connection they open to us, and a
-// session that cannot accept it sees every request time out. That happens when a
-// connect proves the device otherwise silent, and — for a device already shown to
-// behave this way in this process — before probing at all. WithAmsPeerListen(port)
-// moves it; WithoutAmsPeerFallback() refuses it entirely.
+// May bind a listening socket on the AMS port unasked: some devices answer only
+// on a connection they open to us. WithAmsPeerListen moves it,
+// WithoutAmsPeerFallback refuses it. A failed Connect rolls back to Disconnected
+// and releases that listener, so the session stays usable for a retry.
 //
-// A failed Connect leaves the session usable for a retry (the FSM rolls back to
-// Disconnected) and releases the inbound listener it bound, so a caller who
-// discards the session after an error leaks neither the port nor its goroutines.
-// Close is still the caller's responsibility for everything else.
-//
-// Not safe for concurrent invocation on the same Session — the FSM gate via
-// transitionToOnce(Connecting) serializes callers, but races on sess.tx /
-// sess.client publishing would still leak resources. Call once per Session.
+// Not safe for concurrent use on one Session: the FSM gate serialises callers but
+// sess.tx / sess.client publishing would still race.
 func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	local := sess.isLocal
 	// transitionToOnce returns ok=false if another goroutine already won
@@ -737,21 +644,11 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	sess.lifecycle.connecting.Store(true)
 	defer func() {
 		sess.lifecycle.connecting.Store(false)
-		// A drop that landed while the spawn was suppressed and that Connect
-		// itself never noticed — a reset after the last request, say — is
-		// Connect's to adopt: on the success path nothing else will, and
-		// tx.disconnected is the sole record of it. Without this, the
-		// suppression would trade a rival Reconnect for a lost drop, which is
-		// the same invisible-stuck state one layer down.
-		//
-		// The ordering interlocks: a drop suppressed by the gate was recorded
-		// before the gate read the flag, so it is visible here; a drop landing
-		// after the store goes down the normal path and any duplicate this
-		// spawns loses the reconnectOwner CAS.
-		//
-		// Narrow on purpose (retErr == nil): after an error the caller's
-		// contract is to throw the session away, and adopting there would race
-		// a caller's own retry.
+		// A drop suppressed by the gate that Connect never noticed is Connect's to
+		// adopt; otherwise the suppression trades a rival Reconnect for a lost drop.
+		// Ordering interlocks: such a drop was recorded before the gate read the
+		// flag. Only on the success path -- after an error the caller discards the
+		// session, and adopting would race their retry.
 		if retErr == nil && !sess.isClosed() && sess.tx.disconnected.Load() {
 			sess.triggerReconnect()
 		}
@@ -1187,29 +1084,14 @@ func (sess *Session) awaitRouterAwake(ctx context.Context) error {
 	}
 }
 
-// isProbeRetryable reports whether a route-probe error is a transport-level
-// flap worth a TCP redial + probe retry before falling back to AddRoute.
+// isProbeRetryable reports whether a route-probe error is a transport flap worth
+// a redial and retry before falling back to AddRoute. A missing route and a stale
+// TCP slot both surface as ErrTransportClosed / io.EOF / ECONNRESET, and firing
+// AddRoute on the transient one evicts sibling TCPs from this IP (Beckhoff #49):
 //
-// PLC RST mid-probe can mean either "route is actually missing" (PLC's
-// AmsRouter rejects unknown source NetID) OR "PLC slot is still bound to
-// a previous TCP from same source IP" (transient — clears once the stale
-// slot times out). Both surface identically as ErrTransportClosed /
-// wrapped io.EOF / ECONNRESET. Without retry, the transient case spuriously
-// fires AddRoute, which on TC3 also evicts any concurrent sibling TCP from
-// the same source IP (see README §Limitations, Beckhoff/ADS #49). One
-// retry distinguishes:
-//
-//   - retry succeeds → route exists, slot conflict was transient → skip AddRoute
-//   - retry also fails → real missing route → register
-//
-// context.DeadlineExceeded is INTENTIONALLY excluded: that signals the
-// caller's Connect ctx expired, not a transient PLC slot conflict. Retrying
-// would burn the caller's already-expired deadline through a 500ms sleep,
-// a redial, and a doomed second probe before surfacing the original error.
-//
-// Returns false for ADS-level errors (e.g., ReturnCodeRouterNotInitialized,
-// concrete protocol-level rejection), since those indicate something more
-// specific than transport flap and re-dial won't change the outcome.
+// DeadlineExceeded is excluded: that is the caller's ctx expiring, and retrying
+// burns an already-dead deadline. So are ADS-level errors, which are a concrete
+// rejection that a redial cannot change.
 func isProbeRetryable(err error) bool {
 	if err == nil {
 		return false
@@ -1513,30 +1395,14 @@ func (sess *Session) waitDuringActivation(ctxFor func() context.Context, d time.
 }
 
 // redialDuringHandshake replaces the transport during a route probe or activation
-// wait, leaving the new Client in the handshake state its caller needs.
+// wait, leaving the new Client in the handshake state its caller needs. Beyond a
+// bare tearDownAndReset+dialAndStart it sets tx.disconnected across the gap, so
+// the flag gating user RPCs does not claim "connected" with no socket, and it
+// re-disarms ondrop, which publishWiredClient arms on every new Client -- without
+// that a PLC RST mid-handshake spawns the rival Reconnect the disarm prevents.
 //
-// Two things it does that a bare tearDownAndReset + dialAndStart does not:
-//
-//   - It sets tx.disconnected across the gap. awaitRouteActive's redial used to
-//     leave it false (resetForRetry sets it, this path never did), so the flag that
-//     gates user RPCs said "connected" while there was no socket and no workers at
-//     all. Requests in that window failed anyway — on the torn-down Client's closed
-//     `dropped` channel rather than on the flag — so this buys a correct reason
-//     rather than a correct outcome. It was survivable when the gap was a single
-//     dial; with a deliberate backoff before the dial it is up to seconds.
-//     Note the public IsDisconnected() is FSM-based and unaffected: during an
-//     activation window the session is Connecting or Reconnecting, never Connected.
-//   - It re-disarms ondrop. publishWiredClient arms it unconditionally on every
-//     new Client, so a caller that is deliberately holding the transport during a
-//     handshake gets a window in which a PLC RST spawns exactly the rival
-//     Reconnect that the disarm exists to prevent. Both callers need that, so it
-//     lives here rather than being repeated (and eventually forgotten) at each.
-//
-// Takes lifecycle.dialMu for the whole teardown+dial pair, which is what makes
-// the pair atomic against the other handshake-phase redial. Safe to hold here and
-// nowhere else: the two call sites (ensureRouteOnConnect, awaitRouteActive) never
-// nest -- Connect reaches them sequentially and the reconnect path reaches only
-// the second -- and neither holds any other session lock. See dialMu.
+// Holds dialMu for the whole teardown+dial pair, making it atomic against the
+// other handshake redial. The two call sites never nest. See dialMu.
 func (sess *Session) redialDuringHandshake() error {
 	sess.lifecycle.dialMu.Lock()
 	defer sess.lifecycle.dialMu.Unlock()
@@ -1552,25 +1418,14 @@ func (sess *Session) redialDuringHandshake() error {
 	return nil
 }
 
-// awaitRouteActive re-probes the PLC after a route registration until one
-// probe round-trips, redialing when the PLC drops the connection mid-probe
-// (it does that for a source NetID it does not serve yet, so a redial is part
-// of waiting rather than a failure). It returns the symbol version the winning
-// probe read, so the caller need not ask again.
+// awaitRouteActive re-probes after a route registration until one round-trips,
+// redialing when the PLC drops mid-probe (it does that for a NetID it does not
+// serve yet). Returns the symbol version the winning probe read.
 //
-// ctxFor supplies the context for each attempt and is called fresh every time,
-// which is the whole reason it is a function: this routine's own redial calls
-// tearDownAndReset, which cancels and replaces lifecycle.ctx. A caller on the
-// reconnect path that passed lifecycle.ctx by value would have the loop cancel
-// its own context on the first redial — every later probe born already dead,
-// reported as caller cancellation. Connect passes its own caller context, which
-// no teardown touches; the reconnect path passes sess.currentLifecycleCtx.
-//
-// Call immediately after a successful AddRoute. ondrop is disarmed for the
-// duration so a PLC-initiated RST cannot spawn a competing Reconnect
-// goroutine while we own the transport — same rationale as
-// ensureRouteOnConnect. Client.beginHandshake keeps the expected faults off
-// the ERROR channel while we are still working.
+// ctxFor is a function because this routine's redial replaces lifecycle.ctx:
+// passing that ctx by value would have the loop cancel its own context on the
+// first redial. Call right after AddRoute; ondrop stays disarmed throughout so an
+// RST cannot spawn a rival Reconnect while we own the transport.
 func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, error) {
 	if c := sess.client.Load(); c != nil {
 		c.SetOnDrop(nil)
@@ -1875,21 +1730,11 @@ func (sess *Session) autoReloadOnStaleDetection(reason Reason) {
 	}
 }
 
-// reloadSymbolsAndResubscribe re-runs symbol discovery + notification
-// resub after an online-change detection. Re-uses existing reconnect-path
-// helpers (R-NOT-013).
-//
-// Before resubscribing, explicitly Delete the old PLC notification handles.
-// The PLC's per-source-NetID handle table indexes subscriptions by handle
-// ID — without this cleanup, AddSymbolNotifications below would allocate a
-// fresh handle for every symbol while the old handles remain consuming
-// table slots until route-idle-timeout (~10 min). Under repeated online
-// changes this floods the TwinCAT AMS router (Beckhoff issue #268).
-//
-// Transport is alive at this point — PLC just sent us a stale-cache code
-// (0x711/0x705/0x710/...) over the active connection. bestEffortDelete
-// treats 0x714 (NotifyHandleInvalid) as success-equivalent so any handles
-// the PLC already auto-invalidated from the online-change don't error.
+// reloadSymbolsAndResubscribe re-runs symbol discovery and resubscribes after an
+// online change. Deletes the old PLC handles first: left behind they hold table
+// slots until route-idle-timeout (~10 min) and repeated online changes flood the
+// AMS router (Beckhoff #268). The transport is alive here, and 0x714 counts as
+// success for handles the PLC already invalidated.
 func (sess *Session) reloadSymbolsAndResubscribe() error {
 	// Transport is alive here, so quiesce dispatch: samples still arriving for the
 	// handles being deleted are race-window noise, not orphans.
@@ -1970,21 +1815,11 @@ func (sess *Session) markClosed() {
 	})
 }
 
-// releasePLCResources releases PLC-side notification subscriptions and (when
-// transport is still alive) PLC-side symbol handles. Both Close() and the
-// Reconnect-exhaustion path call this so PLC state isn't stranded when the
-// session terminates via either entry point.
-//
-// Notification cleanup runs even when disconnected: PLC tracks subscriptions
-// per source AMS NetID, so a session that closes without deleting its
-// notification handles leaves the PLC delivering them to the next session
-// that opens with the same NetID. bestEffortDelete logs failures but never
-// returns an error, so the call is safe even with a dead transport.
-//
-// symbol handle release is skipped when disconnected — unlike notifications,
-// stranded symbol handles do not generate side effects on subsequent
-// sessions, so the cost of leaking them is just a small PLC-side handle
-// table entry that the PLC reaps on route timeout.
+// releasePLCResources frees PLC-side notifications and, while the transport is
+// alive, symbol handles. Notification cleanup runs even when disconnected: the
+// PLC keys subscriptions by source NetID and would deliver them to the next
+// session using it. Symbol handles are skipped when disconnected -- they strand
+// harmlessly and the PLC reaps them on route timeout.
 func (sess *Session) releasePLCResources(wasDisconnected bool) {
 	// Terminal, so no need to quiesce dispatch. Takes the heartbeat with it, which
 	// is why Close no longer releases that separately.
@@ -2335,23 +2170,11 @@ func (sess *Session) triggerReconnect() {
 	// tx.disconnected, so Connect's own error handling — or its exit adopt —
 	// schedules the redial.
 	//
-	// Placement is load-bearing at both ends:
-	//
-	//   - Above the CAS, the drop is never recorded and the exit adopt has nothing
-	//     to see, so the drop is lost rather than deferred.
-	//   - Above the callback dispatch — which is where the obvious reading of
-	//     "immediately after the CAS" puts it — WithOnDisconnect never fires for a
-	//     drop during Connect. The callback is gated on firstDetector, so the exit
-	//     adopt's second pass, finding the CAS already lost, cannot make up for it:
-	//     a consumer whose only drop signal is the callback gets none at all.
-	//
-	// So: after the callback, before the reconnectDone channel. Returning before
-	// the channel exists is deliberate too — it is closed only by Reconnect, and
-	// the Reconnect this would have spawned is exactly what is being suppressed,
-	// so creating it here would leave Session.Close's unconditional wait on it
-	// hanging forever (verified: the package times out) and park the symbol
-	// helpers' waitForReconnect. The exit adopt re-enters here with the flag
-	// clear and creates it then.
+	// Placement is load-bearing: above the CAS the drop is lost rather than
+	// deferred, and above the callback WithOnDisconnect never fires for a drop
+	// during Connect. So: after the callback, before reconnectDone -- creating that
+	// channel here would hang Close's unconditional wait on it, since the Reconnect
+	// that closes it is exactly what is being suppressed.
 	if sess.lifecycle.connecting.Load() {
 		return
 	}
@@ -2436,21 +2259,11 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		sess.logger.Info("reconnect already in progress, skipping")
 		return nil
 	}
-	// One defer for the whole hand-off, in this order on purpose.
-	//
-	// The tail of a successful reconnect marks the transport live and goes
-	// Connected while this ownership flag is still held. A drop landing in that
-	// gap is seen by triggerReconnect, which takes the session to Disconnected and
-	// spawns a Reconnect — and that one loses the CAS above and returns. So the
-	// drop is acknowledged by the FSM and then abandoned: nothing owns a retry,
-	// and heartbeatWatch skips while disconnected. The session sits Disconnected
-	// with IsClosed() false forever, which is the one state a consumer polling
-	// IsClosed() cannot see.
-	//
-	// Releasing ownership is therefore not enough; whoever releases it has to look
-	// for a drop that arrived while it was finishing and adopt it. Closing
-	// reconnectDone first keeps Close()'s unconditional wait on that channel from
-	// hanging on an orphan triggerReconnect created in the same gap.
+	// One defer, in this order on purpose. A drop landing between "transport live"
+	// and this release is spawned a Reconnect that loses the CAS above, so the FSM
+	// acknowledges it and nothing retries -- the session sits Disconnected with
+	// IsClosed() false for ever. So whoever releases ownership must adopt it.
+	// reconnectDone closes first, or Close's wait hangs on an orphan trigger.
 	defer func() {
 		closeReconnectDone()
 		sess.lifecycle.reconnectOwner.Store(false)
@@ -2534,26 +2347,13 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 	// but snapshot the handle list first, because the PLC may still hold those
 	// registrations.
 	//
-	// Measured 2026-08-23 with a proxy severing the link, same source AmsAddr on
-	// both sides of the outage:
-	//   - TC3.1.4024/CE, silent loss (the PLC never saw a FIN): the handles are
-	//     ALIVE and start streaming to the new connection. Deleting them returns
-	//     0x0 — real registrations.
-	//   - Any device, clean disconnect (FIN reached the PLC): already invalidated,
-	//     0x714 or 0x715.
-	//   - TC2 2.10: gone within 2s either way; the delete is a formality.
-	// So the delete below is load bearing exactly in the field case — cable,
-	// switch, NAT idle-out — where nothing told the PLC we left. Without it a
-	// flapping session accumulates handle slots and eventually crashes the
-	// TwinCAT AMS router (Beckhoff issue #268), and the stale handles stream
-	// alongside the new ones until the orphan reaper catches them.
+	// Load bearing on a silent loss -- cable, switch, NAT idle-out -- where the PLC
+	// never saw a FIN and the old handles are still alive: they stream alongside the
+	// new ones, and uncleaned they fill the AMS router's table (Beckhoff #268). On a
+	// clean disconnect they are already 0x714/0x715 and this is a formality.
 	//
-	// Note when reading the log: bestEffortDelete counts 0x714/0x715 as
-	// success-equivalent, so "deleted=N" does not prove N registrations existed.
-	//
-	// No dispatch quiescing: the transport is about to be torn down, so nothing
-	// more can arrive on it. The heartbeat comes along in this snapshot, which is
-	// what lets establishHeartbeat register a fresh one after the resubscribe.
+	// No dispatch quiescing: the transport is about to go. The heartbeat rides along
+	// in this snapshot, which is what lets establishHeartbeat register a fresh one.
 	savedHandles := sess.takeNotificationHandles(false)
 
 	sess.tearDownAndReset()
@@ -3073,26 +2873,11 @@ func (sess *Session) sourceAddr() AMSAddress {
 	return sess.source
 }
 
-// publishWiredClient allocates the Client for the connection currently on
-// sess.tx, wires its handlers, starts its workers and publishes it.
-//
-// Both connect paths need exactly this, and the ctx/cancel pair must be captured
-// under one RLock: tearDownAndReset replaces them together, so reading them
-// separately can hand the Client a context from one generation and the cancel of
-// the next. Having one copy of that means the invariant lives with the code
-// rather than in two comments.
-//
-// The publish comes BEFORE startWorkers, and the order matters. Previously the
-// workers were started first and sess.client.Store was last, on the reasoning
-// that a concurrent reader must never see a half-initialised Client. But the
-// workers ARE concurrent readers of sess.client: a drop landing in that window
-// runs callOnDrop -> triggerReconnect -> Reconnect -> tearDownAndReset, which
-// loads sess.client and so tore down the PREVIOUS Client — markDropped-ing and
-// waiting the wrong one — while this Client's workers kept running with nobody
-// waiting their WaitGroup and its transmitWorker sharing tx.sendChannel with the
-// next dial's. Storing first closes that window: by the time any worker exists,
-// the pointer and the drop handler are both in place, and the Client is fully
-// built either way (every field is set in the literal below).
+// publishWiredClient wires and starts the Client for the connection on sess.tx.
+// ctx and cancel must be captured under one RLock, or the Client gets a context
+// from one generation and the cancel of the next. Publish before startWorkers:
+// the workers read sess.client, and a drop in that window tears down the previous
+// Client while this one's workers run unwaited.
 func (sess *Session) publishWiredClient() *Client {
 	sess.lifecycle.ctxMu.RLock()
 	clientCtx := sess.lifecycle.ctx
@@ -3131,33 +2916,11 @@ func (sess *Session) publishWiredClient() *Client {
 // device has to dial in and answer one of them.
 const peerFallbackProbes = 3
 
-// tryPeerFallback is the automatic half of peer-route support: when a PLC has
-// accepted our connection and answered nothing at all, bind the AMS port and see
-// whether it is answering on a connection it opens to us instead.
-//
-// Why this is worth binding a socket for: the responses are not lost, they are
-// being delivered somewhere we are not listening (see AcceptPeerConn for the
-// decoded evidence). A caller that only ever calls Connect — which is how the
-// benthos plugin uses this library — has no way to reach for an option, so a
-// session that could work would simply never work. The bind only happens for a
-// session that is otherwise dead, and it is announced at WARN because a device in
-// this state is worth an operator's attention.
-//
-// peerRouteHosts remembers which devices answer on a connection they open to us,
-// keyed by host, for the life of the process.
-//
-// Learning this costs a full route-probe timeout plus the route-activation budget —
-// about 15s on a device in that state, measured on 192.168.3.224 — and it is a
-// property of the DEVICE, not of one session. Re-learning it on every Connect made
-// a suite of ~50 sessions spend a quarter of an hour discovering the same fact.
-//
-// Only ever causes the inbound listener to be bound earlier, so a stale entry
-// (device's route table repaired since) costs a bound port and nothing else: the
-// normal probe still runs and still wins.
-// Keyed by host AND port, not host alone: every scriptable stub in the test suite
-// lives on 127.0.0.1, so an IP-only key made one rescued stub speak for all of them
-// and every later session pre-bound the protocol port they then fought over. Real
-// devices all sit on 48898, so the port adds nothing there and costs nothing.
+// peerRouteHosts remembers which devices answer only on a connection they open to
+// us, for the life of the process: learning it costs ~15s and is a property of the
+// device, not the session. Keyed by host AND port, or the test stubs sharing
+// 127.0.0.1 would all inherit one stub's verdict. A stale entry only pre-binds the
+// listener; the normal probe still runs and still wins.
 var peerRouteHosts sync.Map // "host:port" -> struct{}
 
 func (sess *Session) peerRouteCacheKey() string {
@@ -3171,25 +2934,11 @@ func rememberPeerRouteHost(key string) { peerRouteHosts.Store(key, struct{}{}) }
 // dropped when the session proved the device does not need it.
 func forgetPeerRouteHost(key string) { peerRouteHosts.Delete(key) }
 
-// forgetPeerRouteHostIfUnused drops the remembered fact for this device when the
-// session reached Connected without a single inbound connection from it.
-//
-// This is the self-invalidation the comment on peerRouteHosts describes, and until
-// now it lived inside Connect's route-registration branch — so a caller that does
-// not use WithRoute (umh-core in a container, and every session in the default
-// configuration) never invalidated anything. One observation then governed every
-// later session in the process: each of them pre-bound the inbound AMS port —
-// wildcard :48898 with no WithAmsPeerListen — for its whole lifetime, long after
-// the device's route table had been repaired.
-//
-// The inbound-connection count is what makes this safe to call unconditionally. A
-// Connect can succeed BECAUSE the listener was pre-bound and the device answered
-// there, and dropping the entry then would throw away the ~15s of probing that
-// learned it; a device that dialled us has peerConnsAdopted > 0 and keeps its entry.
-//
-// No expiry and no reaper: with this in place an entry is dropped by the first
-// Connect that does not need it, which is a better clock than any timeout, and a
-// timeout would need a goroutine or a lazy sweep for no gain.
+// forgetPeerRouteHostIfUnused drops the remembered fact when a session reached
+// Connected with no inbound connection from the device. Safe to call
+// unconditionally because a device that dialled us has peerConnsAdopted > 0 and
+// keeps its entry. No expiry needed: the first Connect that does not need the
+// entry drops it, which beats any timeout.
 func (sess *Session) forgetPeerRouteHostIfUnused() {
 	if sess.peerConnsAdopted.Load() != 0 {
 		return
