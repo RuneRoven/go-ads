@@ -1352,8 +1352,16 @@ func (sess *Session) heartbeatWatch() {
 		// gapTicks rather than quietTicks, which a beat resets -- the whole point is
 		// that beats are arriving. Same backoff as the silence path, so a PLC that
 		// refuses the re-subscribe costs the same handful of attempts.
+		// Read once and share with the silence check below: the gap branch must not
+		// fire on a session whose beat is gone. Measured with the link severed --
+		// the gap branch ran on frozen beats, continued past the silence path, and
+		// pushed the transport-dead call out from ~30s to 78s while re-subscribing
+		// into a link that was not there.
+		beats := sess.notifications.heartbeatBeats.Load()
+		beatArrived := beats != lastBeats
+
 		gapTicks++
-		if registered := int(sess.notifications.registered.Load()); registered > active {
+		if registered := int(sess.notifications.registered.Load()); beatArrived && registered > active {
 			allowed := heartbeatAllowedTicks(sess.heartbeatAllowedMisses(), consecutiveFailures, cycle)
 			if gapTicks >= allowed {
 				gapTicks = 0
@@ -1368,6 +1376,11 @@ func (sess *Session) heartbeatWatch() {
 				default:
 					consecutiveFailures++
 				}
+				// This tick saw a beat, so record it exactly as the silence check
+				// would have. Skipping it leaves lastBeats stale, and beatArrived
+				// then stays true for ever -- including after the beat dies.
+				lastBeats = beats
+				quietTicks = 0
 				continue
 			}
 		} else {
@@ -1376,8 +1389,7 @@ func (sess *Session) heartbeatWatch() {
 		// Silence measured in ticks of this ticker, not in wall-clock time: the
 		// ticker is monotonic, so a clock step cannot make a healthy session look
 		// dead (or a dead one look healthy). See notificationManager.heartbeatBeats.
-		beats := sess.notifications.heartbeatBeats.Load()
-		if beats != lastBeats {
+		if beatArrived {
 			lastBeats = beats
 			quietTicks = 0
 			// A beat is proof of life, so a previously-observed silent window no
