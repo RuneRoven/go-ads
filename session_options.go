@@ -513,17 +513,11 @@ func WithRuntimeStateWatch(d time.Duration) SessionOption {
 	}
 }
 
-// WithoutRuntimeStateWatch turns the runtime-state poll off entirely.
-//
-// What it saves: one small request per interval to the system service port. What
-// it accepts: the gates on the symbol and subscription calls fall back to
-// permitting, so a session against a PLC in CONFIG fails the old obscure way
-// (an AMS error naming an index group) rather than saying the runtime is not
-// running, and a session that starts in CONFIG will not notice the return to RUN
-// on its own.
-//
-// Connect still does one synchronous state read, so a device already in CONFIG at
-// connect time is still reported once.
+// WithoutRuntimeStateWatch turns the runtime-state poll off, saving one small
+// request per interval. In exchange the gates fall back to permitting, so a PLC in
+// CONFIG fails the old obscure way instead of saying the runtime is not running,
+// and a session starting in CONFIG will not notice the return to RUN. Connect
+// still does one synchronous read.
 func WithoutRuntimeStateWatch() SessionOption {
 	return func(s *Session) {
 		s.stateWatchDisabled = true

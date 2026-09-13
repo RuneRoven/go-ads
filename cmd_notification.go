@@ -541,16 +541,11 @@ func (sess *Session) beginSubscribe() subscribeToken {
 	return tok
 }
 
-// endSubscribe closes a subscribe operation: it replays samples buffered for
-// the handles that were committed, then — once no subscribe is left in flight
-// — discards what remains. A leftover entry belongs to a handle whose commit
-// never happened (rejected item, stranded cache, TOCTOU loss); if it really is
-// leaked PLC-side it keeps firing, and its next sample takes the orphan path
-// normally.
-//
-// MUST be called after notifications.lock is released: the replay path takes
-// cache.lock, and holding both is forbidden. Deferring it before the
-// lock.Unlock defer gives that ordering for free (defers run LIFO).
+// endSubscribe replays samples buffered for committed handles, then discards what
+// remains once nothing is in flight -- a leftover belongs to a handle that never
+// committed, and if it really is leaked PLC-side its next sample takes the orphan
+// path. MUST run after notifications.lock is released, since the replay takes
+// cache.lock; deferring it before the unlock defer gives that ordering for free.
 func (sess *Session) endSubscribe(ctx context.Context, tok subscribeToken, committed []uint32) {
 	mgr := sess.notifications
 	mgr.lastSubscribeNs.Store(time.Now().UnixNano())
@@ -1284,16 +1279,10 @@ func (sess *Session) heartbeatWatch() {
 			continue
 		}
 		quietTicks++
-		// Every site that counts a failure decides the same way: attempts that keep
-		// failing are evidence about the link, not the subscriptions. Spawned for the
-		// same reason as the versionCallback sites -- this runs on the heartbeat
-		// watcher and Close waits heartbeatWG, so tearing the session down inline
-		// would deadlock against the goroutine it runs on.
-		// One decision, used by every path that reaches a silent window: has any
-		// frame arrived since the last one? Spawned for the same reason as the
-		// versionCallback sites -- this runs on the heartbeat watcher and Close waits
-		// heartbeatWG, so tearing the session down inline would deadlock against the
-		// goroutine it runs on.
+		// One decision for every path reaching a silent window: has any frame arrived
+		// since the last one? Attempts that keep failing are evidence about the link,
+		// not the subscriptions. Spawned, not inline: this runs on the heartbeat
+		// watcher and Close waits heartbeatWG.
 		escalate := func() bool {
 			frames := uint64(0)
 			if c := sess.client.Load(); c != nil {

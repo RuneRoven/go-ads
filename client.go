@@ -549,16 +549,11 @@ func (c *Client) listen() {
 // to us. Frames carry their own invokeID, so responses match regardless of which
 // socket they arrive on.
 func (c *Client) AcceptPeerConn(conn net.Conn) {
-	// Refuse once the adopted connections have been dropped for a teardown. The
-	// PLC re-dials after every drop, which is exactly when teardown runs, and
-	// tearDownAndReset does closePeerConns() and then waits on this WaitGroup:
-	// adopting here would append to a slice nobody will close again (a leaked fd
-	// and a half-open socket the PLC counts against its one-connection-per-IP
-	// limit), block that wait forever in io.ReadFull, and Add to a WaitGroup whose
-	// Wait may already be running at zero, which panics the process.
-	//
-	// The Add stays inside the same critical section as the flag check, so it
-	// cannot slip past a closePeerConns that has already returned.
+	// Refuse once the adopted connections were dropped for a teardown: the PLC
+	// re-dials after every drop, which is exactly when teardown runs, so adopting
+	// here leaks an fd, blocks tearDownAndReset's wait in io.ReadFull for ever, and
+	// Adds to a WaitGroup whose Wait may already be running at zero. The Add stays
+	// in the same critical section as the flag check.
 	c.peerMu.Lock()
 	if c.peerClosed || (c.ctx != nil && c.ctx.Err() != nil) {
 		c.peerMu.Unlock()

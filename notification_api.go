@@ -44,16 +44,10 @@ type notificationManager struct {
 	// is in flight; openSubscribes answers that.
 	lastSubscribeNs atomic.Int64
 
-	// openSubscribes maps each in-flight subscribe to the time it began, so every
-	// one is bounded by subscribeRaceMaxOpen on its own age. Guarded by openMu,
-	// which is also the critical section that closes a subscribe — one shared
-	// counter plus one shared timestamp could not express this: the pair was not
-	// atomic across goroutines (an ending subscribe could clear a clock a starting
-	// one had just written, and "in flight with no clock" suppressed the orphan
-	// reaper permanently), and a single slot recorded when the last quiet period
-	// ended rather than when anything in flight began.
-	//
-	// Lock order where both are taken: openMu then earlyMu, never the reverse.
+	// Each in-flight subscribe with the time it began, so each is bounded by its own
+	// age. A shared counter plus one timestamp could not express this: the pair was
+	// not atomic, and one slot recorded when the last quiet period ended rather than
+	// when anything in flight began. Lock order: openMu then earlyMu, never reverse.
 	openMu             sync.Mutex
 	openSubscribes     map[subscribeToken]int64
 	nextSubscribeToken uint64
@@ -593,17 +587,10 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 }
 
 // AddSymbolNotifications subscribes several symbols in one round-trip, returning
-// per-config results parallel to configs. A non-nil error means the batch could
-// not be sent at all; per-item state is still in the slice. Partial outcomes are
-// normal -- a batch over a network is not atomic.
-//
-// Per result: Skipped != nil means the library did not commit it (match the
-// ErrNotification* sentinels; a non-zero Handle there is a PLC registration
-// released best-effort before returning). Otherwise Error carries the PLC's
-// per-item verdict, and NoErrors means Handle is valid.
-//
-// The caller MUST NOT close ch while any notification is active; delete them or
-// Close first.
+// results parallel to configs; a non-nil error means the batch never went at all.
+// Partial outcomes are normal. Skipped != nil means the library did not commit it
+// (match the ErrNotification* sentinels), otherwise Error is the PLC's verdict and
+// NoErrors means Handle is valid. Do not close ch while notifications are active.
 func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []NotificationConfig, ch chan *Update) ([]SumNotificationResult, error) {
 	// Refuse outside RUN rather than produce a misleading failure: in CONFIG the
 	// runtime port does not exist, so this cannot succeed, and the PLC's answer is
