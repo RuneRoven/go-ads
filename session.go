@@ -319,15 +319,10 @@ type Session struct {
 	stateWatchInterval time.Duration
 	stateWatchDisabled bool
 
-	// runtimeState is the last ADS state read from the system service port, and
-	// runtimeStateNs when. Zero (ADSStateInvalid) means "not known yet" — the gates
-	// below only refuse on a POSITIVE non-RUN reading, never on absence of one, so a
-	// device that does not serve the system service port behaves as before.
-	//
-	// Measured on TC3.1.4024 in CONFIG: the runtime port answers every request with
-	// AMS ErrorCode 6 (target port not found) while port 10000 reports ADSState=15.
-	// Without asking 10000 the session cannot tell "the runtime is not running" from
-	// "this device is broken", and it retries either way.
+	// Last ADS state read from the system service port, and when. Zero means "not
+	// known yet": the gates refuse only on a positive non-RUN reading, never on the
+	// absence of one. Without asking port 10000 a session cannot tell "the runtime
+	// is in CONFIG" from "this device is broken", and retries blindly either way.
 	runtimeState   atomic.Uint32
 	runtimeStateNs atomic.Int64
 	// stateWG, not lifecycle.waitGroup: the watch lives for the whole session, and
@@ -384,16 +379,11 @@ type AMSEndpoint struct {
 	RouterPort int
 }
 
-// NewSession creates a session targeting remote. No I/O until Connect, except
-// when remote.AMS is incomplete: a zero NetID or port is resolved over UDP
-// (IdentifyRemote), and the port then follows the TC major version (801/851), so
-// a project with several runtimes must set it explicitly. A fully specified
-// target is checked against the device by Connect -- see WithTargetCheck.
-//
-// Local NetID defaults to the local TCP source IP; local AMS port to a random
-// dynamic-range value, so each session looks like a distinct AMS client and
-// notification handles cannot collide. Override with WithLocalAMS. Close to shut
-// the session down.
+// NewSession creates a session targeting remote. No I/O until Connect, except to
+// resolve an incomplete remote.AMS over UDP -- the port then follows the TC major
+// version (801/851), so several runtimes means setting it explicitly. Local NetID
+// defaults to the TCP source IP and the AMS port to a random one, so sessions
+// cannot collide on the PLC's handle table. See WithLocalAMS, WithTargetCheck.
 func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) (sess *Session, err error) {
 	if remote.IP == "" {
 		return nil, fmt.Errorf("ads: NewSession: remote.IP must be set")
@@ -1188,15 +1178,10 @@ func redialBackoff(n int) time.Duration {
 	return d
 }
 
-// isTransportDead reports whether err means this TCP connection is gone, as
-// opposed to a request that failed on a connection that still works.
-//
-// Deliberately NOT isProbeRetryable, and deliberately not a widening of it:
-// isProbeRetryable answers "is a redial worth trying", and it excludes
-// context.DeadlineExceeded on purpose (session_test.go pins that, and the reason
-// is in its godoc). This answers a different question -- "is there still a socket
-// to probe on" -- which is what decides whether continuing to poll after the
-// redial budget is spent can achieve anything.
+// isTransportDead reports whether the connection is gone, as opposed to a request
+// that failed on one that still works. Deliberately not isProbeRetryable, which
+// answers "is a redial worth trying" and excludes DeadlineExceeded; this answers
+// "is there still a socket to probe on".
 func isTransportDead(err error) bool {
 	if err == nil {
 		return false
@@ -1225,15 +1210,9 @@ func (sess *Session) routeActivationBudget() (total, probe time.Duration) {
 	return total, probe
 }
 
-// defaultStateWatchInterval is how often the runtime-state poller asks the system
-// service when the caller has not said otherwise.
-//
-// Fixed rather than derived from heartbeatCycle(), which is what it used to be.
-// The coupling was silent and surprising: WithNotificationHeartbeat(30*time.Second,
-// ...) also made the state poll 30s, so the gate that reports "the runtime is in
-// CONFIG" went stale for half a minute because someone tuned an unrelated knob. 5s
-// keeps the poll predictable and, at the 2s default heartbeat, actually reduces the
-// request rate.
+// defaultStateWatchInterval is how often the runtime-state poller runs. Fixed, not
+// derived from the heartbeat cycle: that coupling let WithNotificationHeartbeat
+// silently stale the CONFIG gate by half a minute.
 const defaultStateWatchInterval = 5 * time.Second
 
 // stateWatchCycle is the runtime-state poll interval: the configured one, or
@@ -1560,15 +1539,9 @@ func (sess *Session) tryRecordReloadAttempt() bool {
 	return true
 }
 
-// autoReloadOnStaleDetection runs full re-discovery + resubscribe under
-// SymbolVersionAutoReload (R-CACHE-010). Capped by R-CACHE-013 — on cap
-// exhaustion, logs WARN, fires callback with ReasonReloadCapExhausted,
-// and degrades to Ignore semantics for this call (no further reload
-// attempts until window slides out).
-//
-// Sequence: markAllHandlesStale(ReasonReloadInProgress) → bumpEpoch →
-// zero old handles → LoadSymbols → resubscribeNotifications →
-// fire onReconnect.
+// autoReloadOnStaleDetection re-discovers and resubscribes under
+// SymbolVersionAutoReload. Capped (R-CACHE-013): on exhaustion it warns, fires
+// ReasonReloadCapExhausted and degrades to Ignore until the window slides out.
 func (sess *Session) autoReloadOnStaleDetection(reason Reason) {
 	defer sess.reloadInProgress.Store(false)
 	if !sess.tryRecordReloadAttempt() {
@@ -1915,15 +1888,10 @@ func (l *sessionLifecycle) reconnectAttemptsForTest() int64 {
 	return l.reconnectAttempts.Load()
 }
 
-// isDeviceAnswer reports whether err carries an answer from the far side — an
-// ADS return code from the device, or a rejection from its AMS router — as
-// opposed to silence (a timeout, a dead link, a cancelled context), which says
-// nothing about what is or is not there.
-//
-// A router rejection is an answer, and for a port that does not exist it is the
-// most direct evidence there is: a request to an absent port comes back with AMS
-// ErrorCode 0x06 (defs.go). AMSError deliberately does not unwrap to ReturnCode,
-// so both cases have to be asked about separately.
+// isDeviceAnswer reports whether err carries an answer from the far side -- an ADS
+// return code or a router rejection -- as opposed to silence, which says nothing.
+// A rejection is the most direct evidence for an absent port (AMS ErrorCode 0x06).
+// AMSError does not unwrap to ReturnCode, so both must be asked about separately.
 func isDeviceAnswer(err error) bool {
 	var rc ReturnCode
 	var amsErr AMSError
@@ -2549,15 +2517,9 @@ func (sess *Session) reloadSymbols() error {
 	return nil
 }
 
-// tearDownAndReset cancels the active goroutines, closes the TCP connection,
-// and resets ctx/channels/activeRequests so the connection can be re-dialed.
-// callers but is now a no-op — capability state lives on *Client, and
-// dialAndStart allocates a fresh zero-valued Client on every attempt.
-//
-// Used by three reset paths:
-//   - Connect()'s post-route-registration TCP teardown
-//   - Reconnect()'s pre-retry-loop reset
-//   - resetForRetry()
+// tearDownAndReset cancels the goroutines, closes the connection and resets
+// ctx/channels/activeRequests so it can be re-dialed. Used by Connect's
+// post-route teardown, Reconnect's pre-retry reset, and resetForRetry.
 func (sess *Session) tearDownAndReset() {
 	// Capture cancel under RLock then release before invoking. Calling the
 	// cancel under RLock would deadlock against the subsequent ctxMu.Lock
