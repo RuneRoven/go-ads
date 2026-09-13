@@ -26,10 +26,8 @@ type amsTCPHeader struct {
 //	offset 24 ErrorCode (4)
 //	offset 28 InvokeID (4)
 //
-// Exported so router / proxy implementations can parse, mutate (e.g.
-// rewrite Source for client-isolated routing), and re-encode frames
-// without touching Client RPC plumbing. See ParseAMSHeader and
-// EncodeAMSHeader for the wire codec.
+// Exported so router and proxy implementations can parse, mutate and re-encode
+// frames without touching the Client RPC plumbing.
 type AMSHeader struct {
 	Target    AMSAddress
 	Source    AMSAddress

@@ -268,36 +268,17 @@ var parseableTypes = []string{
 	"LWORD",
 }
 
-// inferBaseType guesses a parseable base type from a symbol's byte size,
-// last-resort fallback when neither the protocol's ADST_ code nor the
-// uploaded datatype table can resolve the type (on-demand mode without
-// LoadSymbols / LoadDataTypes).
+// inferBaseType guesses a base type from a symbol's byte size, the last resort
+// when neither the ADST_ code nor the datatype table resolves it.
 //
-// At 4 and 8 byte widths the layout is genuinely ambiguous between integer
-// and IEEE-754 float (DINT/REAL share size, LINT/LREAL share size).
-// Interpreting a REAL as a DINT silently corrupts every parse — 1.5
-// (0x3FC00000) becomes 1069547520. Per the Beckhoff Information System,
-// the authoritative way to resolve user-defined types (BIGTYPE) is to
-// look up symDataType in the datatype table, not to infer from size:
+// Only 1- and 2-byte widths, where no IEEE-754 form exists and sign affects
+// rendering alone. At 4 and 8 bytes the layout is genuinely ambiguous (DINT/REAL,
+// LINT/LREAL) and reading a REAL as a DINT silently corrupts every parse -- 1.5
+// becomes 1069547520 -- so those return "" and the caller points at LoadSymbols,
+// which is Beckhoff's own answer for user-defined types.
 //
-//	"All PLC structures and arrays (user-defined data types) have the ADS
-//	 data type name: ADST_BIGTYPE and can not be identified through this
-//	 data type constant. In order to be able to identify the user-defined
-//	 data types, use the symDataType variable, or read the base type of the
-//	 individual variables in the structure."
-//
-// To prevent silent corruption, this fallback only handles 1- and 2-byte
-// widths where no IEEE-754 form exists and signed/unsigned only affects
-// rendering of the same bytes. 4 and 8 byte symbols without a table
-// loaded return "" so the caller surfaces a clear error and the user
-// resolves the type via LoadSymbols (Beckhoff-blessed path).
-//
-// baseType is the ADST_ protocol code for the symbol's resolved primitive,
-// when known. The parameter exists so callers thread the protocol code
-// through to keep the resolution chain explicit. Currently the function
-// inspects only `size` because the 1/2-byte cases are unambiguous regardless
-// of baseType; future tightening (refusing 1/2-byte inference when baseType
-// indicates a non-integer primitive) lands here.
+// baseType is threaded through to keep the resolution chain explicit; only size is
+// inspected today.
 func inferBaseType(size uint32, baseType ADSDataType) string {
 	_ = baseType // reserved for future width+type tightening; see godoc above.
 	switch size {
