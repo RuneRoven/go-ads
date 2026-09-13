@@ -728,11 +728,9 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	if !sess.route.shouldSkip() {
 		registered, err := sess.ensureRouteOnConnect(ctx)
 		if err != nil {
-			// WithRoute is an explicit requirement: swallowing this leaves every later
-			// command failing with TargetNotFound on a connection that "succeeded".
-			// Tear down first -- a Client is already published on an open socket, and
-			// returning without this leaves workers running on a transport the caller
-			// believes is dead.
+			// WithRoute is explicit: swallowing this leaves every later command failing
+			// with TargetNotFound on a connection that "succeeded". Tear down first --
+			// a Client is already published on an open socket.
 			sess.tearDownAndReset()
 			return fmt.Errorf("route registration failed during connect: %w", err)
 		}
@@ -853,11 +851,10 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 		sess.logger.Warn("connected, but the PLC runtime is not in RUN: symbol and subscription calls will refuse until it returns",
 			"state", uint16(state), "detail", "in CONFIG the runtime port does not exist, so those calls cannot succeed")
 	}
-	// This Connect worked. If it never heard from the device on a connection the
-	// device opened, that device does not need the inbound listener, whatever an
-	// earlier session concluded. Deliberately here rather than in the branches: only
-	// a Connect that is about to report success has earned the right to overwrite
-	// what a previous one learned.
+	// This Connect worked, and if it never heard from the device on a connection the
+	// device opened, the listener is not needed whatever an earlier session decided.
+	// Here rather than in the branches: only a Connect about to report success has
+	// earned the right to overwrite what a previous one learned.
 	sess.forgetPeerRouteHostIfUnused()
 	sess.enterConnected()
 	sess.lifecycle.flapMu.Lock()
@@ -921,11 +918,10 @@ func (sess *Session) awaitRouterAwake(ctx context.Context) error {
 	}
 }
 
-// isProbeRetryable reports whether a route-probe error is a transport flap worth
-// a redial before falling back to AddRoute. A missing route and a stale TCP slot
-// both surface as ErrTransportClosed / io.EOF / ECONNRESET, and registering on the
-// transient one evicts sibling TCPs (Beckhoff #49). Excludes DeadlineExceeded (the
-// caller's ctx) and ADS-level errors (a rejection a redial cannot change).
+// isProbeRetryable reports whether a probe error is a transport flap worth a
+// redial before falling back to AddRoute: a missing route and a stale TCP slot look
+// identical, and registering on the transient one evicts sibling TCPs (Beckhoff
+// #49). Excludes DeadlineExceeded and ADS-level rejections.
 func isProbeRetryable(err error) bool {
 	if err == nil {
 		return false
@@ -1052,21 +1048,18 @@ func (sess *Session) ensureRouteOnConnect(ctx context.Context) (registered bool,
 }
 
 // Route activation: the router acks an AddRoute before it necessarily serves it,
-// and until it does our requests are dropped in silence rather than refused. So
-// re-probe until it answers and Connect either works or fails honestly. The
-// ceiling is generous because the wait ends on the first successful probe; only a
-// route that never comes live pays it. See WithRouteActivationTimeout.
+// and until then requests are dropped in silence. Re-probe until it answers, so
+// Connect either works or fails honestly. The ceiling is generous because only a
+// route that never comes live pays it.
 const (
 	defaultRouteActivationTimeout = 10 * time.Second
 	routeActivationPollDelay      = 250 * time.Millisecond
 	minRouteActivationProbe       = 500 * time.Millisecond
 	maxRouteActivationProbe       = 2 * time.Second
 
-	// maxRouteActivationRedials caps the TCP connections one activation window may
-	// burn -- uncapped it redialled on every poll, ~40 sockets in 11s. Not
-	// politeness: the router keeps one TCP per host (Beckhoff #49), so each redial
-	// evicted its own predecessor, and on CE those sockets sit in TIME_WAIT for
-	// minutes.
+	// Caps the TCP connections one activation window may burn -- uncapped it
+	// redialled on every poll, ~40 sockets in 11s, each evicting its own predecessor
+	// since the router keeps one TCP per host (Beckhoff #49).
 	maxRouteActivationRedials = 3
 	// redialBackoffBase/redialBackoffMax bound the wait between redials. The wait
 	// happens BEFORE the redial, which is what gives the PLC time to release the
@@ -1158,11 +1151,10 @@ func (sess *Session) currentLifecycleCtx() context.Context {
 	return sess.lifecycle.ctx
 }
 
-// waitDuringActivation sleeps during a route-activation window, honouring three
-// stop signals. The third is why it exists: on the Connect path the attempt ctx is
-// the caller's own, which Close does not cancel, so a two-arm select would wake
-// after Close returned and dial a fresh socket -- in the one path whose purpose is
-// to stop burning ephemeral ports.
+// waitDuringActivation sleeps during an activation window, honouring three stop
+// signals. The third is why it exists: the attempt ctx is the caller's own, which
+// Close does not cancel, so a two-arm select would wake after Close returned and
+// dial a fresh socket.
 func (sess *Session) waitDuringActivation(ctxFor func() context.Context, d time.Duration) error {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
@@ -1176,11 +1168,10 @@ func (sess *Session) waitDuringActivation(ctxFor func() context.Context, d time.
 	}
 }
 
-// redialDuringHandshake replaces the transport mid-handshake. Beyond
-// tearDownAndReset+dialAndStart it sets tx.disconnected across the gap and
-// re-disarms ondrop, which publishWiredClient arms on every new Client -- without
-// that an RST mid-handshake spawns the rival Reconnect the disarm prevents. Holds
-// dialMu for the pair; the two call sites never nest.
+// redialDuringHandshake replaces the transport mid-handshake, setting
+// tx.disconnected across the gap and re-disarming ondrop, which publishWiredClient
+// arms on every new Client -- without that an RST spawns the rival Reconnect the
+// disarm prevents. Holds dialMu for the pair.
 func (sess *Session) redialDuringHandshake() error {
 	sess.lifecycle.dialMu.Lock()
 	defer sess.lifecycle.dialMu.Unlock()
@@ -1249,11 +1240,9 @@ func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, err
 					sess.route.routeProbeFailures.Store(0)
 					sess.logger.Warn("route is active but the PLC runtime is not in RUN; connecting anyway and waiting for it",
 						"state", uint16(state.ADSState), "probeAttempts", attempt)
-					// ErrRuntimeNotRunning, not (0, nil): the route is proven but no
-					// version was read, and reporting success with version 0 made the
-					// caller record 0 as the real symbol version — which disables
-					// online-change detection (consumeHeartbeat requires known != 0)
-					// and skips the liveness block that would otherwise run.
+					// ErrRuntimeNotRunning, not (0, nil): the route is proven but no version
+					// was read, and reporting 0 as the real version disables
+					// online-change detection and skips the liveness block.
 					return 0, fmt.Errorf("route is served but %w (ADS state %d)", ErrRuntimeNotRunning, uint16(state.ADSState))
 				}
 			}
@@ -1262,11 +1251,9 @@ func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, err
 			break
 		}
 		if isProbeRetryable(lastErr) {
-			// Budget spent and no socket left: stop. Every further probe would fail
-			// instantly with ErrTransportClosed, so continuing to poll is a tight
-			// spin for the rest of the budget that cannot discover anything. Without
-			// this early exit, capping the redials makes the loop worse rather than
-			// better.
+			// Budget spent and no socket left: every further probe fails instantly, so
+			// polling on is a tight spin that cannot discover anything. Without this,
+			// capping the redials makes the loop worse rather than better.
 			if redials >= maxRouteActivationRedials && isTransportDead(lastErr) {
 				sess.logger.Error("route activation gave up: redial budget spent and the transport is gone",
 					"attempt", attempt, "redials", redials, "error", lastErr)
@@ -1301,11 +1288,9 @@ func (sess *Session) awaitRouteActive(ctxFor func() context.Context) (uint8, err
 		sess.route.name, total, redials, lastErr)
 }
 
-// probeRouteVersion sends a lightweight ADS command (GetSymbolVersion) to verify
-// the PLC accepts our source NetID, returning the version it read.
-//
-// The route is proven by the round-trip succeeding at all; the version is a free
-// by-product, so a caller that needs it can skip a second identical round-trip.
+// probeRouteVersion sends a GetSymbolVersion to verify the PLC accepts our source
+// NetID. The route is proven by the round-trip succeeding at all; the version is a
+// free by-product, saving a caller an identical second trip.
 func (sess *Session) probeRouteVersion(ctx context.Context) (uint8, error) {
 	return sess.client.Load().GetSymbolVersion(ctx)
 }
@@ -1474,11 +1459,9 @@ func (sess *Session) autoReloadOnStaleDetection(reason Reason) {
 	}
 }
 
-// reloadSymbolsAndResubscribe re-runs symbol discovery and resubscribes after an
-// online change. Deletes the old PLC handles first: left behind they hold table
-// slots until route-idle-timeout (~10 min) and repeated online changes flood the
-// AMS router (Beckhoff #268). The transport is alive here, and 0x714 counts as
-// success for handles the PLC already invalidated.
+// reloadSymbolsAndResubscribe re-runs discovery and resubscribes after an online
+// change, deleting the old handles first: left behind they hold table slots for
+// ~10 min and repeated changes flood the router (Beckhoff #268).
 func (sess *Session) reloadSymbolsAndResubscribe() error {
 	// Transport is alive here, so quiesce dispatch: samples still arriving for the
 	// handles being deleted are race-window noise, not orphans.
@@ -1492,10 +1475,8 @@ func (sess *Session) reloadSymbolsAndResubscribe() error {
 }
 
 // trackGoroutine registers a background goroutine with the session's WaitGroup and
-// starts it, refusing once the session is closed. Reports whether it started.
-//
-// Callers that hold resources for the goroutine (a semaphore slot, a throttle
-// entry) must release them when this returns false.
+// starts it, refusing once closed. Callers holding resources for it (a semaphore
+// slot, a throttle entry) must release them when this returns false.
 func (sess *Session) trackGoroutine(fn func()) bool {
 	return sess.trackGoroutineOn(&sess.lifecycle.waitGroup, fn)
 }
@@ -1554,11 +1535,10 @@ func (sess *Session) markClosed() {
 	})
 }
 
-// releasePLCResources frees PLC-side notifications and, while the transport is
-// alive, symbol handles. Notification cleanup runs even when disconnected: the
-// PLC keys subscriptions by source NetID and would deliver them to the next
-// session using it. Symbol handles are skipped when disconnected -- they strand
-// harmlessly and the PLC reaps them on route timeout.
+// releasePLCResources frees notifications and, while the transport is alive,
+// symbol handles. Notification cleanup runs even disconnected: the PLC keys
+// subscriptions by source NetID and would deliver them to the next session using
+// it. Stranded symbol handles are harmless and get reaped on route timeout.
 func (sess *Session) releasePLCResources(wasDisconnected bool) {
 	// Terminal, so no need to quiesce dispatch. Takes the heartbeat with it, which
 	// is why Close no longer releases that separately.
@@ -1657,11 +1637,10 @@ func (sess *Session) Close() error {
 	// network ops; once state is Closed, isDisconnected() returns false even
 	// if the transport was already gone.
 	wasDisconnected := sess.isDisconnected()
-	// Deliberately NOT gated on winning this transition. giveUpReconnecting may
-	// already have moved the FSM to Closed, and returning early there left the
-	// socket, the 48898 listener and every worker in place: the caller's Close is
-	// the only place that can wait for those workers, because giveUpReconnecting
-	// runs inside the very goroutine this function waits for.
+	// NOT gated on winning this transition: giveUpReconnecting may already have
+	// moved the FSM to Closed, and returning early there left the socket, listener
+	// and workers up. Only Close can wait for those workers, since
+	// giveUpReconnecting runs inside the goroutine it waits for.
 	sess.lifecycle.state.transitionToOnce(SessionStateClosed)
 	sess.markClosed()
 	sess.logger.Info("Close called, shutting down")
@@ -1684,11 +1663,9 @@ func (sess *Session) Close() error {
 				"detail", "an attempt was mid-dial when Close ran; its own context is cancelled and it will exit")
 		}
 	}
-	// The heartbeat watcher is the one goroutine on these paths whose exit Close did
-	// not observe: heartbeatWG was Add'ed and Done'd but never waited, so Close
-	// could return while the watcher was still inside a recovery. Waited after the
-	// cancel and the socket close above, so anything it has in flight aborts rather
-	// than holding this up.
+	// The heartbeat watcher's exit was the one Close never observed, so it could
+	// return mid-recovery. Waited after the cancel and socket close above, so
+	// anything in flight aborts rather than holding this up.
 	sess.heartbeatWG.Wait()
 	sess.stateWG.Wait()
 	sess.logger.Info("Waiting for workers to close")
@@ -1841,11 +1818,9 @@ func (sess *Session) giveUpReconnecting(cause error) error {
 	return cause
 }
 
-// triggerReconnect prepares the connection state for reconnection and launches
-// the Reconnect goroutine (if auto-reconnect is enabled). It sets disconnected=true
-// and creates the reconnectDone channel BEFORE launching the goroutine, eliminating
-// the race window where callers could see a "healthy" connection between the trigger
-// and Reconnect() being scheduled.
+// triggerReconnect prepares the connection state and launches the Reconnect
+// goroutine. disconnected and reconnectDone are set BEFORE the launch, closing the
+// window where a caller could see a "healthy" connection between the two.
 func (sess *Session) triggerReconnect() {
 	if sess.isClosed() {
 		return
@@ -1943,10 +1918,10 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		return nil
 	}
 	// One defer, in this order on purpose. A drop landing between "transport live"
-	// and this release is spawned a Reconnect that loses the CAS above, so the FSM
-	// acknowledges it and nothing retries -- the session sits Disconnected with
-	// IsClosed() false for ever. So whoever releases ownership must adopt it.
-	// reconnectDone closes first, or Close's wait hangs on an orphan trigger.
+	// and this release spawns a Reconnect that loses the CAS above, so the FSM
+	// acknowledges it and nothing retries -- the session then sits Disconnected with
+	// IsClosed() false for ever. Whoever releases ownership must adopt it, and
+	// reconnectDone closes first or Close's wait hangs on an orphan trigger.
 	defer func() {
 		closeReconnectDone()
 		sess.lifecycle.reconnectOwner.Store(false)
@@ -1978,11 +1953,9 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 	}
 	sess.lifecycle.reconnectMu.Unlock()
 
-	// Flap detection: a Connected -> drop inside flapWindow means the last cycle
-	// never stabilised, so back off before dialing and throttle cross-cycle storms,
-	// not just retries within one Reconnect. A drop on a connection that never
-	// carried a frame counts as a flap regardless of how long it nominally lasted --
-	// the PLC reset it without serving anything.
+	// A Connected -> drop inside flapWindow means the last cycle never stabilised,
+	// so back off before dialing and throttle cross-cycle storms too. A drop on a
+	// connection that never carried a frame is always a flap, however long it lasted.
 	neverServed := false
 	if c := sess.client.Load(); c != nil {
 		neverServed = !c.wasEstablished()
