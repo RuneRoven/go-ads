@@ -40,18 +40,14 @@ func (sess *Session) dialTCP() (net.Conn, error) {
 	return dialer.Dial("tcp", net.JoinHostPort(sess.ip, strconv.Itoa(sess.port)))
 }
 
-// sessionLifecycle owns Session's lifecycle plumbing: cancellation context,
-// goroutine waitgroup, single-flight reconnect signaling, the explicit FSM
-// state + unified epoch counter, and the retry policy. Folded into session.go
-// because every field here is owned and mutated by Session methods only —
-// no other type touches it.
+// sessionLifecycle owns Session's lifecycle plumbing: context, waitgroup,
+// single-flight reconnect signalling, the FSM state with its epoch counter, and
+// the retry policy. In session.go because only Session methods touch it.
 type sessionLifecycle struct {
 	ctxMu sync.RWMutex // protects ctx and shutdown against concurrent access during reconnect
-	// parentCtx is the original context.Context passed to NewSession. ctx
-	// (the active lifecycle ctx) is re-derived from parentCtx after every
-	// tearDownAndReset so cancelling the original NewSession ctx still
-	// shuts the session down — even across multiple Reconnect cycles. Set
-	// once at construction; never replaced.
+	// The original ctx passed to NewSession. The active lifecycle ctx is re-derived
+	// from it after every tearDownAndReset, so cancelling the original still shuts
+	// the session down across any number of reconnects. Set once, never replaced.
 	parentCtx context.Context
 	ctx       context.Context
 	shutdown  context.CancelFunc
@@ -60,13 +56,11 @@ type sessionLifecycle struct {
 	reconnectMu   sync.Mutex // protects reconnectDone
 	reconnectDone chan struct{}
 
-	// dialMu makes one teardown+dial pair atomic against another, so two TCPs to the
-	// same router cannot coexist and get us evicted (Beckhoff #49). Scope is the two
-	// handshake redials only: the reconnect loop separates its teardown and dial by
-	// the whole loop body and would self-deadlock on the inner redial. Reconnect is
-	// single-flighted by reconnectOwner, Connect by lifecycle.connecting. INVARIANT:
-	// nothing on lifecycle.waitGroup and no Client worker may take it --
-	// tearDownAndReset waits both WaitGroups while a redial holds it.
+	// dialMu makes one teardown+dial pair atomic against another, so two TCPs cannot
+	// coexist and get us evicted (Beckhoff #49). The two handshake redials only --
+	// the reconnect loop would self-deadlock on the inner one. INVARIANT: nothing on
+	// lifecycle.waitGroup and no Client worker may take it, since tearDownAndReset
+	// waits both WaitGroups while a redial holds it.
 	dialMu sync.Mutex
 
 	// unservedCooldown silences the reconnect loop entirely after N attempts where
@@ -85,11 +79,10 @@ type sessionLifecycle struct {
 	// leaving the session there for ever with IsClosed() false.
 	reconnectOwner atomic.Bool
 
-	// connecting suppresses the automatic Reconnect a drop would spawn for the whole
-	// of Connect. A rival Reconnect tearing down under Connect leaked the socket,
-	// workers and reconnect loop, leaving a session the caller was told had failed
-	// sitting Connected. A flag, not tighter ondrop bookkeeping: five sites arm or
-	// re-arm it, two from a defer mid-Connect; one gate is immune to all of them.
+	// connecting suppresses the automatic Reconnect a drop would spawn during
+	// Connect: a rival tearing down under it leaked the socket, workers and
+	// reconnect loop. A flag, not tighter ondrop bookkeeping -- five sites arm it,
+	// two from a defer mid-Connect, and one gate is immune to all of them.
 	connecting atomic.Bool
 
 	closedCh   chan struct{}
@@ -1403,12 +1396,9 @@ func (sess *Session) consumeStaleFlag(handle uint32) (Reason, bool) {
 	return r, ok
 }
 
-// markAllHandlesStale flags every active notification handle's next sample
-// with reason. Lock order: notifications.lock → staleHandlesMu (acquired
-// inside markSymbolStale). Never acquires cache.lock here (R-CACHE-008).
-//
-// Nil-guard: bare Session{} unit tests may construct without the
-// notification manager; production NewSession always sets it.
+// markAllHandlesStale flags every active handle's next sample with reason. Lock
+// order: notifications.lock then staleHandlesMu, never cache.lock. Nil-guarded for
+// bare Session{} literals in tests.
 func (sess *Session) markAllHandlesStale(reason Reason) {
 	if sess.notifications == nil {
 		return
@@ -1557,12 +1547,10 @@ func (sess *Session) trackGoroutineOn(wg *sync.WaitGroup, fn func()) bool {
 	return true
 }
 
-// admitBackgroundWork reports whether work that touches PLC state may still start.
-//
-// Shares spawnMu with markClosed and trackGoroutineOn, so "the session is not
-// closed" and "we have begun" are one decision rather than two — a bare isClosed()
-// check leaves a window in which Close can complete its PLC-side release and the
-// work then re-registers handles nothing will ever delete.
+// admitBackgroundWork reports whether work touching PLC state may still start.
+// Shares spawnMu with markClosed so "not closed" and "we have begun" are one
+// decision: a bare isClosed() leaves a window where Close finishes its release and
+// the work re-registers handles nobody will delete.
 func (sess *Session) admitBackgroundWork() bool {
 	sess.lifecycle.spawnMu.Lock()
 	defer sess.lifecycle.spawnMu.Unlock()
@@ -1699,12 +1687,9 @@ func (sess *Session) Close() error {
 	sess.markClosed()
 	sess.logger.Info("Close called, shutting down")
 	sess.shutdownTransport(wasDisconnected)
-	// Wait for any in-progress reconnect to stop BEFORE waiting on the
-	// goroutine waitGroup. Reconnect's retry loop may call waitGroup.Add(2)
-	// after we Close — calling Wait first would race with that Add and
-	// trigger "sync: WaitGroup misuse". closedCh signals Reconnect
-	// to exit its retry loop promptly; reconnectDone is closed when Reconnect
-	// returns.
+	// Wait out any in-progress reconnect BEFORE the goroutine waitGroup: its retry
+	// loop may Add after Close, and Wait first races that into "WaitGroup misuse".
+	// closedCh tells it to stop, reconnectDone closes when it returns.
 	sess.lifecycle.reconnectMu.Lock()
 	ch := sess.lifecycle.reconnectDone
 	sess.lifecycle.reconnectMu.Unlock()
@@ -1942,12 +1927,10 @@ const unservedAttemptsBeforeCooldown = 3
 // pause, made deliberate.
 const defaultUnservedCooldown = 30 * time.Second
 
-// preReconnectReleaseAttempts caps how many reconnect attempts will re-try the
-// best-effort delete of the handles held before the drop. Retrying matters — the
-// link is usually still down on the first attempt, so the delete cannot land —
-// but reconnect attempts are unbounded by default, so an unreleasable handle must
-// not buy a round trip on every one of them forever. The orphan reaper is the
-// backstop after that.
+// preReconnectReleaseAttempts caps how many attempts re-try the delete of handles
+// held before the drop. Retrying matters, since the link is usually still down on
+// the first, but attempts are unbounded by default and an unreleasable handle must
+// not cost a round trip for ever. The orphan reaper is the backstop.
 const preReconnectReleaseAttempts = 3
 
 // Reconnect re-establishes the transport, reloads symbols and re-subscribes,
@@ -2198,12 +2181,10 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 		// Re-subscribe notifications using stored configs.
 		if err := sess.resubscribeNotifications(); err != nil {
 			if errors.Is(err, ErrRuntimeNotRunning) {
-				// The transport is fine and the route is served; the runtime is not
-				// running. Counting this as a reconnect attempt spends the budget at
-				// the backoff rate with no network involved and eventually closes a
-				// session whose only problem is a PLC in CONFIG — the opposite of
-				// "stay up and wait". Report it, sleep, and try again without
-				// consuming an attempt.
+				// Transport fine, route served, runtime not running. Counting this as an
+				// attempt spends the budget with no network involved and eventually
+				// closes a session whose only problem is a PLC in CONFIG. Report,
+				// sleep, retry without consuming an attempt.
 				sess.logger.Info("reconnect: transport restored but the PLC runtime is not running; waiting for it",
 					"error", err)
 				// resetForRetry, exactly as retryAfter does: the loop dials a fresh
@@ -2442,12 +2423,10 @@ func (sess *Session) tearDownAndReset() {
 		// per teardown at INFO survives that.
 		sess.logger.Info("closed the TCP connection for a session reset", "localPort", localPort)
 	}
-	// Wait for the previous batch of Client workers (listen, transmit,
-	// recvWorker) to exit. They share ctx with lifecycle.ctx; the cancel
-	// above plus the closed TCP socket trigger their exit. Adopted inbound
-	// connections are closed first: their readers block on a socket nothing else
-	// touches, so leaving them open deadlocks this wait — observed hanging a real
-	// session against a peer-route device.
+	// Wait out the previous Client's workers; the cancel above plus the closed
+	// socket make them exit. Adopted inbound connections close first: their readers
+	// block on a socket nothing else touches, and leaving them open deadlocks this
+	// wait.
 	if c := sess.client.Load(); c != nil {
 		// Release anything waiting on this transport with the reason, rather than
 		// letting it sit out its full request timeout: readFrames returns on
@@ -2807,11 +2786,9 @@ func (sess *Session) resubscribeNotificationsLocked() error {
 	sess.notifications.lock.Lock()
 	savedPending := sess.notifications.pending
 	savedChannel := sess.notifications.notificationChannel
-	// Nothing to resubscribe, so nothing may be destroyed on the way out. The clear
-	// used to happen before this guard, so a no-op that reports success wiped the
-	// caller's declared intent: with a non-empty pending and no bound channel — the
-	// state left by re-queued retry entries plus a full user teardown — every symbol
-	// the caller never cancelled was silently dropped from the resubscribe set, with
+	// Nothing to resubscribe, so nothing may be destroyed on the way out. Clearing
+	// before this guard meant a no-op reporting success wiped the caller's declared
+	// intent -- every symbol they never cancelled dropped from the set, with
 	// "reconnect successful" logged over the top.
 	if len(savedPending) == 0 || savedChannel == nil {
 		sess.notifications.lock.Unlock()
@@ -2945,12 +2922,9 @@ func (sess *Session) resubscribeNotificationsLocked() error {
 		return err
 	}
 
-	// Report what came back. "reconnect successful" says the socket is up, not
-	// that data is flowing, and everything else about a session that returned
-	// with fewer subscriptions than it asked for reads as healthy: the transport
-	// is live and the FSM says Connected. This is the only place the shortfall is
-	// visible, and the symbols that did not come back deliver nothing until some
-	// later retry restores them.
+	// Report what came back: "reconnect successful" says the socket is up, not that
+	// data is flowing, and a session that returned short otherwise reads as healthy
+	// everywhere. This is the only place the shortfall is visible.
 	sess.notifications.lock.Lock()
 	restored := len(sess.notifications.activeNotifications)
 	sess.notifications.lock.Unlock()
@@ -2990,12 +2964,10 @@ func configureKeepAlive(c net.Conn) {
 	}
 }
 
-// zeroOldSymbolHandles invalidates each *symbol in the given map. Sets
-// Handle=0 so callers holding pointers to OLD-map values force on-demand
-// re-resolution via GetSymbol (defends against the PLC reusing the old
-// handle for a different symbol after reconnect), and clears cached
-// Value/Valid/ValueParsed/LastUpdateTime so a Read within MinUpdateInterval
-// of reconnect does not return stale pre-disconnect data. Nil-safe.
+// zeroOldSymbolHandles invalidates each symbol in the map: Handle=0 forces
+// re-resolution, defending against the PLC reusing a handle for a different
+// symbol, and clearing the cached value stops a Read inside MinUpdateInterval
+// returning pre-disconnect data. Nil-safe.
 func zeroOldSymbolHandles(m map[string]*symbol) {
 	for _, s := range m {
 		if s != nil {
