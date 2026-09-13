@@ -34,20 +34,11 @@ var (
 	ErrBatchNoResult = errors.New("no result returned for symbol")
 )
 
-// BatchItemError is the per-item failure detail of a batch symbol read or
-// write. It carries the same three-state contract as SumNotificationResult, so
-// a caller can tell a device verdict from a library-side drop:
-//
-//   - Skipped != nil: the library, not the PLC, is why this item has no value —
-//     it was never sent (unresolved symbol, unserializable value, short
-//     response) or its answer could not be used (cache swapped, parse failed).
-//     Error is not meaningful.
-//   - Skipped == nil: the PLC gave a verdict on this item and Error carries its
-//     return code. A genuinely absent symbol (ReturnCodeDeviceSymbolNoFound,
-//     0x0710) lands here, as does a stale handle after a runtime restart
-//     (0x0710/0x0711).
-//
-// Only failures are reported; an item that succeeded never appears.
+// BatchItemError is the per-item failure of a batch read or write, carrying the
+// same three-state contract as SumNotificationResult so a device verdict is
+// distinguishable from a library-side drop: Skipped != nil means the library never
+// sent it or could not use the answer and Error is meaningless, otherwise Error is
+// the PLC's own return code. Only failures appear.
 type BatchItemError struct {
 	// Symbol is the symbol name as the caller passed it.
 	Symbol string
@@ -65,26 +56,11 @@ func (i BatchItemError) String() string {
 	return fmt.Sprintf("%s (code 0x%X)", i.Symbol, uint32(i.Error))
 }
 
-// BatchError reports the items of a batch symbol read or write that produced no
-// value, while the successful items are still returned in the call's map. It is
-// returned only when at least one item failed, and it is the only error these
-// calls return that leaves the map usable: a bare error (including a wrapped
-// AMSError) means the transport failed and no item's outcome is known.
-//
-// Recover it with errors.As:
-//
-//	values, err := sess.ReadMultipleSymbols(ctx, names)
-//	var batchErr *ads.BatchError
-//	if errors.As(err, &batchErr) {
-//		// values holds batchErr.Succeeded entries and is safe to use;
-//		// batchErr.Items names the ones that failed and why.
-//	} else if err != nil {
-//		// transport failure — values is not trustworthy
-//	}
-//
-// Batch size does not change the contract: one absent symbol read on its own
-// and the same symbol read as one of forty both come back as a BatchError
-// naming that one symbol, with every other value present in the map.
+// BatchError reports the items of a batch read or write that produced no value,
+// while the successful ones stay in the call's map. It is the only error from
+// these calls that leaves the map usable -- any other means the transport failed
+// and no outcome is known. Recover it with errors.As. Batch size does not change
+// the contract: one absent symbol alone or among forty reads the same.
 type BatchError struct {
 	// Op is "read" or "write".
 	Op string

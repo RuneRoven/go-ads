@@ -168,6 +168,8 @@ func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32
 		sess.removeNotificationConfig(symbolName)
 	}
 	delete(sess.notifications.activeNotifications, handle)
+	// The caller asked for this one to go, so a healthy session holds one fewer.
+	sess.notifications.registered.Store(int64(len(sess.notifications.activeNotifications)))
 	// Gated on the handle having actually been ours, not merely on the map being
 	// empty. A raw-handle caller — or one of AddSymbolNotification's own refusal
 	// paths releasing a handle it never committed — would otherwise clear the
@@ -195,34 +197,20 @@ func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32
 	return nil
 }
 
-// SumDeleteDeviceNotification on Session wraps the raw Client RPC with
-// notifications.lock cleanup. Returns the per-handle ReturnCode slice from the
-// PLC. Successfully deleted handles (or handle-invalid / client-unknown,
-// treated as success-equivalent per isBestEffortDeleteSuccess) are removed
-// from activeNotifications.
-//
-// When the underlying Client returns a partial-codes-plus-error result —
-// e.g., the per-handle fallback short-circuits on transport failure mid-
-// batch — the codes processed so far ARE still flushed from
-// activeNotifications, and both the partial slice and the error are
-// surfaced to the caller. This keeps in-memory state coherent with what
-// the PLC actually saw, rather than leaving phantom entries that would
-// trigger duplicate-cleanup loops on the next reconnect.
+// SumDeleteDeviceNotification wraps the raw RPC with activeNotifications cleanup,
+// returning the per-handle codes. On a partial result the codes processed so far
+// are still flushed and both the partial slice and the error are returned, so
+// in-memory state matches what the PLC saw rather than leaving phantom entries for
+// the next reconnect to re-clean.
 func (sess *Session) SumDeleteDeviceNotification(ctx context.Context, handles []uint32) ([]ReturnCode, error) {
 	return sess.sumDeleteDeviceNotification(ctx, handles, true)
 }
 
 // sumDeleteDeviceNotification is SumDeleteDeviceNotification with control over the
-// "last subscription died" bookkeeping.
-//
-// userTeardown=false is for internal cleanup — the reconnect and reload paths,
-// which delete PLC-side registrations they intend to recreate immediately. Those
-// paths wipe activeNotifications BEFORE deleting, so the empty-map rule below
-// would fire on every reconnect, clear notificationChannel, and make
-// resubscribeNotifications return early on a nil channel: reconnect reported
-// success, the FSM said Connected, and not one notification ever came back.
-// Found by power-cycling a TC2 (see TestReconnect_CleanupKeepsTheUserChannel);
-// no stub test had caught it because none asserted resumption after a cleanup.
+// "last subscription died" bookkeeping. userTeardown=false is internal cleanup --
+// reconnect and reload, which wipe activeNotifications before deleting, so the
+// empty-map rule would fire every reconnect, clear notificationChannel and leave
+// resubscribe returning early on a nil channel with the FSM reporting Connected.
 func (sess *Session) sumDeleteDeviceNotification(ctx context.Context, handles []uint32, userTeardown bool) ([]ReturnCode, error) {
 	codes, rpcErr := sess.client.Load().SumDeleteDeviceNotification(ctx, handles)
 	if len(codes) == 0 {
@@ -253,6 +241,11 @@ func (sess *Session) sumDeleteDeviceNotification(ctx context.Context, handles []
 			sess.removeNotificationConfig(symbolName)
 		}
 		delete(sess.notifications.activeNotifications, h)
+		// Only a caller teardown lowers the baseline. A release done by recovery
+		// leaves it where it was, so the gap it opens is visible as want > have.
+		if userTeardown {
+			sess.notifications.registered.Store(int64(len(sess.notifications.activeNotifications)))
+		}
 		deleted++
 		// Debug per handle: routine teardown of an N-symbol subscription is not
 		// worth N Info lines. The summary below is the Info-worthy event.
@@ -345,14 +338,20 @@ func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestam
 			// never sees that tag at all.
 			sess.bufferEarlySample(ctx, handle, timestamp, content)
 		default:
-			// Genuine orphan sample — handle is registered on the PLC but
-			// not in our client-side map. Most likely cause: a prior process
-			// (us or another go-ads client with same source NetID+port) left
-			// the subscription behind on crash/restart. Schedule a Delete
-			// on the PLC so the orphan handle table slot is freed; without
-			// this cleanup the TwinCAT AMS router accumulates entries
-			// across restarts until it crashes (Beckhoff issue #268).
-			sess.logger.Warn("received notification for unknown handle", "handle", handle)
+			// Genuine orphan: registered on the PLC, not in our map -- usually a
+			// prior process with the same source NetID+port. Delete it, or the
+			// router accumulates entries until it crashes (Beckhoff #268). One Warn
+			// per interval with a count, the rest Debug: the PLC pushes one per
+			// cycle per handle, interleaved with healthy samples after a reconnect.
+			n := sess.notifications.orphanSamples.Add(1)
+			if reportNow(&sess.notifications.orphanWarnNs, orphanReportInterval) {
+				sess.logger.Warn("received notification for unknown handle", "handle", handle,
+					"sinceLastReport", n,
+					"detail", "a previous session's subscriptions are still registered on the PLC; deleting them")
+				sess.notifications.orphanSamples.Store(0)
+			} else {
+				sess.logger.Debug("received notification for unknown handle", "handle", handle, "sinceLastReport", n)
+			}
 			sess.tryOrphanDelete(handle)
 		}
 		return
@@ -476,30 +475,19 @@ const (
 	earlySampleMaxBytes = 8 << 20
 )
 
-// subscribeRaceActive reports whether an unknown handle should be presumed to
-// be one of ours mid-registration rather than a leaked one.
-//
-// The in-flight counter is authoritative but not unconditional: a subscribe that
-// wedges would otherwise disable the orphan reaper for the life of the session,
-// and the reaper exists to stop the PLC's handle table filling up. So the window
-// also expires. subscribeRaceMaxOpen is generous enough for any real batch —
-// hundreds of symbols registered one at a time on a slow PLC — while still
-// bounded.
+// subscribeRaceActive reports whether an unknown handle is presumed one of ours
+// mid-registration rather than leaked. The in-flight counter is authoritative but
+// not unconditional -- a wedged subscribe would otherwise disable the orphan reaper
+// for the session's life -- so the window also expires, generously enough for
+// hundreds of symbols registered one at a time.
 func (sess *Session) subscribeRaceActive() bool {
 	mgr := sess.notifications
 	now := time.Now().UnixNano()
-	// Judged on the MOST RECENTLY opened subscribe still in flight. That is the
-	// one whose handles the PLC may be streaming right now, so while it is inside
-	// the cap the window stays open — even if an older sibling has wedged. And a
-	// wedged subscribe on its own cannot hold the window open forever, because
-	// nothing younger is there to vouch for it.
-	//
-	// Neither half works with a single timestamp slot: written on the 0 -> 1
-	// transition it records when the last quiet period ended rather than when
-	// anything in flight began, so sustained overlap pinned it to a call that had
-	// already returned and the window closed under a subscribe that was still
-	// registering. Measuring from the oldest open subscribe has the same failure
-	// for the same reason. Only per-subscribe starts answer both questions.
+	// Judged on the MOST RECENTLY opened subscribe still in flight: its handles are
+	// what the PLC may be streaming now, so the window stays open even if an older
+	// sibling wedged -- and a wedged one alone cannot hold it open, since nothing
+	// younger vouches for it. A single timestamp answers neither question; only
+	// per-subscribe starts do.
 	if newest, open := mgr.newestOpenSubscribe(); open {
 		return now-newest < subscribeRaceMaxOpen.Nanoseconds()
 	}
@@ -522,15 +510,11 @@ func (m *notificationManager) newestOpenSubscribe() (int64, bool) {
 	return newest, newest != 0
 }
 
-// beginSubscribe marks a subscribe operation as in flight and returns the token
-// that closes it. Every call must be paired with endSubscribe, which is why
-// callers defer it immediately.
-//
-// The token exists so each open subscribe is tracked individually. Sharing one
-// counter and one timestamp made the pair non-atomic across goroutines — an
-// ending subscribe could clear the clock a starting one had just written, and the
-// resulting "in flight but no clock" state suppressed the orphan reaper
-// permanently.
+// beginSubscribe marks a subscribe in flight and returns the token that closes it;
+// every call pairs with endSubscribe, which is why callers defer it at once. The
+// token tracks each subscribe individually: one shared counter and timestamp were
+// not atomic across goroutines, and the resulting "in flight but no clock" state
+// suppressed the orphan reaper permanently.
 func (sess *Session) beginSubscribe() subscribeToken {
 	mgr := sess.notifications
 	now := time.Now().UnixNano()
@@ -549,16 +533,11 @@ func (sess *Session) beginSubscribe() subscribeToken {
 	return tok
 }
 
-// endSubscribe closes a subscribe operation: it replays samples buffered for
-// the handles that were committed, then — once no subscribe is left in flight
-// — discards what remains. A leftover entry belongs to a handle whose commit
-// never happened (rejected item, stranded cache, TOCTOU loss); if it really is
-// leaked PLC-side it keeps firing, and its next sample takes the orphan path
-// normally.
-//
-// MUST be called after notifications.lock is released: the replay path takes
-// cache.lock, and holding both is forbidden. Deferring it before the
-// lock.Unlock defer gives that ordering for free (defers run LIFO).
+// endSubscribe replays samples buffered for committed handles, then discards what
+// remains once nothing is in flight -- a leftover belongs to a handle that never
+// committed, and if it really is leaked PLC-side its next sample takes the orphan
+// path. MUST run after notifications.lock is released, since the replay takes
+// cache.lock; deferring it before the unlock defer gives that ordering for free.
 func (sess *Session) endSubscribe(ctx context.Context, tok subscribeToken, committed []uint32) {
 	mgr := sess.notifications
 	mgr.lastSubscribeNs.Store(time.Now().UnixNano())
@@ -683,34 +662,10 @@ func (sess *Session) replayEarlySamples(ctx context.Context, handles []uint32) {
 	}
 }
 
-// Orphan-Delete: when handleNotification receives a sample for a handle that
-// is not in activeNotifications (and we are past the first-sample-race
-// window), the handle is most likely a leftover subscription from a prior
-// process that shared our source NetID+port. The PLC's notification handle
-// table is finite per source identity; without explicit cleanup repeated
-// process restarts accumulate orphan entries until the TwinCAT AMS router
-// runs out of slots and starts rejecting new Adds or crashes outright
-// (Beckhoff issue #268).
-//
-// Mitigation: issue an asynchronous DeleteDeviceNotification for the orphan
-// handle. Constraints:
-//   - Throttle per-handle so a high-rate orphan stream (PLC re-firing every
-//     PLC cycle on a still-live subscription) doesn't spam Delete RPCs.
-//   - Bound concurrency so a burst of N orphans on session resume doesn't
-//     spawn N goroutines simultaneously.
-//   - Re-check that the handle is STILL absent from activeNotifications
-//     immediately before sending the RPC: between scheduling and firing, a
-//     concurrent AddSymbolNotification can have committed this very handle.
-//     Not because IDs get recycled — measured on TC2 and TC3, allocation is
-//     monotonic (+1 per Add, no reuse after a Delete, no restart from a low
-//     number for a fresh source NetID) — but because the sample that looked
-//     orphaned may simply have arrived before its own commit landed. Deleting
-//     our own just-acquired subscription would produce a permanent
-//     orphan-loop. The re-check eliminates that race.
-//   - Track the goroutine via lifecycle.waitGroup so Close waits for any
-//     in-flight Delete to complete instead of leaving zombie goroutines.
-//   - panic recover defensively — an unexpected panic here must not kill
-//     the listen goroutine that called handleNotification.
+// Orphan-Delete frees handles left by a prior process sharing our source
+// NetID+port; uncleaned they fill the PLC's handle table (Beckhoff #268).
+// Throttled per handle, concurrency-bounded, and re-checked against
+// activeNotifications before firing so we never delete our own subscription.
 const (
 	orphanDeleteThrottle       = 60 * time.Second
 	orphanDeleteMaxConcurrency = 10
@@ -718,27 +673,10 @@ const (
 	orphanDeleteRPCTimeout     = 5 * time.Second
 )
 
-// isBestEffortDeleteSuccess reports whether a DeleteDeviceNotification
-// return code counts as cleanup success for best-effort paths.
-// NoErrors                = actually deleted.
-// NotifyHandleInvalid (0x714) = handle already gone on PLC side
-//
-//	(route-idle-timeout, PLC reboot, prior cleanup).
-//
-// DeviceClientUnknown  (0x715) = PLC dropped our client identity (typical
-//
-//	after TCP reset / reconnect); whatever
-//	handles we had are implicitly gone too.
-//
-// In all three cases the handle is no longer consuming PLC resources,
-// which is the only goal of best-effort cleanup paths.
-//
-// Note: Beckhoff's official AdsLib does NOT treat 0x715 as cleanup-success.
-// This library does, because go-ads's reconnect path frequently hits
-// 0x715 when PLC drops the client identity tied to the just-severed TCP,
-// and treating it as failure produces misleading WARN spam during normal
-// recovery. Net effect on cleanup correctness is identical: in both cases
-// the PLC handle is gone.
+// isBestEffortDeleteSuccess reports whether the handle is gone, which is all
+// best-effort cleanup wants: deleted, 0x714 (already gone), or 0x715 (client
+// identity dropped, so our handles went with it). Beckhoff's AdsLib refuses
+// 0x715; here it is routine on reconnect and counting it as failure is spam.
 func isBestEffortDeleteSuccess(code ReturnCode) bool {
 	return code == ReturnCodeNoErrors ||
 		code == ReturnCodeDeviceNotifyHandleInvalid ||
@@ -759,21 +697,10 @@ func isBestEffortDeleteSuccessErr(err error) bool {
 		errors.Is(err, ReturnCodeDeviceClientUnknown)
 }
 
-// tryOrphanDelete schedules an async best-effort Delete of an unknown
-// notification handle. Skip paths log Debug. RPC outcome:
-//   - success         → Info (operators see productive cleanup)
-//   - 0x714 NotifyHandleInvalid → Debug (PLC already reaped, expected)
-//   - 0x715 DeviceClientUnknown → Debug (PLC dropped client identity,
-//     handle implicitly gone)
-//   - any other error → Warn (real failure: transport, auth, timeout,
-//     marshaling, protocol mismatch)
-//
-// orphanDeleteAbortReason re-checks, immediately before the RPC, whether this
-// handle might be ours after all. Both windows it covers open between scheduling
-// the delete and firing it, and deleting our own live subscription is the
-// failure this whole area exists to prevent — so the checks are a named function
-// that can be tested directly rather than inline in a goroutine that a test can
-// only race against.
+// orphanDeleteAbortReason re-checks, immediately before the RPC, whether the
+// handle is ours after all: both windows open between scheduling and firing, and
+// deleting a live subscription is the failure this area exists to prevent. Named
+// so it can be tested directly rather than raced against inside a goroutine.
 func (sess *Session) orphanDeleteAbortReason(handle uint32) (string, bool) {
 	mgr := sess.notifications
 	// A concurrent subscribe may have committed this very handle since the delete
@@ -894,15 +821,9 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 		ctx, cancel := context.WithTimeout(parentCtx, orphanDeleteRPCTimeout)
 		defer cancel()
 		if err := c.DeleteDeviceNotification(ctx, handle); err != nil {
-			// 0x714 NotifyHandleInvalid = expected (PLC already reaped via
-			// route-idle-timeout, reboot, or prior cleanup pass).
-			// 0x715 DeviceClientUnknown = PLC dropped our client identity
-			// entirely (typical after TCP reset / reconnect); the handle
-			// went with it. Both Debug so they don't flood under high-rate
-			// orphan streams.
-			// Every other code (transport, auth, timeout, marshaling,
-			// protocol mismatch) is a real failure operators need to see;
-			// surface at Warn.
+			// 0x714 (already reaped) and 0x715 (client identity dropped, so the handle
+			// went with it) are expected and stay at Debug, or they flood under a
+			// high-rate orphan stream. Everything else is a real failure at Warn.
 			if isBestEffortDeleteSuccessErr(err) {
 				sess.logger.Debug("orphan delete RPC: handle already gone PLC-side (expected)",
 					"handle", handle, "error", err)
@@ -917,9 +838,18 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 		// the v2.2.0 subscribe-race regression it was saying that about
 		// subscriptions this very session had created milliseconds earlier,
 		// which sent the diagnosis in the wrong direction for months.
-		sess.logger.Info("deleted a PLC notification handle this session does not own",
-			"handle", handle,
-			"hint", "usually a subscription left behind by an earlier process sharing this source NetID and port")
+		// Rate-limited with a count: a reconnect leaves one orphan per handle, so
+		// this arrives 40-odd at a time and one line per handle says nothing extra.
+		d := sess.notifications.orphanDeletes.Add(1)
+		if reportNow(&sess.notifications.orphanDeleteNs, orphanReportInterval) {
+			sess.logger.Info("deleted a PLC notification handle this session does not own",
+				"handle", handle, "deletedSinceLastReport", d,
+				"hint", "usually a subscription left behind by an earlier process sharing this source NetID and port")
+			sess.notifications.orphanDeletes.Store(0)
+		} else {
+			sess.logger.Debug("deleted a PLC notification handle this session does not own",
+				"handle", handle, "deletedSinceLastReport", d)
+		}
 	})
 	if !started {
 		// Release what was reserved for a goroutine that will not run: the semaphore
@@ -933,22 +863,14 @@ func (sess *Session) tryOrphanDelete(handle uint32) {
 	}
 }
 
-// Heartbeat: proving the caller's subscriptions are still alive without asking the
-// PLC anything.
+// Heartbeat: proving the caller's subscriptions are alive without asking the PLC.
+// A runtime restart kills subscriptions while leaving the connection, symbol
+// version and ADS state unchanged, so one cyclic subscription of our own turns
+// silence into proof. See notificationManager.heartbeatHandle.
 //
-// See notificationManager.heartbeatHandle for the measurements this rests on. In
-// short: a runtime restart kills subscriptions while leaving the connection, the
-// symbol version and the ADS state unchanged, so there is no inbound event to react
-// to — but one CYCLIC subscription of our own turns silence into proof, because
-// TwinCAT pushes those on a timer whether the value changes or not.
-// HeartbeatRecovery selects what the session does when its internal heartbeat
-// goes silent, i.e. when it concludes the caller's subscriptions have died.
-//
-// Recovery is not free: it deletes and re-adds every notification handle the
-// session holds, which on a 41-symbol session is 82 requests in a burst against
-// a device that may simply have stalled. Immediate is still the default because
-// it is the behaviour that has been in the field, and because in the one
-// investigation that looked for it the heartbeat never went silent at all.
+// HeartbeatRecovery selects what happens when it goes silent. Recovery is not
+// free -- a delete and an add per handle, 82 requests on a 41-symbol session --
+// but Immediate stays the default as the behaviour that has been in the field.
 type HeartbeatRecovery int
 
 const (
@@ -982,6 +904,15 @@ func (h HeartbeatRecovery) String() string {
 const (
 	defaultHeartbeatInterval = 2 * time.Second
 	defaultHeartbeatMissed   = 5
+
+	// heartbeatFailuresBeforeReconnect is how many silent windows may pass, with
+	// no frame arriving on either socket, before the transport itself is treated
+	// as the fault. Re-subscribing cannot fix a link that is gone, and repeated
+	// attempts against one keep the socket busy enough that TCP's keepalive timer
+	// never runs -- measured, the session then survives the whole outage and only
+	// reconnects when the peer's RST arrives. Two is roughly 20-30s, against 107s
+	// observed without this.
+	heartbeatFailuresBeforeReconnect = 2
 	// maxADSCycleTime is the longest cycle an ADS notification can carry: the
 	// wire field is 32-bit 100ns ticks.
 	maxADSCycleTime = 400 * time.Second
@@ -997,25 +928,14 @@ const (
 	maxFailureBackoffShift = 6
 )
 
-// heartbeatAllowedTicks reports how many silent ticks the watcher tolerates before
-// it attempts a recovery: the base window, doubled once per consecutive failed
-// recovery, bounded by maxHeartbeatRecoveryBackoff in wall-clock terms.
+// heartbeatAllowedTicks reports the silent ticks tolerated before a recovery: the
+// base window doubled per consecutive failure, capped in wall-clock terms. Pure
+// and separate because both ways the arithmetic goes wrong are invisible -- the
+// session just retries at the wrong rate.
 //
-// Pure and separate from the watcher because the two ways this arithmetic goes
-// wrong are both invisible from the outside — the session simply retries at the
-// wrong rate — and a previous version of this fix was lost precisely because
-// nothing pinned it.
-//
-// The cap is a duration converted to ticks, which is why it is floored at base:
-//   - At a long cycle the budget is FEWER ticks than the base window, so applying
-//     it raw makes the first failure shrink the tolerated silence instead of
-//     growing it (base 5 at a 10s cycle: 50s -> 30s) — backoff running backwards.
-//   - Once cycle >= the budget the division truncates to 0. Skipping the cap on
-//     that (the old `capped > 0` guard) let the window grow to base<<6 unbounded:
-//     at a 31s cycle the effective wait was hours.
-//
-// The floor answers both: it keeps the cap from ever reducing the window, and it
-// keeps the cap binding when the division has nothing left to say.
+// The cap is a duration in ticks, floored at base: at a long cycle it is fewer
+// ticks than base and would run the backoff backwards, and once the cycle exceeds
+// the budget the division truncates to zero and the window grows unbounded.
 func heartbeatAllowedTicks(base, consecutiveFailures int, cycle time.Duration) int {
 	if consecutiveFailures <= 0 || base <= 0 || cycle <= 0 {
 		return base
@@ -1025,19 +945,11 @@ func heartbeatAllowedTicks(base, consecutiveFailures int, cycle time.Duration) i
 	return min(base<<shift, capTicks)
 }
 
-// normalizeHeartbeatOptions resolves the options that depend on each other, once,
-// after every option has been applied and before any goroutine exists.
-//
-// WithNotificationSilenceTimeout is stated in wall-clock time but enforced in
-// ticks, so it needs the cycle — which a later option may still change. Resolving
-// it here rather than at first use is deliberate: heartbeatAllowedMisses() is read
-// on every tick by the watcher goroutine, so a lazy write into heartbeatMissed
-// would be a genuine data race, and the ordering problem it would be solving is
-// entirely contained in NewSession's single-threaded option loop.
-//
-// Last-wins between the two ways of saying it: whichever of
-// WithNotificationHeartbeat's missed argument and WithNotificationSilenceTimeout
-// ran later is the one that decides, because the caller wrote it later.
+// normalizeHeartbeatOptions resolves the interdependent options once, after the
+// option loop and before any goroutine exists. WithNotificationSilenceTimeout is
+// stated in time but enforced in ticks, so it needs a cycle a later option may
+// change -- and resolving it lazily would be a data race against the watcher.
+// Last-wins between the two ways of saying it.
 func (sess *Session) normalizeHeartbeatOptions() {
 	if sess.heartbeatSilence <= 0 {
 		return
@@ -1085,16 +997,18 @@ func (sess *Session) heartbeatAllowedMisses() int {
 
 // establishHeartbeat registers the internal cyclic notification, if enabled and not
 // already present. Failing is not fatal: the session works, it just loses the
-// ability to notice its subscriptions dying quietly.
-func (sess *Session) establishHeartbeat(ctx context.Context) {
+// ability to notice its subscriptions dying quietly. The error is returned so a
+// caller can tell a PLC that refused from one that did not answer; most callers
+// have nothing to do with it.
+func (sess *Session) establishHeartbeat(ctx context.Context) error {
 	// Same window as recoverDeadSubscriptions: registering a beat on a session that
 	// has already released its PLC resources strands it.
 	if sess.isClosed() || !sess.heartbeatEnabled() || sess.notifications.heartbeatHandle.Load() != 0 {
-		return
+		return nil
 	}
 	c := sess.client.Load()
 	if c == nil {
-		return
+		return nil
 	}
 	// Cyclic, one byte, on the symbol-version group: runtime-served (so it dies
 	// with the runtime's notification table, which is the event being detected),
@@ -1116,7 +1030,7 @@ func (sess *Session) establishHeartbeat(ctx context.Context) {
 		// — no retry, and a later silent death went unnoticed with one Warn as the
 		// only trace. The watcher re-attempts the beat itself (see heartbeatWatch).
 		sess.startHeartbeatWatch()
-		return
+		return err
 	}
 	sess.notifications.heartbeatEstablishFailures.Store(0)
 	// A handle that is already one of the caller's would make every sample for
@@ -1137,7 +1051,7 @@ func (sess *Session) establishHeartbeat(ctx context.Context) {
 		// unnoticed. The collision itself is transient — the next attempt asks the
 		// PLC for a fresh handle.
 		sess.startHeartbeatWatch()
-		return
+		return nil
 	}
 	// CompareAndSwap, not Store: two concurrent first subscribes both see no
 	// heartbeat, both register one, and the second Store would orphan the first —
@@ -1148,11 +1062,12 @@ func (sess *Session) establishHeartbeat(ctx context.Context) {
 		if derr := c.DeleteDeviceNotification(ctx, handle); derr != nil {
 			sess.logger.Debug("releasing the redundant heartbeat handle failed", "handle", handle, "error", derr)
 		}
-		return
+		return nil
 	}
 	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
 	sess.logger.Debug("notification heartbeat established", "handle", handle, "cycle", sess.heartbeatCycle())
 	sess.startHeartbeatWatch()
+	return nil
 }
 
 // consumeHeartbeat records a beat. Returns true when the sample was the heartbeat
@@ -1202,20 +1117,13 @@ func (sess *Session) startHeartbeatWatch() {
 	})
 }
 
-// heartbeatWatch re-subscribes when the beats stop.
+// heartbeatWatch re-subscribes when the beats stop. Retrying matters as much as
+// detecting: in CONFIG the re-subscribe cannot succeed, and the watcher keeps
+// trying so the session recovers by itself once the runtime serves again.
 //
-// Retrying matters as much as detecting: while the PLC is in CONFIG the
-// re-subscribe cannot succeed, and that is fine — no data is expected then. The
-// watcher keeps trying so the session recovers by itself the moment the runtime is
-// serving again, which is the whole requirement.
-//
-// But it retries on a leash. Measured in our own integration run against
-// 192.168.3.224: 1468 copies of the silence warning, 28% of the entire log, each
-// followed by "batch add notification failed: ads: client transport closed". Two
-// causes, both fixed here — a closed transport was treated exactly like a PLC in
-// CONFIG (retry on the very next tick), and failures did not slow anything down.
-// Each attempt also re-queues every config, so the resubscribe attempt counters
-// were being burned at the heartbeat interval.
+// On a leash, though: uncapped it produced 1468 silence warnings in one run, 28%
+// of the log. A closed transport was treated like a PLC in CONFIG, failures slowed
+// nothing down, and each attempt re-queued every config.
 func (sess *Session) heartbeatWatch() {
 	// No Done here: trackGoroutineOn owns the Add and the Done.
 	cycle := sess.heartbeatCycle()
@@ -1233,6 +1141,16 @@ func (sess *Session) heartbeatWatch() {
 	// consecutiveFailures backs the retry off and keeps the log to one line per
 	// episode. Goroutine-local: this is the only writer.
 	consecutiveFailures := 0
+	// Frames seen when the last silent window opened, and how many windows have
+	// passed without that number moving. A PLC that answers -- even to refuse --
+	// moves it, which is the whole discriminator: anything arriving means the link
+	// works and the subscriptions are worth retrying. Nothing arriving is the only
+	// evidence about the transport, and it cannot be misread the way an error can.
+	framesAtWindow := uint64(0)
+	framelessWindows := 0
+	// Ticks since the subscription gap was last acted on. Separate from quietTicks,
+	// which a beat resets.
+	gapTicks := 0
 	// silentWindows counts consecutive silent windows, for
 	// HeartbeatRecoveryConfirm. Reset whenever a beat arrives or a recovery runs,
 	// so "2" always means two in a row rather than two ever.
@@ -1244,18 +1162,11 @@ func (sess *Session) heartbeatWatch() {
 			return
 		case <-ticker.C:
 		}
-		// A completed reconnect starts the detector over. Without this, a session
-		// that dropped one tick short of the threshold fired recovery on its FIRST
-		// Connected tick after a fully successful reconnect and resubscribe, before
-		// the new beat could arrive: a full delete-and-re-add of every handle the
-		// reconnect had just registered, and if the PLC's router was still settling
-		// the re-add bound nothing while takeNotificationHandles had already emptied
-		// activeNotifications — Connected, no subscriptions, no data.
-		//
-		// Strictly conservative: it can only ever DELAY a recovery. A frozen-but-alive
-		// PLC does not reconnect, so its generation does not move and it is treated
-		// exactly as before. See lifecycle.connectedGen for why this is not epoch()
-		// and why nothing but a real connect/reconnect may advance it.
+		// A completed reconnect restarts the detector: otherwise a session that
+		// dropped one tick short of the threshold fired recovery on its first
+		// Connected tick, re-adding every handle the reconnect had just registered.
+		// Strictly conservative -- it can only delay a recovery, and a frozen-but-
+		// alive PLC does not reconnect, so its generation never moves.
 		if gen := sess.connectedGen(); gen != lastGen {
 			lastGen = gen
 			// The beat counter is monotonic across reconnects, so re-read it rather
@@ -1270,17 +1181,11 @@ func (sess *Session) heartbeatWatch() {
 			// bounded by reconnectSleep, not by this counter.
 			consecutiveFailures = 0
 		}
-		// Connected, not merely "not disconnected": dialAndStart clears
-		// tx.disconnected before the route, reload and resubscribe steps run, so a
-		// reconnect's tail looks live here. Ticking through it accumulates quiet
-		// ticks against subscriptions the reconnect is in the middle of restoring,
-		// and can trigger a full delete-and-re-add of handles it has just
-		// registered — correct, thanks to resubscribeMu, but pure churn.
-		//
-		// Deliberately no reset here: every path back to Connected bumps the
-		// generation above, and resetting on any non-Connected tick would reset
-		// once per tick for as long as some future long-lived state (Reloading)
-		// were held — which is the masking bug, arrived at from the other side.
+		// Connected, not merely "not disconnected": dialAndStart clears the flag
+		// before the route, reload and resubscribe steps, so a reconnect's tail
+		// looks live and ticking through it churns handles it is still restoring.
+		// No reset here -- every path back to Connected bumps the generation above,
+		// and resetting per non-Connected tick is the masking bug from the other side.
 		if sess.lifecycle.state.load() != SessionStateConnected {
 			continue // a drop has its own recovery path; do not compete with it
 		}
@@ -1294,19 +1199,56 @@ func (sess *Session) heartbeatWatch() {
 		sess.notifications.lock.Lock()
 		active := len(sess.notifications.activeNotifications)
 		wanted := len(sess.notifications.pending)
+		// Under the same lock as active, not re-read later: every writer updates
+		// the map and this counter together while holding it, so reading them a
+		// lock apart can pair a fresh registered with a stale active, and a reconnect
+		// committing a batch in between then looks like a full gap.
+		registered := int(sess.notifications.registered.Load())
 		sess.notifications.lock.Unlock()
 		if wanted == 0 && active == 0 {
 			continue // the caller has asked for nothing; nothing to protect
 		}
-		// No special case for "wanted but none active": a failed recovery leaves the
-		// heartbeat clock stale, so the silence check below fires again on the next
-		// tick and retries. Verified by removing this path and watching the test
-		// still pass, which is the definition of code not worth keeping.
+		// Subscriptions can die while the beat keeps arriving, and silence is the
+		// only other trigger for recovery. Read the beat once and share it with the
+		// silence check: the gap branch must not fire on a dead beat.
+		beats := sess.notifications.heartbeatBeats.Load()
+		beatArrived := beats != lastBeats
+
+		gapTicks++
+		if registered > active {
+			// Count the gap regardless, act only on a tick that saw a beat: the
+			// ticker runs at the beat's period, so gating the count on beatArrived
+			// lets jitter reset it before it ever reaches allowed.
+			if beatArrived {
+				allowed := heartbeatAllowedTicks(sess.heartbeatAllowedMisses(), consecutiveFailures, cycle)
+				if gapTicks >= allowed {
+					gapTicks = 0
+					sess.logger.Error("subscriptions are missing; recovering",
+						"want", registered, "have", active,
+						"detail", "the beat is arriving, so silence would never have revealed this")
+					switch sess.recoverDeadSubscriptions() {
+					case recoveryDone:
+						consecutiveFailures = 0
+					case recoveryDeferred:
+						// Runtime not serving yet: wait, exactly as the silence path does.
+					default:
+						consecutiveFailures++
+					}
+					// This tick saw a beat, so record it exactly as the silence check
+					// would have. Skipping it leaves lastBeats stale, and beatArrived
+					// then stays true for ever -- including after the beat dies.
+					lastBeats = beats
+					quietTicks = 0
+					continue
+				}
+			}
+		} else {
+			gapTicks = 0
+		}
 		// Silence measured in ticks of this ticker, not in wall-clock time: the
 		// ticker is monotonic, so a clock step cannot make a healthy session look
 		// dead (or a dead one look healthy). See notificationManager.heartbeatBeats.
-		beats := sess.notifications.heartbeatBeats.Load()
-		if beats != lastBeats {
+		if beatArrived {
 			lastBeats = beats
 			quietTicks = 0
 			// A beat is proof of life, so a previously-observed silent window no
@@ -1322,6 +1264,30 @@ func (sess *Session) heartbeatWatch() {
 			continue
 		}
 		quietTicks++
+		// One decision for every path reaching a silent window: has any frame arrived
+		// since the last one? Attempts that keep failing are evidence about the link,
+		// not the subscriptions. Spawned, not inline: this runs on the heartbeat
+		// watcher and Close waits heartbeatWG.
+		escalate := func() bool {
+			frames := uint64(0)
+			if c := sess.client.Load(); c != nil {
+				frames = c.framesSeen()
+			}
+			if frames != framesAtWindow {
+				framesAtWindow = frames
+				framelessWindows = 0
+				return false
+			}
+			framelessWindows++
+			if framelessWindows < heartbeatFailuresBeforeReconnect {
+				return false
+			}
+			sess.logger.Error("no frame has arrived on either socket; treating the transport as dead and reconnecting",
+				"windows", framelessWindows, "framesSeen", frames,
+				"detail", "re-subscribing cannot fix a link that is gone, and retrying on it keeps TCP from noticing")
+			go sess.triggerReconnect()
+			return true
+		}
 		// Each consecutive failed recovery doubles the tolerated silence, capped, so
 		// a PLC that stays in CONFIG for an hour costs a handful of attempts instead
 		// of one per interval.
@@ -1342,14 +1308,22 @@ func (sess *Session) heartbeatWatch() {
 			// rate was not.
 			consecutiveFailures++
 			ctx, cancel := context.WithTimeout(sess.currentLifecycleCtx(), cycle)
-			sess.establishHeartbeat(ctx)
+			_ = sess.establishHeartbeat(ctx)
 			cancel()
+			// Checked here too, not only after a recovery: recoverDeadSubscriptions
+			// releases the heartbeat handle, so once one attempt has failed the loop
+			// lives in this branch and never reaches the recovery path again.
+			if escalate() {
+				return
+			}
 			continue
 		}
 		quietTicks = 0
 
-		// One Warn per episode. Repeats go to Debug: the operator needs to know the
-		// subscriptions died, not to be told again every interval until they recover.
+		// One Error per episode, because nothing is being delivered and a
+		// notification session loses the samples in the window. Repeats go to Debug:
+		// the operator needs to know the subscriptions died, not to be told again
+		// every interval until they recover.
 		msg := "no notification heartbeat within the allowed window; treating this session's subscriptions as dead and re-subscribing"
 		args := []any{
 			"cycle", cycle, "missedTicks", allowed,
@@ -1360,7 +1334,7 @@ func (sess *Session) heartbeatWatch() {
 				"changing the symbol version or reporting an error",
 		}
 		if consecutiveFailures == 0 {
-			sess.logger.Warn(msg, args...)
+			sess.logger.Error(msg, args...)
 		} else {
 			sess.logger.Debug(msg, append(args, "retry", consecutiveFailures)...)
 		}
@@ -1384,7 +1358,7 @@ func (sess *Session) heartbeatWatch() {
 			// handles under a caller that would rather rebuild the session is the
 			// thing this mode exists to avoid.
 			if consecutiveFailures == 0 {
-				sess.logger.Warn("heartbeat silent; not re-subscribing (WithHeartbeatRecovery(Observe))",
+				sess.logger.Error("heartbeat silent; not re-subscribing (WithHeartbeatRecovery(Observe))",
 					"detail", "this session's subscriptions are dead until the consumer rebuilds it")
 				// Spawned, never called inline: Close waits heartbeatWG, and this
 				// runs ON the heartbeat watcher, so a callback that rebuilds the
@@ -1411,6 +1385,9 @@ func (sess *Session) heartbeatWatch() {
 			// measured on 192.168.3.118, which never recovered inside a 2 minute grace.
 		default:
 			consecutiveFailures++
+			if escalate() {
+				return
+			}
 		}
 	}
 }
@@ -1430,17 +1407,10 @@ const (
 )
 
 func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
-	// heartbeatWatch checks this too, but that check is a TOCTOU: Close can land
-	// immediately after it. Close marks the session closed and releases the PLC
-	// resources BEFORE cancelling the context, so a recovery entering that window
-	// still has a live transport and its registrations land after the release that
-	// was meant to be the last word — handles nobody will ever delete, streaming
-	// into a channel the caller considers finished.
-	// Atomic with markClosed, not a bare check: Close marks the session closed and
-	// releases its PLC resources before cancelling the context, and a concurrent
-	// Reconnect re-derives lifecycle.ctx from the (uncancelled) parent — so a
-	// recovery that passed a bare check could register handles over a freshly
-	// dialled transport AFTER the release meant to be terminal.
+	// Atomic with markClosed, not a bare check, which heartbeatWatch's own is: Close
+	// releases the PLC resources BEFORE cancelling the context, so a recovery
+	// entering that window still has a live transport and registers handles after
+	// the release meant to be terminal -- nobody will ever delete them.
 	if !sess.admitBackgroundWork() {
 		sess.logger.Debug("skipping subscription recovery: the session is closed")
 		return recoveryFailed
@@ -1506,7 +1476,7 @@ func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
 			sess.logger.Info("re-subscribe deferred: the PLC runtime stopped serving", "error", err)
 			return recoveryDeferred
 		}
-		sess.logger.Warn("re-subscribe after a heartbeat timeout failed; keeping the subscriptions on file and retrying in the next window",
+		sess.logger.Error("re-subscribe after a heartbeat timeout failed; keeping the subscriptions on file and retrying in the next window",
 			"error", err, "configs", len(intent))
 		return recoveryFailed
 	}
@@ -1517,12 +1487,15 @@ func (sess *Session) recoverDeadSubscriptions() recoveryOutcome {
 	sess.notifications.lock.Unlock()
 	if bound == 0 && len(intent) > 0 {
 		restoreIntent()
-		sess.logger.Warn("re-subscribe bound nothing (PLC not serving yet); keeping the subscriptions on file and retrying in the next window",
+		sess.logger.Error("re-subscribe bound nothing (PLC not serving yet); keeping the subscriptions on file and retrying in the next window",
 			"configs", len(intent))
 		return recoveryFailed
 	}
 	sess.notifications.heartbeatLastNs.Store(time.Now().UnixNano())
-	sess.establishHeartbeat(ctx)
+	_ = sess.establishHeartbeat(ctx)
+	sess.notifications.lock.Lock()
+	sess.notifications.raiseRegistered()
+	sess.notifications.lock.Unlock()
 	sess.logger.Info("subscriptions re-established after the heartbeat stopped")
 	return recoveryDone
 }

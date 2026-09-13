@@ -4,20 +4,11 @@ import (
 	"sync/atomic"
 )
 
-// capabilities consolidates feature-detection state for a single connection.
-// Each field tracks whether a particular ADS sub-protocol is supported by
-// the PLC. State transitions:
-//   - sumReadCmd: 0 = unchecked (try Ex2 first); uint32(GroupSumupReadEx2) = use 0xF084;
-//     uint32(GroupSumupReadEx) = use 0xF083; 1 = no sum read support (individual reads).
-//   - sumWriteState / sumAddNotifState / sumDeleteNotifState: 0 = unchecked,
-//     1 = supported, 2 = unsupported. Add (0xF085) and Delete (0xF086) are
-//     tracked separately because a PLC may support one and not the other.
-//   - chunkedDownloadSupported / chunkedDownloadChecked: pair tracks whether a chunked
-//     download probe has been done and whether it succeeded.
-//
-// Reset is implicit: see the comment at the bottom of this file — a fresh
-// Client (allocated on every Connect / dialAndStart) starts zeroed, so no
-// explicit reset method is needed.
+// capabilities holds per-connection feature detection. sumReadCmd is 0 unchecked,
+// the group constant for the variant in use, or 1 for no sum read at all; the
+// sum*State fields are 0 unchecked / 1 supported / 2 unsupported, tracked
+// separately because a PLC may serve Add but not Delete. Reset is implicit -- a
+// fresh Client is allocated on every dial and starts zeroed.
 type capabilities struct {
 	sumReadCmd               atomic.Uint32
 	sumWriteState            atomic.Uint32

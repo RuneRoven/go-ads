@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"strconv"
@@ -376,5 +378,48 @@ func TestAddRoute_RefusalIsNotRetransmitted(t *testing.T) {
 	}
 	if elapsed > 2*time.Second {
 		t.Errorf("took %v to report a refusal answered immediately; the caller waited out the retransmit budget", elapsed)
+	}
+}
+
+// A router that answers nothing must be reported as retryable, not read as a
+// missing route. Measured at ~8s of silence on a TC3 4024 after the client
+// restarted; the old code spent that window registering a route that existed.
+func TestAwaitRouterAwake_DeafRouterIsRetryable(t *testing.T) {
+	host, port, stop := startFlakyIdentifyResponder(t, 1<<30, false) // never answers
+	defer stop()
+	defer func(d time.Duration) { routerDeafGrace = d }(routerDeafGrace)
+	routerDeafGrace = 2 * time.Second
+
+	sess := &Session{
+		ip:     net.JoinHostPort(host, strconv.Itoa(port)),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	start := time.Now()
+	err := sess.awaitRouterAwake(context.Background())
+	if !errors.Is(err, ErrRouterUnresponsive) {
+		t.Fatalf("got %v, want ErrRouterUnresponsive — a deaf router reads as a missing route again", err)
+	}
+	if waited := time.Since(start); waited < routerDeafGrace {
+		t.Errorf("gave up after %v, before the %v grace", waited, routerDeafGrace)
+	}
+}
+
+// And it must not wait when the router is answering, which is every other call.
+func TestAwaitRouterAwake_ReturnsWhileTheRouterAnswers(t *testing.T) {
+	host, port, stop := startFlakyIdentifyResponder(t, 0, false)
+	defer stop()
+	defer func(d time.Duration) { routerDeafGrace = d }(routerDeafGrace)
+	routerDeafGrace = 5 * time.Second
+
+	sess := &Session{
+		ip:     net.JoinHostPort(host, strconv.Itoa(port)),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	start := time.Now()
+	if err := sess.awaitRouterAwake(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if waited := time.Since(start); waited > routerAwakePoll {
+		t.Errorf("waited %v on a router that was answering", waited)
 	}
 }

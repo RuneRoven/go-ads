@@ -211,15 +211,10 @@ func (sess *Session) LoadSymbolsSlow(ctx context.Context, cfg SlowDiscoveryConfi
 	return nil
 }
 
-// downloadInChunks reads a large ADS data blob in smaller pieces using
-// the offset parameter of the ADS Read command.
-// If chunked downloads are already known to be unsupported (e.g. TwinCAT 2),
-// this returns an error immediately so the caller can use the single-request fallback.
-// DownloadInChunks reads totalLength bytes from group:0 in chunkSize-byte
-// chunks with optional inter-chunk delay. Tracks chunked-download support
-// in capabilities so subsequent calls short-circuit when the PLC does not
-// support it. Used by the Slow / List / DataTypes loaders to fetch large
-// upload tables without overwhelming the PLC's real-time loop.
+// downloadInChunks reads a large blob in chunkSize pieces via the Read command's
+// offset, with an optional inter-chunk delay, so the loaders do not overwhelm the
+// PLC's real-time loop. Returns immediately when chunking is already known to be
+// unsupported, so the caller takes the single-request fallback.
 func (c *Client) DownloadInChunks(ctx context.Context, group uint32, totalLength uint32, chunkSize uint32, delay time.Duration) ([]byte, error) {
 	if totalLength == 0 {
 		return []byte{}, nil
@@ -241,14 +236,9 @@ func (c *Client) DownloadInChunks(ctx context.Context, group uint32, totalLength
 		}
 		chunk, err := c.Read(ctx, group, offset, readLen)
 		if err != nil {
-			// Only flip the "chunked-download unsupported" capability when
-			// the PLC's response unambiguously indicates this offset/service
-			// combination is not implemented — and only on the very first
-			// chunk attempt. Transient errors (transport closed, ctx
-			// cancellation, timeouts, intermittent transport hiccups) must
-			// NOT poison the session-wide capability flag, since the PLC
-			// may support chunking just fine and a subsequent call would
-			// then take the single-request fallback unnecessarily.
+			// Flip the capability only on an unambiguous "not implemented", and only
+			// on the first chunk: a transient error would otherwise poison the
+			// session-wide flag and send every later call down the fallback.
 			if offset == 0 && !c.capabilities.ChunkedDownloadCheckedLoad() && isChunkedDownloadUnsupportedErr(err) {
 				c.capabilities.ChunkedDownloadSupportedStore(false)
 				c.capabilities.ChunkedDownloadCheckedStore(true)
@@ -289,19 +279,11 @@ func (sess *Session) GetSymbol(ctx context.Context, symbolName string) (SymbolVi
 	return sym.view(sess), nil
 }
 
-// logSymbolGot traces a resolved symbol without handing the live *symbol to the
-// logger. slog formats a *symbol by reflection, reading Value / Valid /
-// ValueParsed / LastUpdateTime — the exact fields updateValue writes under
-// cache.lock from the Client's recvWorker (handleNotification → dispatchSample).
-// Logging the pointer therefore read a string header and a multi-word time.Time
-// with no lock, and a panic inside the handler on a spliced header would land in
-// the listen path. -race stayed green only because slog skips its args at a
-// disabled level, so the defect was armed for the first trace-logged subscribed
-// session in the field, never for CI.
-//
-// The snapshot is taken under cache.lock and the lock is released before the log
-// call: the handler can be user-supplied, and holding a cache lock across
-// arbitrary handler code is how the deadlocks in this package were built.
+// logSymbolGot traces a symbol without handing the live *symbol to the logger:
+// slog would format it by reflection, reading the very fields updateValue writes
+// under cache.lock from the recvWorker. -race stayed green only because slog skips
+// args at a disabled level, so the defect was armed for the field, never CI. The
+// snapshot is taken under the lock and logged after releasing it.
 func (sess *Session) logSymbolGot(sym *symbol) {
 	ctx := context.Background()
 	if !sess.logger.Enabled(ctx, LevelTrace) {

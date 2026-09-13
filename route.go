@@ -27,16 +27,13 @@ const (
 	tagResponseError uint16 = 1
 )
 
-// splitHostRouterPort accepts either a bare host or host:port and returns the
-// host with the router UDP port to use. A PLC behind NAT answers on a forwarded
-// port that cannot be derived from anything else, and these standalone helpers
-// take no port argument — so they read it off the host string rather than
-// forcing callers into the Session API for a one-shot probe.
+// splitHostRouterPort accepts a bare host or host:port and returns the host plus
+// the router UDP port. A PLC behind NAT answers on a forwarded port derivable from
+// nothing else, and these standalone helpers take no port argument.
 //
-// A port that is present but unusable is an error, not a fallback. Folding it
-// back into the hostname made a mistyped port surface as a name-resolution
-// failure for an address nobody typed, and silently substituting 48899 for a
-// forwarded port can reach an entirely different device on a NAT host.
+// A present-but-unusable port is an error, not a fallback: folding it back into
+// the hostname turned a typo into a resolution failure for an address nobody
+// typed, and defaulting to 48899 can reach a different device entirely.
 func splitHostRouterPort(host string) (string, int, error) {
 	h, portStr, err := net.SplitHostPort(host)
 	if err != nil {
@@ -55,21 +52,13 @@ func splitHostRouterPort(host string) (string, int, error) {
 	return h, port, nil
 }
 
-// AddRemoteRoute registers a route on the remote PLC via the Beckhoff UDP protocol (port 48899).
-// This tells the PLC how to reach this client's AmsNetId.
+// AddRemoteRoute registers a route on the PLC over UDP 48899, telling it how to
+// reach this client's NetID. remoteHost may carry the router's UDP port
+// ("10.0.0.5:6499") when the PLC is behind NAT; computerName is the address the
+// PLC should dial back.
 //
-// Security: credentials are transmitted in cleartext over UDP. This is a limitation of
-// Beckhoff's route registration protocol — there is no encrypted alternative.
-// Ensure this is only called on trusted networks.
-//
-// Parameters:
-//   - remoteHost: IP or hostname of the PLC, optionally with the router's UDP
-//     port ("10.0.0.5:6499") when the PLC is reached through NAT forwarding
-//   - localNetID: the AMS NetID this client will use as source
-//   - routeName: name for the route entry on the PLC
-//   - computerName: the IP/hostname the PLC should use to connect back to this client
-//   - username: PLC admin username (typically "Administrator")
-//   - password: PLC admin password
+// Security: Beckhoff's protocol sends credentials in cleartext and offers no
+// encrypted alternative. Trusted networks only.
 func AddRemoteRoute(remoteHost string, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
 	return AddRemoteRouteWithLogger(getDefaultLogger(), remoteHost, localNetID, routeName, computerName, username, password)
 }
@@ -83,17 +72,11 @@ func AddRemoteRouteWithLogger(logger *slog.Logger, remoteHost string, localNetID
 	return addRemoteRouteFrom(logger, nil, host, port, localNetID, routeName, computerName, username, password)
 }
 
-// addRemoteRouteFrom is AddRemoteRouteWithLogger with an explicit local source
-// IP for the UDP socket.
-//
-// This matters on a multi-homed host: TwinCAT records the route against the UDP
-// SOURCE IP of the registration, not the computerName tag it carries (TC2 uses
-// the tag, TC3 does not). Letting the OS pick the interface therefore registers
-// the route for whichever NIC wins the route metric, and a session bound to the
-// other one is then reset by the PLC — the registration reports success and
-// nothing is ever served. localIP nil keeps OS-default routing.
-// port is the router's UDP port; production passes the session's, which is
-// routePort unless the PLC sits behind NAT with port forwarding.
+// addRemoteRouteFrom is AddRemoteRouteWithLogger with an explicit UDP source IP.
+// Matters on a multi-homed host: TC3 records the route against the UDP SOURCE IP,
+// not the computerName tag, so letting the OS choose registers whichever NIC wins
+// the metric and a session on the other one is reset despite a successful
+// registration. nil keeps OS-default routing.
 func addRemoteRouteFrom(logger *slog.Logger, localIP net.IP, remoteHost string, port int, localNetID [6]byte, routeName string, computerName string, username string, password string) error {
 	if logger == nil {
 		logger = getDefaultLogger()
@@ -370,20 +353,11 @@ type routeManager struct {
 	skipRegistration   bool // set via WithSkipRouteRegistration — caller manages routes externally
 	routeProbeFailures atomic.Int32
 
-	// registered records that this session has already registered its route, so
-	// an ordinary reconnect storm does not register again and again.
-	//
-	// Not an absolute once-per-session rule, because re-registering the CORRECT
-	// route is the documented recovery for a router that has stopped answering.
-	// Measured: two TC3 devices (3.1.4024 and 3.1.4026) mute after a foreign NetID
-	// claimed the address they route to us, both restored to normal service by one
-	// re-registration of our own NetID at our own address. TwinCAT keys the TC3
-	// route table by ADDRESS, so registering the right NetID for an address rebinds
-	// it; registering a NetID that does not own the address is what broke them.
-	//
-	// So the flag is cleared whenever the session concludes the PLC has stopped
-	// answering (see Session.coolDownAfterUnserved), which permits exactly one
-	// healing registration per cooldown cycle and no more.
+	// registered stops a reconnect storm re-registering the route over and over.
+	// Not absolute: re-registering the CORRECT route is the documented recovery for
+	// a muted router, since TC3 keys its table by address and the right NetID
+	// rebinds it. Cleared whenever the session concludes the PLC stopped answering,
+	// permitting one healing registration per cooldown cycle.
 	registered atomic.Bool
 }
 

@@ -5,16 +5,11 @@ import (
 	"fmt"
 )
 
-// AMSAddress identifies an ADS endpoint by its 6-byte AMS NetID and 16-bit
-// AMS port.
+// AMSAddress identifies an ADS endpoint by 6-byte NetID and 16-bit port.
 //
-// Wire layout: [6]byte NetID + uint16 Port = 8 contiguous bytes. The Go
-// encoding/binary package emits fields in declaration order with no
-// padding for fixed-size types, so binary.Size(AMSAddress{}) == 8 matches
-// Beckhoff's documented on-wire size. DO NOT reorder fields, insert
-// fields between NetID and Port, or change either type without also
-// updating AMSHeader and every binary.Read/Write site that depends on
-// the 8-byte encoding.
+// Wire layout is those 8 bytes contiguously, which encoding/binary reproduces from
+// declaration order. DO NOT reorder or insert fields, or change either type,
+// without updating AMSHeader and every binary.Read/Write site.
 type AMSAddress struct {
 	NetID [6]byte
 	Port  uint16
@@ -30,23 +25,12 @@ const (
 	TransModeClientOnChange TransMode = 2
 	TransModeServerCycle    TransMode = 3
 	TransModeServerOnChange TransMode = 4
-	// ServerCycle2 / ServerOnChange2 are the "InContext" variants (called CyclicInContext
-	// and OnChangeInContext in Beckhoff's .NET SDK). They execute the notification check
-	// within the PLC task cycle instead of a separate ADS server thread, giving more
-	// deterministic timing. Both modes are part of the same feature — if one is supported,
-	// the other is too.
-	//
-	// InContext modes require the target symbol to have a non-zero ContextMask (bits 8-11
-	// of the symbol flags). ContextMask indicates which PLC task owns the variable. If
-	// ContextMask is 0, the PLC rejects the request with 0x070B (invalid parameter) on TC3,
-	// or silently ignores it on TC2 (notifications never fire, no error).
-	//
-	// ContextMask is non-zero only for variables local to a PROGRAM POU assigned to a
-	// single task in a multi-task PLC project. GVL variables and single-task projects
-	// always have ContextMask=0. Most PLC projects are single-task.
-	//
-	// AddSymbolNotification and AddSymbolNotifications automatically fall back to
-	// ServerCycle/ServerOnChange when the symbol's ContextMask is 0.
+	// The "InContext" variants run the notification check inside the PLC task cycle
+	// rather than a separate ADS thread, for more deterministic timing. They need a
+	// non-zero ContextMask (the owning task), which only variables local to a
+	// PROGRAM POU in a multi-task project have -- GVLs and single-task projects are
+	// always 0, and TC3 then rejects with 0x070B while TC2 silently never fires.
+	// The AddSymbolNotification paths fall back automatically when it is 0.
 	TransModeServerCycle2    TransMode = 5 // CyclicInContext
 	TransModeServerOnChange2 TransMode = 6 // OnChangeInContext
 	TransModeClient1Request  TransMode = 10
@@ -107,18 +91,10 @@ const (
 	SymbolFlagTComObj SymbolFlag = 0x0010
 	// SymbolFlagReadOnly indicates the symbol is read-only.
 	SymbolFlagReadOnly SymbolFlag = 0x0020
-	// SymbolFlagContextMask extracts the PLC task context index from bits 8-11.
-	// Non-zero means the variable is bound to a specific PLC task, enabling
-	// InContext notification modes (TransMode 5/6). The value corresponds to the
-	// task's index in the global TASKINFOARRAY.
-	// Zero means no task binding — InContext modes will be rejected (0x070B on TC3)
-	// or silently ignored (TC2).
-	//
-	// ContextMask is non-zero only when:
-	//   - The PLC project has multiple tasks (Referenced Tasks in Solution Explorer)
-	//   - The variable is local to a PROGRAM POU assigned to a single task
-	// GVL (Global Variable List) variables always have ContextMask=0.
-	// Single-task projects (the default) always have ContextMask=0 for all symbols.
+	// SymbolFlagContextMask extracts the PLC task index from bits 8-11: non-zero
+	// binds the variable to a task and enables the InContext modes, zero means they
+	// are rejected (0x070B on TC3) or silently ignored (TC2). Only variables local
+	// to a PROGRAM POU in a multi-task project are non-zero.
 	SymbolFlagContextMask SymbolFlag = 0x0F00
 	// SymbolFlagAttributes indicates attribute key-value pairs follow after the type GUID.
 	SymbolFlagAttributes SymbolFlag = 0x1000
@@ -666,6 +642,26 @@ func adsTypeToString(code ADSDataType) string {
 	}
 }
 
+// adsTypeWidth returns the fixed width in bytes of a scalar ADST_ code, or 0
+// when the width is not fixed (STRING/WSTRING) or the code is not scalar.
+// Used to tell an aggregate apart from a scalar: an array reports its element's
+// ADST_ code alongside the whole array's length, so a symbol whose length
+// disagrees with its base type's width is not the scalar the code claims.
+func adsTypeWidth(code ADSDataType) uint32 {
+	switch code {
+	case ADSTBool, ADSTInt8, ADSTUint8:
+		return 1
+	case ADSTInt16, ADSTUint16:
+		return 2
+	case ADSTInt32, ADSTUint32, ADSTReal32:
+		return 4
+	case ADSTInt64, ADSTUint64, ADSTReal64:
+		return 8
+	default:
+		return 0
+	}
+}
+
 // isSumCommandUnsupportedError returns true if the error indicates the PLC does
 // not support sum/batch commands (as opposed to a transient network error).
 func isSumCommandUnsupportedError(err error) bool {
@@ -693,15 +689,10 @@ const (
 	// caller decides reconnect timing.
 	SymbolVersionClose
 
-	// SymbolVersionIgnore surfaces the PLC error verbatim to the calling
-	// op (Read/Write/Sum*) and flags surviving notification handles' next
-	// sample with Update.Stale=true, Update.Reason=<detected reason>
-	// (one-shot — consumed on first delivery, subsequent samples are
-	// Stale=false again).
-	//
-	// Asymmetry: removed-symbol channels go SILENT — no terminal Update
-	// is delivered for the dead handle. Use WithOnSymbolVersionChanged to
-	// observe symbol-removal events.
+	// SymbolVersionIgnore surfaces the PLC error verbatim and flags the next sample
+	// on surviving handles Stale, once. Removed symbols go SILENT instead -- no
+	// terminal Update for a dead handle, so use WithOnSymbolVersionChanged to see
+	// removals.
 	SymbolVersionIgnore
 )
 

@@ -11,19 +11,13 @@ import (
 	"time"
 )
 
-// notificationManager owns the connection-level notification state:
-// the per-handle symbol map, the saved configs for reconnect re-subscribe,
-// the user-supplied channel that all notifications are dispatched to, and
-// the timestamp of the most recent successful subscribe (used to suppress
-// "unknown handle" warnings during the first-sample race window).
+// notificationManager owns the connection-level notification state: the per-handle
+// symbol map, the configs for reconnect re-subscribe, the user channel, and the
+// last-subscribe timestamp that suppresses race-window warnings.
 //
-// Lock ordering: NEVER hold both cache.lock and notifications.lock simultaneously.
-// activeNotification couples a subscribed symbol with the user channel
-// updates flow to. Stored in notificationManager.activeNotifications under
-// notifications.lock. Pairing the channel with the symbol here (instead of
-// on the symbol struct) keeps the cross-lock invariant entirely inside the
-// notifications subsystem — symbol records reachable via cache.symbols no
-// longer carry notifications.lock-guarded state.
+// Lock ordering: NEVER hold cache.lock and notifications.lock at once.
+// activeNotification pairs the symbol with its channel here rather than on the
+// symbol struct, keeping notifications.lock-guarded state out of cache.symbols.
 type activeNotification struct {
 	Sym *symbol
 	Ch  chan<- *Update
@@ -50,16 +44,10 @@ type notificationManager struct {
 	// is in flight; openSubscribes answers that.
 	lastSubscribeNs atomic.Int64
 
-	// openSubscribes maps each in-flight subscribe to the time it began, so every
-	// one is bounded by subscribeRaceMaxOpen on its own age. Guarded by openMu,
-	// which is also the critical section that closes a subscribe — one shared
-	// counter plus one shared timestamp could not express this: the pair was not
-	// atomic across goroutines (an ending subscribe could clear a clock a starting
-	// one had just written, and "in flight with no clock" suppressed the orphan
-	// reaper permanently), and a single slot recorded when the last quiet period
-	// ended rather than when anything in flight began.
-	//
-	// Lock order where both are taken: openMu then earlyMu, never the reverse.
+	// Each in-flight subscribe with the time it began, so each is bounded by its own
+	// age. A shared counter plus one timestamp could not express this: the pair was
+	// not atomic, and one slot recorded when the last quiet period ended rather than
+	// when anything in flight began. Lock order: openMu then earlyMu, never reverse.
 	openMu             sync.Mutex
 	openSubscribes     map[subscribeToken]int64
 	nextSubscribeToken uint64
@@ -89,59 +77,42 @@ type notificationManager struct {
 	earlyBytes int
 
 	// heartbeatHandle is an internal CYCLIC notification on the symbol-version
-	// index group, and heartbeatLastNs is when it last delivered.
-	//
-	// It exists because a subscription can die with nothing observable happening:
-	// measured on TC3.1.4024 across CONFIG -> RUN with no program change, the TCP
-	// connection survives, the symbol version is unchanged, ADS state reads back
-	// identical, no error or terminal sample arrives — and the caller's
-	// subscriptions never deliver again (confirmed with a fully passive listener
-	// that sent the PLC nothing). An on-change subscription may also be silent
-	// legitimately, so silence alone proves nothing.
-	//
-	// A cyclic subscription fixes that: TwinCAT pushes on a timer regardless of
-	// change, so ITS silence is conclusive. Measured on the same transition, the
-	// beat and the caller's samples stop in the same second, which is what makes
-	// this a valid detector. 0xF008 is served by the runtime (so it dies with the
-	// runtime's notification table, unlike anything on the system port), exists
-	// regardless of the caller's program, is one byte, and its payload is the
-	// symbol version — so each beat doubles as online-change detection.
+	// index group. A subscription can die silently (TC3 across CONFIG->RUN: TCP up,
+	// symbol version unchanged, no error, no more samples), and an on-change
+	// subscription may be silent legitimately -- so only a cyclic beat's silence is
+	// conclusive. 0xF008 dies with the runtime's notification table and its payload
+	// is the symbol version, so each beat doubles as online-change detection.
 	heartbeatHandle atomic.Uint32
-	// heartbeatBeats counts delivered beats. The watchdog compares this against what
-	// it saw on the previous tick, so the decision never touches a clock.
-	//
-	// It used to compare time.Now().UnixNano() against a stored timestamp, and
-	// time.Unix carries no monotonic reading — so a wall-clock STEP was read as
-	// elapsed time. That is not exotic on the hardware this runs on: an IPC without
-	// a battery-backed RTC boots at some stale time and steps years forward on its
-	// first NTP sync, and a suspended VM or container resumes with a jump. A forward
-	// step past the window declared every live subscription dead and re-registered
-	// all of them for nothing; a backward step blinded the watchdog for the length of
-	// the step while subscriptions may genuinely have been gone. The ticker driving
-	// the watch is monotonic, so counting its ticks is both correct and less code.
+	// heartbeatBeats counts delivered beats; the watchdog compares it against the
+	// previous tick so the decision never touches a clock. A wall-clock step -- an
+	// IPC with no RTC on its first NTP sync, a resumed VM -- otherwise reads as
+	// elapsed time and kills every live subscription.
 	heartbeatBeats atomic.Uint64
 	// heartbeatEstablishFailures counts consecutive failures to register the beat,
 	// so a PLC that refuses it permanently costs one Warn rather than one per retry.
 	heartbeatEstablishFailures atomic.Int64
+	// registered is what a healthy session holds, compared against
+	// len(activeNotifications) to spot subscriptions that died unasked. Not
+	// len(pending), which is a superset and outlives a handle. Raised by any commit;
+	// lowered only by a caller teardown or a symbol the PLC no longer has.
+	registered atomic.Int64
+	// Samples for handles we do not own, and the deletes that follow, counted since
+	// the last report. Reported on a timer rather than per episode: after a
+	// reconnect orphans interleave with healthy samples, so a counter reset by the
+	// next owned sample ends the episode at once and every orphan reports again.
+	orphanSamples  atomic.Int64
+	orphanWarnNs   atomic.Int64
+	orphanDeletes  atomic.Int64
+	orphanDeleteNs atomic.Int64
 	// heartbeatLastNs is kept for the log line only ("silentFor"), never for the
 	// decision. A stepped clock makes it a confusing number, not a wrong outcome.
 	heartbeatLastNs atomic.Int64
 
-	// resubscribeMu serialises whole re-subscribe sequences. Three paths run one —
-	// the reconnect loop, the auto-reload after an online change, and heartbeat
-	// recovery — and each begins by snapshotting pending and clearing it, so two at
-	// once means one of them reads an empty intent: it either subscribes nothing and
-	// reports success, or both register the same symbols and the PLC ends up holding
-	// two registrations per symbol.
-	//
-	// Measured on hardware, power-cycling 192.168.3.70 with 40 symbols subscribed:
-	// the heartbeat fired while the FSM still said Connected, the TCP drop was
-	// detected two seconds later, both recoveries ran, and the session reported
-	// "bound notifications = 24, want 40" while still in Reconnecting. Everything
-	// recovered in the end, but the bookkeeping disagreed with the PLC in between.
-	//
-	// Not `lock`: the sequence includes PLC round-trips, and `lock` is the dispatch
-	// hot path's mutex. Never held while taking `lock` for more than a snapshot.
+	// resubscribeMu serialises whole re-subscribe sequences. Three paths run one --
+	// reconnect, auto-reload after an online change, heartbeat recovery -- and each
+	// snapshots pending and clears it, so two at once leaves one reading an empty
+	// intent or both registering the same symbols twice on the PLC. Not `lock`,
+	// which is the dispatch hot path's; never held while taking it beyond a snapshot.
 	resubscribeMu sync.Mutex
 
 	// orphanDelete tracks unknown-handle Delete attempts so we don't spam
@@ -211,23 +182,54 @@ func (m *notificationManager) hasConfig(symbolName string) bool {
 	return ok
 }
 
-// hasLiveNotification reports whether symbolName currently has a committed handle
-// in activeNotifications. Caller must hold lock.
-//
-// This, and not hasConfig, is what makes a subscribe a duplicate. The three pieces
-// of state mean different things:
-//
-//   - pending / configsByKey — the caller's declared intent, one entry per symbol.
-//   - activeNotifications — the handles the PLC has actually given us.
-//   - notificationChannel — the single channel everything is delivered to.
-//
-// pending is a superset by design and legitimately outlives a handle: a resubscribe
-// re-queues every entry the PLC refused for a retryable reason
-// (ErrNotificationStrandedByReload, ErrNotificationSymbolVanished) and those have no
-// handle of their own. Deciding duplicates on pending therefore answered "symbol
-// already has an active notification" for a symbol with no notification at all —
-// and since DeleteDeviceNotification works by handle, a pending-only entry had no
-// exported way out: the symbol was un-subscribable for the life of the session.
+// hasLiveNotification reports whether symbolName has a committed handle. Caller
+// must hold lock. This, not hasConfig, is what makes a subscribe a duplicate:
+// pending is the caller's intent and outlives a handle, since a resubscribe
+// re-queues retryable refusals that have no handle at all. Deciding on pending
+// left such a symbol un-subscribable for the life of the session, with no exported
+// way out because deletes work by handle.
+func (m *notificationManager) subscriptionGap() (want, have int) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	return int(m.registered.Load()), len(m.activeNotifications)
+}
+
+// reportNow reports true at most once per interval, so a burst produces one line
+// instead of one per event. Only the caller winning the CAS reports.
+func reportNow(last *atomic.Int64, interval time.Duration) bool {
+	now := time.Now().UnixNano()
+	prev := last.Load()
+	if now-prev < int64(interval) {
+		return false
+	}
+	return last.CompareAndSwap(prev, now)
+}
+
+// orphanReportInterval bounds how often the orphan sample/delete lines appear.
+const orphanReportInterval = 30 * time.Second
+
+// raiseRegistered lifts the baseline to what is held now and never lowers it: a
+// commit proves the session can hold that many, not that fewer is the new normal.
+// Storing the count outright let a partial re-subscribe redefine healthy as the
+// smaller set, leaving no gap for the symbols it failed to restore.
+// Caller must hold lock.
+func (m *notificationManager) raiseRegistered() {
+	if n := int64(len(m.activeNotifications)); n > m.registered.Load() {
+		m.registered.Store(n)
+	}
+}
+
+// lowerRegisteredTo drops the baseline to n when it currently sits higher, for
+// the cases where a healthy session genuinely holds less than it used to: a
+// symbol the PLC no longer has, or a config abandoned after too many retries.
+// Without it the gap check would chase handles that can never come back.
+// Caller must hold lock.
+func (m *notificationManager) lowerRegisteredTo(n int) {
+	if int64(n) < m.registered.Load() {
+		m.registered.Store(int64(n))
+	}
+}
+
 func (m *notificationManager) hasLiveNotification(symbolName string) bool {
 	key := symbolKey(symbolName)
 	for _, entry := range m.activeNotifications {
@@ -357,17 +359,11 @@ const resubscribeMaxAttempts = 3
 // connection anyway if this does not land.
 const notificationReleaseTimeout = 2 * time.Second
 
-// releaseCleanupCtx picks the context for a best-effort release of PLC handles
-// the library declined to bind. A usable caller context is used as-is; a done one
-// is replaced, because the handles exist on the PLC either way and a context that
-// is already cancelled fails the delete before it is sent.
-// The replacement deliberately does NOT inherit cancellation: the batch may have
-// aborted precisely because the session is closing, and callers on that path
-// (resubscribeNotifications) pass the lifecycle context itself — deriving from it
-// would hand back a context that is already done. WithoutCancel keeps the values
-// and drops the Done channel, and the timeout is what keeps a closing session
-// from blocking here. A nil lifecycle context (Session struct literals) falls
-// back to Background rather than panicking inside WithTimeout.
+// releaseCleanupCtx picks the context for releasing handles the library declined
+// to bind: a usable caller ctx as-is, a done one replaced, since the handles exist
+// on the PLC either way. The replacement does NOT inherit cancellation -- the
+// batch may have aborted because the session is closing -- so WithoutCancel keeps
+// the values and a timeout bounds it. A nil lifecycle ctx falls back to Background.
 func (sess *Session) releaseCleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx.Err() == nil {
 		return ctx, func() {}
@@ -381,50 +377,23 @@ func (sess *Session) releaseCleanupCtx(ctx context.Context) (context.Context, co
 	return context.WithTimeout(parent, notificationReleaseTimeout)
 }
 
-// releaseUncommittedHandle gives back a PLC handle this session acquired but never
-// committed into activeNotifications.
-//
-// Deliberately the raw Client call, not the Session wrapper: the wrapper's job is
-// to retire a subscription the caller owns, and running it for a handle that was
-// never committed used to clear notificationChannel whenever activeNotifications
-// happened to be empty — the state every sweep leaves behind — which silently
-// dropped the caller's whole subscription set on the next resubscribe.
-//
-// The release also has to outlive a cancelled caller context. These paths run
-// after the PLC round-trip has already succeeded, so if the caller's deadline
-// expired during it, a delete on that same context is never sent and the PLC is
-// left streaming a subscription nobody owns. The batch path solved this with
-// releaseCleanupCtx; the single-symbol path was still passing ctx straight through.
+// releaseUncommittedHandle gives back a handle acquired but never committed.
+// Deliberately the raw Client call: the Session wrapper retires subscriptions the
+// caller owns, and using it here cleared notificationChannel whenever
+// activeNotifications was empty -- the state every sweep leaves behind. The
+// release must also outlive a cancelled caller ctx, or a deadline expiring during
+// the round-trip leaves the PLC streaming a subscription nobody owns.
 func (sess *Session) releaseUncommittedHandle(ctx context.Context, handle uint32) error {
 	releaseCtx, cancel := sess.releaseCleanupCtx(ctx)
 	defer cancel()
 	return sess.client.Load().DeleteDeviceNotification(releaseCtx, handle)
 }
 
-// takeNotificationHandles stops trusting the current notification registrations:
-// it empties activeNotifications and returns every handle the PLC still holds for
-// this session, the internal heartbeat included.
-//
-// Four places need exactly this — auto-reload after an online change, the
-// reconnect loop, heartbeat recovery, and terminal release — and each used to
-// open-code it. The heartbeat is deliberately NOT in activeNotifications (a beat
-// must never reach the caller), so every one of those copies had to remember it
-// separately. Only the Close path did. The other three left heartbeatHandle armed,
-// which made establishHeartbeat a no-op on the next connection: after its first
-// reconnect a session had no beat at all, could no longer notice its subscriptions
-// dying quietly, leaked one PLC handle per reconnect, and — once the PLC reissued
-// that handle number to a caller subscription — swallowed that tag's samples as
-// beats while keeping the watchdog clock fresh. Collecting the two together here
-// is the whole point.
-//
-// quiesceDispatch bumps lastSubscribeNs so samples already in flight for the
-// handles we are about to delete are logged as race-window noise rather than Warn.
-// Callers whose transport is still alive want that; a reconnect about to tear the
-// transport down does not, because nothing more can arrive on it.
-//
-// The heartbeat clock is restarted rather than zeroed: zero reads as "no beat
-// expected yet" and would park heartbeatWatch permanently if the re-subscribe that
-// follows never manages to register a new beat.
+// takeNotificationHandles empties activeNotifications and returns every handle the
+// PLC still holds, heartbeat included -- the point, since the heartbeat is not in
+// that map and callers open-coding this forgot it, leaving the session with no beat.
+// quiesceDispatch makes in-flight samples for the doomed handles read as race-window
+// noise; the heartbeat clock restarts rather than zeroing, which would park the watcher.
 func (sess *Session) takeNotificationHandles(quiesceDispatch bool) []uint32 {
 	sess.notifications.lock.Lock()
 	handles := make([]uint32, 0, len(sess.notifications.activeNotifications)+1)
@@ -460,18 +429,14 @@ func (sess *Session) releaseNotificationHandles(ctx context.Context, handles []u
 	return deleted
 }
 
-// AddSymbolNotification registers a notification for a single symbol.
-// All notifications on one connection must share the same updateReceiver
-// channel; subscribing the same symbol twice is rejected.
-// On reconnect, the stored channel is used to re-subscribe all notifications.
-// For multiple notifications, prefer AddSymbolNotifications.
+// AddSymbolNotification subscribes a single symbol. All notifications on one
+// connection share the same channel, and a duplicate symbol is rejected; the
+// stored channel is reused to re-subscribe after a reconnect. Prefer
+// AddSymbolNotifications for more than one.
 //
-// Channel ownership: the caller MUST NOT close updateReceiver while any
-// notification is active on this connection. The library guards against
-// accidental close with a recover (see deliverNotification), but a closed
-// channel will silently drop notifications and emit Error logs. To stop
-// receiving notifications, call DeleteDeviceNotification or Close() — these
-// remove the PLC-side registration before the channel is no longer used.
+// The caller MUST NOT close updateReceiver while any notification is active -- a
+// recover guards against it, but samples are silently dropped. Delete them or
+// Close first.
 func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName string, maxDelay time.Duration, cycleTime time.Duration, transMode TransMode, updateReceiver chan *Update) (uint32, error) {
 	// Refuse outside RUN rather than produce a misleading failure: in CONFIG the
 	// runtime port does not exist, so this cannot succeed, and the PLC's answer is
@@ -527,17 +492,11 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 		maxDelay,
 		cycleTime)
 	if err != nil {
-		// Online-change detection (R-CACHE-009). Same intercept as
-		// readFromSymbolRetry / writeToSymbolRetry: the request above carried a
-		// cached symbol handle, so a stale-cache code here means that handle is
-		// dead. On TC3 a runtime restart answers 0x710 and does NOT bump the
-		// symbol version, so this is the only signal there is — without it every
-		// later subscribe repeats the same dead handle forever.
-		//
-		// Detection only, deliberately no retry: subscribe is not idempotent, and
-		// a retry racing the reload's own resubscribe would double-register the
-		// symbol. The caller's next call re-resolves by name and succeeds, which
-		// is the same two-call shape the read path has in practice.
+		// Online-change detection: the request carried a cached handle, so a
+		// stale-cache code means it is dead. On TC3 a runtime restart answers 0x710
+		// without bumping the symbol version, making this the only signal there is.
+		// Detection only -- subscribe is not idempotent, and a retry racing the
+		// reload's own resubscribe would double-register the symbol.
 		var rc ReturnCode
 		if errors.As(err, &rc) {
 			sess.handleStaleDetection(rc)
@@ -545,7 +504,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 		return 0, err
 	}
 	// A subscription now exists, so it is worth protecting.
-	sess.establishHeartbeat(ctx)
+	_ = sess.establishHeartbeat(ctx)
 	// Per-subscription, so it scales with the caller's symbol count. See the note
 	// on "symbol resolved on-demand".
 	sess.logger.Debug("notification created",
@@ -606,6 +565,8 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	}
 	defer sess.notifications.lock.Unlock()
 	sess.notifications.activeNotifications[handle] = activeNotification{Sym: fresh, Ch: updateReceiver}
+	// The PLC gave us this handle, so it is part of what a healthy session holds.
+	sess.notifications.raiseRegistered()
 	committed = append(committed, handle)
 
 	// Save config for reconnect re-subscribe
@@ -620,32 +581,11 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	return handle, nil
 }
 
-// AddSymbolNotifications adds multiple symbol notifications in a single ADS round-trip using SumAddDeviceNotification.
-// Returns per-config results (parallel to configs) so callers can detect
-// partial failure. A non-nil error indicates the batch could not be sent at
-// all (transport failure); per-item state is still in the result slice.
-//
-// Per-result state:
-//   - Skipped != nil: the library did not commit this entry. Match it against
-//     the ErrNotification* sentinels to decide what to do; ErrNotificationStranded
-//     ByReload and ErrNotificationTransportFailure are worth retrying, the
-//     others are caller bugs. Error is not meaningful. Handle IS meaningful
-//     when non-zero: the PLC created that registration before the library
-//     refused it. The library releases it best-effort before returning, and
-//     surfaces it here so the caller can verify or retry that release.
-//   - Skipped == nil && Error != ReturnCodeNoErrors: PLC accepted the batch
-//     but rejected this item (e.g. invalid handle).
-//   - Skipped == nil && Error == ReturnCodeNoErrors: success; Handle is valid.
-//
-// Partial outcomes are normal: a batch over a network is not atomic. In
-// particular a symbol-cache reload landing mid-batch invalidates entries this
-// call had already committed, and those are reported as Skipped with
-// ErrNotificationStrandedByReload rather than as successes.
-//
-// Channel ownership: the caller MUST NOT close ch while any notification is
-// active on this connection. To stop receiving notifications, call
-// DeleteDeviceNotification or Close() — these remove the PLC-side registration
-// before the channel is no longer used.
+// AddSymbolNotifications subscribes several symbols in one round-trip, returning
+// results parallel to configs; a non-nil error means the batch never went at all.
+// Partial outcomes are normal. Skipped != nil means the library did not commit it
+// (match the ErrNotification* sentinels), otherwise Error is the PLC's verdict and
+// NoErrors means Handle is valid. Do not close ch while notifications are active.
 func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []NotificationConfig, ch chan *Update) ([]SumNotificationResult, error) {
 	// Refuse outside RUN rather than produce a misleading failure: in CONFIG the
 	// runtime port does not exist, so this cannot succeed, and the PLC's answer is
@@ -782,16 +722,10 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		}
 		if r.Error != ReturnCodeNoErrors {
 			results[info.configIndex] = r
-			// Level by whether anyone has to act. A code in the stale-detection set
-			// is the expected answer after a runtime restart: detection fires, the
-			// handle is invalidated, and the next call re-resolves it. Measured on a
-			// TC3 box, logging those at Error turned one ordinary restart into 22
-			// ERROR lines in a second for a condition that healed immediately —
-			// the log-flood shape this branch has already fixed twice elsewhere.
-			// Anything else is something the library cannot resolve on its own.
-			//
-			// The code reaches the caller in results either way, so demoting costs
-			// no signal.
+			// Level by whether anyone has to act: a stale-detection code is the
+			// expected answer after a runtime restart and heals itself, and logging
+			// those at Error turned one restart into 22 ERROR lines in a second. The
+			// code reaches the caller in results either way, so demoting costs nothing.
 			level := slog.LevelError
 			if stale, _ := detectStaleCache(r.Error); stale {
 				level = slog.LevelWarn
@@ -828,34 +762,17 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		sess.warnUnresolvedBaseType(info.config.SymbolName)
 	}
 
-	// settle is the batch tail: the sweep amendment, then the release of every PLC
-	// handle nothing on this side ended up owning. Deferred rather than called at
-	// each return, because the bug it fixes was a return path that skipped it —
-	// the transport-abort path, which is exactly where handles get created and not
-	// bound. A defer covers every present and future exit, panics included. It is
-	// registered AFTER the endSubscribe defer so LIFO runs settle first: the
-	// amendment must decide what is stranded before the replay looks at what
-	// committed. On a dead transport the delete short-circuits in
-	// sumDeleteNotificationFallback, so this costs one failed round trip, not one
-	// per handle.
+	// settle is the batch tail: amend the sweep, then release every handle nothing
+	// here ended up owning. Deferred because the bug it fixes was a return path that
+	// skipped it -- the transport abort, which is exactly where handles are created
+	// and not bound. Registered AFTER the endSubscribe defer so LIFO runs it first:
+	// the amendment must decide what is stranded before the replay looks.
 	settle := func() {
-		// A sweep (auto-reload, reconnect, resource release) snapshots
-		// activeNotifications, wipes it, and deletes those handles PLC-side.
-		// Anything this batch committed before that was in the snapshot, so it now
-		// exists on neither side, and reporting it as a success would be a silent
-		// lie. No unwinding is needed precisely because the sweep already released
-		// them.
-		//
-		// The question is per entry — "was MINE swept" — so it is asked of the map
-		// rather than inferred from a generation counter. A counter answers "a
-		// sweep happened", which is a different question: an item that commits
-		// AFTER the sweep lands in the fresh map, is owned by nobody else, and is
-		// in no snapshot anyone will delete. Stranding it reports a working
-		// subscription as gone and then deletes the handle out from under the
-		// caller. That is not hypothetical on the reconnect path, which sweeps
-		// without bumping the epoch, so commitNotification cannot refuse the late
-		// commit. Asking the map also needs no bump site to be remembered at every
-		// present and future place that sweeps.
+		// A sweep wipes activeNotifications and deletes those handles PLC-side, so
+		// anything this batch committed beforehand now exists on neither side and
+		// must not be reported as success. Asked of the map, not a generation
+		// counter: "was MINE swept" is per entry, and a counter would also strand an
+		// item that commits after the sweep and is owned by nobody else.
 		if len(committedIdx) > 0 {
 			var stranded []int
 			sess.notifications.lock.Lock()
@@ -944,23 +861,16 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 	// Everything else was already bound (or recorded as failed/skipped) by
 	// onItem as its result arrived; nothing left to commit here.
 	if len(committed) > 0 {
-		sess.establishHeartbeat(ctx)
+		_ = sess.establishHeartbeat(ctx)
 	}
 	return results, nil
 }
 
-// commitNotification binds a PLC-assigned handle to its symbol, making the
-// handle recognisable to dispatchSample. Returns nil on success, or the reason
-// the library refused to commit — the caller surfaces that as Skipped together
-// with the handle so the PLC-side registration can be released.
-//
-// Called once per handle, as soon as that handle is known, so a batch that the
-// PLC serves one Add at a time has each symbol bound while the rest are still
-// registering rather than all of them at the end.
-//
-// Caller must hold neither cache.lock nor notifications.lock: this takes
-// cache.lock first and releases it before taking notifications.lock, per the
-// never-both-held rule.
+// commitNotification binds a PLC handle to its symbol so dispatchSample
+// recognises it, returning the reason for any refusal so the caller can surface
+// it as Skipped and release the registration. Called once per handle as soon as
+// it is known, so a batch served one Add at a time binds progressively. Caller
+// must hold neither lock: this takes cache.lock and releases it before the other.
 func (sess *Session) commitNotification(cfg NotificationConfig, handle uint32, ch chan *Update, batchCacheEpoch uint64) error {
 	// Re-fetch the *symbol under cache.lock. The pointer resolved before the
 	// PLC round-trip may have been stranded by a concurrent loadSymbols /
@@ -993,6 +903,10 @@ func (sess *Session) commitNotification(cfg NotificationConfig, handle uint32, c
 	}
 
 	sess.notifications.activeNotifications[handle] = activeNotification{Sym: fresh, Ch: ch}
+	// Same as the single-subscribe site: this is what a healthy session holds.
+	// Missing it here made the gap check inert for every batch subscriber, which
+	// is how the plugin subscribes -- caught on hardware, want=0 have=1.
+	sess.notifications.raiseRegistered()
 	// addConfig wraps in a fresh pendingNotification with resubscribeAttempts=0,
 	// so a successful subscribe naturally resets any prior retry counter.
 	sess.notifications.addConfig(cfg)

@@ -186,6 +186,18 @@ func (s *symbol) parse(data []byte, offset int, datatypes map[string]SymbolUploa
 		// Use ADST_ numeric type code from protocol (authoritative).
 		// The PLC sends the correct base type (e.g., ADSTReal32=4 for a REAL-based alias).
 		if resolved := adsTypeToString(s.BaseType); resolved != "" {
+			// An array reports its element's ADST_ code with the whole array's
+			// Length, so resolving on BaseType alone would hand the scalar case
+			// 40 bytes to read a 4-byte DINT. That reports "DINT Size Wrong" --
+			// a type the caller never asked for, and no hint that the datatype
+			// table is what is missing. Children (and with them per-element
+			// parsing) are only linked when that table resolves the type, so
+			// name the real problem.
+			if w := adsTypeWidth(s.BaseType); w > 0 && w != s.Length {
+				return "", fmt.Errorf("cannot parse %s: %d bytes, but its base type %s is %d bytes — "+
+					"this looks like an array or struct, which needs the datatype table; call LoadSymbols()",
+					s.DataType, s.Length, resolved, w)
+			}
 			cp := *s
 			cp.DataType = resolved
 			val, err := cp.parse(data, offset, nil)
@@ -256,36 +268,13 @@ var parseableTypes = []string{
 	"LWORD",
 }
 
-// inferBaseType guesses a parseable base type from a symbol's byte size,
-// last-resort fallback when neither the protocol's ADST_ code nor the
-// uploaded datatype table can resolve the type (on-demand mode without
-// LoadSymbols / LoadDataTypes).
+// inferBaseType guesses a base type from a symbol's byte size, the last resort
+// when neither the ADST_ code nor the datatype table resolves it.
 //
-// At 4 and 8 byte widths the layout is genuinely ambiguous between integer
-// and IEEE-754 float (DINT/REAL share size, LINT/LREAL share size).
-// Interpreting a REAL as a DINT silently corrupts every parse — 1.5
-// (0x3FC00000) becomes 1069547520. Per the Beckhoff Information System,
-// the authoritative way to resolve user-defined types (BIGTYPE) is to
-// look up symDataType in the datatype table, not to infer from size:
-//
-//	"All PLC structures and arrays (user-defined data types) have the ADS
-//	 data type name: ADST_BIGTYPE and can not be identified through this
-//	 data type constant. In order to be able to identify the user-defined
-//	 data types, use the symDataType variable, or read the base type of the
-//	 individual variables in the structure."
-//
-// To prevent silent corruption, this fallback only handles 1- and 2-byte
-// widths where no IEEE-754 form exists and signed/unsigned only affects
-// rendering of the same bytes. 4 and 8 byte symbols without a table
-// loaded return "" so the caller surfaces a clear error and the user
-// resolves the type via LoadSymbols (Beckhoff-blessed path).
-//
-// baseType is the ADST_ protocol code for the symbol's resolved primitive,
-// when known. The parameter exists so callers thread the protocol code
-// through to keep the resolution chain explicit. Currently the function
-// inspects only `size` because the 1/2-byte cases are unambiguous regardless
-// of baseType; future tightening (refusing 1/2-byte inference when baseType
-// indicates a non-integer primitive) lands here.
+// Only 1- and 2-byte widths, where no IEEE-754 form exists. At 4 and 8 the layout
+// is ambiguous (DINT/REAL, LINT/LREAL) and reading a REAL as a DINT silently
+// corrupts every parse, so those return "" and the caller points at LoadSymbols.
+// baseType is threaded through for the chain; only size is inspected today.
 func inferBaseType(size uint32, baseType ADSDataType) string {
 	_ = baseType // reserved for future width+type tightening; see godoc above.
 	switch size {

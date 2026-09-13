@@ -144,19 +144,11 @@ func (sess *Session) readFromSymbolRetry(ctx context.Context, symbolName string,
 	return value, nil
 }
 
-// symbolSumAddress returns the index group and offset to use for a symbol
-// inside a sum command (batch read/write).
-//
-// It prefers handle-based addressing (ADSIGRP_SYM_VALBYHND / 0xF005) because
-// direct group/offset addressing with process image groups (e.g. 0x4040) does
-// not work inside sum read commands on some TwinCAT versions, even with correct
-// absolute offsets.
-//
-// Falls back to direct group/offset with accumulated absolute offsets when no
-// handle is available (e.g. before handle acquisition).
-//
-// Caller MUST hold cache.lock: this reads sym.Handle which is written by
-// zeroOldSymbolHandles + handle-resolve paths under the same lock.
+// symbolSumAddress returns the group and offset for a symbol inside a sum command.
+// Prefers handle-based addressing, because direct group/offset with process image
+// groups does not work inside sum reads on some TwinCAT versions even with correct
+// offsets; falls back to direct when no handle exists yet. Caller MUST hold
+// cache.lock -- it reads sym.Handle.
 func symbolSumAddress(sym *symbol) (group, offset uint32) {
 	if sym.Handle != 0 {
 		return uint32(GroupSymbolValueByHandle), sym.Handle
@@ -173,18 +165,11 @@ func symbolSumAddress(sym *symbol) (group, offset uint32) {
 	return uint32(GroupSymbolValueByHandle), sym.Handle
 }
 
-// ReadMultipleSymbols reads multiple symbols in a single ADS round-trip using SumRead.
-// Returns a map of symbol name to parsed string value, holding one entry per
-// symbol that was read successfully.
-//
-// Any symbol that produced no value is reported in a *BatchError, recoverable
-// with errors.As, which names each failed symbol and says whether the PLC
-// rejected it or the library never got a value onto or off the wire. The map is
-// still usable in that case: one absent symbol in a batch of forty leaves the
-// other thirty-nine present. A returned error that is NOT a *BatchError means
-// the transport failed and no item's outcome is known.
-//
-// Reading no symbols returns nil, nil.
+// ReadMultipleSymbols reads several symbols in one round-trip, returning a map of
+// name to parsed value for those that succeeded. Failures are named in a
+// *BatchError (errors.As), and the map stays usable -- one absent symbol in forty
+// leaves thirty-nine present. Any other error means the transport failed and no
+// outcome is known. Reading none returns nil, nil.
 func (sess *Session) ReadMultipleSymbols(ctx context.Context, names []string) (map[string]string, error) {
 	return sess.readMultipleSymbolsRetry(ctx, names, 1)
 }
@@ -315,22 +300,14 @@ func (sess *Session) readMultipleSymbolsRetry(ctx context.Context, names []strin
 	return values, newBatchError("read", len(names), len(values), failed)
 }
 
-// WriteMultipleSymbols writes multiple symbols in a single ADS round-trip using SumWrite.
-// Returns a map of symbol name to per-symbol error code, holding one entry per
-// symbol that reached the PLC.
+// WriteMultipleSymbols writes several symbols in one round-trip, returning a map
+// of name to per-symbol code for those that reached the PLC.
 //
-// Do not read success out of the map alone: ReturnCodeNoErrors is 0, so a
-// symbol that was never written — because it would not resolve, or its value
-// would not serialize — is indistinguishable from a successful one by its map
-// entry's zero value. Any symbol that was not written successfully is named in
-// a *BatchError, recoverable with errors.As, which says whether the PLC
-// rejected the write or the library never sent it. A returned error that is NOT
-// a *BatchError means the transport failed and no item's outcome is known.
-//
-// Uses direct iGroup/iOffs addressing when available (after LoadSymbols),
-// falling back to handle-based addressing for on-demand symbols.
-//
-// Writing no symbols returns nil, nil.
+// Do not read success from the map alone: NoErrors is 0, so a symbol that was
+// never written is indistinguishable from one that succeeded. Failures are named
+// in a *BatchError (errors.As), which says whether the PLC rejected it or the
+// library never sent it; any other error means the transport failed and no
+// outcome is known. Writing none returns nil, nil.
 func (sess *Session) WriteMultipleSymbols(ctx context.Context, values map[string]string) (map[string]ReturnCode, error) {
 	return sess.writeMultipleSymbolsRetry(ctx, values, 1)
 }

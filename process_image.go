@@ -7,23 +7,13 @@ import (
 	"math"
 )
 
-// Process Image I/O
+// Process Image I/O — EXPERIMENTAL. Direct access to the PLC's process image,
+// bypassing the symbol table to read and write raw I/O memory.
 //
-// EXPERIMENTAL — These methods provide direct access to the PLC's process image
-// memory. Unlike symbol-based access (ReadFromSymbol/WriteToSymbol), process image
-// operations bypass the symbol table and write raw bytes to I/O memory regions.
-//
-// WARNING: Writing to the wrong offset can cause unexpected physical output changes
-// (motors, valves, actuators). The PLC runtime may overwrite your changes on the
-// next scan cycle, or your writes may conflict with the running PLC program.
-//
-// Use cases:
-//   - Diagnostics: reading raw I/O state without symbol resolution
-//   - Commissioning: toggling outputs before PLC program is deployed
-//   - Testing: verifying I/O wiring by reading/writing specific bits
-//
-// For normal operation, prefer symbol-based access (ReadFromSymbol/WriteToSymbol)
-// which is safer and self-documenting.
+// WARNING: a wrong offset can change physical outputs (motors, valves, actuators).
+// The runtime may overwrite your write on the next scan, or conflict with the
+// running program. For diagnostics, commissioning and I/O testing; prefer
+// symbol-based access for normal operation.
 
 // EXPERIMENTAL: ReadProcessInput reads bytes from the input process image at the given byte offset.
 func (c *Client) ReadProcessInput(ctx context.Context, byteOffset, length uint32) ([]byte, error) {
