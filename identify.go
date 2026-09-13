@@ -10,22 +10,13 @@ import (
 	"time"
 )
 
-// Target discovery over the AMS router's identify service.
+// Target discovery over the AMS router's identify service: UDP 48899, the same
+// framing as route registration with service id 1 instead of 6.
 //
-// A caller normally has to know the PLC's AmsNetId before it can talk to it,
-// and a wrong one is the single most common ADS misconfiguration: the router
-// accepts the TCP socket and then silently drops every request, which looks
-// nothing like an addressing mistake. The router will however tell you its own
-// NetID if asked over UDP — the same port and framing used to register a route
-// (48899), with service id 1 instead of 6.
-//
-// The request is read-only. It registers nothing, needs no route and no
-// credentials, and it answers before any route exists, which is what makes it
-// usable to bootstrap a connection rather than only to inspect one.
-//
-// Verified against TwinCAT 2.10 (CX), TwinCAT 3.1.4024 (CX) and TwinCAT 3.1.4026
-// on TC/RTOS. All three answer a request carrying a zero source NetID, so
-// discovery needs no local configuration at all.
+// A wrong NetID is the most common ADS misconfiguration and looks nothing like
+// one -- the router accepts the socket and silently drops every request. This
+// asks the router for its own. Read-only, needs no route or credentials, and
+// answers before any route exists, so it can bootstrap a connection.
 const (
 	routeServiceIdentify = 1
 
@@ -47,17 +38,12 @@ const (
 	identifyReadBuf = 64 * 1024
 )
 
-// RemoteIdentity is what a TwinCAT AMS router reports about ITSELF.
-// Obtained with IdentifyRemote.
+// RemoteIdentity is what an AMS router reports about ITSELF, from IdentifyRemote.
 //
-// Read AMS carefully: it is the identity of the router answering at that IP,
-// not "the NetID of the PLC behind it". An AMS router routes to many NetIDs, so
-// on an embedded target (a CX, where the router and the runtime are the same
-// device) this is the PLC's NetID, but on an engineering PC or a gateway
-// fronting other PLCs it is that machine's NetID and the PLC you want is one
-// of the entries in its route table. Nothing in the response distinguishes the
-// two cases — HostName and Version describe the responder, and NetIDs are not
-// derived from the IP, so they cannot be cross-checked either.
+// Read AMS carefully: it identifies the router answering at that IP, not the PLC
+// behind it. On a CX the two are the same device; on an engineering PC or gateway
+// the PLC you want is an entry in its route table. Nothing in the response
+// distinguishes the cases, and NetIDs are not derived from the IP.
 type RemoteIdentity struct {
 	// AMS is the router's own address. The port is the router's (10000), NOT a
 	// PLC runtime port — see RuntimePort.
@@ -97,16 +83,10 @@ func (id RemoteIdentity) RuntimePort() uint16 {
 	return uint16(PortR0PlcTc3)
 }
 
-// IdentifyRemote asks the device at host for its own AMS NetID and system
-// details. host is an IP or hostname, optionally with a port ("10.0.0.5:6499")
-// for a device reached through NAT port forwarding; bare hosts use the
-// protocol's own UDP port.
-//
-// Read-only — see the block comment above. Honors ctx's deadline if it is
-// sooner than the default 3s.
-//
-// The answer describes the ROUTER at that address, which is the PLC only when
-// the two are the same device. See RemoteIdentity.
+// IdentifyRemote asks the device at host for its own NetID and system details.
+// host may carry a port for NAT forwarding; bare hosts use the protocol's UDP
+// port. Read-only, honouring ctx's deadline if sooner than the default 3s. The
+// answer describes the ROUTER, which is the PLC only when they are one device.
 func IdentifyRemote(ctx context.Context, host string) (RemoteIdentity, error) {
 	return IdentifyRemoteWithLogger(ctx, getDefaultLogger(), host)
 }

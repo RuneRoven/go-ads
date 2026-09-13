@@ -95,15 +95,10 @@ var allowedTransitions = map[SessionState]map[SessionState]struct{}{
 	SessionStateClosed: nil, // terminal
 }
 
-// sessionFSM wraps the atomic state field plus a transition mutex. The mutex
-// serializes transitions; readers can Load lock-free.
-//
-// epoch is the unified generation counter: bumped on every transition INTO
-// Connected and on every cache.symbols swap during Connected (user-driven
-// LoadSymbols/LoadSymbolList/LoadDataTypes/RefreshSymbols). Retry helpers
-// and TOCTOU re-checks load epoch at start, compare at retry point; any
-// change means "something the caller cared about advanced." False-positive
-// retries (e.g. a transition + a swap during one reconnect) are harmless.
+// sessionFSM wraps the atomic state plus a transition mutex: transitions
+// serialize, readers Load lock-free. epoch is the generation counter, bumped on
+// every entry into Connected and every cache.symbols swap, so retry helpers and
+// TOCTOU re-checks can ask "did anything the caller cared about advance?".
 type sessionFSM struct {
 	mu    sync.Mutex
 	value atomic.Uint32
@@ -112,17 +107,10 @@ type sessionFSM struct {
 
 func (s *sessionFSM) load() SessionState { return SessionState(s.value.Load()) }
 
-// transitionTo advances the state from its current value to want, returning
-// the prior state and whether the transition was permitted by
-// allowedTransitions. Holds s.mu for the duration so concurrent transitions
-// serialize.
-//
-// Invalid transitions return ok=false; callers log but do not panic.
-//
-// Idempotent re-entry (from == want) returns ok=true without rechecking
-// the table — harmless. Use transitionToOnce() if the caller needs the
-// transition to be the FIRST one to land (Close gate, single-flight
-// Reconnect launch).
+// transitionTo advances the state to want, returning the prior state and whether
+// allowedTransitions permitted it; invalid ones return false and are logged, not
+// panicked. Idempotent re-entry returns true without rechecking the table. Use
+// transitionToOnce when the caller must be the FIRST to land.
 func (s *sessionFSM) transitionTo(want SessionState) (from SessionState, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -218,16 +206,10 @@ func (sess *Session) bumpEpoch() {
 	sess.lifecycle.state.epoch.Add(1)
 }
 
-// waitForReconnect blocks until any in-flight reconnect completes (or the
-// Session is closed). No-op if no reconnect is in flight.
-//
-// Used by Session-managed retry-helpers (readFromSymbolRetry etc.) before
-// they decide whether to retry. Without this, a fast-failing transport-down
-// error returns to the caller before the reconnect cycle has had a chance
-// to advance epoch — the helper's "epoch changed?" check fires false and
-// the user observes a transient failure that strict R-TX-005 says should
-// have been transparent. With waitForReconnect inserted before the epoch
-// re-check, the helper retries through the post-reconnect Client.
+// waitForReconnect blocks until any in-flight reconnect finishes, or the session
+// closes; a no-op otherwise. The retry helpers need it before their "epoch
+// changed?" check: a fast-failing transport-down error otherwise returns before
+// the reconnect advanced epoch, surfacing a transient failure as a real one.
 func (sess *Session) waitForReconnect() {
 	if sess.isClosed() {
 		return
