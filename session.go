@@ -2094,11 +2094,10 @@ func (sess *Session) Reconnect(ctx context.Context) error {
 			continue
 		}
 
-		// Release here, not after the reload: this is the first point where the
-		// transport is up AND routed, which is all a Delete needs. A session whose
-		// reload kept failing otherwise never issued these at all. Forget the
-		// snapshot only once every handle is accounted for -- clearing it on a
-		// release that did not land loses the record of what the PLC still holds.
+		// Release here, not after the reload: first point where the transport is up
+		// AND routed, which is all a Delete needs. Forget the snapshot only once
+		// every handle is accounted for, or a release that did not land loses the
+		// record of what the PLC still holds.
 		if len(savedHandles) > 0 {
 			releaseTries++
 			deleted := sess.bestEffortDeleteNotifications(sess.currentLifecycleCtx(), savedHandles)
@@ -2194,10 +2193,9 @@ func (sess *Session) ensureRoute() error {
 	}
 
 	// Register on force or repeated probe failures, unless this session registered
-	// recently: re-registering the same route fixes nothing and on some firmware
-	// leaves a duplicate entry. Force bypasses the latch, as it does on Connect --
-	// gating it made WithForceRouteRegistration mean "register once, then stop",
-	// failing the reboot case it exists for.
+	// recently -- re-registering fixes nothing and on some firmware leaves a
+	// duplicate entry. Force bypasses the latch, or the option would mean "register
+	// once, then stop" and fail the reboot case it exists for.
 	probeFailures := sess.route.routeProbeFailures.Load()
 	if sess.route.forceRouteRegistration || probeFailures >= 3 {
 		if !sess.route.forceRouteRegistration && !sess.route.mayRegister() {
@@ -2420,11 +2418,9 @@ func (sess *Session) tearDownAndReset() {
 	// dialAndStart on each reconnect attempt) has zero-value capabilities,
 }
 
-// dialAndStart performs net.DialTimeout, configures keepalive, clears the
-// disconnected flag, and starts the listen/transmit goroutines. Used by both
-// Connect()'s post-route-registration redial path and Reconnect()'s retry loop.
-// Re-checks closed before waitGroup.Add(2) to prevent the sync.WaitGroup
-// misuse race.
+// dialAndStart dials, configures keepalive, clears the disconnected flag and
+// starts the workers, for both Connect's post-route redial and Reconnect's retry
+// loop. Re-checks closed before waitGroup.Add to avoid the misuse race.
 func (sess *Session) dialAndStart() error {
 	newConn, err := sess.dialTCP()
 	if err != nil {
@@ -2467,10 +2463,9 @@ func (sess *Session) sourceAddr() AMSAddress {
 }
 
 // publishWiredClient wires and starts the Client for the connection on sess.tx.
-// ctx and cancel must be captured under one RLock, or the Client gets a context
-// from one generation and the cancel of the next. Publish before startWorkers:
-// the workers read sess.client, and a drop in that window tears down the previous
-// Client while this one's workers run unwaited.
+// ctx and cancel come from one RLock, or the Client gets a context from one
+// generation and the cancel of the next. Publish before startWorkers: the workers
+// read sess.client, and a drop in that window tears down the previous Client.
 func (sess *Session) publishWiredClient() *Client {
 	sess.lifecycle.ctxMu.RLock()
 	clientCtx := sess.lifecycle.ctx
@@ -2510,10 +2505,9 @@ func (sess *Session) publishWiredClient() *Client {
 const peerFallbackProbes = 3
 
 // peerRouteHosts remembers which devices answer only on a connection they open to
-// us, for the life of the process: learning it costs ~15s and is a property of the
-// device, not the session. Keyed by host AND port, or the test stubs sharing
-// 127.0.0.1 would all inherit one stub's verdict. A stale entry only pre-binds the
-// listener; the normal probe still runs and still wins.
+// us: learning it costs ~15s and is a property of the device, not the session.
+// Keyed by host AND port, or test stubs sharing 127.0.0.1 inherit one verdict. A
+// stale entry only pre-binds the listener; the normal probe still wins.
 var peerRouteHosts sync.Map // "host:port" -> struct{}
 
 func (sess *Session) peerRouteCacheKey() string {
@@ -2528,10 +2522,9 @@ func rememberPeerRouteHost(key string) { peerRouteHosts.Store(key, struct{}{}) }
 func forgetPeerRouteHost(key string) { peerRouteHosts.Delete(key) }
 
 // forgetPeerRouteHostIfUnused drops the remembered fact when a session reached
-// Connected with no inbound connection from the device. Safe to call
-// unconditionally because a device that dialled us has peerConnsAdopted > 0 and
-// keeps its entry. No expiry needed: the first Connect that does not need the
-// entry drops it, which beats any timeout.
+// Connected with no inbound connection. Safe unconditionally: a device that dialled
+// us has peerConnsAdopted > 0 and keeps its entry. The first Connect that does not
+// need it drops it, which beats any expiry.
 func (sess *Session) forgetPeerRouteHostIfUnused() {
 	if sess.peerConnsAdopted.Load() != 0 {
 		return
@@ -2559,11 +2552,9 @@ func (sess *Session) tryPeerFallback(ctx context.Context) (rescued bool, why err
 		sess.logger.Info("PLC answered nothing on our connection; listening for one it may open to us",
 			"port", sess.peerListenPortOrDefault())
 	}
-	// Probe either way. Returning early when a listener already existed was wrong
-	// twice over: a caller that set WithAmsPeerListen never got the fallback's
-	// probes at all, and pre-binding for a device already KNOWN to answer on its own
-	// connection turned the fast path into a guaranteed failure. Whether the device
-	// answers there is exactly what the probes below determine.
+	// Probe either way. Returning early when a listener existed was wrong twice: a
+	// caller setting WithAmsPeerListen never got the probes, and pre-binding for a
+	// device known to answer on its own connection made the fast path fail outright.
 
 	for attempt := 1; attempt <= peerFallbackProbes; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -2598,11 +2589,10 @@ func (sess *Session) peerListenPortOrDefault() int {
 // port a PLC serves ADS on. Only relevant with WithAmsPeerListen.
 const amsPeerListenPort = 48898
 
-// startPeerListener accepts connections the PLC opens to us, handing each to
-// whichever Client is current so it survives reconnects. A mutex, not sync.Once:
-// Once runs its body once whether it succeeded or not, so after a failed bind
-// every later call returned nil with nothing listening -- hiding the usual cause,
-// a local TwinCAT router already owning the port.
+// startPeerListener accepts connections the PLC opens to us, handing each to the
+// current Client so it survives reconnects. A mutex, not sync.Once: Once runs its
+// body once whether it succeeded or not, so after a failed bind every later call
+// returned nil with nothing listening.
 func (sess *Session) startPeerListener() error {
 	sess.peerMu.Lock()
 	defer sess.peerMu.Unlock()
@@ -2669,10 +2659,9 @@ func (sess *Session) peerAcceptLoop(ln net.Listener) {
 func (sess *Session) stopPeerListener() {
 	sess.peerMu.Lock()
 	// Latch so a Connect descheduled just before its bind cannot bind after Close
-	// returns, leaving 48898 held in a session the caller believes is closed. Set
-	// BEFORE releasePeerListener takes the lock: startPeerListener holds peerMu
-	// across net.Listen, so a visible latch means the bind either landed or is
-	// refused.
+	// returns. Set BEFORE releasePeerListener takes the lock: startPeerListener
+	// holds peerMu across net.Listen, so a visible latch means the bind either
+	// landed or is refused.
 	sess.peerStopped = true
 	sess.peerMu.Unlock()
 	sess.releasePeerListener()
@@ -2714,11 +2703,9 @@ func (sess *Session) localHandshake() error {
 	return nil
 }
 
-// resubscribeNotifications restores notification subscriptions stored in
-// notificationConfigs after a successful reconnect. Filters out symbols that
-// no longer exist after symbol reload. On error, rolls back partial PLC-side
-// successes and restores the saved configs so they can be retried by
-// the next reconnect attempt.
+// resubscribeNotifications restores the stored subscriptions after a reconnect,
+// filtering out symbols that no longer exist. On error it rolls back partial
+// PLC-side successes and restores the configs for the next attempt.
 func (sess *Session) resubscribeNotifications() error {
 	// One re-subscribe at a time, whichever path asked for it. See
 	// notificationManager.resubscribeMu: the snapshot-then-clear at the top of this
@@ -2773,11 +2760,10 @@ func (sess *Session) resubscribeNotificationsLocked() error {
 		sess.notifications.lock.Unlock()
 		return nil
 	}
-	// Same reasoning for a partial disappearance: what filterValidPending dropped
-	// is gone from the PLC, not missing because a re-subscribe failed, so it must
-	// come off the baseline. Everything still on file -- including entries this
-	// attempt will fail to restore and re-queue -- stays counted, which is what
-	// leaves the shortfall visible as want > have.
+	// What filterValidPending dropped is gone from the PLC, not missing because a
+	// re-subscribe failed, so it comes off the baseline. Everything still on file --
+	// including what this attempt re-queues -- stays counted, leaving a shortfall
+	// visible as want > have.
 	if dropped := len(savedPending) - len(validPending); dropped > 0 {
 		sess.notifications.lock.Lock()
 		sess.notifications.lowerRegisteredTo(len(validPending))
@@ -2785,11 +2771,9 @@ func (sess *Session) resubscribeNotificationsLocked() error {
 		sess.logger.Info("re-subscribe: symbols are no longer on the PLC, lowering what a healthy session holds",
 			"dropped", dropped, "remaining", len(validPending))
 	}
-	// Snapshot active handles before the re-subscribe attempt. If
-	// AddSymbolNotifications partially succeeds and then errors, we use the
-	// snapshot diff to roll back the PLC-side registrations created during
-	// this attempt. Without rollback, repeated reconnect retries
-	// accumulate orphaned PLC notifications until the next TCP disconnect.
+	// Snapshot the handles first: on a partial success that then errors, the diff is
+	// what rolls back the registrations this attempt created. Without it, repeated
+	// retries accumulate orphaned notifications until the next disconnect.
 	sess.notifications.lock.Lock()
 	preHandles := make(map[uint32]struct{}, len(sess.notifications.activeNotifications))
 	for h := range sess.notifications.activeNotifications {
@@ -2964,11 +2948,9 @@ func (sess *Session) loadSymbols(ctx context.Context) error {
 		return fmt.Errorf("failed to parse symbols: %w", err)
 	}
 	sess.cache.lock.Lock()
-	// invalidate Handle on every old *symbol before swap so external
-	// callers holding old pointers (e.g. infos[i].symbol in
-	// readMultipleSymbolsRetry) fail fast on next use and re-resolve via
-	// GetSymbol instead of using a stale handle that the PLC may have
-	// reassigned to a different symbol after reconnect.
+	// Invalidate Handle on every old symbol before the swap, so a caller holding an
+	// old pointer fails fast and re-resolves instead of using a handle the PLC may
+	// have reassigned to a different symbol.
 	zeroOldSymbolHandles(sess.cache.symbols)
 	sess.cache.datatypes = datatypes
 	// Stamp the session's logger onto every symbol as the cache takes ownership,
@@ -3046,11 +3028,9 @@ func isRunningInContainer() bool {
 // it only yields a misleading AMS "port not found". The session keeps polling.
 var ErrRuntimeNotRunning = errors.New("ads: PLC runtime is not in RUN")
 
-// RuntimeState reads the device's ADS state from the system service port.
-//
-// This is the state of the SYSTEM, not of the runtime port the session talks to:
-// ADSStateConfig means the PLC is in configuration mode and no runtime port is
-// serving. Answers while the runtime is unavailable, which is the point.
+// RuntimeState reads the device's ADS state from the system service port. This is
+// the SYSTEM's state, not the runtime port's: ADSStateConfig means no runtime port
+// is serving. Answers while the runtime is unavailable, which is the point.
 func (sess *Session) RuntimeState(ctx context.Context) (ADSState, error) {
 	c := sess.client.Load()
 	if c == nil {
@@ -3089,18 +3069,15 @@ func (sess *Session) recordRuntimeState(state ADSState) {
 		return
 	}
 	sess.logger.Info("PLC runtime state changed", "from", previous, "to", state)
-	// No nudge into the heartbeat watcher here. One was written — force a recovery on
-	// the transition back into RUN — and then removed: with deferrals no longer
-	// counted as failures the interval never inflates while a runtime is unavailable,
-	// so no test could distinguish the nudge being present from absent. Unprovable
-	// machinery, and a coupling from the state poll into notification internals.
+	// No nudge into the heartbeat watcher. One was written and removed: with
+	// deferrals no longer counted as failures the interval never inflates while the
+	// runtime is away, so no test could tell the nudge from its absence.
 }
 
-// runtimeStateTTL is how long a state reading is trusted; beyond it the gates
-// permit again. Without an expiry a session that saw CONFIG and then lost the
-// system service refused everything for life, with no poller left to notice the
-// runtime return. Failing open costs an attempt the PLC answers; failing closed
-// costs the session.
+// runtimeStateTTL is how long a reading is trusted; beyond it the gates permit
+// again. Without it a session that saw CONFIG and lost the system service refused
+// everything for life. Failing open costs one attempt the PLC answers, failing
+// closed costs the session.
 const runtimeStateTTL = 30 * time.Second
 
 // knownRuntimeState returns the last observed state and whether one was observed
@@ -3151,11 +3128,9 @@ func (sess *Session) requireRunningRuntime(what string) error {
 // would carry a notification does not exist. Gives up after a run of failures, so
 // a device without a system service port costs nothing and the gates permit.
 func (sess *Session) startRuntimeStateWatch() {
-	// Checked OUTSIDE stateOnce.Do on purpose: consuming the Once here would mean a
-	// session that had the watch disabled could never start one, and it costs
-	// nothing to leave the Once unused. With the watch off, stateWG.Wait() in Close
-	// is a no-op at zero and the gates fall back to permitting with no reading,
-	// which is exactly the behaviour that predates the watch.
+	// Checked OUTSIDE stateOnce.Do: consuming the Once here would leave a session
+	// that had the watch disabled unable to ever start one. With it off, Close's
+	// wait is a no-op and the gates fall back to permitting.
 	if sess.stateWatchDisabled {
 		sess.logger.Debug("runtime state watch disabled by option")
 		return
@@ -3200,11 +3175,9 @@ func (sess *Session) startRuntimeStateWatch() {
 				c.endHandshake()
 				cancel()
 				if err != nil {
-					// Only an answer counts as evidence. A timeout says nothing about
-					// whether the port exists — it is what a busy device, a congested
-					// link, or a router mid-activation produces — so counting those
-					// towards "this device has no system service" retired the feature
-					// on healthy hardware.
+					// Only an answer is evidence. A timeout is what a busy device or a
+					// router mid-activation produces, so counting those towards "no
+					// system service" retired the feature on healthy hardware.
 					if !isDeviceAnswer(err) {
 						sess.logger.Debug("runtime-state poll did not get an answer; not counting it against the device",
 							"error", err)
