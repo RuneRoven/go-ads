@@ -537,6 +537,47 @@ func TestMakeArrayChildren_2D(t *testing.T) {
 	}
 }
 
+// A symbol of a 2-D array type must expand to rows of elements and parse. The
+// outer rows name the element type (INT), so expanding them by datatype lookup
+// made each 6-byte row a single INT and failed with "INT Size Wrong".
+func TestAddSymbol_2DArrayParses(t *testing.T) {
+	const typeName = "ARRAY [0..2,0..2] OF INT"
+	levels := []datatypeArrayInfo{{LBound: 0, Elements: 3}, {LBound: 0, Elements: 3}}
+	datatypes := map[string]SymbolUploadDataType{
+		typeName: {
+			Name:          typeName,
+			DataType:      "INT",
+			DatatypeEntry: datatypeEntry{Size: 18, ArrayDim: 2},
+			Children:      makeArrayChildren(levels, "INT", 18, nil),
+		},
+	}
+	sym := addSymbol(symbolUploadSymbol{
+		Name:        "MAIN.a",
+		DataType:    typeName,
+		SymbolEntry: symbolEntry{Size: 18},
+	}, datatypes, nil)
+
+	data := make([]byte, 18)
+	for i := range 9 {
+		binary.LittleEndian.PutUint16(data[i*2:], uint16(i))
+	}
+	if _, err := sym.parse(data, 0, datatypes); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for row := range 3 {
+		r := sym.Children[fmt.Sprintf("[%d]", row)]
+		if r == nil || len(r.Children) != 3 {
+			t.Fatalf("row %d: want 3 elements, got %+v", row, r)
+		}
+		for col := range 3 {
+			e := r.Children[fmt.Sprintf("[%d]", col)]
+			if want := strconv.Itoa(row*3 + col); e.Value != want {
+				t.Errorf("%s = %q, want %s", e.FullName, e.Value, want)
+			}
+		}
+	}
+}
+
 // Validates: NO-SPEC (regression guard, awaiting spec backfill).
 // Pins 3-D array nested child generation (2x2x2 leaf shape).
 func TestMakeArrayChildren_3D(t *testing.T) {

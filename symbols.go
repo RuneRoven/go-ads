@@ -646,10 +646,16 @@ func (data *SymbolUploadDataType) addOffsetDepth(parent *symbol, datatypes map[s
 			Parent: parent,
 		}
 
-		// Check if subitems exist — but skip enum types.
+		// An outer dimension of a multi-dimensional array carries its inner
+		// dimension as prebuilt children (makeArrayChildren), while its DataType
+		// names the element type -- looking that up would make the whole row one
+		// element and fail its parse on size. Expand the prebuilt level instead.
+		// Otherwise check if subitems exist — but skip enum types.
 		// Enums have children (enum constants) but should be parsed as
 		// their base type (e.g. INT), not expanded as struct fields.
-		if dt, ok := datatypes[segment.DataType]; ok && !isEnumDataType(&dt) {
+		if segment.Name[0] == '[' && len(segment.Children) > 0 {
+			child.Children = segment.addOffsetDepth(&child, datatypes, child.Group, depth+1, lg)
+		} else if dt, ok := datatypes[segment.DataType]; ok && !isEnumDataType(&dt) {
 			child.Children = dt.addOffsetDepth(&child, datatypes, child.Group, depth+1, lg)
 		}
 
