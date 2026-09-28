@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf16"
 )
 
@@ -44,6 +45,31 @@ func TestParse_HappyPath_INT(t *testing.T) {
 	}
 	if got != "1" {
 		t.Errorf("got %q, want %q", got, "1")
+	}
+}
+
+// A change decoded straight after the previous sample must be stored and
+// returned. updateValue used to skip values arriving within MinUpdateInterval
+// of the last one, so a notification carried the value it was replacing.
+func TestParse_BackToBackChangesAreNotDropped(t *testing.T) {
+	sym := &symbol{
+		Name:              "x",
+		DataType:          "UDINT",
+		Length:            4,
+		MinUpdateInterval: time.Hour, // far longer than the gap between parses
+	}
+	for _, want := range []uint32{1, 100002, 7} {
+		data := binary.LittleEndian.AppendUint32(nil, want)
+		got, err := sym.parse(data, 0, nil)
+		if err != nil {
+			t.Fatalf("parse %d: %v", want, err)
+		}
+		if got != strconv.FormatUint(uint64(want), 10) {
+			t.Errorf("parse %d returned %q", want, got)
+		}
+		if sym.Value != got {
+			t.Errorf("parse %d: cached Value %q, returned %q", want, sym.Value, got)
+		}
 	}
 }
 
