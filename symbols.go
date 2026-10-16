@@ -39,6 +39,15 @@ type symbolCache struct {
 // ensures consistent lookups regardless of caller or PLC casing.
 func symbolKey(name string) string { return strings.ToLower(name) }
 
+// cString cuts b at its first NUL. TC2 2.11 counts the terminator in
+// NameLength for struct members and array elements.
+func cString(b []byte) string {
+	if i := bytes.IndexByte(b, 0); i >= 0 {
+		b = b[:i]
+	}
+	return string(b)
+}
+
 // normalizeStringDataType strips trailing array/length suffixes from STRING
 // and WSTRING type names. The PLC reports types like "STRING(80)" or
 // "WSTRING(255)"; the library treats all string variants of the same kind
@@ -527,10 +536,9 @@ func parseUploadSymbolInfoSymbols(data []byte, datatypes map[string]SymbolUpload
 		}
 		buff.Next(1)
 		item := symbolUploadSymbol{}
-		item.Name = string(name)
-		item.DataType = string(dt)
-		item.DataType = normalizeStringDataType(item.DataType)
-		item.Comment = string(comment)
+		item.Name = cString(name)
+		item.DataType = normalizeStringDataType(cString(dt))
+		item.Comment = cString(comment)
 		item.SymbolEntry = result
 		endBuff := buff.Len()
 		symbol := addSymbol(item, datatypes, lg)
@@ -714,9 +722,9 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string, lg *slog.Logg
 	}
 	data.Next(1)
 
-	header.Name = string(name)
-	header.DataType = string(dt)
-	header.Comment = string(comment)
+	header.Name = cString(name)
+	header.DataType = cString(dt)
+	header.Comment = cString(comment)
 
 	header.DatatypeEntry = result
 
