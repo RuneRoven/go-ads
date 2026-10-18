@@ -432,13 +432,13 @@ func (c *Client) GetSymbolInfoByName(ctx context.Context, symbolName string) (*s
 	if err := binary.Read(buff, binary.LittleEndian, comment); err != nil {
 		return nil, fmt.Errorf("reading symbol comment for %s: %w", symbolName, err)
 	}
-	dataType := normalizeStringDataType(string(dt))
+	dataType := normalizeStringDataType(cString(dt))
 	flags := SymbolFlag(entry.Flags)
 	return &symbol{
-		FullName:          string(name), // PLC-returned casing (authoritative)
-		Name:              string(name),
+		FullName:          cString(name), // PLC-returned casing (authoritative)
+		Name:              cString(name),
 		DataType:          dataType,
-		Comment:           string(comment),
+		Comment:           cString(comment),
 		Group:             entry.IGroup,
 		Offset:            entry.IOffs,
 		Length:            entry.Size,
