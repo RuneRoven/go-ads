@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -25,17 +26,70 @@ func TestMakeArrayChildren_CapsExcessiveElements(t *testing.T) {
 	}
 }
 
-// F-15: LBound + Elements that overflows uint32 must be rejected.
+// F-15: an upper bound past DINT's range must be rejected.
 //
 // Validates: R-SYM-002.
 func TestMakeArrayChildren_RejectsOverflowBound(t *testing.T) {
-	levels := []datatypeArrayInfo{{LBound: 0xFFFFFFF0, Elements: 0x20}} // overflows
+	levels := []datatypeArrayInfo{{LBound: math.MaxInt32 - 0x0F, Elements: 0x20}} // upper bound past MaxInt32
 	got := makeArrayChildren(levels, "INT", 64, nil)
 	if got == nil {
 		t.Fatalf("expected non-nil empty map on overflow, got nil")
 	}
 	if len(got) != 0 {
-		t.Errorf("expected zero children on uint32 overflow, got %d", len(got))
+		t.Errorf("expected zero children on DINT overflow, got %d", len(got))
+	}
+}
+
+// The lower bound is a DINT: ARRAY[-9..9] arrives as 0xFFFFFFF7 and names its
+// elements [-9] to [9], laid out from -9 upwards.
+func TestMakeArrayChildren_NegativeLowerBound(t *testing.T) {
+	levels := []datatypeArrayInfo{{LBound: uint32(0xFFFFFFF7), Elements: 19}}
+	got := makeArrayChildren(levels, "DINT", 76, nil)
+	if len(got) != 19 {
+		t.Fatalf("got %d children, want 19", len(got))
+	}
+	for i := -9; i <= 9; i++ {
+		c, ok := got[fmt.Sprintf("[%d]", i)]
+		if !ok {
+			t.Errorf("element [%d] missing", i)
+			continue
+		}
+		if want := uint32((i + 9) * 4); c.DatatypeEntry.Offs != want {
+			t.Errorf("[%d]: offset %d, want %d", i, c.DatatypeEntry.Offs, want)
+		}
+	}
+}
+
+// Parsing an ARRAY[-9..9] gives elements named [-9]..[9], each decoded to its
+// signed value at the right offset.
+func TestParseNegativeBoundArray(t *testing.T) {
+	const typeName = "ARRAY [-9..9] OF DINT"
+	datatypes := map[string]SymbolUploadDataType{
+		typeName: {
+			Name: typeName, DataType: "DINT", DatatypeEntry: datatypeEntry{Size: 76, ArrayDim: 1},
+			Children: makeArrayChildren([]datatypeArrayInfo{{LBound: uint32(0xFFFFFFF7), Elements: 19}}, "DINT", 76, nil),
+		},
+	}
+	sym := addSymbol(symbolUploadSymbol{Name: "MAIN.a", DataType: typeName, SymbolEntry: symbolEntry{Size: 76}}, datatypes, nil)
+	data := make([]byte, 76)
+	for i := 0; i < 19; i++ {
+		binary.LittleEndian.PutUint32(data[i*4:], uint32(int32(i-9)))
+	}
+	if _, err := sym.parse(data, 0, datatypes); err != nil {
+		t.Fatal(err)
+	}
+	for i := -9; i <= 9; i++ {
+		name := fmt.Sprintf("[%d]", i)
+		c, ok := sym.Children[name]
+		if !ok {
+			t.Fatalf("element %s missing", name)
+		}
+		if want := "MAIN.a" + name; c.FullName != want {
+			t.Errorf("element %s: FullName = %q, want %q", name, c.FullName, want)
+		}
+		if want := strconv.Itoa(i); c.Value != want {
+			t.Errorf("element %s: Value = %q, want %q", name, c.Value, want)
+		}
 	}
 }
 
