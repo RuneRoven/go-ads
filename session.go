@@ -565,7 +565,11 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	var err error
 	sess.logger.Debug("dialing", "ip", sess.ip, "port", sess.port)
 	if local {
-		sess.target.NetID = [6]byte{127, 0, 0, 1, 1, 1}
+		// Keep a caller-supplied NetID: a usermode runtime on this host has its own
+		// NetID behind the local router, distinct from the system's 127.0.0.1.1.1.
+		if sess.target.NetID == [6]byte{} {
+			sess.target.NetID = [6]byte{127, 0, 0, 1, 1, 1}
+		}
 		sess.ip = "127.0.0.1"
 	}
 	// Check the target NetID against the device before spending a dial on it.
