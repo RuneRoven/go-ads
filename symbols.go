@@ -921,13 +921,17 @@ func (s *symbol) parseTree() (rData interface{}) {
 	} else {
 		localMap := make(map[string]interface{})
 		for _, child := range s.Children {
-			key := strings.ReplaceAll(child.Name, "[", `"[`)
-			key = strings.ReplaceAll(key, "]", `]"`)
-			localMap[key] = child.parseTree()
+			localMap[jsonKey(child.Name)] = child.parseTree()
 		}
 		rData = localMap
 	}
 	return
+}
+
+// jsonKey is a member's key in the JSON value: array indices keep literal quotes.
+func jsonKey(name string) string {
+	key := strings.ReplaceAll(name, "[", `"[`)
+	return strings.ReplaceAll(key, "]", `]"`)
 }
 
 func isInSet(s string, set map[string]struct{}) bool {

@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -449,6 +450,28 @@ func TestWriteToNodeStructPartialFields(t *testing.T) {
 	}
 	if data[1] != 0 {
 		t.Errorf("y: got %d, want 0 (unset)", data[1])
+	}
+}
+
+// An array read as JSON writes back unchanged: the reader quotes element keys.
+func TestWriteToNodeArrayRoundTripsReadJSON(t *testing.T) {
+	e0 := &symbol{Name: "[0]", FullName: "a[0]", DataType: "DINT", Length: 4, Offset: 0}
+	e1 := &symbol{Name: "[1]", FullName: "a[1]", DataType: "DINT", Length: 4, Offset: 4}
+	arr := &symbol{
+		Name: "a", FullName: "a", DataType: "ARRAY [0..1] OF DINT", Length: 8,
+		Children: map[string]*symbol{"[0]": e0, "[1]": e1},
+	}
+	want := []byte{7, 0, 0, 0, 9, 0, 0, 0}
+	read, err := arr.parse(want, 0, nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got, err := arr.writeToNode(read, nil)
+	if err != nil {
+		t.Fatalf("writeToNode(%s): %v", read, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("writeToNode(%s) = % x, want % x", read, got, want)
 	}
 }
 
