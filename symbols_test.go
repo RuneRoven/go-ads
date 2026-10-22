@@ -650,6 +650,16 @@ func TestMakeArrayChildren_3D(t *testing.T) {
 	}
 }
 
+// A size that is not a whole number of elements is logged, not silently used.
+func TestMakeArrayChildren_WarnsOnUnevenSize(t *testing.T) {
+	var buf bytes.Buffer
+	lg := slog.New(slog.NewTextHandler(&buf, nil))
+	makeArrayChildren([]datatypeArrayInfo{{LBound: 0, Elements: 3}}, "INT", 7, lg)
+	if !strings.Contains(buf.String(), "not a whole number of elements") {
+		t.Errorf("no warning for 7 bytes over 3 elements; log: %q", buf.String())
+	}
+}
+
 // The element cap applies to all dimensions together, not each alone.
 func TestMakeArrayChildren_CapsTotalElements(t *testing.T) {
 	levels := []datatypeArrayInfo{{LBound: 0, Elements: 2000}, {LBound: 0, Elements: 2000}}

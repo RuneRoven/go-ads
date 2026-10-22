@@ -776,11 +776,9 @@ func decodeSymbolUploadDataType(data *bytes.Buffer, parent string, lg *slog.Logg
 	return
 }
 
-// maxArrayElementsPerLevel caps PLC-declared array Elements per dimension to
-// prevent malformed/buggy datatype responses from triggering huge map
-// allocations. Real PLC arrays rarely exceed a few thousand elements;
-// 1M is a safety ceiling well above any legitimate use.
-const maxArrayElementsPerLevel = 1_000_000
+// maxArrayElements caps an array's element count over all dimensions, so a
+// malformed datatype answer cannot allocate a huge map.
+const maxArrayElements = 1_000_000
 
 func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32, lg *slog.Logger) (children map[string]*SymbolUploadDataType) {
 	children = map[string]*SymbolUploadDataType{}
@@ -805,17 +803,20 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32, lg *s
 			return
 		}
 		total *= uint64(level.Elements)
-		// Malformed datatype answers must not allocate a huge map.
-		if total > maxArrayElementsPerLevel {
+		if total > maxArrayElements {
 			logOr(lg).Error("makeArrayChildren: array Elements exceeds sanity cap, refusing to allocate",
 				"declared_elements", total,
-				"cap", maxArrayElementsPerLevel,
+				"cap", maxArrayElements,
 				"datatype", dt)
 			return
 		}
 	}
 
 	elemSize := size / uint32(total)
+	if size%uint32(total) != 0 {
+		logOr(lg).Warn("makeArrayChildren: array size is not a whole number of elements, offsets may be wrong",
+			"size", size, "elements", total, "datatype", dt)
+	}
 	idx := slices.Clone(lbounds)
 	parts := make([]string, len(idx))
 	for n := range total {
