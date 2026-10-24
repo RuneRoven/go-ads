@@ -21,6 +21,8 @@ import (
 type activeNotification struct {
 	Sym *symbol
 	Ch  chan<- *Update
+	// lastStamp is the PLC timestamp of the newest sample delivered on this handle.
+	lastStamp uint64
 }
 
 type notificationManager struct {

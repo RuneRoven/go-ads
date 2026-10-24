@@ -370,6 +370,7 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 			sendChannel:    make(chan []byte),
 			systemResponse: make(chan []byte, 1),
 			recvQueue:      make(chan []byte, recvQueueSize),
+			notifQueue:     make(chan []byte, notifQueueSize),
 			activeRequests: map[uint32]chan amsReply{},
 		},
 		lifecycle: &sessionLifecycle{
@@ -2414,6 +2415,7 @@ func (sess *Session) tearDownAndReset() {
 	sess.tx.sendChannel = make(chan []byte)
 	sess.tx.systemResponse = make(chan []byte, 1)
 	sess.tx.recvQueue = make(chan []byte, recvQueueSize)
+	sess.tx.notifQueue = make(chan []byte, notifQueueSize)
 	sess.tx.chanMu.Unlock()
 	sess.tx.activeRequestLock.Lock()
 	sess.tx.activeRequests = map[uint32]chan amsReply{}

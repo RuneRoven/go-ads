@@ -360,6 +360,17 @@ func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestam
 		}
 		return
 	}
+	// Live samples arrive in order per handle; only a replayed early sample can be
+	// older than one already delivered, and then the consumer has the newer one.
+	if !buffer && timestamp < entry.lastStamp {
+		sess.notifications.lock.Unlock()
+		sess.logger.Debug("dropped a replayed sample older than one already delivered", "handle", handle)
+		return
+	}
+	if buffer || timestamp > entry.lastStamp {
+		entry.lastStamp = timestamp // live samples follow the PLC clock, even back
+		sess.notifications.activeNotifications[handle] = entry
+	}
 	notification := entry.Ch
 	fullName := entry.Sym.FullName
 	sess.notifications.lock.Unlock()

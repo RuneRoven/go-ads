@@ -1630,3 +1630,30 @@ func TestSubscribeRace_EarlySampleDuringReconnectResubscribe(t *testing.T) {
 		t.Errorf("Delete RPC calls = %d, want 0", got)
 	}
 }
+
+// A sample older, by PLC timestamp, than one already delivered for its handle
+// is dropped: a late replay must not overwrite a newer value at the consumer.
+func TestDispatch_OlderSampleThanDeliveredIsDropped(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	sess, _ := newWiredTestSession(t, srv, WithoutNotificationHeartbeat())
+	sym := preSeedTypedSymbol(sess, "MAIN.n", 0xC0DE)
+	ch := make(chan *Update, 4)
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[0x42] = activeNotification{Sym: sym, Ch: ch}
+	sess.notifications.lock.Unlock()
+
+	ctx := context.Background()
+	sess.dispatchSample(ctx, 0x42, 2000, intSample(2), true)
+	sess.dispatchSample(ctx, 0x42, 1000, intSample(1), false) // a late replay: dropped
+	sess.dispatchSample(ctx, 0x42, 2000, intSample(3), true)  // same stamp, still current
+	sess.dispatchSample(ctx, 0x42, 500, intSample(4), true)   // PLC clock set back: live, kept
+
+	var got []string
+	for len(ch) > 0 {
+		got = append(got, (<-ch).Value)
+	}
+	if fmt.Sprint(got) != "[2 3 4]" {
+		t.Errorf("delivered %v, want [2 3 4]: only the stale replay may be dropped", got)
+	}
+}

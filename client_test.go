@@ -1494,3 +1494,69 @@ func TestHandleReceive_AMSErrorSurfacesAsItself(t *testing.T) {
 		t.Fatal("timed out waiting for the reply")
 	}
 }
+
+// notificationFrame wraps a DeviceNotification payload in the AMS/TCP and AMS
+// headers, as it arrives on the socket.
+func notificationFrame(payload []byte) []byte {
+	ams := make([]byte, 32, 32+len(payload))
+	binary.LittleEndian.PutUint16(ams[16:], uint16(CommandIDDeviceNotification))
+	binary.LittleEndian.PutUint32(ams[20:], uint32(len(payload)))
+	return append(append(buildAmsTCPHeader(0, uint32(32+len(payload))), ams...), payload...)
+}
+
+// Samples of one handle reach the handler in the order the PLC sent them, even
+// when handling an earlier one takes longer than the gap to the next.
+func TestNotifications_DeliveredInOrderPerHandle(t *testing.T) {
+	server, conn := net.Pipe()
+	defer server.Close()
+	defer conn.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Client{
+		logger: getDefaultLogger(),
+		ctx:    ctx,
+		cancel: cancel,
+		tx: &transport{
+			connection:     conn,
+			sendChannel:    make(chan []byte),
+			systemResponse: make(chan []byte, 1),
+			recvQueue:      make(chan []byte, recvQueueSize),
+			notifQueue:     make(chan []byte, notifQueueSize),
+			activeRequests: map[uint32]chan amsReply{},
+		},
+	}
+	const n = 200
+	var mu sync.Mutex
+	var got []uint16
+	done := make(chan struct{})
+	c.SetNotificationHandler(func(_ context.Context, handle uint32, _ uint64, content []byte) {
+		v := binary.LittleEndian.Uint16(content)
+		if v%10 == 0 {
+			time.Sleep(5 * time.Millisecond) // a slow sample must not be overtaken
+		}
+		mu.Lock()
+		got = append(got, v)
+		if len(got) == n {
+			close(done)
+		}
+		mu.Unlock()
+	})
+	c.startWorkers()
+	for i := range n {
+		if _, err := server.Write(notificationFrame(buildNotificationPacket(7, uint64(i), intSample(uint16(i))))); err != nil {
+			t.Fatalf("write frame %d: %v", i, err)
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("not every sample was delivered")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i, v := range got {
+		if int(v) != i {
+			t.Fatalf("sample %d delivered as value %d; order: %v", i, v, got[:min(len(got), i+5)])
+		}
+	}
+}
