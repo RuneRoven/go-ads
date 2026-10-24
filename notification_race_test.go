@@ -1585,3 +1585,48 @@ func TestRestoreConfigs_KeepsWhatArrivedDuringTheAttempt(t *testing.T) {
 		t.Errorf("pending = %d after restoring the same snapshot twice, want 3", len(mgr.pending))
 	}
 }
+
+// The resubscribe after a reconnect runs while the session is still
+// Reconnecting; a first sample arriving before its handle is bound must be
+// buffered and replayed like on a first subscribe, not dropped as stale.
+func TestSubscribeRace_EarlySampleDuringReconnectResubscribe(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	var deleted atomic.Int32
+	srv.onDeleteDeviceNotification(func(_ uint32) ReturnCode {
+		deleted.Add(1)
+		return ReturnCodeNoErrors
+	})
+	sess, c := newWiredTestSession(t, srv, WithoutNotificationHeartbeat())
+	c.SetNotificationHandler(sess.handleNotification)
+	preSeedTypedSymbol(sess, "MAIN.sStatic", 0xC0DE)
+
+	const plcHandle = 0x9000
+	srv.onWriteRead(GroupSumupAddDeviceNotification, func(_ []byte) []byte {
+		if err := sess.drivePacket(sess.lifecycle.ctx, buildNotificationPacket(plcHandle, 0, intSample(7))); err != nil {
+			t.Errorf("drivePacket from Add handler: %v", err)
+		}
+		resp := make([]byte, 8)
+		binary.LittleEndian.PutUint32(resp[4:], plcHandle)
+		return resp
+	})
+	sess.lifecycle.state.value.Store(uint32(SessionStateReconnecting))
+
+	ch := make(chan *Update, 4)
+	cfgs := []NotificationConfig{{SymbolName: "MAIN.sStatic", TransmissionMode: TransModeServerOnChange}}
+	results, err := sess.AddSymbolNotifications(context.Background(), cfgs, ch)
+	if err != nil || results[0].Skipped != nil || results[0].Handle != plcHandle {
+		t.Fatalf("AddSymbolNotifications = %+v, %v; want handle 0x%X", results, err, plcHandle)
+	}
+	select {
+	case u := <-ch:
+		if u.Value != "7" {
+			t.Errorf("Update.Value = %q, want %q", u.Value, "7")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first sample dropped during the reconnect resubscribe; the subscription stays silent")
+	}
+	if got := deleted.Load(); got != 0 {
+		t.Errorf("Delete RPC calls = %d, want 0", got)
+	}
+}

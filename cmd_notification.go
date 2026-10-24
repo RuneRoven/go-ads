@@ -327,9 +327,11 @@ func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestam
 		//   activeNotifications insert completes. The PLC-side handle exists the
 		//   moment Add returns, so this window is unavoidable; it is wide enough
 		//   to matter whenever a subscribe is still in flight.
+		// The buffer case precedes reconnecting: the resubscribe after a reconnect
+		// runs in that state, and its first samples race their handles' commit too.
 		switch {
-		case sess.isClosed() || sess.isReconnecting():
-			sess.logger.Debug("received notification for deleted handle (expected during close/reconnect)", "handle", handle)
+		case sess.isClosed():
+			sess.logger.Debug("received notification for deleted handle (expected during close)", "handle", handle)
 		case buffer && sess.subscribeRaceActive():
 			// Our own subscribe is mid-flight, so this handle is almost
 			// certainly one we are about to commit. Park the sample instead of
@@ -337,6 +339,8 @@ func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestam
 			// one sample, at subscribe time, and dropping it means the consumer
 			// never sees that tag at all.
 			sess.bufferEarlySample(ctx, handle, timestamp, content)
+		case sess.isReconnecting():
+			sess.logger.Debug("received notification for deleted handle (expected during reconnect)", "handle", handle)
 		default:
 			// Genuine orphan: registered on the PLC, not in our map -- usually a
 			// prior process with the same source NetID+port. Delete it, or the
