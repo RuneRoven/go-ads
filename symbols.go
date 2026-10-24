@@ -784,57 +784,57 @@ const maxArrayElementsPerLevel = 1_000_000
 
 func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32, lg *slog.Logger) (children map[string]*SymbolUploadDataType) {
 	children = map[string]*SymbolUploadDataType{}
-
 	if len(levels) < 1 {
 		return
 	}
-
-	level := levels[0]
-	if level.Elements == 0 {
-		return
+	// One flat level for all dimensions, named as the PLC names elements
+	// ([i,j]) and laid out with the last index fastest.
+	lbounds := make([]int64, len(levels))
+	total := uint64(1)
+	for d, level := range levels {
+		if level.Elements == 0 {
+			return
+		}
+		// The lower bound is a DINT on the wire: ARRAY[-9..9] arrives as 0xFFFFFFF7.
+		lbounds[d] = int64(int32(level.LBound))
+		if lbounds[d]+int64(level.Elements)-1 > math.MaxInt32 {
+			logOr(lg).Error("makeArrayChildren: LBound + Elements overflows DINT, refusing",
+				"lbound", lbounds[d],
+				"elements", level.Elements,
+				"datatype", dt)
+			return
+		}
+		total *= uint64(level.Elements)
+		// Malformed datatype answers must not allocate a huge map.
+		if total > maxArrayElementsPerLevel {
+			logOr(lg).Error("makeArrayChildren: array Elements exceeds sanity cap, refusing to allocate",
+				"declared_elements", total,
+				"cap", maxArrayElementsPerLevel,
+				"datatype", dt)
+			return
+		}
 	}
-	// The lower bound is a DINT on the wire: ARRAY[-9..9] arrives as 0xFFFFFFF7.
-	lbound := int64(int32(level.LBound))
-	// defend against malformed/buggy PLC datatype responses.
-	// (1) Cap Elements at a sanity limit to prevent DoS via huge map allocation.
-	// (2) Reject when the upper bound would pass DINT's range.
-	if level.Elements > maxArrayElementsPerLevel {
-		logOr(lg).Error("makeArrayChildren: array Elements exceeds sanity cap, refusing to allocate",
-			"declared_elements", level.Elements,
-			"cap", maxArrayElementsPerLevel,
-			"datatype", dt)
-		return
-	}
-	if lbound+int64(level.Elements)-1 > math.MaxInt32 {
-		logOr(lg).Error("makeArrayChildren: LBound + Elements overflows DINT, refusing",
-			"lbound", lbound,
-			"elements", level.Elements,
-			"datatype", dt)
-		return
-	}
-	// subChildren is shared across all array elements at this level.
-	// This is intentional: children are read-only after symbol table construction,
-	// and deep-copying would be expensive for large arrays (e.g., ARRAY[0..999]).
-	// Recursion size shrinks by this level's element count so inner-dim
-	// elements compute correct per-element byte size, not the outer total.
-	subChildren := makeArrayChildren(levels[1:], dt, size/level.Elements, lg)
 
-	var offset uint32
-
-	for i := lbound; i < lbound+int64(level.Elements); i++ {
-		name := fmt.Sprintf("[%d]", i)
-
-		child := SymbolUploadDataType{}
-		child.Name = name
-		child.DataType = dt
-		child.DatatypeEntry.Offs = offset
-		child.DatatypeEntry.Size = size / level.Elements
-		child.Children = subChildren
-
+	elemSize := size / uint32(total)
+	idx := slices.Clone(lbounds)
+	parts := make([]string, len(idx))
+	for n := range total {
+		for d, i := range idx {
+			parts[d] = strconv.FormatInt(i, 10)
+		}
+		name := "[" + strings.Join(parts, ",") + "]"
+		child := SymbolUploadDataType{Name: name, DataType: dt}
+		child.DatatypeEntry.Offs = uint32(n) * elemSize
+		child.DatatypeEntry.Size = elemSize
 		children[name] = &child
-		offset += size / level.Elements
+		for d := len(idx) - 1; d >= 0; d-- {
+			idx[d]++
+			if idx[d] < lbounds[d]+int64(levels[d].Elements) {
+				break
+			}
+			idx[d] = lbounds[d]
+		}
 	}
-
 	return
 }
 

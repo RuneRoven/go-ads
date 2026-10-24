@@ -552,81 +552,109 @@ func TestMakeArrayChildrenNonZeroLBound(t *testing.T) {
 	}
 }
 
-// Validates: NO-SPEC (regression guard, awaiting spec backfill).
-// Pins 2-D array hierarchical child generation (outer dim has 3 sub-children each).
+// A 2-D array has one flat level named as the PLC names it, [row,col], laid
+// out with the last index fastest.
 func TestMakeArrayChildren_2D(t *testing.T) {
-	// ARRAY[0..1, 0..2] OF INT — 2x3 = 6 elements, 12 bytes total
-	levels := []datatypeArrayInfo{
-		{LBound: 0, Elements: 2},
-		{LBound: 0, Elements: 3},
-	}
+	levels := []datatypeArrayInfo{{LBound: 0, Elements: 2}, {LBound: 0, Elements: 3}}
 	children := makeArrayChildren(levels, "INT", 12, nil)
-	if len(children) != 2 {
-		t.Fatalf("expected 2 top-level children, got %d", len(children))
+	if len(children) != 6 {
+		t.Fatalf("got %d children, want 6", len(children))
 	}
-	for _, name := range []string{"[0]", "[1]"} {
-		child, ok := children[name]
-		if !ok {
-			t.Errorf("missing child %s", name)
-			continue
-		}
-		if len(child.Children) != 3 {
-			t.Errorf("child %s: expected 3 sub-children, got %d", name, len(child.Children))
-		}
-		if child.DatatypeEntry.Size != 6 { // 12/2 = 6 bytes per row
-			t.Errorf("child %s: size = %d, want 6", name, child.DatatypeEntry.Size)
-		}
-		// Inner-element Size must equal one INT (2 bytes), not the outer row size.
-		// Regression guard for makeArrayChildren passing full size to recursion.
-		for _, inner := range []string{"[0]", "[1]", "[2]"} {
-			leaf, ok := child.Children[inner]
+	for row := range 2 {
+		for col := range 3 {
+			name := fmt.Sprintf("[%d,%d]", row, col)
+			c, ok := children[name]
 			if !ok {
-				t.Errorf("child %s missing inner %s", name, inner)
+				t.Errorf("missing %s", name)
 				continue
 			}
-			if leaf.DatatypeEntry.Size != 2 {
-				t.Errorf("child %s inner %s: size = %d, want 2", name, inner, leaf.DatatypeEntry.Size)
+			if want := uint32((row*3 + col) * 2); c.DatatypeEntry.Offs != want || c.DatatypeEntry.Size != 2 || len(c.Children) != 0 {
+				t.Errorf("%s: offset %d size %d children %d, want offset %d size 2 no children",
+					name, c.DatatypeEntry.Offs, c.DatatypeEntry.Size, len(c.Children), want)
 			}
 		}
 	}
 }
 
-// Validates: NO-SPEC (regression guard, awaiting spec backfill).
-// Pins 3-D array nested child generation (2x2x2 leaf shape).
+// A symbol of a 2-D array type decodes every element, and each element's
+// FullName is the name the PLC resolves.
+func TestAddSymbol_2DArrayParses(t *testing.T) {
+	const typeName = "ARRAY [0..2,0..2] OF INT"
+	levels := []datatypeArrayInfo{{LBound: 0, Elements: 3}, {LBound: 0, Elements: 3}}
+	datatypes := map[string]SymbolUploadDataType{
+		typeName: {
+			Name:          typeName,
+			DataType:      "INT",
+			DatatypeEntry: datatypeEntry{Size: 18, ArrayDim: 2},
+			Children:      makeArrayChildren(levels, "INT", 18, nil),
+		},
+	}
+	sym := addSymbol(symbolUploadSymbol{
+		Name:        "MAIN.a",
+		DataType:    typeName,
+		SymbolEntry: symbolEntry{Size: 18},
+	}, datatypes, nil)
+
+	data := make([]byte, 18)
+	for i := range 9 {
+		binary.LittleEndian.PutUint16(data[i*2:], uint16(i))
+	}
+	if _, err := sym.parse(data, 0, datatypes); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for row := range 3 {
+		for col := range 3 {
+			name := fmt.Sprintf("[%d,%d]", row, col)
+			e := sym.Children[name]
+			if e == nil {
+				t.Fatalf("missing %s", name)
+			}
+			if want := "MAIN.a" + name; e.FullName != want {
+				t.Errorf("FullName %q, want %q", e.FullName, want)
+			}
+			if want := strconv.Itoa(row*3 + col); e.Value != want {
+				t.Errorf("%s = %q, want %s", e.FullName, e.Value, want)
+			}
+		}
+	}
+	got := sym.getJSON()
+	if !strings.Contains(got, `"\"[1,2]\"":5`) {
+		t.Errorf("JSON %s lacks element [1,2] = 5", got)
+	}
+}
+
+// Negative bounds in several dimensions: [-1..0, 1..2] names [-1,1] first.
+func TestMakeArrayChildren_NegativeMultiDim(t *testing.T) {
+	levels := []datatypeArrayInfo{{LBound: uint32(0xFFFFFFFF), Elements: 2}, {LBound: 1, Elements: 2}}
+	children := makeArrayChildren(levels, "INT", 8, nil)
+	want := map[string]uint32{"[-1,1]": 0, "[-1,2]": 2, "[0,1]": 4, "[0,2]": 6}
+	if len(children) != len(want) {
+		t.Fatalf("got %d children, want %d", len(children), len(want))
+	}
+	for name, off := range want {
+		if c, ok := children[name]; !ok || c.DatatypeEntry.Offs != off {
+			t.Errorf("%s: present %v, want offset %d", name, ok, off)
+		}
+	}
+}
+
+// A 3-D array is one flat level too: [i,j,k], one BYTE each.
 func TestMakeArrayChildren_3D(t *testing.T) {
-	// ARRAY[0..1, 0..1, 0..1] OF BYTE — 2x2x2 = 8 elements
-	levels := []datatypeArrayInfo{
-		{LBound: 0, Elements: 2},
-		{LBound: 0, Elements: 2},
-		{LBound: 0, Elements: 2},
-	}
+	levels := []datatypeArrayInfo{{LBound: 0, Elements: 2}, {LBound: 0, Elements: 2}, {LBound: 0, Elements: 2}}
 	children := makeArrayChildren(levels, "BYTE", 8, nil)
-	if len(children) != 2 {
-		t.Fatalf("expected 2 children, got %d", len(children))
+	if len(children) != 8 {
+		t.Fatalf("got %d children, want 8", len(children))
 	}
-	// Drill down to leaf level
-	c0 := children["[0]"]
-	if c0 == nil {
-		t.Fatal("missing [0]")
+	if c := children["[1,0,1]"]; c == nil || c.DatatypeEntry.Offs != 5 || c.DatatypeEntry.Size != 1 {
+		t.Errorf("[1,0,1] = %+v, want offset 5 size 1", c)
 	}
-	if len(c0.Children) != 2 {
-		t.Fatalf("[0] expected 2 children, got %d", len(c0.Children))
-	}
-	c00 := c0.Children["[0]"]
-	if c00 == nil {
-		t.Fatal("missing [0][0]")
-	}
-	if len(c00.Children) != 2 {
-		t.Fatalf("[0][0] expected 2 children, got %d", len(c00.Children))
-	}
-	// Leaf-element Size must equal one BYTE (1 byte), not the parent slab.
-	// Regression guard for makeArrayChildren passing full size to recursion.
-	c000 := c00.Children["[0]"]
-	if c000 == nil {
-		t.Fatal("missing [0][0][0]")
-	}
-	if c000.DatatypeEntry.Size != 1 {
-		t.Errorf("[0][0][0] size = %d, want 1", c000.DatatypeEntry.Size)
+}
+
+// The element cap applies to all dimensions together, not each alone.
+func TestMakeArrayChildren_CapsTotalElements(t *testing.T) {
+	levels := []datatypeArrayInfo{{LBound: 0, Elements: 2000}, {LBound: 0, Elements: 2000}}
+	if got := makeArrayChildren(levels, "BYTE", 4_000_000, nil); len(got) != 0 {
+		t.Errorf("got %d children for 4M elements, want none", len(got))
 	}
 }
 
