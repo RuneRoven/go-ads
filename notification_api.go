@@ -21,6 +21,14 @@ import (
 type activeNotification struct {
 	Sym *symbol
 	Ch  chan<- *Update
+	// order serializes delivery on this handle; set on first dispatch.
+	order *handleOrder
+}
+
+// handleOrder makes the stamp check and the send for one handle a single step,
+// so a replayed early sample and a live one cannot swap on the way out.
+type handleOrder struct {
+	mu sync.Mutex
 	// lastStamp is the PLC timestamp of the newest sample delivered on this handle.
 	lastStamp uint64
 }

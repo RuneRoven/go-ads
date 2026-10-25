@@ -1657,3 +1657,40 @@ func TestDispatch_OlderSampleThanDeliveredIsDropped(t *testing.T) {
 		t.Errorf("delivered %v, want [2 3 4]: only the stale replay may be dropped", got)
 	}
 }
+
+// A replayed early sample and a newer live sample for the same handle run on
+// different goroutines; the older one must never reach the consumer second.
+func TestDispatch_ReplayAndLiveSampleKeepOrder(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	sess, _ := newWiredTestSession(t, srv, WithoutNotificationHeartbeat())
+	const handle = 0x44
+	sym := preSeedTypedSymbol(sess, "MAIN.n", 0xD)
+	ctx := context.Background()
+
+	reordered := 0
+	const rounds = 50000
+	for range rounds {
+		ch := make(chan *Update, 4)
+		sess.notifications.lock.Lock()
+		sess.notifications.activeNotifications[handle] = activeNotification{Sym: sym, Ch: ch}
+		sess.notifications.lock.Unlock()
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); <-start; sess.dispatchSample(ctx, handle, 1000, intSample(1), false) }()
+		go func() { defer wg.Done(); <-start; sess.dispatchSample(ctx, handle, 2000, intSample(2), true) }()
+		close(start)
+		wg.Wait()
+		var got []string
+		for len(ch) > 0 {
+			got = append(got, (<-ch).Value)
+		}
+		if fmt.Sprint(got) == "[2 1]" {
+			reordered++
+		}
+	}
+	if reordered > 0 {
+		t.Errorf("older replayed sample delivered after the newer live one in %d of %d rounds", reordered, rounds)
+	}
+}
