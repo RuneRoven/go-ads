@@ -462,12 +462,8 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 		return 0, fmt.Errorf("notification for %q: %w", symbolName, err)
 	}
 
-	// Auto-fallback: InContext modes (5/6) require non-zero ContextMask on the symbol.
-	// If ContextMask is 0 (single-task PLC, TC2, or variable not bound to a task),
-	// downgrade to the regular mode (3/4) to avoid 0x070B errors or silent failures.
-	actualMode := transMode
-	if (transMode == TransModeServerCycle2 || transMode == TransModeServerOnChange2) && symbol.ContextMask == 0 {
-		actualMode = downgradeTransMode(transMode)
+	actualMode, cycleField := notificationCycleField(transMode, symbol.ContextMask, cycleTime)
+	if actualMode != transMode {
 		sess.logger.Warn("InContext mode not available for symbol (ContextMask=0), falling back",
 			"symbol", symbolName,
 			"requested", transMode.String(),
@@ -490,7 +486,7 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 		symbol.Length,
 		actualMode,
 		maxDelay,
-		cycleTime)
+		cycleField)
 	if err != nil {
 		// Online-change detection: the request carried a cached handle, so a
 		// stale-cache code means it is dead. On TC3 a runtime restart answers 0x710
@@ -649,9 +645,8 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 		}
 		infos = append(infos, symbolInfo{configIndex: i, config: cfg, symbol: symbol})
 
-		actualMode := cfg.TransmissionMode
-		if (actualMode == TransModeServerCycle2 || actualMode == TransModeServerOnChange2) && symbol.ContextMask == 0 {
-			actualMode = downgradeTransMode(actualMode)
+		actualMode, cycleField := notificationCycleField(cfg.TransmissionMode, symbol.ContextMask, cfg.CycleTime)
+		if actualMode != cfg.TransmissionMode {
 			sess.logger.Warn("InContext mode not available for symbol (ContextMask=0), falling back",
 				"symbol", cfg.SymbolName,
 				"requested", cfg.TransmissionMode.String(),
@@ -665,7 +660,7 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 			Length:           symbol.Length,
 			TransmissionMode: actualMode,
 			MaxDelay:         cfg.MaxDelay,
-			CycleTime:        cfg.CycleTime,
+			CycleTime:        cycleField,
 		})
 	}
 

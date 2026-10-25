@@ -2,6 +2,7 @@ package ads
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"log/slog"
 	"strings"
@@ -1294,6 +1295,82 @@ func TestAddSymbolNotifications_StaleItemLogsAtWarnNotError(t *testing.T) {
 			if rec.Level != tc.wantLevel {
 				t.Errorf("per-item log for %v logged at %v, want %v — %s",
 					tc.code, rec.Level, tc.wantLevel, tc.why)
+			}
+		})
+	}
+}
+
+// For the in-context modes the PLC reads the cycle-time field as the task
+// context number; the other modes, and a fallback, carry the cycle time.
+var inContextCases = []struct {
+	name      string
+	mode      TransMode
+	ctxMask   uint8
+	wantMode  TransMode
+	wantCycle uint32
+}{
+	{name: "cycle2 sends the task context", mode: TransModeServerCycle2, ctxMask: 1, wantMode: TransModeServerCycle2, wantCycle: 1},
+	{name: "onchange2 sends the task context", mode: TransModeServerOnChange2, ctxMask: 2, wantMode: TransModeServerOnChange2, wantCycle: 2},
+	{name: "cycle2 without context falls back with the cycle time", mode: TransModeServerCycle2, ctxMask: 0, wantMode: TransModeServerCycle, wantCycle: 100000},
+	{name: "cycle keeps the cycle time", mode: TransModeServerCycle, ctxMask: 1, wantMode: TransModeServerCycle, wantCycle: 100000},
+}
+
+func seedContextSymbol(sess *Session, name string, ctxMask uint8) {
+	sess.cache.lock.Lock()
+	sess.cache.symbols[symbolKey(name)] = &symbol{
+		FullName: name, Name: name, DataType: "INT", Length: 2, Handle: 0xC0DE, ContextMask: ctxMask,
+	}
+	sess.cache.lock.Unlock()
+}
+
+func TestAddSymbolNotification_InContextSendsTaskContext(t *testing.T) {
+	for _, tc := range inContextCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := startScriptableServer(t)
+			defer srv.stop()
+			got := make(chan addNotifRequest, 1)
+			srv.onAddDeviceNotification(func(req addNotifRequest) addNotifResponse {
+				got <- req
+				return addNotifResponse{Handle: 0x1001, Error: ReturnCodeNoErrors}
+			})
+			sess, _ := newWiredTestSession(t, srv, WithoutNotificationHeartbeat())
+			seedContextSymbol(sess, "MAIN.x", tc.ctxMask)
+
+			ch := make(chan *Update, 1)
+			if _, err := sess.AddSymbolNotification(context.Background(), "MAIN.x", 0, 10*time.Millisecond, tc.mode, ch); err != nil {
+				t.Fatalf("AddSymbolNotification: %v", err)
+			}
+			req := <-got
+			if TransMode(req.TransMode) != tc.wantMode || req.CycleTime != tc.wantCycle {
+				t.Errorf("sent mode %v cycle field %d, want %v and %d", TransMode(req.TransMode), req.CycleTime, tc.wantMode, tc.wantCycle)
+			}
+		})
+	}
+}
+
+func TestAddSymbolNotifications_InContextSendsTaskContext(t *testing.T) {
+	for _, tc := range inContextCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := startScriptableServer(t)
+			defer srv.stop()
+			got := make(chan []byte, 1)
+			srv.onWriteRead(GroupSumupAddDeviceNotification, func(req []byte) []byte {
+				got <- append([]byte(nil), req...)
+				return buildSumAddNotifPayload([]sumNotifResponse{{Handle: 0x1001, Error: ReturnCodeNoErrors}})
+			})
+			sess, _ := newWiredTestSession(t, srv, WithoutNotificationHeartbeat())
+			seedContextSymbol(sess, "MAIN.x", tc.ctxMask)
+
+			ch := make(chan *Update, 1)
+			cfg := NotificationConfig{SymbolName: "MAIN.x", TransmissionMode: tc.mode, CycleTime: 10 * time.Millisecond}
+			if _, err := sess.AddSymbolNotifications(context.Background(), []NotificationConfig{cfg}, ch); err != nil {
+				t.Fatalf("AddSymbolNotifications: %v", err)
+			}
+			req := <-got
+			mode := TransMode(binary.LittleEndian.Uint32(req[12:]))
+			cycle := binary.LittleEndian.Uint32(req[20:])
+			if mode != tc.wantMode || cycle != tc.wantCycle {
+				t.Errorf("sent mode %v cycle field %d, want %v and %d", mode, cycle, tc.wantMode, tc.wantCycle)
 			}
 		})
 	}
