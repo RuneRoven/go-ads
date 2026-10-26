@@ -491,6 +491,9 @@ func (sess *Session) AddSymbolNotification(ctx context.Context, symbolName strin
 	committed := make([]uint32, 0, 1)
 	defer func() { sess.endSubscribe(ctx, subTok, committed) }()
 
+	if err := sess.requireClient(); err != nil {
+		return 0, err
+	}
 	handle, err := sess.client.Load().AddDeviceNotification(ctx,
 		uint32(GroupSymbolValueByHandle),
 		symbol.Handle,
@@ -832,6 +835,9 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 	}
 	defer settle()
 
+	if err := sess.requireClient(); err != nil {
+		return results, err
+	}
 	subResults, err := sess.client.Load().sumAddDeviceNotificationFunc(ctx, requests, onItem)
 	if err != nil {
 		// Transport-aborted batch: every entry that was about to be sent must

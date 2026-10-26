@@ -142,6 +142,9 @@ func (c *Client) DeleteDeviceNotification(ctx context.Context, handle uint32) er
 // last subscription dies. Callers that want raw delete behavior use
 // the Client method directly.
 func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32) error {
+	if err := sess.requireClient(); err != nil {
+		return err
+	}
 	// Snapshot symbol name BEFORE PLC RPC so a concurrent Reconnect clearing
 	// activeNotifications mid-flight doesn't strand notificationConfigs (which
 	// would cause resubscribeNotifications to re-subscribe a deleted symbol).
@@ -203,6 +206,9 @@ func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32
 // in-memory state matches what the PLC saw rather than leaving phantom entries for
 // the next reconnect to re-clean.
 func (sess *Session) SumDeleteDeviceNotification(ctx context.Context, handles []uint32) ([]ReturnCode, error) {
+	if err := sess.requireClient(); err != nil {
+		return nil, err
+	}
 	return sess.sumDeleteDeviceNotification(ctx, handles, true)
 }
 

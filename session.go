@@ -1699,6 +1699,15 @@ func (sess *Session) Close() error {
 // errors.Is(err, ErrDisconnected) to detect this case.
 var ErrDisconnected = errors.New("connection is disconnected")
 
+// requireClient refuses a call made before Connect has succeeded: there is no
+// client to send it on, and dereferencing the missing one panicked.
+func (sess *Session) requireClient() error {
+	if sess.client.Load() == nil {
+		return fmt.Errorf("%w: the session has not connected yet; call Connect first", ErrDisconnected)
+	}
+	return nil
+}
+
 // reconnectBackoff returns the delay for the given reconnect attempt number (1-indexed)
 // based on the configured BackoffConfig tiers.
 func (sess *Session) reconnectBackoff(attempt int) time.Duration {
@@ -3045,6 +3054,9 @@ var ErrRuntimeNotRunning = errors.New("ads: PLC runtime is not in RUN")
 // the SYSTEM's state, not the runtime port's: ADSStateConfig means no runtime port
 // is serving. Answers while the runtime is unavailable, which is the point.
 func (sess *Session) RuntimeState(ctx context.Context) (ADSState, error) {
+	if err := sess.requireClient(); err != nil {
+		return 0, err
+	}
 	c := sess.client.Load()
 	if c == nil {
 		return ADSStateInvalid, ErrTransportClosed

@@ -74,6 +74,9 @@ func (sess *Session) ListSymbols() (map[string]SymbolView, error) {
 // which may cause real-time jitter on the PLC. For large programs, consider
 // LoadSymbolsSlow() instead.
 func (sess *Session) LoadSymbols(ctx context.Context) error {
+	if err := sess.requireClient(); err != nil {
+		return err
+	}
 	// Refuse outside RUN rather than produce a misleading failure: in CONFIG the
 	// runtime port does not exist, so this cannot succeed, and the PLC's answer is
 	// an AMS "port not found" rather than anything about symbols. Permits when no
@@ -118,6 +121,9 @@ func (cfg *SlowDiscoveryConfig) applyDefaults() {
 // If the PLC does not support offset-based chunked reads, it falls back
 // to downloading each table in a single request with a delay between them.
 func (sess *Session) LoadSymbolsSlow(ctx context.Context, cfg SlowDiscoveryConfig) error {
+	if err := sess.requireClient(); err != nil {
+		return err
+	}
 	// Gated like LoadSymbols: which discovery mode a caller picked should not change
 	// whether a PLC in CONFIG produces a clear refusal or an obscure AMS error. The
 	// unexported loadSymbols stays ungated on purpose — the reconnect loop calls it
@@ -309,6 +315,9 @@ func (sess *Session) getSymbol(ctx context.Context, symbolName string) (*symbol,
 
 	if ok {
 		if needHandle {
+			if err := sess.requireClient(); err != nil {
+				return nil, err
+			}
 			// Network I/O must happen outside the lock to avoid deadlock
 			// with handleNotification which also acquires cache.lock.
 			handle, err := sess.client.Load().GetHandleByName(ctx, symbolName)
@@ -354,6 +363,9 @@ func (sess *Session) getSymbol(ctx context.Context, symbolName string) (*symbol,
 	}
 
 	// On-demand resolution: query the PLC for this specific symbol
+	if err := sess.requireClient(); err != nil {
+		return nil, err
+	}
 	sym, err := sess.client.Load().GetSymbolInfoByName(ctx, symbolName)
 	if err != nil {
 		return nil, fmt.Errorf("symbol %q not found and on-demand lookup failed: %w", symbolName, err)
@@ -538,6 +550,9 @@ func (c *Client) GetSymbolVersion(ctx context.Context) (uint8, error) {
 // CheckSymbolVersion compares the current PLC symbol version against the stored version.
 // Returns true if the version has changed.
 func (sess *Session) CheckSymbolVersion(ctx context.Context) (changed bool, err error) {
+	if err := sess.requireClient(); err != nil {
+		return false, err
+	}
 	version, err := sess.client.Load().GetSymbolVersion(ctx)
 	if err != nil {
 		return false, err
@@ -557,6 +572,9 @@ func (sess *Session) CheckSymbolVersion(ctx context.Context) (changed bool, err 
 // RefreshSymbols reloads the symbol table if the symbol version has changed.
 // It releases old handles, reloads symbol/datatype tables, and re-acquires handles for active symbols.
 func (sess *Session) RefreshSymbols(ctx context.Context) error {
+	if err := sess.requireClient(); err != nil {
+		return err
+	}
 	changed, err := sess.CheckSymbolVersion(ctx)
 	if err != nil {
 		return err
@@ -603,6 +621,9 @@ func (sess *Session) RefreshSymbols(ctx context.Context) error {
 // After calling this, BrowseSymbols() can list root symbols and navigate by prefix.
 // To also expand struct/array children, call LoadDataTypes() afterwards.
 func (sess *Session) LoadSymbolList(ctx context.Context, cfg SlowDiscoveryConfig) error {
+	if err := sess.requireClient(); err != nil {
+		return err
+	}
 	cfg.applyDefaults()
 
 	// Read symbol version
@@ -671,6 +692,9 @@ func (sess *Session) LoadSymbolList(ctx context.Context, cfg SlowDiscoveryConfig
 // After calling this along with LoadSymbolList(), struct/array children can be
 // browsed and expanded via BrowseSymbols().
 func (sess *Session) LoadDataTypes(ctx context.Context, cfg SlowDiscoveryConfig) error {
+	if err := sess.requireClient(); err != nil {
+		return err
+	}
 	cfg.applyDefaults()
 
 	// Get upload info
