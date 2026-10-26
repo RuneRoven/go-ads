@@ -54,10 +54,11 @@ type notificationManager struct {
 	// is in flight; openSubscribes answers that.
 	lastSubscribeNs atomic.Int64
 
-	// Each in-flight subscribe with the time it began, so each is bounded by its own
-	// age. A shared counter plus one timestamp could not express this: the pair was
-	// not atomic, and one slot recorded when the last quiet period ended rather than
-	// when anything in flight began. Lock order: openMu then earlyMu, never reverse.
+	// Each in-flight subscribe with the time it began or last completed an Add, so
+	// each is bounded by its own progress. A shared counter plus one timestamp could
+	// not express this: the pair was not atomic, and one slot recorded when the last
+	// quiet period ended rather than when anything in flight began. Lock order:
+	// openMu then earlyMu, never reverse.
 	openMu             sync.Mutex
 	openSubscribes     map[subscribeToken]int64
 	nextSubscribeToken uint64
@@ -703,6 +704,7 @@ func (sess *Session) AddSymbolNotifications(ctx context.Context, configs []Notif
 	// whole batch becoming recognisable at the end. Called synchronously on
 	// this goroutine, so results/committed need no extra guarding.
 	onItem := func(i int, r SumNotificationResult) {
+		sess.subscribeProgress(subTok)
 		if i < 0 || i >= len(infos) {
 			// Defensive: the index crosses a layer boundary. One bad index would
 			// otherwise panic inside the RPC call.

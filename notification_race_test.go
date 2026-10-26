@@ -1694,3 +1694,29 @@ func TestDispatch_ReplayAndLiveSampleKeepOrder(t *testing.T) {
 		t.Errorf("older replayed sample delivered after the newer live one in %d of %d rounds", reordered, rounds)
 	}
 }
+
+// A subscribe that is old but still completing registrations is not wedged: a
+// first sample for one of its handles is buffered, not taken for an orphan.
+func TestSubscribeRaceActive_ProgressKeepsSlowSubscribeOpen(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	sess, _ := newWiredTestSession(t, srv, WithoutNotificationHeartbeat())
+	const handle = 0x43
+	sym := preSeedTypedSymbol(sess, "MAIN.n", 0xC)
+	ch := make(chan *Update, 4)
+	ctx := context.Background()
+
+	tok := sess.beginSubscribe()
+	ageOpenSubscribe(sess, tok, time.Now().Add(-subscribeRaceMaxOpen-time.Second))
+	sess.subscribeProgress(tok) // an Add just returned
+	sess.dispatchSample(ctx, handle, 1000, intSample(7), true)
+
+	sess.notifications.lock.Lock()
+	sess.notifications.activeNotifications[handle] = activeNotification{Sym: sym, Ch: ch}
+	sess.notifications.lock.Unlock()
+	sess.endSubscribe(ctx, tok, []uint32{handle})
+
+	if len(ch) == 0 {
+		t.Errorf("first sample of a handle from a slow but progressing subscribe was dropped")
+	}
+}

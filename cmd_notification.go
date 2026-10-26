@@ -501,8 +501,9 @@ const (
 // subscribeRaceActive reports whether an unknown handle is presumed one of ours
 // mid-registration rather than leaked. The in-flight counter is authoritative but
 // not unconditional -- a wedged subscribe would otherwise disable the orphan reaper
-// for the session's life -- so the window also expires, generously enough for
-// hundreds of symbols registered one at a time.
+// for the session's life -- so the window expires once a subscribe has made no
+// progress for subscribeRaceMaxOpen. Age alone is not wedged: a TwinCAT 2 batch
+// registers one symbol at a time and can take minutes under load.
 func (sess *Session) subscribeRaceActive() bool {
 	mgr := sess.notifications
 	now := time.Now().UnixNano()
@@ -531,6 +532,17 @@ func (m *notificationManager) newestOpenSubscribe() (int64, bool) {
 		}
 	}
 	return newest, newest != 0
+}
+
+// subscribeProgress records that an open subscribe just completed an Add, which
+// keeps a slow but working subscribe from being judged wedged.
+func (sess *Session) subscribeProgress(tok subscribeToken) {
+	mgr := sess.notifications
+	mgr.openMu.Lock()
+	defer mgr.openMu.Unlock()
+	if _, open := mgr.openSubscribes[tok]; open {
+		mgr.openSubscribes[tok] = time.Now().UnixNano()
+	}
 }
 
 // beginSubscribe marks a subscribe in flight and returns the token that closes it;
