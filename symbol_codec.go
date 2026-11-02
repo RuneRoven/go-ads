@@ -230,14 +230,16 @@ func (s *symbol) parse(data []byte, offset int, datatypes map[string]SymbolUploa
 	return s.Value, nil
 }
 
+// updateValue stores a freshly decoded value. It always stores: the data came
+// off the wire, so it is the current value. MinUpdateInterval is a read-cache
+// TTL (see readFromSymbolRetry), not a rate limit on decoding -- applying it
+// here dropped any change arriving within the interval of the previous one, so
+// a notification returned the value it was replacing.
 func (s *symbol) updateValue(newValue string) {
-	if s.Value != newValue &&
-		(!s.ValueParsed || time.Since(s.LastUpdateTime) > s.MinUpdateInterval) {
-		s.LastUpdateTime = time.Now()
-		s.Value = newValue
-		s.Valid = true
-		s.ValueParsed = true
-	}
+	s.LastUpdateTime = time.Now()
+	s.Value = newValue
+	s.Valid = true
+	s.ValueParsed = true
 }
 
 var parseableTypes = []string{
