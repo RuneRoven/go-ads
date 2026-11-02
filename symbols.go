@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -792,10 +793,11 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32, lg *s
 	if level.Elements == 0 {
 		return
 	}
+	// The lower bound is a DINT on the wire: ARRAY[-9..9] arrives as 0xFFFFFFF7.
+	lbound := int64(int32(level.LBound))
 	// defend against malformed/buggy PLC datatype responses.
 	// (1) Cap Elements at a sanity limit to prevent DoS via huge map allocation.
-	// (2) Reject when LBound + Elements overflows uint32 — loop counter would
-	//     wrap and either skip the body or iterate ~4 billion times.
+	// (2) Reject when the upper bound would pass DINT's range.
 	if level.Elements > maxArrayElementsPerLevel {
 		logOr(lg).Error("makeArrayChildren: array Elements exceeds sanity cap, refusing to allocate",
 			"declared_elements", level.Elements,
@@ -803,9 +805,9 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32, lg *s
 			"datatype", dt)
 		return
 	}
-	if uint64(level.LBound)+uint64(level.Elements) > uint64(^uint32(0)) {
-		logOr(lg).Error("makeArrayChildren: LBound + Elements overflows uint32, refusing",
-			"lbound", level.LBound,
+	if lbound+int64(level.Elements)-1 > math.MaxInt32 {
+		logOr(lg).Error("makeArrayChildren: LBound + Elements overflows DINT, refusing",
+			"lbound", lbound,
 			"elements", level.Elements,
 			"datatype", dt)
 		return
@@ -819,7 +821,7 @@ func makeArrayChildren(levels []datatypeArrayInfo, dt string, size uint32, lg *s
 
 	var offset uint32
 
-	for i := level.LBound; i < level.LBound+level.Elements; i++ {
+	for i := lbound; i < lbound+int64(level.Elements); i++ {
 		name := fmt.Sprintf("[%d]", i)
 
 		child := SymbolUploadDataType{}
