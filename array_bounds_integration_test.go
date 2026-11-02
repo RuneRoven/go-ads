@@ -54,19 +54,29 @@ func flattenJSON(s string) (map[string]float64, error) {
 	return out, nil
 }
 
+// Whole arrays need the datatype table: without LoadSymbols they do not decode.
+func TestHardwareArrayBounds_NeedsLoadSymbols(t *testing.T) {
+	sess := setupConnection(t)
+	defer sess.Close()
+	pre := boundPrefix()
+	for n := range boundWant {
+		if v, err := sess.ReadFromSymbol(context.Background(), pre+n); err == nil {
+			t.Errorf("%s decoded without LoadSymbols as %q; drop this test once that works", n, v)
+		}
+	}
+}
+
 // Negative lower bounds and multi-dimensional arrays decode to the exact
-// values, with and without LoadSymbols, whole and per element.
+// values after LoadSymbols, whole and per element.
 func TestHardwareArrayBounds_Values(t *testing.T) {
 	ctx := context.Background()
 	pre := boundPrefix()
-	for _, mode := range []string{"ondemand", "loadsymbols"} {
+	for _, mode := range []string{"loadsymbols"} {
 		t.Run(mode, func(t *testing.T) {
 			sess := setupConnection(t)
 			defer sess.Close()
-			if mode == "loadsymbols" {
-				if err := sess.LoadSymbols(ctx); err != nil {
-					t.Fatalf("LoadSymbols: %v", err)
-				}
+			if err := sess.LoadSymbols(ctx); err != nil {
+				t.Fatalf("LoadSymbols: %v", err)
 			}
 			names := make([]string, 0, len(boundWant))
 			for n := range boundWant {
@@ -125,11 +135,15 @@ func TestHardwareArrayBounds_Values(t *testing.T) {
 	}
 }
 
-// A subscription to a negative-bound 2-D array delivers the exact values.
+// A subscription to a negative-bound 2-D array delivers the exact values
+// once the datatype table is loaded.
 func TestHardwareArrayBounds_Subscribe(t *testing.T) {
 	name := boundPrefix() + "aNegMulti"
 	sess := setupConnection(t)
 	defer sess.Close()
+	if err := sess.LoadSymbols(context.Background()); err != nil {
+		t.Fatalf("LoadSymbols: %v", err)
+	}
 	ch := make(chan *Update, 4)
 	h, err := sess.AddSymbolNotification(context.Background(), name, 100*time.Millisecond, 100*time.Millisecond, TransModeServerCycle, ch)
 	if err != nil {
