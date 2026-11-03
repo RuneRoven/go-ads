@@ -1182,3 +1182,56 @@ func TestReadFromSymbol_SymbolNotFoundReResolvesTheCachedHandle(t *testing.T) {
 		t.Errorf("GetHandleByName calls = %d, want 1 (the handle must be re-resolved exactly once)", n)
 	}
 }
+
+// TestConnect_LocalModeKeepsCallerNetID: a usermode runtime behind the local
+// router has its own NetID, distinct from the system service's
+// 127.0.0.1.1.1. WithLocalMode must not clobber a NetID the caller already
+// supplied -- doing so sent every request to the wrong runtime, with nothing
+// in the error path pointing at the cause.
+func TestConnect_LocalModeKeepsCallerNetID(t *testing.T) {
+	ep := testEndpoint() // AMS.NetID = {1, 2, 3, 4, 1, 1}
+	// Nothing serves TCP port 1 on loopback, so the dial fails immediately: this
+	// test must never depend on a timeout. The NetID is assigned before the
+	// dial, so the failure does not stop it being observed.
+	ep.Port = 1
+
+	sess, err := NewSession(context.Background(), ep,
+		WithLocalMode(),
+		WithAutoReconnect(false),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	if err := sess.Connect(context.Background()); err == nil {
+		t.Fatal("Connect succeeded against a closed port")
+	}
+	if want := [6]byte{1, 2, 3, 4, 1, 1}; sess.target.NetID != want {
+		t.Errorf("target NetID = %s, want %s (caller-supplied NetID overwritten)",
+			sess.target.NetIDString(), AMSAddress{NetID: want}.NetIDString())
+	}
+}
+
+// TestConnect_LocalModeDefaultsNetIDWhenUnset: with no target NetID supplied,
+// local mode must still fall back to the system service's well-known
+// 127.0.0.1.1.1, exactly as before the caller-supplied-NetID fix.
+func TestConnect_LocalModeDefaultsNetIDWhenUnset(t *testing.T) {
+	ep := AMSEndpoint{IP: "127.0.0.1", Port: 1} // AMS left zero
+	sess, err := NewSession(context.Background(), ep,
+		WithLocalMode(),
+		WithAutoReconnect(false),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	if err := sess.Connect(context.Background()); err == nil {
+		t.Fatal("Connect succeeded against a closed port")
+	}
+	if want := [6]byte{127, 0, 0, 1, 1, 1}; sess.target.NetID != want {
+		t.Errorf("target NetID = %s, want %s (no fallback applied)",
+			sess.target.NetIDString(), AMSAddress{NetID: want}.NetIDString())
+	}
+}

@@ -327,9 +327,11 @@ func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestam
 		//   activeNotifications insert completes. The PLC-side handle exists the
 		//   moment Add returns, so this window is unavoidable; it is wide enough
 		//   to matter whenever a subscribe is still in flight.
+		// The buffer case precedes reconnecting: the resubscribe after a reconnect
+		// runs in that state, and its first samples race their handles' commit too.
 		switch {
-		case sess.isClosed() || sess.isReconnecting():
-			sess.logger.Debug("received notification for deleted handle (expected during close/reconnect)", "handle", handle)
+		case sess.isClosed():
+			sess.logger.Debug("received notification for deleted handle (expected during close)", "handle", handle)
 		case buffer && sess.subscribeRaceActive():
 			// Our own subscribe is mid-flight, so this handle is almost
 			// certainly one we are about to commit. Park the sample instead of
@@ -337,6 +339,8 @@ func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestam
 			// one sample, at subscribe time, and dropping it means the consumer
 			// never sees that tag at all.
 			sess.bufferEarlySample(ctx, handle, timestamp, content)
+		case sess.isReconnecting():
+			sess.logger.Debug("received notification for deleted handle (expected during reconnect)", "handle", handle)
 		default:
 			// Genuine orphan: registered on the PLC, not in our map -- usually a
 			// prior process with the same source NetID+port. Delete it, or the
@@ -356,9 +360,28 @@ func (sess *Session) dispatchSample(ctx context.Context, handle uint32, timestam
 		}
 		return
 	}
+	if entry.order == nil {
+		entry.order = &handleOrder{}
+		sess.notifications.activeNotifications[handle] = entry
+	}
+	order := entry.order
 	notification := entry.Ch
 	fullName := entry.Sym.FullName
 	sess.notifications.lock.Unlock()
+
+	// Replays run on the subscribing goroutine, live samples on the handle's
+	// shard: check, parse and send under one lock or the two sends can swap.
+	order.mu.Lock()
+	defer order.mu.Unlock()
+	// Live samples arrive in order per handle; only a replayed early sample can be
+	// older than one already delivered, and then the consumer has the newer one.
+	if !buffer && timestamp < order.lastStamp {
+		sess.logger.Debug("dropped a replayed sample older than one already delivered", "handle", handle)
+		return
+	}
+	if buffer || timestamp > order.lastStamp {
+		order.lastStamp = timestamp // live samples follow the PLC clock, even back
+	}
 
 	var notificationTime time.Time
 	if timestamp == 0 {

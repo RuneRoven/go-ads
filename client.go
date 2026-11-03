@@ -333,6 +333,7 @@ func Dial(
 			sendChannel:    make(chan []byte),
 			systemResponse: make(chan []byte, 1),
 			recvQueue:      make(chan []byte, recvQueueSize),
+			notifQueue:     make(chan []byte, notifQueueSize),
 			activeRequests: map[uint32]chan amsReply{},
 		},
 	}
@@ -507,9 +508,10 @@ func (c *Client) callOnDrop() {
 // every successful dial / redial. Each goroutine ends on c.ctx.Done() or
 // transport-level error.
 func (c *Client) startWorkers() {
-	c.waitGroup.Add(2 + recvWorkerCount)
+	c.waitGroup.Add(3 + recvWorkerCount)
 	go c.listen()
 	go c.transmitWorker()
+	go c.notifWorker()
 	for i := 0; i < recvWorkerCount; i++ {
 		go c.recvWorker()
 	}
@@ -671,13 +673,23 @@ func (c *Client) readFrames(conn net.Conn, primary bool) {
 		} else {
 			c.framesPeer.Add(1)
 		}
-		if tcpHeader.System > 0 {
+		switch {
+		case tcpHeader.System > 0:
 			select {
 			case c.tx.systemResponse <- data:
 			case <-c.ctx.Done():
 				return
 			}
-		} else {
+		case c.tx.notifQueue != nil && isNotificationFrame(data):
+			select {
+			case c.tx.notifQueue <- data:
+			case <-c.ctx.Done():
+				return
+			default:
+				c.logger.Warn("notification queue full, dropping inbound notification frame (PLC overrun or slow handler)",
+					"queue_size", notifQueueSize, "packet_bytes", len(data))
+			}
+		default:
 			select {
 			case c.tx.recvQueue <- data:
 			case <-c.ctx.Done():
@@ -687,6 +699,63 @@ func (c *Client) readFrames(conn net.Conn, primary bool) {
 					"queue_size", recvQueueSize,
 					"workers", recvWorkerCount,
 					"packet_bytes", len(data))
+			}
+		}
+	}
+}
+
+// isNotificationFrame reports whether an AMS frame carries a DeviceNotification.
+func isNotificationFrame(data []byte) bool {
+	return len(data) >= 32 && CommandID(binary.LittleEndian.Uint16(data[16:18])) == CommandIDDeviceNotification
+}
+
+// notifSample is one decoded notification sample on its way to a shard.
+type notifSample struct {
+	handle    uint32
+	timestamp uint64
+	content   []byte
+}
+
+// notifWorker decodes notification frames in arrival order and hands each
+// sample to the shard of its handle, so one handle's samples are never
+// reordered while different handles are handled in parallel.
+func (c *Client) notifWorker() {
+	defer c.waitGroup.Done()
+	shards := make([]chan notifSample, notifShardCount)
+	var wg sync.WaitGroup
+	for i := range shards {
+		shards[i] = make(chan notifSample, notifShardQueue)
+		wg.Add(1)
+		go func(in chan notifSample) {
+			defer wg.Done()
+			for smp := range in {
+				c.dispatchNotification(c.ctx, smp.handle, smp.timestamp, smp.content)
+			}
+		}(shards[i])
+	}
+	defer func() {
+		for _, sh := range shards {
+			close(sh)
+		}
+		wg.Wait()
+	}()
+	route := func(handle uint32, timestamp uint64, content []byte) {
+		select {
+		case shards[handle%notifShardCount] <- notifSample{handle, timestamp, content}:
+		case <-c.ctx.Done():
+		}
+	}
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case data := <-c.tx.notifQueue:
+			if len(data) < 32 || int(binary.LittleEndian.Uint32(data[20:24])) != len(data)-32 {
+				c.logger.Error("malformed notification frame", "bytes", len(data))
+				continue
+			}
+			if err := decodeNotification(data[32:], route); err != nil {
+				c.logger.Error("device notification decode failed", "error", err)
 			}
 		}
 	}
@@ -809,6 +878,14 @@ func (c *Client) transmitWorker() {
 }
 
 func (c *Client) deviceNotification(ctx context.Context, in []byte) error {
+	return decodeNotification(in, func(handle uint32, timestamp uint64, content []byte) {
+		c.dispatchNotification(ctx, handle, timestamp, content)
+	})
+}
+
+// decodeNotification walks a DeviceNotification payload and passes each sample
+// to emit in wire order.
+func decodeNotification(in []byte, emit func(handle uint32, timestamp uint64, content []byte)) error {
 	var stream NotificationStream
 	var header StampHeader
 	var sample NotificationSample
@@ -838,7 +915,7 @@ func (c *Client) deviceNotification(ctx context.Context, in []byte) error {
 				return fmt.Errorf("short read on notification content: got %d of %d bytes",
 					n, sample.Size)
 			}
-			c.dispatchNotification(ctx, sample.Handle, header.Timestamp, content)
+			emit(sample.Handle, header.Timestamp, content)
 		}
 	}
 	return nil

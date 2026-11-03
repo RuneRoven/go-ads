@@ -370,6 +370,7 @@ func NewSession(ctx context.Context, remote AMSEndpoint, opts ...SessionOption) 
 			sendChannel:    make(chan []byte),
 			systemResponse: make(chan []byte, 1),
 			recvQueue:      make(chan []byte, recvQueueSize),
+			notifQueue:     make(chan []byte, notifQueueSize),
 			activeRequests: map[uint32]chan amsReply{},
 		},
 		lifecycle: &sessionLifecycle{
@@ -565,7 +566,11 @@ func (sess *Session) Connect(ctx context.Context) (retErr error) {
 	var err error
 	sess.logger.Debug("dialing", "ip", sess.ip, "port", sess.port)
 	if local {
-		sess.target.NetID = [6]byte{127, 0, 0, 1, 1, 1}
+		// Keep a caller-supplied NetID: a usermode runtime on this host has its own
+		// NetID behind the local router, distinct from the system's 127.0.0.1.1.1.
+		if sess.target.NetID == [6]byte{} {
+			sess.target.NetID = [6]byte{127, 0, 0, 1, 1, 1}
+		}
 		sess.ip = "127.0.0.1"
 	}
 	// Check the target NetID against the device before spending a dial on it.
@@ -2410,6 +2415,7 @@ func (sess *Session) tearDownAndReset() {
 	sess.tx.sendChannel = make(chan []byte)
 	sess.tx.systemResponse = make(chan []byte, 1)
 	sess.tx.recvQueue = make(chan []byte, recvQueueSize)
+	sess.tx.notifQueue = make(chan []byte, notifQueueSize)
 	sess.tx.chanMu.Unlock()
 	sess.tx.activeRequestLock.Lock()
 	sess.tx.activeRequests = map[uint32]chan amsReply{}

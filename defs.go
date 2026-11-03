@@ -3,6 +3,7 @@ package ads
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // AMSAddress identifies an ADS endpoint by 6-byte NetID and 16-bit port.
@@ -25,12 +26,8 @@ const (
 	TransModeClientOnChange TransMode = 2
 	TransModeServerCycle    TransMode = 3
 	TransModeServerOnChange TransMode = 4
-	// The "InContext" variants run the notification check inside the PLC task cycle
-	// rather than a separate ADS thread, for more deterministic timing. They need a
-	// non-zero ContextMask (the owning task), which only variables local to a
-	// PROGRAM POU in a multi-task project have -- GVLs and single-task projects are
-	// always 0, and TC3 then rejects with 0x070B while TC2 silently never fires.
-	// The AddSymbolNotification paths fall back automatically when it is 0.
+	// InContext modes check the value every cycle of the task that owns it; the
+	// cycle time is ignored, and a symbol without a task context falls back.
 	TransModeServerCycle2    TransMode = 5 // CyclicInContext
 	TransModeServerOnChange2 TransMode = 6 // OnChangeInContext
 	TransModeClient1Request  TransMode = 10
@@ -70,6 +67,21 @@ func downgradeTransMode(mode TransMode) TransMode {
 		return TransModeServerCycle
 	default:
 		return mode
+	}
+}
+
+// notificationCycleField returns the mode to send and the cycle-time field value.
+// For InContext modes the PLC reads that field as the task context number.
+func notificationCycleField(mode TransMode, contextMask uint8, cycleTime time.Duration) (TransMode, time.Duration) {
+	switch mode {
+	case TransModeServerCycle2, TransModeServerOnChange2:
+		if contextMask == 0 {
+			return downgradeTransMode(mode), cycleTime
+		}
+		// One 100 ns tick per context number, so the field carries the number itself.
+		return mode, time.Duration(contextMask) * 100 * time.Nanosecond
+	default:
+		return mode, cycleTime
 	}
 }
 

@@ -17,6 +17,7 @@ type transport struct {
 	sendChannel    chan []byte
 	systemResponse chan []byte
 	recvQueue      chan []byte // bounded inbound packet queue feeding recvWorkers
+	notifQueue     chan []byte // notification frames, kept in arrival order
 
 	currentRequest    atomic.Uint32
 	activeRequestLock sync.Mutex // protects activeRequests against concurrent map access
@@ -41,6 +42,17 @@ const recvWorkerCount = 16
 // recvQueueSize is the buffer between listen and recvWorkers. Beyond this,
 // listen drops packets with a Warn log.
 const recvQueueSize = 256
+
+// notifQueueSize buffers notification frames ahead of the splitter; beyond it,
+// listen drops frames with a Warn log, like recvQueue.
+const notifQueueSize = 1024
+
+// notifShardCount workers dispatch notification samples, each owning the
+// handles that map to it; notifShardQueue buffers samples per worker.
+const (
+	notifShardCount = 8
+	notifShardQueue = 4096
+)
 
 // amsReply is one response handed back to the goroutine that issued the request.
 //
