@@ -302,6 +302,9 @@ func (s *symbol) writeToNode(value string, datatypes map[string]SymbolUploadData
 		for name, child := range s.Children {
 			raw, ok := fields[name]
 			if !ok {
+				raw, ok = fields[jsonKey(name)]
+			}
+			if !ok {
 				continue
 			}
 			// Convert JSON value to string for writeToNode:

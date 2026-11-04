@@ -1938,3 +1938,27 @@ func TestRegisteredBaseline_LowersWhenSymbolsAreGone(t *testing.T) {
 		t.Errorf("lowerRegisteredTo raised the baseline to %d", want)
 	}
 }
+
+// A recovery that is followed by another failure before delivery has stayed
+// healthy is a flapping PLC: the backoff must keep growing, not restart.
+func TestRecoveryStreak_FlappingKeepsBackingOff(t *testing.T) {
+	r := recoveryStreak{stableTicks: 4}
+	for want := 1; want <= 3; want++ {
+		r.attempt() // a recovery that "succeeds"
+		r.healthyTick()
+		r.healthyTick() // alive for less than stableTicks
+		r.unhealthyTick()
+		if r.failures != want {
+			t.Fatalf("after %d flaps failures=%d, want %d", want, r.failures, want)
+		}
+	}
+	for range 4 {
+		r.healthyTick()
+	}
+	if r.failures != 0 {
+		t.Errorf("failures=%d after a stable stretch, want 0", r.failures)
+	}
+	if got := heartbeatAllowedTicks(5, 3, 2*time.Second); got != 15 {
+		t.Errorf("allowed ticks after 3 flaps = %d, want the cap 15", got)
+	}
+}

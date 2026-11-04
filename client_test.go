@@ -1560,3 +1560,18 @@ func TestNotifications_DeliveredInOrderPerHandle(t *testing.T) {
 		}
 	}
 }
+
+// A full AMS router mailbox means the PLC is not keeping up; the client names
+// that once per interval instead of leaving a bare error code per request.
+func TestClient_WarnsOnRouterMailboxFull(t *testing.T) {
+	var buf bytes.Buffer
+	c := &Client{logger: slog.New(slog.NewTextHandler(&buf, nil))}
+	for range 3 {
+		c.noteRouterReply(ReturnCodeGlobalInsertMailboxError)
+	}
+	c.noteRouterReply(ReturnCodeRouterMailboxFull)
+	c.noteRouterReply(0)
+	if got := strings.Count(buf.String(), "AMS router mailbox is full"); got != 1 {
+		t.Errorf("warned %d times, want 1; log: %s", got, buf.String())
+	}
+}

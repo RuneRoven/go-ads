@@ -245,6 +245,9 @@ type Client struct {
 	framesPrimary atomic.Uint64
 	framesPeer    atomic.Uint64
 
+	// Last "router mailbox full" warning, so an overloaded PLC logs once per interval.
+	mailboxWarnNs atomic.Int64
+
 	// When this connection was established, for the uptime on a drop. Set in the
 	// literal before publishing and never written again -- readFrames reads it from
 	// the listen goroutine. Zero is legitimate, so every log site goes through
@@ -1055,8 +1058,27 @@ func (c *Client) sendRequestTo(ctx context.Context, target AMSAddress, command C
 			return nil, ErrTransportClosed
 		}
 	case reply := <-responseCh:
+		c.noteRouterReply(reply.amsErr)
 		return reply.payload()
 	}
+}
+
+// mailboxWarnInterval spaces the warnings while a PLC stays overloaded.
+const mailboxWarnInterval = time.Minute
+
+// noteRouterReply warns when the PLC's AMS router refuses a request because its
+// mailbox is full: the PLC cannot keep up, usually with the notification load.
+func (c *Client) noteRouterReply(code ReturnCode) {
+	if code != ReturnCodeGlobalInsertMailboxError && code != ReturnCodeRouterMailboxFull {
+		return
+	}
+	if !reportNow(&c.mailboxWarnNs, mailboxWarnInterval) {
+		return
+	}
+	c.logger.Warn("the PLC's AMS router mailbox is full and refused a request; the PLC is not keeping up",
+		"code", code,
+		"detail", "usually too many notifications or too short cycle times for this CPU; "+
+			"on small PLCs the router may stay full until the runtime restarts")
 }
 
 func (c *Client) dispatchNotification(ctx context.Context, handle uint32, ts uint64, content []byte) {

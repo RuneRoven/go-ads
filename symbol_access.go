@@ -10,6 +10,9 @@ import (
 // WriteToSymbol writes a value to a PLC symbol by name (handle resolved
 // on-demand and cached).
 func (sess *Session) WriteToSymbol(ctx context.Context, symbolName string, value string) error {
+	if err := sess.requireClient(); err != nil {
+		return err
+	}
 	return sess.writeToSymbolRetry(ctx, symbolName, value, 1)
 }
 
@@ -71,6 +74,9 @@ func (sess *Session) writeToSymbolRetry(ctx context.Context, symbolName string, 
 // ReadFromSymbol reads a PLC symbol by name and returns its stringified
 // value (handle resolved on-demand and cached).
 func (sess *Session) ReadFromSymbol(ctx context.Context, symbolName string) (string, error) {
+	if err := sess.requireClient(); err != nil {
+		return "", err
+	}
 	return sess.readFromSymbolRetry(ctx, symbolName, 1)
 }
 
@@ -171,6 +177,9 @@ func symbolSumAddress(sym *symbol) (group, offset uint32) {
 // leaves thirty-nine present. Any other error means the transport failed and no
 // outcome is known. Reading none returns nil, nil.
 func (sess *Session) ReadMultipleSymbols(ctx context.Context, names []string) (map[string]string, error) {
+	if err := sess.requireClient(); err != nil {
+		return nil, err
+	}
 	return sess.readMultipleSymbolsRetry(ctx, names, 1)
 }
 
@@ -309,6 +318,9 @@ func (sess *Session) readMultipleSymbolsRetry(ctx context.Context, names []strin
 // library never sent it; any other error means the transport failed and no
 // outcome is known. Writing none returns nil, nil.
 func (sess *Session) WriteMultipleSymbols(ctx context.Context, values map[string]string) (map[string]ReturnCode, error) {
+	if err := sess.requireClient(); err != nil {
+		return nil, err
+	}
 	return sess.writeMultipleSymbolsRetry(ctx, values, 1)
 }
 

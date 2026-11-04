@@ -1569,9 +1569,8 @@ func (sess *Session) releasePLCResources(wasDisconnected bool) {
 	}
 	sess.cache.lock.Unlock()
 
-	// Release handles individually — ADS has no batch release command.
-	// Re-check disconnected each iteration so a mid-loop PLC failure
-	// doesn't force every remaining Write to time out.
+	// One Write per handle; stop on a drop or on the first request left unanswered,
+	// so a dead PLC costs Close one timeout rather than one per handle.
 	for i, h := range symHandles {
 		if sess.isDisconnected() {
 			sess.logger.Info("releasePLCResources: disconnected during handle release, stopping cleanup",
@@ -1581,7 +1580,15 @@ func (sess *Session) releasePLCResources(wasDisconnected bool) {
 		}
 		handleBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(handleBytes, h)
-		if err := sess.client.Load().Write(sess.currentLifecycleCtx(), uint32(GroupSymbolReleaseHandle), 0, handleBytes); err != nil {
+		err := sess.client.Load().Write(sess.currentLifecycleCtx(), uint32(GroupSymbolReleaseHandle), 0, handleBytes)
+		if isUnservedError(err) || isTransportDead(err) {
+			// TCP can stay up while ADS answers nothing; each further release would
+			// wait out its own timeout, so Close would block once per handle.
+			sess.logger.Warn("releasePLCResources: PLC not answering, stopping handle cleanup",
+				"error", err, "released", i, "remaining", len(symHandles)-i)
+			break
+		}
+		if err != nil {
 			sess.logger.Warn("failed to release symbol handle", "error", err, "handle", h)
 		} else {
 			// Per handle. The notification-delete path was demoted in 6fc9b14; this is
@@ -1691,6 +1698,15 @@ func (sess *Session) Close() error {
 // either Close() has been called or a reconnect has failed. Callers should use
 // errors.Is(err, ErrDisconnected) to detect this case.
 var ErrDisconnected = errors.New("connection is disconnected")
+
+// requireClient refuses a call made before Connect has succeeded: there is no
+// client to send it on, and dereferencing the missing one panicked.
+func (sess *Session) requireClient() error {
+	if sess.client.Load() == nil {
+		return fmt.Errorf("%w: the session has not connected yet; call Connect first", ErrDisconnected)
+	}
+	return nil
+}
 
 // reconnectBackoff returns the delay for the given reconnect attempt number (1-indexed)
 // based on the configured BackoffConfig tiers.
@@ -3038,6 +3054,9 @@ var ErrRuntimeNotRunning = errors.New("ads: PLC runtime is not in RUN")
 // the SYSTEM's state, not the runtime port's: ADSStateConfig means no runtime port
 // is serving. Answers while the runtime is unavailable, which is the point.
 func (sess *Session) RuntimeState(ctx context.Context) (ADSState, error) {
+	if err := sess.requireClient(); err != nil {
+		return 0, err
+	}
 	c := sess.client.Load()
 	if c == nil {
 		return ADSStateInvalid, ErrTransportClosed

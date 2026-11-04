@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -1525,5 +1526,40 @@ func TestConnect_ResetNamesTheRouteAsALikelyCause(t *testing.T) {
 			t.Errorf("Connect error does not mention %q: %v\n"+
 				"a caller that logs only this error cannot tell a missing route from a dead PLC", want, err)
 		}
+	}
+}
+
+// A PLC whose TCP stays up while ADS answers nothing must not hold Close for
+// one request timeout per cached symbol handle.
+func TestClose_UnresponsivePLCCostsOneTimeout(t *testing.T) {
+	srv := startScriptableServer(t)
+	defer srv.stop()
+	srv.onWrite(GroupSymbolReleaseHandle, func(_, _ uint32, _ []byte) ReturnCode { return ReturnCodeNoErrors })
+	srv.delayBefore(CommandIDWrite, uint32(GroupSymbolReleaseHandle), time.Minute)
+
+	sess := newDialableTestSession(t, srv.host, srv.port, 5)
+	sess.lifecycle.state.transitionTo(SessionStateDisconnected)
+	if err := sess.Reconnect(context.Background()); err != nil {
+		t.Fatalf("initial reconnect: %v", err)
+	}
+	const handles = 20
+	for i := range handles {
+		preSeedTypedSymbol(sess, fmt.Sprintf("MAIN.n%d", i), uint32(0x100+i))
+	}
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		sess.Close()
+		close(done)
+	}()
+	limit := 3 * sess.requestTimeout
+	select {
+	case <-done:
+		t.Logf("Close returned after %s", time.Since(start).Round(time.Millisecond))
+	case <-time.After(limit):
+		t.Errorf("Close still blocked after %s with %d handles and a %s request timeout", limit, handles, sess.requestTimeout)
+		<-done
+		t.Logf("Close returned after %s", time.Since(start).Round(time.Millisecond))
 	}
 }

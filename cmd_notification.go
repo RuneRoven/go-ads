@@ -142,6 +142,9 @@ func (c *Client) DeleteDeviceNotification(ctx context.Context, handle uint32) er
 // last subscription dies. Callers that want raw delete behavior use
 // the Client method directly.
 func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32) error {
+	if err := sess.requireClient(); err != nil {
+		return err
+	}
 	// Snapshot symbol name BEFORE PLC RPC so a concurrent Reconnect clearing
 	// activeNotifications mid-flight doesn't strand notificationConfigs (which
 	// would cause resubscribeNotifications to re-subscribe a deleted symbol).
@@ -203,6 +206,9 @@ func (sess *Session) DeleteDeviceNotification(ctx context.Context, handle uint32
 // in-memory state matches what the PLC saw rather than leaving phantom entries for
 // the next reconnect to re-clean.
 func (sess *Session) SumDeleteDeviceNotification(ctx context.Context, handles []uint32) ([]ReturnCode, error) {
+	if err := sess.requireClient(); err != nil {
+		return nil, err
+	}
 	return sess.sumDeleteDeviceNotification(ctx, handles, true)
 }
 
@@ -501,8 +507,9 @@ const (
 // subscribeRaceActive reports whether an unknown handle is presumed one of ours
 // mid-registration rather than leaked. The in-flight counter is authoritative but
 // not unconditional -- a wedged subscribe would otherwise disable the orphan reaper
-// for the session's life -- so the window also expires, generously enough for
-// hundreds of symbols registered one at a time.
+// for the session's life -- so the window expires once a subscribe has made no
+// progress for subscribeRaceMaxOpen. Age alone is not wedged: a TwinCAT 2 batch
+// registers one symbol at a time and can take minutes under load.
 func (sess *Session) subscribeRaceActive() bool {
 	mgr := sess.notifications
 	now := time.Now().UnixNano()
@@ -531,6 +538,17 @@ func (m *notificationManager) newestOpenSubscribe() (int64, bool) {
 		}
 	}
 	return newest, newest != 0
+}
+
+// subscribeProgress records that an open subscribe just completed an Add, which
+// keeps a slow but working subscribe from being judged wedged.
+func (sess *Session) subscribeProgress(tok subscribeToken) {
+	mgr := sess.notifications
+	mgr.openMu.Lock()
+	defer mgr.openMu.Unlock()
+	if _, open := mgr.openSubscribes[tok]; open {
+		mgr.openSubscribes[tok] = time.Now().UnixNano()
+	}
 }
 
 // beginSubscribe marks a subscribe in flight and returns the token that closes it;
@@ -1140,6 +1158,30 @@ func (sess *Session) startHeartbeatWatch() {
 	})
 }
 
+// recoveryStreak sets the recovery backoff. Every recovery counts as an attempt
+// until delivery has stayed healthy for stableTicks ticks in a row.
+type recoveryStreak struct {
+	failures, healthy, stableTicks int
+}
+
+// attempt records a recovery or re-establish attempt, successful or not: a
+// PLC that accepts the re-subscribe and goes silent again must still back off.
+func (r *recoveryStreak) attempt() {
+	r.failures++
+	r.healthy = 0
+}
+
+func (r *recoveryStreak) healthyTick() {
+	r.healthy++
+	if r.healthy >= r.stableTicks {
+		r.failures = 0
+	}
+}
+
+func (r *recoveryStreak) unhealthyTick() { r.healthy = 0 }
+
+func (r *recoveryStreak) reset() { r.failures, r.healthy = 0, 0 }
+
 // heartbeatWatch re-subscribes when the beats stop. Retrying matters as much as
 // detecting: in CONFIG the re-subscribe cannot succeed, and the watcher keeps
 // trying so the session recovers by itself once the runtime serves again.
@@ -1161,9 +1203,9 @@ func (sess *Session) heartbeatWatch() {
 	ticker := time.NewTicker(cycle)
 	defer ticker.Stop()
 
-	// consecutiveFailures backs the retry off and keeps the log to one line per
-	// episode. Goroutine-local: this is the only writer.
-	consecutiveFailures := 0
+	// streak backs the retry off and keeps the log to one line per episode.
+	// Goroutine-local: this is the only writer.
+	streak := recoveryStreak{stableTicks: 2 * sess.heartbeatAllowedMisses()}
 	// Frames seen when the last silent window opened, and how many windows have
 	// passed without that number moving. A PLC that answers -- even to refuse --
 	// moves it, which is the whole discriminator: anything arriving means the link
@@ -1202,7 +1244,7 @@ func (sess *Session) heartbeatWatch() {
 			// to maxHeartbeatRecoveryBackoff. A PLC that flaps faster than the window
 			// therefore regains the un-backed-off rate on each reconnect; that is
 			// bounded by reconnectSleep, not by this counter.
-			consecutiveFailures = 0
+			streak.reset()
 		}
 		// Connected, not merely "not disconnected": dialAndStart clears the flag
 		// before the route, reload and resubscribe steps, so a reconnect's tail
@@ -1243,19 +1285,15 @@ func (sess *Session) heartbeatWatch() {
 			// ticker runs at the beat's period, so gating the count on beatArrived
 			// lets jitter reset it before it ever reaches allowed.
 			if beatArrived {
-				allowed := heartbeatAllowedTicks(sess.heartbeatAllowedMisses(), consecutiveFailures, cycle)
+				allowed := heartbeatAllowedTicks(sess.heartbeatAllowedMisses(), streak.failures, cycle)
 				if gapTicks >= allowed {
 					gapTicks = 0
 					sess.logger.Error("subscriptions are missing; recovering",
 						"want", registered, "have", active,
 						"detail", "the beat is arriving, so silence would never have revealed this")
-					switch sess.recoverDeadSubscriptions() {
-					case recoveryDone:
-						consecutiveFailures = 0
-					case recoveryDeferred:
-						// Runtime not serving yet: wait, exactly as the silence path does.
-					default:
-						consecutiveFailures++
+					// Runtime not serving yet (deferred): wait, exactly as the silence path does.
+					if sess.recoverDeadSubscriptions() != recoveryDeferred {
+						streak.attempt()
 					}
 					// This tick saw a beat, so record it exactly as the silence check
 					// would have. Skipping it leaves lastBeats stale, and beatArrived
@@ -1277,16 +1315,17 @@ func (sess *Session) heartbeatWatch() {
 			// A beat is proof of life, so a previously-observed silent window no
 			// longer counts toward Confirm's two-in-a-row.
 			silentWindows = 0
-			// And the failure counter goes with it. Under Observe nothing else ever
-			// resets it — no recovery runs — so without this the first episode is the
-			// only one that warns or fires the callback (both are gated on zero), and
-			// the tolerated window doubles for every later episode. A beat means the
-			// PLC is serving our heartbeat again, which is exactly the evidence that
-			// the previous failures no longer describe the situation.
-			consecutiveFailures = 0
+			// The failure counter clears only after a stable stretch: a PLC that
+			// serves a beat or two after each re-subscribe and dies again is flapping.
+			if registered <= active {
+				streak.healthyTick()
+			} else {
+				streak.unhealthyTick()
+			}
 			continue
 		}
 		quietTicks++
+		streak.unhealthyTick()
 		// One decision for every path reaching a silent window: has any frame arrived
 		// since the last one? Attempts that keep failing are evidence about the link,
 		// not the subscriptions. Spawned, not inline: this runs on the heartbeat
@@ -1314,7 +1353,7 @@ func (sess *Session) heartbeatWatch() {
 		// Each consecutive failed recovery doubles the tolerated silence, capped, so
 		// a PLC that stays in CONFIG for an hour costs a handful of attempts instead
 		// of one per interval.
-		allowed := heartbeatAllowedTicks(sess.heartbeatAllowedMisses(), consecutiveFailures, cycle)
+		allowed := heartbeatAllowedTicks(sess.heartbeatAllowedMisses(), streak.failures, cycle)
 		if quietTicks < allowed {
 			continue
 		}
@@ -1329,7 +1368,7 @@ func (sess *Session) heartbeatWatch() {
 			// cyclic notifications outright would otherwise get a round-trip every
 			// `allowed` ticks forever. The log is throttled already; the request
 			// rate was not.
-			consecutiveFailures++
+			streak.attempt()
 			ctx, cancel := context.WithTimeout(sess.currentLifecycleCtx(), cycle)
 			_ = sess.establishHeartbeat(ctx)
 			cancel()
@@ -1356,10 +1395,10 @@ func (sess *Session) heartbeatWatch() {
 			"detail", "a runtime restart or CONFIG toggle stops delivery without dropping the connection, " +
 				"changing the symbol version or reporting an error",
 		}
-		if consecutiveFailures == 0 {
+		if streak.failures == 0 {
 			sess.logger.Error(msg, args...)
 		} else {
-			sess.logger.Debug(msg, append(args, "retry", consecutiveFailures)...)
+			sess.logger.Debug(msg, append(args, "retry", streak.failures)...)
 		}
 
 		switch mode := sess.heartbeatRecoveryMode(); mode {
@@ -1380,7 +1419,7 @@ func (sess *Session) heartbeatWatch() {
 			// Report and do nothing. The consumer owns the decision; churning 41
 			// handles under a caller that would rather rebuild the session is the
 			// thing this mode exists to avoid.
-			if consecutiveFailures == 0 {
+			if streak.failures == 0 {
 				sess.logger.Error("heartbeat silent; not re-subscribing (WithHeartbeatRecovery(Observe))",
 					"detail", "this session's subscriptions are dead until the consumer rebuilds it")
 				// Spawned, never called inline: Close waits heartbeatWG, and this
@@ -1392,7 +1431,7 @@ func (sess *Session) heartbeatWatch() {
 					go cb(ReasonHeartbeatSilent)
 				}
 			}
-			consecutiveFailures++
+			streak.attempt()
 			continue
 		default:
 			silentWindows = 0
@@ -1400,14 +1439,14 @@ func (sess *Session) heartbeatWatch() {
 
 		switch sess.recoverDeadSubscriptions() {
 		case recoveryDone:
-			consecutiveFailures = 0
+			streak.attempt()
 		case recoveryDeferred:
 			// Nothing was attempted, so this says nothing about how hard recovery is.
 			// Counting it doubled the wait every window while a runtime sat in CONFIG,
 			// so by the time it returned to RUN the next attempt was minutes out —
 			// measured on 192.168.3.118, which never recovered inside a 2 minute grace.
 		default:
-			consecutiveFailures++
+			streak.attempt()
 			if escalate() {
 				return
 			}
